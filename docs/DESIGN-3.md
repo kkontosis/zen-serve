@@ -202,6 +202,21 @@ Your idea, "the first to write with an event id takes it", is the **cursor-in-tr
 
 * **Safety:** paths are canonicalised, symlinks out of the directory are refused, and correct `Content-Type`, `ETag` and caching headers are set.
 * **Optional service worker:** the file lives at `/unencrypted/sw.js` and is served with `Service-Worker-Allowed: /`, so it can control the whole origin.
+* **Optional cross-origin isolation** (needed by WASM programs that block on file calls, e.g. a legacy Linux program running in an emulator or as WASI over zen-fs):
+
+  ```toml
+  cross_origin_isolation = false   # default
+  ```
+
+  When `true`, every response from zen-serve (`/unencrypted/*`, root aliases, SPA fallback, `/v1/*`) carries:
+
+  ```
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: same-origin
+  ```
+
+  This enables `SharedArrayBuffer` + `Atomics.wait`, so a Web Worker can make zen-fs calls appear synchronous to the program. With COEP on, any resource the app loads from *another* origin must send CORP or CORS headers, so it's off by default. When enabled, it's reported in `GET /v1/info` (G4) so client libraries can choose the synchronous-adapter path.
 * **HA option:** `unencrypted_source = "replicated"` stores the directory in FoundationDB (a plaintext `fs_id = 0`, uploaded with `zen-serve static push <dir>`), so every node serves identical files. The default `"dir"` reads from local disk.
 
 ---
