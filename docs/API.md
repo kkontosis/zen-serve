@@ -36,8 +36,9 @@ POST /v1/commit
   expect?:  [{fs, key, version}],             // long mode: per-key version CAS
   expect_ranges?: [{fs, begin, end, hash}],
   writes?:  [{fs, key, value | null}],
-  append?:  [{topic, envelope}],              // events published only if this commits
-  consume?: [{group, topic, partition, from, to, lease_token}],
+  append?:  [{topic, key_token?, envelope}],  // events published only if this commits
+  consume?: [{group, topic, partition? | key_token?, from, to, token}],
+  crdt_ops?: [{fs, object, op}],             // server-merged CRDT objects (DESIGN-4 §2)
 }
 → 200 {commit_version, appended: [versionstamp...]}
 → 409 {conflict}            // retryable
@@ -60,7 +61,8 @@ This replaces the per-device `device_seq` gap rule from DESIGN-2 §2.3, so concu
 |---|---|---|
 | POST | `/v1/consume/lease` | `{group, topic, partition}` → `{token, expires}` (acquire or renew) |
 | DELETE | `/v1/consume/lease` | release |
-| GET | `/v1/consume/cursor` | current cursor (+ `last_commit_id`) |
+| GET | `/v1/consume/cursor` | current cursor (+ `last_commit_id`); for `per_key`: low watermark |
+| POST | `/v1/consume/groups` | `{group, topic, mode: broadcast\|sequential\|partitioned\|per_key\|single_key, partitions?, key_token?, max_inflight?}` |
 
 ### Static
 `GET /unencrypted/*`, the root aliases (`/`, `/favicon.ico`, …) and the SPA fallback (DESIGN-3 §4.2).
@@ -125,3 +127,6 @@ const doc = await zen.loro("docs/shopping-list");       // snapshot in KV, updat
 // ---------- admin ----------
 await zen.admin.keyslots.add({ webauthn }); await zen.admin.acl.grant(user, "/home/user", ["read"]);
 ```
+
+
+See DESIGN-4.md for event keys, consumer modes and server-side CRDT objects.
