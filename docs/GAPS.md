@@ -154,6 +154,10 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 
 ---
 
+## Status
+
+**All proposals G1–G26 accepted as written** (round 6). Amendment from the same round: `fs_id` is an integer, not a byte (DESIGN-3 §4.1).
+
 ## Summary
 
 Tier 1 has **six decisions** to settle before the build: G1–G6. Proposals for all of them are above. Everything else has a home in a later milestone.

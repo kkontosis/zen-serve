@@ -8,7 +8,7 @@ Part 3 of the design, following `DESIGN.md` and `DESIGN-2.md`. Where they disagr
 * **Web trust:** browser clients are only as trustworthy as the server at page-load time. Accepted and documented.
 * **Client:** library mode (`@zen/client`). No WebContainers. The service worker is an optional cache only.
 * **Event signatures:** a hybrid-signed checkpoint every `sig_every` events, configurable per topic. `sig_every = 1` signs every event.
-* **Filesystems:** a configured set of filesystems (defaults: `/` and `/home/user`), mounted together on the client. Permissions apply per filesystem only. All of them live in the same FoundationDB keyspace, distinguished by an `fs_id` key prefix.
+* **Filesystems:** a configured set of filesystems (defaults: `/` and `/home/user`), mounted together on the client. Permissions apply per filesystem only. All of them live in the same FoundationDB keyspace, distinguished by an integer `fs_id` key prefix (§4.1).
 * **Static files:** served plaintext from `/unencrypted` (§4).
 * **zen-db runs on the client.** The SQLite-on-pages idea is **dropped**. zen-db becomes a client-side encryption layer over an encrypted key-value API (§2).
 * **Single-leader consumption:** leases plus fencing plus atomic consume-commit, all inside FoundationDB transactions (§3). No separate Raft.
@@ -186,7 +186,7 @@ Your idea, "the first to write with an event id takes it", is the **cursor-in-tr
 ```
 
 * On the client, an encrypted mount table maps `fs_id → mount path`. Each filesystem has its own master key, keyslots and ACL entry.
-* `fs_id` is a single byte (256 filesystems), but FoundationDB's tuple encoding makes a wider integer just as cheap, so the byte is a policy limit, not a format limit.
+* `fs_id` is an **unsigned integer** (u32 on the wire). It's stored as the first element of the FoundationDB tuple key, where the tuple encoding is variable-length: small ids take 2 bytes, so there's no cost to the wider range. `0` is reserved for the replicated plaintext `/unencrypted` store.
 * For multi-tenant later, the prefix becomes `(tenant_id, fs_id)`.
 * Permission rights per filesystem: `read`, `write`. Per topic prefix: `read`, `append`, `consume` (lead).
 
