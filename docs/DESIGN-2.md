@@ -312,3 +312,7 @@ FIPS does **not** make things more secure than the modern suite. It's a complian
 2. Is it acceptable that web clients are only as trustworthy as the server at load time? If not, the verification extension or desktop client moves earlier.
 3. Is the WebContainers commercial licence acceptable for Option 1, or do we build our own environment?
 4. Do we need per-event Ed25519 signatures by default, or only hybrid-signed checkpoints?
+
+---
+
+> **Superseded in part by DESIGN-3.md**: zen-db is now an encrypted KV layer (SQLite-on-pages has been dropped), the filesystem is built on KV transactions (the tree-CRDT filesystem becomes optional), and single-leader consumers have been added. The open questions above are answered in DESIGN-3 §0.
