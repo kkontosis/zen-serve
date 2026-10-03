@@ -318,9 +318,11 @@ docker/         # multi-stage build; compose: 3x FDB + 2x zen-server + LB
 7. Multi-user: epochs, revocation and re-encryption, hybrid-signed commit log, optional witness.
 8. Optional: changeset/CRDT mode, ORAM volume type.
 
-## 10. Open questions
+## 10. Decisions (round 1)
 
-1. Is the first deliverable the **block device** (native) or **zen-db** (browser and multi-user)?
-2. Is FoundationDB acceptable as a dependency, or is a single self-contained binary a hard requirement?
-3. Target scale: one family or team, or many tenants?
-4. Do we need the FIPS-only algorithm set (AES-GCM-SIV/SHA-2), or is XChaCha/BLAKE3 fine?
+1. Crypto suite in §2 is accepted. A per-volume `suite` field is added; the FIPS suite is deferred (see DESIGN-2.md §7).
+2. Storage backend: FoundationDB, bundled and supervised by zen-serve (no docker-compose). See DESIGN-2.md §6.
+3. Scale: family first; the event store must scale to multi-tenant.
+4. Both block mode and zen-db are wanted, plus an encrypted event log for client-side CRDTs and event sourcing.
+
+Continued in **DESIGN-2.md**.
