@@ -31,6 +31,8 @@ pub const SIG_ML_DSA_65: &str = "zen/v1/sig-ml-dsa-65";
 pub const DEVICE_SIG: &str = "zen/v1/device-sig";
 /// KDF: device X-Wing seed from a device secret.
 pub const DEVICE_KEM: &str = "zen/v1/device-kem";
+/// KDF: hybrid identity seed of a password-derived key from its Argon2id output.
+pub const PASSWORD_SIG: &str = "zen/v1/password-sig";
 /// Hash: fingerprint of public key material.
 pub const FINGERPRINT: &str = "zen/v1/fingerprint";
 /// Hash: chain hash of a signed ACL document.
@@ -73,6 +75,8 @@ pub const SIG_EVENT: &str = "zen/v1/sig/event";
 pub const SIG_SESSION: &str = "zen/v1/sig/session";
 /// Signature purpose: filesystem tree checkpoint.
 pub const SIG_TREE_CHECKPOINT: &str = "zen/v1/sig/tree-checkpoint";
+/// Signature purpose: sign-in challenge signed by a password-derived key.
+pub const SIG_PASSWORD_SESSION: &str = "zen/v1/sig/password-session";
 
 /// Every label, for registry checks.
 pub const ALL: &[&str] = &[
@@ -91,6 +95,7 @@ pub const ALL: &[&str] = &[
     SIG_ML_DSA_65,
     DEVICE_SIG,
     DEVICE_KEM,
+    PASSWORD_SIG,
     FINGERPRINT,
     ACL_CHAIN,
     RANGE_HASH,
@@ -111,6 +116,7 @@ pub const ALL: &[&str] = &[
     SIG_EVENT,
     SIG_SESSION,
     SIG_TREE_CHECKPOINT,
+    SIG_PASSWORD_SESSION,
 ];
 
 /// Signature purposes accepted by [`crate::sig`].
@@ -123,4 +129,5 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_EVENT,
     SIG_SESSION,
     SIG_TREE_CHECKPOINT,
+    SIG_PASSWORD_SESSION,
 ];

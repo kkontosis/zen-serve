@@ -13,6 +13,7 @@ pub mod kdf;
 pub mod keys;
 pub mod keyslot;
 pub mod labels;
+pub mod pwkey;
 pub mod rng;
 pub mod seal;
 pub mod sig;

@@ -175,6 +175,24 @@ The verifier checks the signature with the expected user identity, **and** that 
 
 The membership log that distributes certificates (G1) is the ACL chain (§9).
 
+### 7.5 Password-derived key (sign-in method 6, auth.md §11)
+
+A client derives a hybrid signing key from a password. Only the client ever sees the password.
+
+```
+root     = Argon2id(password, salt[32], m_cost_kib, t_cost, p_cost, out = 32)
+seed     = KDF("zen/v1/password-sig", root, "")
+identity = the identity of `seed` (§7.1)
+```
+
+* `password` is the UTF-8 bytes the user typed, unchanged. The login name is not an input: it only finds the account (auth.md §11.1).
+* `salt` is 32 random bytes chosen by the client at registration. The server stores the salt, the parameters and the **public identity** (§7.2), never the password or `root`.
+* **Argon2id parameters** follow the passphrase keyslot (§6): **registration** requires m ≥ 65536 KiB, t ≥ 1 and 1 ≤ p ≤ 4, and **sign-in** enforces only the ceiling m ≤ 4194304 KiB, 1 ≤ t ≤ 16, 1 ≤ p ≤ 4, because the server supplies the parameters.
+* To sign in, the client signs the session message of §10 with purpose `zen/v1/sig/password-session`. A device signature (`zen/v1/sig/session`) never verifies as a password signature, or the reverse.
+* The public identity is a **verifier**: whoever holds it, the server included, can test password guesses offline at the cost of one Argon2id run each, exactly as with a passphrase keyslot.
+
+Vectors: `test-vectors/pwkey.json`.
+
 ## 8. Not yet specified
 
 These later-milestone formats are out of scope here:
@@ -242,6 +260,8 @@ msg     = lp(challenge) ‖ lp(origin)
 ```
 
 `origin` is the UTF-8 `scheme://host[:port]` of the server, as the client sees it.
+
+A password-derived key (§7.5) signs the same `msg` with purpose `zen/v1/sig/password-session`.
 
 ## 11. Filesystem objects (spec/fs.md)
 

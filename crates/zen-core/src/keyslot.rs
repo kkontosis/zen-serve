@@ -73,7 +73,8 @@ impl Argon2Params {
     /// Maximum lanes accepted when creating or opening a slot.
     pub const MAX_P_COST: u32 = 4;
 
-    fn validate_for_open(&self) -> Result<()> {
+    /// Check the opening ceilings: m ≤ 4 GiB, 1 ≤ t ≤ 16, 1 ≤ p ≤ 4.
+    pub fn validate_for_open(&self) -> Result<()> {
         if self.m_cost_kib > Self::MAX_M_COST_KIB
             || !(1..=Self::MAX_T_COST).contains(&self.t_cost)
             || !(1..=Self::MAX_P_COST).contains(&self.p_cost)
@@ -83,7 +84,8 @@ impl Argon2Params {
         Ok(())
     }
 
-    fn validate_for_create(&self) -> Result<()> {
+    /// Check the creation floors (m ≥ 64 MiB) as well as the ceilings.
+    pub fn validate_for_create(&self) -> Result<()> {
         self.validate_for_open()?;
         if self.m_cost_kib < Self::MIN_M_COST_KIB {
             return Err(Error::Param);
@@ -91,7 +93,7 @@ impl Argon2Params {
         Ok(())
     }
 
-    fn derive(&self, passphrase: &[u8], salt: &[u8; 32]) -> Result<Key32> {
+    pub(crate) fn derive(&self, passphrase: &[u8], salt: &[u8; 32]) -> Result<Key32> {
         let params = argon2::Params::new(self.m_cost_kib, self.t_cost, self.p_cost, Some(32))
             .map_err(|_| Error::Param)?;
         let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);

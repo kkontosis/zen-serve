@@ -297,3 +297,64 @@ fn device_cert_binds_user_and_device() {
     bad[40] ^= 1; // inside the device public key
     assert!(sig::verify_device_cert(&user.public(), &bad).is_err());
 }
+
+#[test]
+fn password_key_round_trip_and_separation() {
+    use zen_core::pwkey::{self, PasswordKey};
+    let p = vectors::FIXTURE_ARGON2;
+    let (key, salt) = PasswordKey::create(b"hunter2 hunter2", p, &mut OsRng).unwrap();
+    let again = PasswordKey::derive(b"hunter2 hunter2", &salt, p).unwrap();
+    assert_eq!(key.public(), again.public());
+    let sig = again.sign_session(&[7; 32], "https://a.example").unwrap();
+    pwkey::verify_session(&key.public(), &[7; 32], "https://a.example", &sig).unwrap();
+    // Bound to the challenge and the origin.
+    assert_eq!(
+        pwkey::verify_session(&key.public(), &[8; 32], "https://a.example", &sig),
+        Err(Error::Signature)
+    );
+    assert_eq!(
+        pwkey::verify_session(&key.public(), &[7; 32], "https://b.example", &sig),
+        Err(Error::Signature)
+    );
+    // Another password, or another salt, is another key.
+    let wrong = PasswordKey::derive(b"hunter3 hunter3", &salt, p).unwrap();
+    assert_ne!(wrong.public(), key.public());
+    let other = PasswordKey::derive(b"hunter2 hunter2", &[0; 32], p).unwrap();
+    assert_ne!(other.public(), key.public());
+}
+
+#[test]
+fn password_key_parameter_bounds() {
+    use zen_core::pwkey::PasswordKey;
+    let low = Argon2Params {
+        m_cost_kib: 1024,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    // Creation enforces the floor; sign-in only the ceilings.
+    assert!(matches!(
+        PasswordKey::create(b"pw", low, &mut OsRng),
+        Err(Error::Param)
+    ));
+    assert!(PasswordKey::derive(b"pw", &[1; 32], low).is_ok());
+    let huge = Argon2Params {
+        m_cost_kib: Argon2Params::MAX_M_COST_KIB + 1,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    assert!(matches!(
+        PasswordKey::derive(b"pw", &[1; 32], huge),
+        Err(Error::Param)
+    ));
+    for (t, pc) in [(0, 1), (17, 1), (1, 0), (1, 5)] {
+        let bad = Argon2Params {
+            m_cost_kib: 1024,
+            t_cost: t,
+            p_cost: pc,
+        };
+        assert!(matches!(
+            PasswordKey::derive(b"pw", &[1; 32], bad),
+            Err(Error::Param)
+        ));
+    }
+}

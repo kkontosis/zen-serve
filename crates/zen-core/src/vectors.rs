@@ -6,6 +6,7 @@
 use crate::kdf::{fingerprint, kdf, prf16};
 use crate::keys::FsKeys;
 use crate::keyslot::{self, Argon2Params, Unlock};
+use crate::pwkey::{self, PasswordKey};
 use crate::rng::DetRng;
 use crate::seal::{self, EventBody};
 use crate::sig::{self, DeviceSecret, SigningIdentity};
@@ -32,6 +33,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("keyslots.json", keyslot_vectors()?),
         ("signatures.json", signature_vectors()?),
         ("fs.json", fs_vectors()?),
+        ("pwkey.json", pwkey_vectors()?),
     ])
 }
 
@@ -253,5 +255,37 @@ fn fs_vectors() -> Result<Value> {
         "manifest": {"rng_seed": "fs-manifest", "plaintext": h(&manifest.encode()), "sealed": h(&sealed_manifest)},
         "chunk": {"rng_seed": "fs-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_chunk)},
         "op_chain": {"replaces": [h(&[0x66; 12])], "steps": chains},
+    }))
+}
+
+/// Challenge signed in the password-key vectors.
+pub const FIXTURE_CHALLENGE: [u8; 32] = [0x5A; 32];
+/// Origin signed in the password-key vectors.
+pub const FIXTURE_ORIGIN: &str = "https://zen.example.org";
+
+fn pwkey_vectors() -> Result<Value> {
+    let (key, salt) = PasswordKey::create(
+        FIXTURE_PASSPHRASE,
+        FIXTURE_ARGON2,
+        &mut DetRng::new("pwkey"),
+    )?;
+    let root = pwkey::root(FIXTURE_PASSPHRASE, &salt, FIXTURE_ARGON2)?;
+    let seed = pwkey::seed(&root);
+    let public = key.public();
+    let msg = pwkey::session_message(&FIXTURE_CHALLENGE, FIXTURE_ORIGIN);
+    let signature = key.sign_session(&FIXTURE_CHALLENGE, FIXTURE_ORIGIN)?;
+    // Sanity: sign-in derives the same key from the stored salt.
+    let again = PasswordKey::derive(FIXTURE_PASSPHRASE, &salt, FIXTURE_ARGON2)?;
+    assert_eq!(again.public(), public);
+    pwkey::verify_session(&public, &FIXTURE_CHALLENGE, FIXTURE_ORIGIN, &signature)?;
+    Ok(json!({
+        "description": "Password-derived signing key (formats.md §7.5): root = Argon2id(password, salt), seed = KDF(\"zen/v1/password-sig\", root, \"\"), identity from seed (§7.1); sign-in signature over lp(challenge) || lp(origin).",
+        "password": String::from_utf8_lossy(FIXTURE_PASSPHRASE),
+        "salt_rng_seed": "pwkey", "salt": h(&salt),
+        "m_cost_kib": FIXTURE_ARGON2.m_cost_kib, "t_cost": FIXTURE_ARGON2.t_cost, "p_cost": FIXTURE_ARGON2.p_cost,
+        "root": h(root.as_ref()), "seed": h(seed.as_ref()),
+        "public": h(&public.encode()), "fingerprint": h(&public.fingerprint()),
+        "session": {"purpose": labels::SIG_PASSWORD_SESSION, "challenge": h(&FIXTURE_CHALLENGE),
+                    "origin": FIXTURE_ORIGIN, "message": h(&msg), "signature": h(&signature)},
     }))
 }

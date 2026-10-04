@@ -143,3 +143,38 @@ fn hlc_clock_rules() {
     assert_eq!(c.tick(1001), hlc(5000, 4));
     assert!(c.tick(6000) > hlc(5000, 4));
 }
+
+#[test]
+fn pwkey_vectors_verify_from_files() {
+    use zen_core::keyslot::Argon2Params;
+    use zen_core::pwkey::{self, PasswordKey};
+    let v = load("pwkey.json");
+    let params = Argon2Params {
+        m_cost_kib: v["m_cost_kib"].as_u64().unwrap() as u32,
+        t_cost: v["t_cost"].as_u64().unwrap() as u32,
+        p_cost: v["p_cost"].as_u64().unwrap() as u32,
+    };
+    let salt: [u8; 32] = hx(&v["salt"]).try_into().unwrap();
+    let key =
+        PasswordKey::derive(v["password"].as_str().unwrap().as_bytes(), &salt, params).unwrap();
+    assert_eq!(key.public().encode(), hx(&v["public"]));
+    let public = PublicIdentity::decode(&hx(&v["public"])).unwrap();
+    assert_eq!(public.fingerprint().to_vec(), hx(&v["fingerprint"]));
+    let s = &v["session"];
+    let origin = s["origin"].as_str().unwrap();
+    assert_eq!(
+        pwkey::session_message(&hx(&s["challenge"]), origin),
+        hx(&s["message"])
+    );
+    pwkey::verify_session(&public, &hx(&s["challenge"]), origin, &hx(&s["signature"])).unwrap();
+    // The purpose separates it from a device's session signature.
+    assert!(
+        public
+            .verify(
+                labels::SIG_SESSION,
+                &hx(&s["message"]),
+                &hx(&s["signature"])
+            )
+            .is_err()
+    );
+}
