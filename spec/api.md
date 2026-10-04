@@ -17,11 +17,13 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 404 | `not_found` (unknown fs, group, …) | no |
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
   | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
+  | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
+  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, fs.md §3.4) | with a fresh `hlc` (rebase) |
+  | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
   | 429 | `quota` | later |
-  | 501 | `not_implemented` (`crdt_ops`) | no |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -33,11 +35,13 @@ No authentication. Returns:
 { server: text, api: 1,
   suites: [1],                       // supported suite ids (spec/suites.md)
   formats: [1],
-  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static"
+  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs"
   cross_origin_isolation: bool,      // DESIGN-3 §4.2
   claimed: bool,                     // an ACL exists
+  time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
   limits: { max_key_bytes, max_value_bytes, max_envelope_bytes, max_commit_bytes,
-            max_commit_ops, max_range_items, idempotency_ttl_secs, session_ttl_secs } }
+            max_commit_ops, max_range_items, idempotency_ttl_secs, session_ttl_secs,
+            crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo } }
 ```
 
 ## 3. Sessions
@@ -141,8 +145,14 @@ POST /v1/commit
   append?: [{fs, topic: bytes, key_token: bytes(16)?, envelope: bytes}],
   consume?: [{fs, group: bytes, partition?: u32, key_token: bytes(16)?,
               from: bytes(12), to: bytes(12), token: u64}],
-  crdt_ops?: [any] }                                        // non-empty → 501
-→ { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)] }
+  chunks?: [{fs, id: bytes(16), data: bytes}],              // filesystem chunks (fs.md §4.1)
+  crdt_ops?: [CrdtOp] }                                     // filesystem operations (fs.md §3, §4)
+→ { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)], dots: [bytes(12)] }
+
+CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), hlc: u64, meta?: bytes}
+       | {fs, tree: bytes(16), op: "meta",  node: bytes(16), hlc: u64, meta: bytes}
+       | {fs, tree: bytes(16), op: "write", node: bytes(16), replaces?: [bytes(12)],
+                                            chunks?: [bytes(16)], manifest: bytes}
 ```
 
 The whole commit is **one storage transaction**: all of it applies, or none of it.
@@ -159,6 +169,8 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys, else 413), then `writes`, where the last write to a key wins.
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
+8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
+9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` and `manifest` are at most `max_value_bytes`. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`.
 
 ## 7. Log
 
@@ -307,3 +319,36 @@ Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5
   redundancy?: text,           // FoundationDB: "single", "double", "triple"
   machines: u32, processes: u32, coordinators: u32, messages: [text] }
 ```
+
+## 12. Filesystem (spec/fs.md)
+
+All requests need fs `read`. Writes go through `/v1/commit` (§6). A **node state** is:
+
+```
+NodeState = { node: bytes(16),
+              parent?: bytes(16),                 // absent: invisible (fs.md §1)
+              move_hlc: u64, move_device: bytes(32),
+              meta?: bytes, meta_hlc?: u64, meta_device?: bytes(32),
+              versions: u32,                      // number of content versions (siblings when > 1)
+              changed: bytes(12) }                // change offset (fs.md §5)
+```
+
+| Request | Response |
+|---|---|
+| `POST /v1/fs/tree/list {fs}` | `{trees: [{tree, ops: u64}]}` |
+| `POST /v1/fs/tree/get {fs, tree, nodes: [bytes(16)], read_version?}` | `{read_version, nodes: [NodeState]}`. Unknown nodes are left out. |
+| `POST /v1/fs/tree/children {fs, tree, parent, after?: bytes(16), limit?, read_version?}` | `{read_version, nodes: [NodeState], more}`, in node-id order after `after` |
+| `POST /v1/fs/tree/changes {fs, tree, after?: bytes(12), limit?, wait_ms?}` | `{changes: [{offset: bytes(12), node, state?: NodeState}], cursor?: bytes(12), more}` |
+| `POST /v1/fs/tree/chain {fs, tree}` | `{ops: u64, chain: bytes(32)}` (formats.md §11.5) |
+| `POST /v1/fs/file/get {fs, tree, node, read_version?}` | `{read_version, versions: [{dot, device, chunks: [bytes(16)], manifest}]}` |
+| `POST /v1/fs/chunks/get {fs, ids: [bytes(16)]}` | `{chunks: [{id, data?}]}`. `data` is absent for unknown ids. |
+
+* **`changes`.**
+  * It lists nodes changed after `after`, in change order; with no `after`, it lists every node.
+  * A change without `state` is a purged node (tombstone).
+  * `cursor` is the offset of the last change returned. Pass it as `after` next time; it is absent when nothing was returned and no `after` was given.
+  * With `wait_ms` (at most 30,000), an empty result waits for the next change of the tree.
+  * 409 `resync`: start again without `after`.
+* **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`. `nodes` and `ids` take at most 1,000 and 64 entries.
+* **`read_version`** works as in KV reads (§5): several reads at one version see one snapshot.
+

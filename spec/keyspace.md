@@ -73,7 +73,7 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 
 | Key | Value |
 |---|---|
-| `pack("cid", commit_id)` | idempotency record: `versionstamp ‖ u16 appended_count ‖ device_fp(32)` |
+| `pack("cid", commit_id)` | idempotency record: `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count` (§3.6) |
 | `pack("cix", vs, commit_id)` | empty: expiry index for idempotency records, oldest first |
 | `pack("acl", version)` | signed ACL (formats.md §9), every version kept (the membership log) |
 | `pack("acl_head")` | `u64 version` of the current ACL |
@@ -94,3 +94,39 @@ Every node of a cluster shares these, so a request can go to any node.
 * The sweeper deletes expired sessions and consumed challenges, and ephemeral entries older than `limits.ephemeral_ttl_secs` (api.md §9.1).
 
 Leases are never deleted: the stored token is what keeps fencing tokens increasing.
+
+### 3.6 Filesystem trees (spec/fs.md)
+
+`tree`, `node`, `parent` and `chunk` are 16-byte ids, stored as byte-string elements. `hlc` is an integer element. `dev` is the 32-byte device fingerprint. `cvs` is a 12-byte versionstamp element.
+
+| Key | Value |
+|---|---|
+| `pack("tr", fs, tree)` | tree header: `u64 ops ‖ chain(32) ‖ resync_before(12)` |
+| `pack("th", fs, tree)` | `versionstamp` of the tree's last change; watched by `changes` long-polls |
+| `pack("tn", fs, tree, node)` | node record (below) |
+| `pack("tc", fs, tree, parent, node)` | empty: children index of the node's current parent |
+| `pack("tm", fs, tree, hlc, dev)` | move log: `node ‖ parent ‖ u8 has_old ‖ [old_parent ‖ u64 old_hlc ‖ old_dev(32)]`: the parent and move timestamp the move replaced, restored on undo |
+| `pack("tv", fs, tree, cvs, node)` | change index: empty, or `0x01` for a purged node's tombstone |
+| `pack("tx", fs, tree, cvs, node)` | empty: tombstones only, so the sweeper can drop old ones without scanning the change index |
+| `pack("tf", fs, tree, node, dot)` | content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest` |
+| `pack("ck", fs, chunk)` | sealed chunk |
+| `pack("cr", fs, chunk)` | `i64` little-endian, atomic add: number of versions referencing the chunk |
+| `pack("cz", fs, cvs, chunk)` | empty: chunk GC candidate, from upload or the release of a reference |
+
+**Node record:**
+
+```
+changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
+            ‖ u64 meta_hlc ‖ meta_dev(32) ‖ u32 versions ‖ meta
+```
+
+* `changed` is written as a versionstamp at commit time, the same offset as the node's `tv` entry. The `u16` index numbers the changed nodes of the commit.
+* `flags`: bit 0 = has a parent, bit 1 = has meta. When a bit is clear, the matching fields are zero.
+* `meta` runs to the end of the record.
+
+**Notes:**
+* The move log is in timestamp order. Undo and redo read the range after a move's key.
+* A node's old `tv` entry is cleared when it changes again, so the change index holds one entry per live node, plus tombstones.
+* `resync_before` in the tree header is the newest tombstone the sweeper has dropped. A `changes` cursor before it gets 409 `resync`.
+* The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count`. Records written before milestone 3.5 have no `write_count`, which then reads as 0.
+

@@ -104,6 +104,11 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 * A **maximum late-operation horizon**: operations older than the stability point are rejected and the client rebases.
 * Contention: a single tree comfortably handles family load, and one tree per filesystem keeps them independent.
 
+**Decided (milestone 3.5):**
+* A late move undoes and redoes at most `crdt_max_redo` logged moves.
+* Operations older than a time horizon (`crdt_horizon_secs`) are refused with `stale_op`, and the client rebases. Batches are ordinary commits.
+* See spec/fs.md §3.4.
+
 ### G11. Mixing CRDT ops with transactions
 **Gap:** what isolation do `crdt_ops` get inside a `commit` with read conflicts?
 
@@ -111,6 +116,11 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 * CRDT ops never abort *other* transactions because of their own reads. The merge is internal and conflicts are retried by the server.
 * They **do** commit atomically with the KV writes, appends and consumes in the same request.
 * Document: "CRDT ops are always accepted, never conflict."
+
+**Decided (milestone 3.5):**
+* In long mode the server retries its own conflicts.
+* In short mode, CRDT reads conflict like any read.
+* See spec/fs.md §7.
 
 ### G12. Quotas, limits and abuse by members
 **Gap:** an authorized member, or a compromised device, can fill storage, create millions of nodes or topics, or flood the event log.

@@ -85,6 +85,12 @@ impl FsKeys {
         kdf(labels::TOPIC_DATA, &self.epoch_key, &self.fs_epoch_info())
     }
 
+    /// `KDF("zen/v1/fs-data", MK_e, u32(fs) || u32(e))`: AEAD key of filesystem
+    /// meta, manifests and chunks (spec/formats.md §11).
+    pub fn fs_data_key(&self) -> Key32 {
+        kdf(labels::FS_DATA, &self.epoch_key, &self.fs_epoch_info())
+    }
+
     /// Encode as the 72-byte keyslot payload: `u32(fs) || u32(e) || NK || MK_e`.
     pub fn to_bundle(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::with_capacity(BUNDLE_LEN));

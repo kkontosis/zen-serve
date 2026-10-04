@@ -72,6 +72,9 @@ pub struct Info {
     pub cross_origin_isolation: bool,
     /// Whether an ACL exists.
     pub claimed: bool,
+    /// Server clock, unix milliseconds (HLC observation, spec/fs.md §2).
+    #[serde(default)]
+    pub time_ms: u64,
     /// Server limits.
     pub limits: Limits,
 }
@@ -95,6 +98,15 @@ pub struct Limits {
     pub idempotency_ttl_secs: u64,
     /// Session lifetime.
     pub session_ttl_secs: u64,
+    /// How far an `hlc` may be ahead of the server clock.
+    #[serde(default)]
+    pub crdt_max_skew_ms: u64,
+    /// How far back a late filesystem operation may reach.
+    #[serde(default)]
+    pub crdt_horizon_secs: u64,
+    /// Max logged moves one late move may undo and redo.
+    #[serde(default)]
+    pub crdt_max_redo: u32,
 }
 
 // ---------------------------------------------------------------- auth
@@ -441,9 +453,12 @@ pub struct Commit {
     /// Consume steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consume: Vec<Consume>,
-    /// Server-side CRDT ops (not implemented yet).
+    /// Filesystem chunks (spec/fs.md §4.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub crdt_ops: Vec<ciborium::Value>,
+    pub chunks: Vec<ChunkPut>,
+    /// Filesystem operations (spec/fs.md §3, §4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crdt_ops: Vec<CrdtOp>,
 }
 
 /// `POST /v1/commit` response.
@@ -456,6 +471,9 @@ pub struct CommitResult {
     pub versionstamp: Vec<u8>,
     /// Offsets of the appended events, in request order.
     pub appended: Vec<ByteBuf>,
+    /// Dots of the versions created by `write` operations, in request order.
+    #[serde(default)]
+    pub dots: Vec<ByteBuf>,
 }
 
 /// `POST /v1/log/append` request.
@@ -815,6 +833,330 @@ pub struct DlqOp {
     pub commit_id: Option<Vec<u8>>,
 }
 
+// ---------------------------------------------------------------- filesystem
+
+/// A chunk upload in a commit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChunkPut {
+    /// fs_id.
+    pub fs: u32,
+    /// Chunk id (16 bytes).
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+    /// Sealed chunk.
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// A filesystem operation in a commit, tagged by `op` (spec/api.md §6).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CrdtOp {
+    /// Create, move, rename+move, delete (to trash), restore.
+    Move {
+        /// fs_id.
+        fs: u32,
+        /// Tree id.
+        #[serde(with = "serde_bytes")]
+        tree: Vec<u8>,
+        /// Node id.
+        #[serde(with = "serde_bytes")]
+        node: Vec<u8>,
+        /// New parent.
+        #[serde(with = "serde_bytes")]
+        parent: Vec<u8>,
+        /// Hybrid logical clock.
+        hlc: u64,
+        /// Sealed meta, applied with the same timestamp.
+        #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+        meta: Option<Vec<u8>>,
+    },
+    /// Set a node's sealed meta (LWW).
+    Meta {
+        /// fs_id.
+        fs: u32,
+        /// Tree id.
+        #[serde(with = "serde_bytes")]
+        tree: Vec<u8>,
+        /// Node id.
+        #[serde(with = "serde_bytes")]
+        node: Vec<u8>,
+        /// Hybrid logical clock.
+        hlc: u64,
+        /// Sealed meta.
+        #[serde(with = "serde_bytes")]
+        meta: Vec<u8>,
+    },
+    /// Write a content version (multi-value register).
+    Write {
+        /// fs_id.
+        fs: u32,
+        /// Tree id.
+        #[serde(with = "serde_bytes")]
+        tree: Vec<u8>,
+        /// Node id.
+        #[serde(with = "serde_bytes")]
+        node: Vec<u8>,
+        /// Dots of the versions this one replaces.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replaces: Vec<ByteBuf>,
+        /// Chunk ids in file order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chunks: Vec<ByteBuf>,
+        /// Sealed manifest.
+        #[serde(with = "serde_bytes")]
+        manifest: Vec<u8>,
+    },
+}
+
+impl CrdtOp {
+    /// The op's fs and tree.
+    pub fn target(&self) -> (u32, &[u8]) {
+        match self {
+            CrdtOp::Move { fs, tree, .. }
+            | CrdtOp::Meta { fs, tree, .. }
+            | CrdtOp::Write { fs, tree, .. } => (*fs, tree),
+        }
+    }
+}
+
+/// A node's state (spec/api.md §12).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeState {
+    /// Node id.
+    #[serde(with = "serde_bytes")]
+    pub node: Vec<u8>,
+    /// Parent; absent = invisible.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Vec<u8>>,
+    /// HLC of the move that set the parent.
+    pub move_hlc: u64,
+    /// Device of that move.
+    #[serde(with = "serde_bytes")]
+    pub move_device: Vec<u8>,
+    /// Sealed meta.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Vec<u8>>,
+    /// HLC of the meta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_hlc: Option<u64>,
+    /// Device of the meta.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub meta_device: Option<Vec<u8>>,
+    /// Number of content versions.
+    pub versions: u32,
+    /// Change offset.
+    #[serde(with = "serde_bytes")]
+    pub changed: Vec<u8>,
+}
+
+/// `POST /v1/fs/tree/list` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeList {
+    /// fs_id.
+    pub fs: u32,
+}
+
+/// One tree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeEntry {
+    /// Tree id.
+    #[serde(with = "serde_bytes")]
+    pub tree: Vec<u8>,
+    /// Operations applied.
+    pub ops: u64,
+}
+
+/// `POST /v1/fs/tree/list` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trees {
+    /// Trees of the fs.
+    pub trees: Vec<TreeEntry>,
+}
+
+/// `POST /v1/fs/tree/get` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeGet {
+    /// fs_id.
+    pub fs: u32,
+    /// Tree id.
+    #[serde(with = "serde_bytes")]
+    pub tree: Vec<u8>,
+    /// Node ids.
+    pub nodes: Vec<ByteBuf>,
+    /// Snapshot to read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_version: Option<u64>,
+}
+
+/// `POST /v1/fs/tree/children` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeChildren {
+    /// fs_id.
+    pub fs: u32,
+    /// Tree id.
+    #[serde(with = "serde_bytes")]
+    pub tree: Vec<u8>,
+    /// Parent node id.
+    #[serde(with = "serde_bytes")]
+    pub parent: Vec<u8>,
+    /// Exclusive start node id.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub after: Option<Vec<u8>>,
+    /// Max nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Snapshot to read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_version: Option<u64>,
+}
+
+/// `tree/get` and `tree/children` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Nodes {
+    /// The snapshot read.
+    pub read_version: u64,
+    /// Node states.
+    pub nodes: Vec<NodeState>,
+    /// `children` only: the limit cut the list short.
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// `POST /v1/fs/tree/changes` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeChanges {
+    /// fs_id.
+    pub fs: u32,
+    /// Tree id.
+    #[serde(with = "serde_bytes")]
+    pub tree: Vec<u8>,
+    /// Exclusive start change offset; absent = full sync.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub after: Option<Vec<u8>>,
+    /// Max changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Long-poll up to this long when nothing changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u32>,
+}
+
+/// One change.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Change {
+    /// Change offset.
+    #[serde(with = "serde_bytes")]
+    pub offset: Vec<u8>,
+    /// Node id.
+    #[serde(with = "serde_bytes")]
+    pub node: Vec<u8>,
+    /// Current state; absent = purged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<NodeState>,
+}
+
+/// `POST /v1/fs/tree/changes` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Changes {
+    /// Changes in offset order.
+    pub changes: Vec<Change>,
+    /// Offset of the last change returned (or the request's `after`).
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Vec<u8>>,
+    /// The limit cut the list short.
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// `POST /v1/fs/tree/chain` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeRef {
+    /// fs_id.
+    pub fs: u32,
+    /// Tree id.
+    #[serde(with = "serde_bytes")]
+    pub tree: Vec<u8>,
+}
+
+/// `POST /v1/fs/tree/chain` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TreeChain {
+    /// Operations applied.
+    pub ops: u64,
+    /// Op chain head (spec/formats.md §11.5).
+    #[serde(with = "serde_bytes")]
+    pub chain: Vec<u8>,
+}
+
+/// `POST /v1/fs/file/get` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileGet {
+    /// fs_id.
+    pub fs: u32,
+    /// Tree id.
+    #[serde(with = "serde_bytes")]
+    pub tree: Vec<u8>,
+    /// Node id.
+    #[serde(with = "serde_bytes")]
+    pub node: Vec<u8>,
+    /// Snapshot to read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_version: Option<u64>,
+}
+
+/// One content version.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Version {
+    /// Dot (12 bytes).
+    #[serde(with = "serde_bytes")]
+    pub dot: Vec<u8>,
+    /// Writing device.
+    #[serde(with = "serde_bytes")]
+    pub device: Vec<u8>,
+    /// Chunk ids in file order.
+    pub chunks: Vec<ByteBuf>,
+    /// Sealed manifest.
+    #[serde(with = "serde_bytes")]
+    pub manifest: Vec<u8>,
+}
+
+/// `POST /v1/fs/file/get` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Versions {
+    /// The snapshot read.
+    pub read_version: u64,
+    /// Versions in dot order (siblings when more than one).
+    pub versions: Vec<Version>,
+}
+
+/// `POST /v1/fs/chunks/get` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChunksGet {
+    /// fs_id.
+    pub fs: u32,
+    /// Chunk ids.
+    pub ids: Vec<ByteBuf>,
+}
+
+/// One chunk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChunkData {
+    /// Chunk id.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+    /// Sealed chunk; absent = unknown.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<u8>>,
+}
+
+/// `POST /v1/fs/chunks/get` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Chunks {
+    /// Chunks in request order.
+    pub chunks: Vec<ChunkData>,
+}
+
 // ---------------------------------------------------------------- admin
 
 /// `POST /v1/admin/status` (admins only).
@@ -975,6 +1317,48 @@ mod tests {
             let back: Frame = from_cbor(&to_cbor(&f)).unwrap();
             assert_eq!(back, f);
         }
+    }
+
+    #[test]
+    fn crdt_ops_roundtrip() {
+        let c = Commit {
+            commit_id: vec![9; 16],
+            chunks: vec![ChunkPut {
+                fs: 1,
+                id: vec![3; 16],
+                data: vec![4; 60],
+            }],
+            crdt_ops: vec![
+                CrdtOp::Move {
+                    fs: 1,
+                    tree: vec![1; 16],
+                    node: vec![2; 16],
+                    parent: vec![0; 16],
+                    hlc: 1 << 40,
+                    meta: Some(vec![5; 50]),
+                },
+                CrdtOp::Write {
+                    fs: 1,
+                    tree: vec![1; 16],
+                    node: vec![2; 16],
+                    replaces: vec![],
+                    chunks: vec![ByteBuf::from(vec![3; 16])],
+                    manifest: vec![6; 70],
+                },
+            ],
+            ..Default::default()
+        };
+        let back: Commit = from_cbor(&to_cbor(&c)).unwrap();
+        assert_eq!(back, c);
+        // Tagged by "op", like stream frames.
+        let v: CborValue = from_cbor(&to_cbor(&c.crdt_ops[0])).unwrap();
+        let op = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("op"))
+            .map(|(_, v)| v.as_text().unwrap().to_owned());
+        assert_eq!(op.as_deref(), Some("move"));
     }
 
     #[test]

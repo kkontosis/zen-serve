@@ -13,6 +13,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/kv-name` | NK | `u32(fs_id)` | root of the KV naming chain |
 | `zen/v1/topic-name` | NK | `u32(fs_id)` | root of the topic naming chain |
 | `zen/v1/topic-data` | MK_e | `u32(fs_id) ‖ u32(epoch)` | root of the topic data chain |
+| `zen/v1/fs-data` | MK_e | `u32(fs_id) ‖ u32(epoch)` | AEAD key for filesystem meta, manifests and chunks (formats.md §11) |
 | `zen/v1/name-chain` | chain key N_{i-1} | `lp(element)` | next naming-chain key N_i |
 | `zen/v1/topic-data-chain` | topic data key D_{i-1} | `lp(segment)` | next topic data key D_i |
 | `zen/v1/event-key` | topic naming key N_topic | empty | key for event key tokens |
@@ -30,6 +31,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/fingerprint` | `FP(public_bytes)` |
 | `zen/v1/acl-chain` | `H(doc)` of a signed ACL, chaining ACL versions (formats.md §9.2) |
 | `zen/v1/range-hash` | hash of a KV range for `expect_ranges` (api.md §6) |
+| `zen/v1/tree-op-chain` | per-tree chain over filesystem operations (formats.md §11.5) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 
@@ -39,6 +41,9 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/event` | sealed event |
 | `zen/v1/aad/epoch-chain` | epoch-chain record |
 | `zen/v1/aad/keyslot` | keyslot |
+| `zen/v1/aad/fs-meta` | filesystem node meta (kind 4) |
+| `zen/v1/aad/fs-manifest` | filesystem manifest (kind 5) |
+| `zen/v1/aad/fs-chunk` | filesystem chunk (kind 6) |
 
 ## Signatures
 
@@ -53,6 +58,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig/membership` | admin identity | reserved; the membership log is the ACL chain (formats.md §9) |
 | `zen/v1/sig/session` | device | sign-in challenge (formats.md §10) |
 | `zen/v1/sig/event` | device | a single event (later milestone) |
+| `zen/v1/sig/tree-checkpoint` | device | filesystem tree checkpoint over (state hash, count, chain) (fs.md §9, later milestone) |
 
 Signing with a purpose not in this table is an error.
 

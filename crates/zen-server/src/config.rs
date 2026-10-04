@@ -161,6 +161,14 @@ pub struct LimitsConfig {
     pub sweep_interval_secs: u64,
     /// How long ephemeral messages stay in the cross-node ring.
     pub ephemeral_ttl_secs: u64,
+    /// How far a filesystem `hlc` may be ahead of the server clock.
+    pub crdt_max_skew_ms: u64,
+    /// How far back a late filesystem operation may reach (spec/fs.md §3.4).
+    pub crdt_horizon_secs: u64,
+    /// Max logged moves one late move may undo and redo.
+    pub crdt_max_redo: u32,
+    /// How long an unreferenced chunk is kept.
+    pub chunk_grace_secs: u64,
 }
 
 impl Default for LimitsConfig {
@@ -177,6 +185,10 @@ impl Default for LimitsConfig {
             claim_ttl_ms: 30_000,
             sweep_interval_secs: 60,
             ephemeral_ttl_secs: 60,
+            crdt_max_skew_ms: 60_000,
+            crdt_horizon_secs: 7 * 86_400,
+            crdt_max_redo: 1000,
+            chunk_grace_secs: 86_400,
         }
     }
 }

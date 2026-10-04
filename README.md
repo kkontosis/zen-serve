@@ -7,7 +7,7 @@ zen-serve stores and replicates **ciphertext only**. It never sees keys, file na
 Building blocks:
 * encrypted ordered **KV** with transactions
 * an **event log** with exactly-once append and sequential, per-key and single-leader consumers
-* **server-side CRDTs that merge on ciphertext** (including the file tree)
+* a **filesystem whose tree and file versions the server merges as CRDTs**, on ciphertext
 * plaintext **`/unencrypted`** static serving for the app bootstrap
 
 ## Repository layout
@@ -27,6 +27,7 @@ Building blocks:
 * Milestone 1 (`spec/` + `zen-core`): done.
 * Milestone 2 (`zen-server` on the embedded backend, [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md)): done. Server-side CRDT ops return 501 for now.
 * Milestone 3 (FoundationDB backend, supervisor, backup/PITR, [`docs/MILESTONE-3.md`](docs/MILESTONE-3.md)): done.
+* Milestone 3.5 (server-merged CRDT filesystem, [`spec/fs.md`](spec/fs.md), [`docs/MILESTONE-3.5.md`](docs/MILESTONE-3.5.md)): done on the server side; the zen-fs client follows in milestones 4–5.
 
 ## Running
 

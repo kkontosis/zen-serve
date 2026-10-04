@@ -10,7 +10,7 @@ use crate::rng::DetRng;
 use crate::seal::{self, EventBody};
 use crate::sig::{self, DeviceSecret, SigningIdentity};
 use crate::token::{NameChain, TopicKeys, kv_key};
-use crate::{Result, labels};
+use crate::{Result, fs, labels};
 use serde_json::{Value, json};
 
 fn h(b: &[u8]) -> String {
@@ -31,6 +31,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("seal.json", seal_vectors()?),
         ("keyslots.json", keyslot_vectors()?),
         ("signatures.json", signature_vectors()?),
+        ("fs.json", fs_vectors()?),
     ])
 }
 
@@ -186,5 +187,71 @@ fn signature_vectors() -> Result<Value> {
         "signature": {"purpose": labels::SIG_COMMIT, "message": h(msg), "signature": h(&signature)},
         "device_cert": {"device_rng_seed": "device", "device_fingerprint": h(&dev.public().fingerprint()),
                         "created_unix": 1_790_000_000u64, "cert": h(&cert)},
+    }))
+}
+
+/// Fixture filesystem ids: tree, a file node, two chunks, a device.
+pub fn fixture_fs_ids() -> ([u8; 16], [u8; 16], [[u8; 16]; 2], [u8; 32]) {
+    ([0x11; 16], [0x22; 16], [[0x33; 16], [0x44; 16]], [0xDE; 32])
+}
+
+/// Fixture node meta.
+pub fn fixture_meta() -> fs::NodeMeta {
+    fs::NodeMeta {
+        node_type: fs::NodeType::File,
+        name: "notes.txt".into(),
+        mode: 0o644,
+        mtime_ms: 1_790_000_000_123,
+        xattrs: Vec::new(),
+    }
+}
+
+fn fs_vectors() -> Result<Value> {
+    let fsk = fixture_fs();
+    let (tree, node, chunk_ids, device) = fixture_fs_ids();
+    let meta = fixture_meta();
+    let sealed_meta = fs::seal_meta(&fsk, &tree, &node, &meta, &mut DetRng::new("fs-meta"))?;
+    let manifest = fs::Manifest {
+        size: 70_000,
+        chunk_size: 65_536,
+        chunks: chunk_ids.to_vec(),
+    };
+    let sealed_manifest = fs::seal_manifest(
+        &fsk,
+        &tree,
+        &node,
+        &manifest,
+        &mut DetRng::new("fs-manifest"),
+    )?;
+    let chunk0 = vec![0x61u8; 64];
+    let sealed_chunk = fs::seal_chunk(&fsk, &chunk_ids[0], &chunk0, &mut DetRng::new("fs-chunk"))?;
+    let hlc = fs::hlc(1_790_000_000_123, 7);
+    let ops = [
+        fs::move_bytes(fsk.fs_id, &tree, &node, &fs::ROOT, hlc, &sealed_meta),
+        fs::meta_bytes(fsk.fs_id, &tree, &node, hlc + 1, &sealed_meta),
+        fs::write_bytes(
+            fsk.fs_id,
+            &tree,
+            &node,
+            &[[0x66; 12]],
+            &chunk_ids,
+            &sealed_manifest,
+        ),
+    ];
+    let mut chain = [0u8; 32];
+    let mut chains = Vec::new();
+    for op in &ops {
+        chain = fs::chain_next(&chain, op, &device);
+        chains.push(json!({"op": h(op), "chain": h(&chain)}));
+    }
+    Ok(json!({
+        "description": "CRDT filesystem objects (formats.md §11) for the fixture fs at epoch 0.",
+        "fs_data_key": h(fsk.fs_data_key().as_ref()),
+        "tree": h(&tree), "node": h(&node), "device": h(&device),
+        "hlc": {"unix_ms": 1_790_000_000_123u64, "counter": 7, "hlc": hlc},
+        "meta": {"rng_seed": "fs-meta", "plaintext": h(&meta.encode()?), "sealed": h(&sealed_meta)},
+        "manifest": {"rng_seed": "fs-manifest", "plaintext": h(&manifest.encode()), "sealed": h(&sealed_manifest)},
+        "chunk": {"rng_seed": "fs-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_chunk)},
+        "op_chain": {"replaces": [h(&[0x66; 12])], "steps": chains},
     }))
 }
