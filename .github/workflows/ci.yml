@@ -20,8 +20,34 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
       - name: wasm32 check
         run: cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown
+
+  # The FoundationDB backend against a real single-process cluster.
+  fdb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FoundationDB
+        run: sudo scripts/install-fdb.sh /opt/foundationdb
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Start a cluster
+        run: |
+          mkdir -p /tmp/fdb/data /tmp/fdb/log
+          echo "ci:ci@127.0.0.1:4500" > /tmp/fdb/fdb.cluster
+          /opt/foundationdb/usr/sbin/fdbserver -C /tmp/fdb/fdb.cluster -p 127.0.0.1:4500 \
+            -d /tmp/fdb/data -L /tmp/fdb/log &
+          /opt/foundationdb/usr/bin/fdbcli -C /tmp/fdb/fdb.cluster --timeout 60 \
+            --exec "configure new single ssd"
+      - name: Test (fdb)
+        env:
+          ZEN_TEST_CLUSTER_FILE: /tmp/fdb/fdb.cluster
+        run: cargo test -p zen-store --features fdb
