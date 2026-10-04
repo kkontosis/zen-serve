@@ -67,8 +67,9 @@ pub enum Backend {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
-    /// Backend.
-    pub backend: Backend,
+    /// Backend. Absent: `fdb` on a node set up by `zen-serve init/join`
+    /// (`data_dir/fdb.cluster` exists), else `embedded`.
+    pub backend: Option<Backend>,
     /// FoundationDB cluster file. Absent: `data_dir/fdb.cluster` if it
     /// exists (written by `zen-serve init/join`), else the platform default.
     pub cluster_file: Option<PathBuf>,
@@ -227,6 +228,17 @@ impl Config {
             fdb: FdbConfig::default(),
             backup: BackupConfig::default(),
         }
+    }
+
+    /// The backend in effect.
+    pub fn backend(&self) -> Backend {
+        self.storage.backend.unwrap_or_else(|| {
+            if self.data_dir.join("fdb.cluster").exists() {
+                Backend::Fdb
+            } else {
+                Backend::Embedded
+            }
+        })
     }
 
     /// The cluster file to connect with, if any.

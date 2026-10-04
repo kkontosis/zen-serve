@@ -22,16 +22,49 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+/// TLS files for the client: certificate, key, CA bundle.
+#[derive(Clone, Debug)]
+pub struct Tls {
+    /// Certificate chain (PEM).
+    pub cert: String,
+    /// Private key (PEM).
+    pub key: String,
+    /// CA bundle (PEM).
+    pub ca: String,
+}
+
+static TLS: OnceLock<Option<Tls>> = OnceLock::new();
+
+/// Use TLS for every connection of this process. Call before the first
+/// [`Fdb::open`]; returns false if the network already started.
+pub fn set_tls(tls: Tls) -> bool {
+    TLS.set(Some(tls)).is_ok()
+}
+
 /// Start the FoundationDB client network thread once per process. It runs
 /// until the process exits. Called by [`Fdb::open`].
-pub fn network() {
-    static BOOTED: OnceLock<()> = OnceLock::new();
-    BOOTED.get_or_init(|| {
-        // SAFETY: called once per process (guarded by the OnceLock); the
-        // network is never stopped, so the guard is leaked on purpose.
-        let guard = unsafe { foundationdb::boot() };
-        std::mem::forget(guard);
-    });
+pub fn network() -> Result<()> {
+    static BOOTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    BOOTED
+        .get_or_init(|| {
+            let start = || -> std::result::Result<(), FdbError> {
+                let mut b = foundationdb::api::FdbApiBuilder::default().build()?;
+                if let Some(t) = TLS.get_or_init(|| None) {
+                    use foundationdb::options::NetworkOption as N;
+                    b = b.set_option(N::TLSCertPath(t.cert.clone()))?;
+                    b = b.set_option(N::TLSKeyPath(t.key.clone()))?;
+                    b = b.set_option(N::TLSCaPath(t.ca.clone()))?;
+                }
+                // SAFETY: runs once per process (guarded by the OnceLock); the
+                // network is never stopped, so the guard is leaked on purpose.
+                let guard = unsafe { b.boot()? };
+                std::mem::forget(guard);
+                Ok(())
+            };
+            start().map_err(|e| format!("start the FoundationDB client: {}", e.message()))
+        })
+        .clone()
+        .map_err(Error::Io)
 }
 
 fn map_err(e: FdbError) -> Error {
@@ -59,7 +92,7 @@ impl Fdb {
     /// Connect with a cluster file (`None`: the platform default,
     /// `/etc/foundationdb/fdb.cluster`).
     pub fn open(cluster_file: Option<&str>) -> Result<Self> {
-        network();
+        network()?;
         let db = Arc::new(Database::new(cluster_file).map_err(map_err)?);
         Ok(Fdb(Arc::new(Inner {
             hub: Arc::new(Hub {

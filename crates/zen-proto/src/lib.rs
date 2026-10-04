@@ -815,6 +815,30 @@ pub struct DlqOp {
     pub commit_id: Option<Vec<u8>>,
 }
 
+// ---------------------------------------------------------------- admin
+
+/// `POST /v1/admin/status` (admins only).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClusterStatus {
+    /// `"embedded"` or `"fdb"`.
+    pub backend: String,
+    /// The database answers reads and writes.
+    pub available: bool,
+    /// Fully replicated, no degraded processes.
+    pub healthy: bool,
+    /// FoundationDB redundancy mode (`single`, `double`, `triple`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<String>,
+    /// Machines (zen-serve nodes) in the cluster.
+    pub machines: u32,
+    /// `fdbserver` processes.
+    pub processes: u32,
+    /// Coordinators.
+    pub coordinators: u32,
+    /// Cluster messages (warnings).
+    pub messages: Vec<String>,
+}
+
 // ---------------------------------------------------------------- stream
 
 /// A WebSocket frame (spec/api.md §9), tagged by `op`.

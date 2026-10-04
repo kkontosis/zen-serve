@@ -110,7 +110,7 @@ fn use_test_backend(cfg: &mut Config) {
     if !on_fdb() {
         return;
     }
-    cfg.storage.backend = zen_server::config::Backend::Fdb;
+    cfg.storage.backend = Some(zen_server::config::Backend::Fdb);
     cfg.storage.cluster_file = Some(
         std::env::var("ZEN_TEST_CLUSTER_FILE")
             .expect("ZEN_TEST_CLUSTER_FILE")

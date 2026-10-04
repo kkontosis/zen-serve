@@ -20,6 +20,7 @@ pub mod log;
 pub mod state;
 pub mod statics;
 pub mod stream;
+pub mod supervisor;
 mod txn;
 
 use crate::cbor::Cbor;
@@ -66,6 +67,44 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             session_ttl_secs: l.session_ttl_secs,
         },
     })
+}
+
+/// `POST /v1/admin/status`: storage health, admins only.
+async fn admin_status(
+    State(st): State<Shared>,
+    caller: auth::Caller,
+    Cbor(_): Cbor<zen_proto::Empty>,
+) -> error::ApiResult<Cbor<zen_proto::ClusterStatus>> {
+    if !caller.is_admin() {
+        return Err(error::forbidden("admins only"));
+    }
+    Ok(Cbor(cluster_status(&st.cfg).await))
+}
+
+/// Storage health for `zen-serve status` and `/v1/admin/status`.
+pub async fn cluster_status(cfg: &Config) -> zen_proto::ClusterStatus {
+    match (cfg.backend(), cfg.cluster_file()) {
+        (config::Backend::Fdb, Some(file)) => match supervisor::status_json(cfg, &file).await {
+            Ok(s) => supervisor::summarize(&s),
+            Err(e) => zen_proto::ClusterStatus {
+                backend: "fdb".into(),
+                messages: vec![e],
+                ..Default::default()
+            },
+        },
+        (config::Backend::Fdb, None) => zen_proto::ClusterStatus {
+            backend: "fdb".into(),
+            messages: vec!["no cluster file".into()],
+            ..Default::default()
+        },
+        (config::Backend::Embedded, _) => zen_proto::ClusterStatus {
+            backend: "embedded".into(),
+            available: true,
+            healthy: true,
+            machines: 1,
+            ..Default::default()
+        },
+    }
 }
 
 async fn isolation_headers(State(st): State<Shared>, req: Request, next: Next) -> Response {
@@ -116,6 +155,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/consume/dlq/list", post(consume::dlq_list))
         .route("/v1/consume/dlq/retry", post(consume::dlq_retry))
         .route("/v1/consume/dlq/drop", post(consume::dlq_drop))
+        .route("/v1/admin/status", post(admin_status))
         .route("/v1/stream", get(stream::ws))
         .fallback(statics::fallback)
         .layer(DefaultBodyLimit::max(limit))
@@ -195,7 +235,7 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
 
 /// Open the configured storage backend.
 pub fn open_store(cfg: &Config) -> Result<Arc<dyn Storage>, String> {
-    let store: Arc<dyn Storage> = match cfg.storage.backend {
+    let store: Arc<dyn Storage> = match cfg.backend() {
         config::Backend::Embedded => {
             std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
             Arc::new(
@@ -205,6 +245,15 @@ pub fn open_store(cfg: &Config) -> Result<Arc<dyn Storage>, String> {
         }
         #[cfg(feature = "fdb")]
         config::Backend::Fdb => {
+            if let (Some(cert), Some(key), Some(ca)) =
+                (&cfg.fdb.tls_cert, &cfg.fdb.tls_key, &cfg.fdb.tls_ca)
+            {
+                zen_store::fdb::set_tls(zen_store::fdb::Tls {
+                    cert: cert.display().to_string(),
+                    key: key.display().to_string(),
+                    ca: ca.display().to_string(),
+                });
+            }
             let file = cfg.cluster_file();
             let file = file.as_ref().map(|p| p.to_string_lossy().into_owned());
             Arc::new(
