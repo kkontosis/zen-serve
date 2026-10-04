@@ -228,3 +228,9 @@ Tests:
   * change-feed long-poll, sweeper purge, chunk GC and `resync`
   * changes across two nodes (FDB)
 * All server tests pass on both backends.
+
+Review fixes:
+* **Overwrites reach the change feed.** A write that replaced one version left the node record byte-identical, and the "unchanged" skip dropped it.
+* **Late moves pass over purged nodes.** Undo/redo of a logged move naming a node purged since (a skipped cycle move) no longer fails with 500.
+* **Sweeper margin.** The sweeper keeps `crdt_max_skew_ms` of margin beyond the horizon, for nodes with slower clocks.
+* **Chunk re-upload.** Re-uploading a chunk restarts its grace period.

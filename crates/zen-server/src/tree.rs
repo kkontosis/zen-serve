@@ -274,6 +274,8 @@ pub struct Engine<'a> {
     nodes: HashMap<NodeKey, Option<NodeRec>>,
     orig: HashMap<NodeKey, Option<NodeRec>>,
     dirty: BTreeSet<NodeKey>,
+    /// Nodes whose content changed: re-stamped even if the record is not.
+    touched: HashSet<NodeKey>,
     trees: BTreeMap<(u32, Id), Header>,
     new_chunks: HashSet<(u32, Id)>,
     /// Writes so far (the next write's dot index).
@@ -292,6 +294,7 @@ impl<'a> Engine<'a> {
             nodes: HashMap::new(),
             orig: HashMap::new(),
             dirty: BTreeSet::new(),
+            touched: HashSet::new(),
             trees: BTreeMap::new(),
             new_chunks: HashSet::new(),
             writes: 0,
@@ -417,10 +420,11 @@ impl<'a> Engine<'a> {
         e: &LogEntry,
     ) -> ApiResult<()> {
         let k = (fs, tree, e.node);
-        let mut rec = self
-            .get_node(t, k)
-            .await?
-            .ok_or_else(|| internal("move log names a missing node"))?;
+        // Undo never removes a record, so a missing one was purged (a
+        // skipped move can name a node purged since): nothing to undo.
+        let Some(mut rec) = self.get_node(t, k).await? else {
+            return Ok(());
+        };
         match e.old {
             Some((p, ts)) => {
                 rec.parent = Some(p);
@@ -507,6 +511,10 @@ impl<'a> Engine<'a> {
         let old = self.do_move(t, fs, tree, ts, node, parent).await?;
         t.set(&key, &LogEntry { node, parent, old }.encode());
         for (k, ts, e) in &redo {
+            // A move of a purged node (not a creation) stays as logged.
+            if e.old.is_some() && self.get_node(t, (fs, tree, e.node)).await?.is_none() {
+                continue;
+            }
             let old = self.do_move(t, fs, tree, *ts, e.node, e.parent).await?;
             let entry = LogEntry {
                 node: e.node,
@@ -597,6 +605,7 @@ impl<'a> Engine<'a> {
         self.delta.entry(fs).or_default().0 += bytes;
         rec.versions += 1;
         self.put_node(k, rec);
+        self.touched.insert(k);
         Ok(())
     }
 
@@ -609,14 +618,15 @@ impl<'a> Engine<'a> {
             Some(_) => return Err(bad_request("chunk id already holds other data")),
             None => {
                 t.set(&key, &c.data);
-                let (p, s) = keys::chunk_gc(c.fs)
-                    .vs_incomplete(0)
-                    .bytes(&id)
-                    .finish_incomplete();
-                t.set_versionstamped_key(&p, &s, &[]);
                 self.delta.entry(c.fs).or_default().0 += c.data.len() as i64;
             }
         }
+        // A (re-)upload starts the grace period (again).
+        let (p, s) = keys::chunk_gc(c.fs)
+            .vs_incomplete(0)
+            .bytes(&id)
+            .finish_incomplete();
+        t.set_versionstamped_key(&p, &s, &[]);
         self.new_chunks.insert((c.fs, id));
         Ok(())
     }
@@ -705,7 +715,7 @@ impl<'a> Engine<'a> {
         for k @ (fs, tree, node) in &self.dirty {
             let rec = self.nodes[k].clone().expect("dirty nodes exist");
             let orig = self.orig.get(k).cloned().flatten();
-            if orig.as_ref().is_some_and(|o| o.body() == rec.body()) {
+            if !self.touched.contains(k) && orig.as_ref().is_some_and(|o| o.body() == rec.body()) {
                 continue; // undone and redone back to the same state
             }
             if let Some(o) = &orig {
@@ -1023,7 +1033,9 @@ pub async fn chunks_get(
 pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
     let l = &st.cfg.limits;
     let now_ms = unix_ms();
-    let cutoff_ms = now_ms.saturating_sub(l.crdt_horizon_secs * 1000);
+    // Another node with a slower clock still accepts ops down to its own
+    // `now − horizon`: keep `crdt_max_skew_ms` of margin.
+    let cutoff_ms = now_ms.saturating_sub(l.crdt_horizon_secs * 1000 + l.crdt_max_skew_ms);
     let horizon_cvs = offset(
         &stamp_of(now.saturating_sub(l.crdt_horizon_secs * VERSIONS_PER_SEC)),
         0,

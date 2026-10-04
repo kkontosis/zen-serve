@@ -118,7 +118,7 @@ write {node, replaces: [dot], chunks: [chunk_id], manifest}
 * A chunk is an immutable sealed blob (formats.md §11.4), at most `max_value_bytes`. Clients use 64 KiB of plaintext.
 * Chunk ids are random 16-byte ids chosen by the client. They belong to the fs, not to a tree.
 * Chunks are uploaded through the commit field `chunks` (api.md §6). Large files are uploaded over several commits, then referenced by one `write`.
-* Re-uploading an identical chunk is a no-op. Uploading different bytes under an existing id is refused (400).
+* Re-uploading an identical chunk stores nothing new but restarts its grace period (below). Uploading different bytes under an existing id is refused (400).
 * The server counts references to every chunk. A chunk that no version references, and hasn't been referenced for `limits.chunk_grace_secs` (default 24 h), is deleted (§6). The grace period covers chunks uploaded in one commit and referenced by a later one.
 
 ## 5. Change feed and sync
@@ -136,13 +136,14 @@ write {node, replaces: [dot], chunks: [chunk_id], manifest}
 
 The sweeper (every node runs it) keeps the tree bounded:
 * **Move log:** entries older than the horizon are removed. No accepted operation can need them (§3.4).
+* **Margin.** "Older than the horizon" here means older than `crdt_horizon_secs` plus `crdt_max_skew_ms` by the sweeping node's clock. So a node whose clock is slightly behind never accepts an operation that needs a removed entry.
 * **Trash purge.** A child of `TRASH` is purged when:
   * its move into trash is older than the horizon, and
   * every node in its subtree has a move older than the horizon.
 
   Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed.
 * **Chunks:** unreferenced chunks are deleted after the grace period (§4.1).
-* **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.
+* **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Logged moves of a purged node itself (a skipped move can name one) are passed over by undo and redo. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.
 
 ## 7. Transactions (G11)
 

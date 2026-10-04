@@ -770,12 +770,50 @@ async fn change_feed_cursor_and_long_poll() {
     assert_eq!(c.changes.len(), 1);
     assert_eq!(c.changes[0].node, id(2).to_vec());
     assert_eq!(c.changes[0].state.as_ref().and_then(parent_of), Some(id(1)));
+
+    // Content changes are changes, including an overwrite that leaves the
+    // node with one version as before.
+    let changes_after = |after: Option<Vec<u8>>| {
+        let req = TreeChanges {
+            fs: 1,
+            tree: TREE.to_vec(),
+            after,
+            limit: None,
+            wait_ms: None,
+        };
+        let h = &h;
+        let tok = a.tok.clone();
+        async move {
+            h.call::<_, Changes>("/v1/fs/tree/changes", Some(&tok), &req)
+                .await
+                .unwrap()
+        }
+    };
+    let r = ops(&h, &a, vec![write(id(2), &[], &[], b"v1")])
+        .await
+        .unwrap();
+    let c1 = changes_after(c.cursor.clone()).await;
+    assert_eq!(c1.changes.len(), 1);
+    assert_eq!(c1.changes[0].node, id(2).to_vec());
+    ops(
+        &h,
+        &a,
+        vec![write(id(2), &[r.dots[0].to_vec()], &[], b"v2")],
+    )
+    .await
+    .unwrap();
+    let c2 = changes_after(c1.cursor.clone()).await;
+    assert_eq!(c2.changes.len(), 1, "an overwrite is a change");
+    assert_eq!(c2.changes[0].node, id(2).to_vec());
+    assert!(c2.changes[0].offset > c1.changes[0].offset);
+    assert_eq!(c2.changes[0].state.as_ref().unwrap().versions, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sweeper_purges_trash_and_collects_chunks() {
     let (h, a, _) = two_devices(|c| {
         c.limits.crdt_horizon_secs = 2;
+        c.limits.crdt_max_skew_ms = 500;
         c.limits.chunk_grace_secs = 0;
         c.limits.sweep_interval_secs = 1;
     })
@@ -882,6 +920,51 @@ async fn sweeper_purges_trash_and_collects_chunks() {
     }
     let s = full_sync(&h, &a).await;
     assert_eq!(s.keys().copied().collect::<Vec<_>>(), vec![id(3)]);
+}
+
+/// A skipped (cycle) move can name a node that is purged later; a late move
+/// that undoes and redoes past it must still apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn late_move_past_a_purged_node() {
+    const HORIZON_MS: u64 = 8_000;
+    let (h, a, _) = two_devices(|c| {
+        c.limits.crdt_horizon_secs = HORIZON_MS / 1000;
+        c.limits.crdt_max_skew_ms = 500;
+        c.limits.sweep_interval_secs = 1;
+    })
+    .await;
+    let t = zfs::hlc(now_ms(), 0);
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"x")),
+            mv(id(2), id(1), t + 1, Some(b"d")),
+            mv(id(5), ROOT, t + 2, Some(b"z")),
+            mv(id(1), TRASH, t + 3, None),
+        ],
+    )
+    .await
+    .unwrap();
+    // Halfway through the horizon, a stale replica moves X under its own
+    // child D: skipped, but logged with a recent timestamp.
+    tokio::time::sleep(Duration::from_millis(HORIZON_MS / 2)).await;
+    let skipped = zfs::hlc(now_ms(), 0);
+    ops(&h, &a, vec![mv(id(1), id(2), skipped, None)])
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while get(&h, &a, &[id(1), id(2)]).await.contains_key(&id(1)) {
+        assert!(Instant::now() < deadline, "trash purged");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // A late move before the skipped one undoes and redoes it.
+    ops(&h, &a, vec![mv(id(5), ROOT, skipped - 1, Some(b"z2"))])
+        .await
+        .expect("a late move past a purged node applies");
+    let s = full_sync(&h, &a).await;
+    assert_eq!(s.keys().copied().collect::<Vec<_>>(), vec![id(5)]);
+    assert_eq!(s[&id(5)].1.as_deref(), Some(&b"z2"[..]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
