@@ -1,10 +1,13 @@
 //! RSA public keys under one policy, for passkeys (auth.md §7) and TLS
-//! certificates (operations.md §8): a modulus of [`MIN_BITS`]..=[`MAX_BITS`]
-//! bits and an odd public exponent in [`MIN_E`]..=[`MAX_E`].
+//! certificates and keys (operations.md §8): a modulus of
+//! [`MIN_BITS`]..=[`MAX_BITS`] bits and an odd public exponent in
+//! [`MIN_E`]..=[`MAX_E`].
 //!
-//! Only public-key operations are used. Private-key operations of the `rsa`
-//! crate are not constant-time (RUSTSEC-2023-0071), so the server never
-//! holds an RSA private key (`TD-TLS-RSA-SERVER-KEY`).
+//! Only public-key operations of the `rsa` crate are used. Its private-key
+//! operations are not constant-time (RUSTSEC-2023-0071), so it never holds
+//! an RSA private key (`TD-TLS-RSA-SERVER-KEY`). An RSA TLS server key is
+//! ring's, with the `ring` feature (`tls::ring`), and checked here by its
+//! public part ([`check_spki_der`]).
 
 /// Smallest RSA modulus accepted, in bits.
 pub const MIN_BITS: usize = 2048;
@@ -28,6 +31,15 @@ pub enum Refused {
 /// The key with modulus `n` and exponent `e`, big-endian (leading zero
 /// bytes are ignored), checked against the policy.
 pub fn from_components(n: &[u8], e: &[u8]) -> Result<rsa::RsaPublicKey, Refused> {
+    let (n, e64) = policy(n, e)?;
+    let n = rsa::BoxedUint::from_be_slice_vartime(n);
+    let e = rsa::BoxedUint::from(e64);
+    rsa::RsaPublicKey::new_with_max_size(n, e, MAX_BITS).map_err(|_| Refused::Malformed)
+}
+
+/// The policy on a modulus `n` and an exponent `e`, big-endian: the
+/// modulus without leading zeros, and the exponent.
+fn policy<'a>(n: &'a [u8], e: &[u8]) -> Result<(&'a [u8], u64), Refused> {
     let strip = |b: &[u8]| -> usize { b.iter().position(|&x| x != 0).unwrap_or(b.len()) };
     let (n, e) = (&n[strip(n)..], &e[strip(e)..]);
     let bits = match n.first() {
@@ -50,9 +62,10 @@ pub fn from_components(n: &[u8], e: &[u8]) -> Result<rsa::RsaPublicKey, Refused>
             "the RSA public exponent must be odd, at least 65537 and fit 32 bits",
         ));
     }
-    let n = rsa::BoxedUint::from_be_slice_vartime(n);
-    let e = rsa::BoxedUint::from(e64);
-    rsa::RsaPublicKey::new_with_max_size(n, e, MAX_BITS).map_err(|_| Refused::Malformed)
+    if n.last().is_some_and(|b| b & 1 == 0) {
+        return Err(Refused::Malformed);
+    }
+    Ok((n, e64))
 }
 
 /// The key in a DER `RSAPublicKey` (RFC 8017 A.1.1: `SEQUENCE { modulus
@@ -60,6 +73,48 @@ pub fn from_components(n: &[u8], e: &[u8]) -> Result<rsa::RsaPublicKey, Refused>
 /// `subjectPublicKey` for `rsaEncryption`. Strict DER: minimal lengths and
 /// integers, positive integers, nothing trailing.
 pub fn from_pkcs1_der(der: &[u8]) -> Result<rsa::RsaPublicKey, Refused> {
+    let (n, e) = pkcs1_components(der)?;
+    from_components(n, e)
+}
+
+/// [`from_pkcs1_der`]'s checks, for a key that something other than the
+/// `rsa` crate will use (ring, in `tls::ring`).
+pub fn check_pkcs1_der(der: &[u8]) -> Result<(), Refused> {
+    let (n, e) = pkcs1_components(der)?;
+    policy(n, e).map(|_| ())
+}
+
+/// The policy on the key of a DER `SubjectPublicKeyInfo` for
+/// `rsaEncryption` (RFC 5280 4.1, RFC 3279 2.3.1): `SEQUENCE { SEQUENCE {
+/// OID 1.2.840.113549.1.1.1, NULL }, BIT STRING { 0 unused bits,
+/// RSAPublicKey } }`.
+pub fn check_spki_der(spki: &[u8]) -> Result<(), Refused> {
+    const ALG: [u8; 15] = [
+        0x30, 13, 6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1, 5, 0,
+    ];
+    let (seq, rest) = tlv(spki, 0x30).ok_or(Refused::Malformed)?;
+    if !rest.is_empty() {
+        return Err(Refused::Malformed);
+    }
+    let key = seq.strip_prefix(&ALG[..]).ok_or(Refused::Malformed)?;
+    let (bits, rest) = tlv(key, 0x03).ok_or(Refused::Malformed)?;
+    if !rest.is_empty() {
+        return Err(Refused::Malformed);
+    }
+    check_pkcs1_der(bits.strip_prefix(&[0]).ok_or(Refused::Malformed)?)
+}
+
+/// Whether a PKCS#8 key's algorithm is `rsaEncryption` (1.2.840.113549.1.1.1):
+/// `SEQUENCE { INTEGER 0, SEQUENCE { OID, ... }, ... }`.
+pub fn pkcs8_is_rsa(k: &[u8]) -> bool {
+    const OID: [u8; 11] = [6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
+    // The algorithm's OID follows the version within the first few bytes,
+    // whatever the outer length's form.
+    k.windows(OID.len()).take(16).any(|w| w == OID)
+}
+
+/// The modulus and the exponent of a DER `RSAPublicKey`, strictly.
+fn pkcs1_components(der: &[u8]) -> Result<(&[u8], &[u8]), Refused> {
     let (seq, rest) = tlv(der, 0x30).ok_or(Refused::Malformed)?;
     if !rest.is_empty() {
         return Err(Refused::Malformed);
@@ -69,7 +124,7 @@ pub fn from_pkcs1_der(der: &[u8]) -> Result<rsa::RsaPublicKey, Refused> {
     if !rest.is_empty() {
         return Err(Refused::Malformed);
     }
-    from_components(n, e)
+    Ok((n, e))
 }
 
 /// One DER element with tag `tag`: its content and what follows. Lengths
@@ -286,6 +341,49 @@ mod tests {
             from_pkcs1_der(&testing::public_der(&small.to_public_key())),
             Err(Refused::Policy(_))
         ));
+    }
+
+    #[test]
+    fn checks_without_the_rsa_crate() {
+        use rustls::pki_types::alg_id;
+        use rustls::sign::public_key_to_spki;
+        // The same verdicts as from_pkcs1_der.
+        let e = [1, 0, 1];
+        for (bits, e) in [
+            (2048, &e[..]),
+            (4096, &e),
+            (1024, &e),
+            (4097, &e),
+            (2048, &[3]),
+        ] {
+            let k = key(&modulus(bits), e);
+            assert_eq!(
+                check_pkcs1_der(&k),
+                from_pkcs1_der(&k).map(|_| ()),
+                "{bits}"
+            );
+        }
+        // An even modulus is no RSA key.
+        let mut even = modulus(2048);
+        *even.last_mut().unwrap() = 0xfe;
+        assert_eq!(check_pkcs1_der(&key(&even, &e)), Err(Refused::Malformed));
+        // A SubjectPublicKeyInfo, as rustls builds it.
+        let real = crate::webauthn::soft::rsa_key(1, 2048).to_public_key();
+        let spki = public_key_to_spki(&alg_id::RSA_ENCRYPTION, testing::public_der(&real));
+        assert_eq!(check_spki_der(spki.as_ref()), Ok(()));
+        let small = public_key_to_spki(&alg_id::RSA_ENCRYPTION, key(&modulus(1024), &e));
+        assert!(matches!(
+            check_spki_der(small.as_ref()),
+            Err(Refused::Policy(_))
+        ));
+        let ec = public_key_to_spki(&alg_id::ECDSA_P256, testing::public_der(&real));
+        assert_eq!(check_spki_der(ec.as_ref()), Err(Refused::Malformed));
+        let trailing = [spki.as_ref(), &[0]].concat();
+        assert_eq!(check_spki_der(&trailing), Err(Refused::Malformed));
+        // PKCS#8 RSA keys are told apart.
+        let k = crate::webauthn::soft::rsa_key(1, 2048);
+        assert!(pkcs8_is_rsa(&testing::pkcs8_der(&k)));
+        assert!(!pkcs8_is_rsa(&[0x30, 0]));
     }
 
     #[test]

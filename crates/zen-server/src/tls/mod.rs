@@ -1,7 +1,11 @@
-//! Native TLS on the API listener (operations.md §8): rustls with the
-//! pure-Rust provider of [`provider`], TLS 1.3 only, and optional client
-//! certificates for sign-in method 5 (auth.md §10).
+//! Native TLS on the API listener (operations.md §8): rustls, TLS 1.3
+//! only, and optional client certificates for sign-in method 5 (auth.md
+//! §10).
 //!
+//! * The crypto provider ([`provider`]): ring's, with our post-quantum
+//!   hybrid key exchange added ([`ring`], the `ring` feature, on by
+//!   default), or the pure-Rust one on RustCrypto ([`rustcrypto`], built
+//!   with `--no-default-features`).
 //! * `[tls]` absent: plain HTTP, as before.
 //! * `[tls] cert` and `key`: the listener speaks TLS only.
 //! * `[tls] client_ca`, with `[auth] mtls` on: the server asks for a client
@@ -12,7 +16,9 @@
 //! can't hold up the others. Each connection's verified client
 //! certificate reaches the handlers as [`Peer::cert`].
 
-pub mod provider;
+#[cfg(feature = "ring")]
+pub mod ring;
+pub mod rustcrypto;
 
 use crate::config::TlsConfig;
 use axum::extract::connect_info::Connected;
@@ -28,6 +34,29 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+
+/// The crypto provider of this build: [`ring::provider`] with the `ring`
+/// feature, otherwise [`rustcrypto::provider`].
+pub fn provider() -> rustls::crypto::CryptoProvider {
+    #[cfg(feature = "ring")]
+    return ring::provider();
+    #[cfg(not(feature = "ring"))]
+    return rustcrypto::provider();
+}
+
+/// The name of [`provider`], for the start-up log.
+pub const PROVIDER: &str = if cfg!(feature = "ring") {
+    "ring, with the X25519MLKEM768 hybrid on RustCrypto"
+} else {
+    "RustCrypto (pure Rust)"
+};
+
+/// Make [`provider`] the process-wide default of rustls, for code that
+/// builds TLS configurations without naming one (HTTP clients in tests and
+/// tools). Does nothing if a default is installed already.
+pub fn install_default() {
+    let _ = provider().install_default();
+}
 
 /// How long a TLS handshake may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,7 +120,7 @@ fn certs(path: &std::path::Path, what: &str) -> Result<Vec<CertificateDer<'stati
 /// The rustls server configuration for `[tls]`. Client certificates are
 /// requested when `client_certs` is set ([`requests_client_certs`]).
 pub fn server_config(t: &TlsConfig, client_certs: bool) -> Result<Arc<ServerConfig>, String> {
-    let provider = Arc::new(provider::provider());
+    let provider = Arc::new(provider());
     let chain = certs(&t.cert, "cert")?;
     let key = PrivateKeyDer::from_pem_file(&t.key)
         .map_err(|e| format!("tls.key: {}: {e}", t.key.display()))?;

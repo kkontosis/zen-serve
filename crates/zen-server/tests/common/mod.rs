@@ -168,8 +168,8 @@ impl Harness {
     async fn launch(cfg: Config, dir: tempfile::TempDir) -> Self {
         let server = zen_server::start(cfg.clone()).await.unwrap();
         let base = format!("http://{}", server.addr);
-        // The server's pure-Rust rustls provider (reqwest has none of its own).
-        zen_server::tls::provider::install_default();
+        // The server's rustls provider (reqwest has none of its own).
+        zen_server::tls::install_default();
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         Harness {
             server,

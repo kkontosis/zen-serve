@@ -1,6 +1,7 @@
 //! Test certificates: CAs, server and client certificates made with
 //! rcgen, signed with RustCrypto keys (rcgen's own crypto backends are not
-//! built), and HTTPS clients on the server's rustls provider.
+//! built), and HTTPS clients on the server's rustls provider
+//! (`zen_server::tls::provider`).
 
 use base64::Engine;
 use ecdsa::signature::Signer as _;
@@ -16,8 +17,9 @@ pub enum Key {
     P384(p384::ecdsa::SigningKey, Vec<u8>),
     Ed25519(ed25519_dalek::SigningKey, Vec<u8>),
     /// An RSA key (PKCS#1 `RSAPublicKey`), signing certificates with
-    /// PKCS#1 v1.5 and the given algorithm's hash. The server refuses RSA
-    /// private keys; test clients sign handshakes with it ([`RsaClientKey`]).
+    /// PKCS#1 v1.5 and the given algorithm's hash. Test clients sign
+    /// handshakes with it ([`RsaClientKey`]); the server loads it with the
+    /// ring provider only.
     Rsa(
         Arc<rsa::RsaPrivateKey>,
         Vec<u8>,
@@ -168,8 +170,8 @@ impl rcgen::SigningKey for Key {
     }
 }
 
-/// A test client's RSA key for TLS 1.3 handshakes: RSA-PSS with SHA-256.
-/// (The server's own provider refuses RSA private keys.)
+/// A test client's RSA key for TLS 1.3 handshakes: RSA-PSS with SHA-256,
+/// on the `rsa` crate, whichever provider the build has.
 #[derive(Clone)]
 pub struct RsaClientKey(Arc<rsa::RsaPrivateKey>, Vec<u8>);
 
@@ -367,7 +369,7 @@ pub fn tls_config(dir: &Path, server: &Ident, client_ca: Option<&Ca>) -> TlsConf
 /// A rustls client configuration on the server's provider that trusts
 /// `ca`, presenting `ident` if given.
 pub fn client_config(ca: &Ca, ident: Option<&Ident>) -> rustls::ClientConfig {
-    client_config_with(zen_server::tls::provider::provider(), ca, ident)
+    client_config_with(zen_server::tls::provider(), ca, ident)
 }
 
 /// [`client_config`] with another provider (for example fewer groups).

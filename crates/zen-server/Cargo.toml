@@ -11,6 +11,11 @@ name = "zen-serve"
 path = "src/main.rs"
 
 [features]
+default = ["ring"]
+# The rustls crypto provider on ring (`tls::ring`), with RSA server keys.
+# ring builds C and assembly: it needs a C compiler. Without it
+# (`--no-default-features`) the provider is `tls::rustcrypto`, pure Rust.
+ring = ["rustls/ring"]
 # FoundationDB backend and supervisor commands (needs libfdb_c).
 fdb = ["zen-store/fdb"]
 # A software WebAuthn authenticator (`webauthn::soft`), for tests.
@@ -37,7 +42,8 @@ rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["sha2"]
 # WebAuthn (spec/auth.md §7): ES256 verification, pure Rust.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 # Native TLS and client certificates (spec/auth.md §10): rustls with a
-# crypto provider of our own on RustCrypto (`tls::provider`), pure Rust.
+# crypto provider of our own on RustCrypto (`tls::rustcrypto`), pure Rust,
+# or ring's (`tls::ring`, feature `ring`) with our hybrid key exchange.
 aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 hmac = "0.13"
@@ -69,4 +75,6 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 tempfile = "3"
 tokio-tungstenite = "0.30"
 zen-core = { path = "../zen-core", features = ["test-utils", "opaque"] }
-zen-server = { path = ".", features = ["test-utils"] }
+# No default features: the tests build with the features of the command
+# line (`--no-default-features` tests the pure-Rust provider).
+zen-server = { path = ".", default-features = false, features = ["test-utils"] }

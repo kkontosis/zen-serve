@@ -1,5 +1,8 @@
 //! A rustls [`CryptoProvider`] on RustCrypto: pure Rust, no C or assembly
-//! files, the same crate generation as the rest of the server.
+//! files, the same crate generation as the rest of the server. The
+//! provider of builds without the `ring` feature ([`super::provider`]);
+//! with it, its X25519MLKEM768 group serves the ring provider too
+//! ([`super::ring`]).
 //!
 //! * **TLS 1.3 only**, with `TLS_AES_128_GCM_SHA256`,
 //!   `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256`.
@@ -13,7 +16,7 @@
 //! * **Private keys** (signing): ECDSA P-256 or P-384 (PKCS#8 or SEC1), or
 //!   Ed25519 (PKCS#8). RSA keys are refused: the `rsa` crate's private-key
 //!   operations are not constant-time (RUSTSEC-2023-0071,
-//!   `TD-TLS-RSA-SERVER-KEY`).
+//!   `TD-TLS-RSA-SERVER-KEY`). The ring provider signs with RSA.
 //!
 //! The glue follows rustls's own providers; the primitives are RustCrypto's.
 
@@ -56,13 +59,6 @@ pub fn provider() -> CryptoProvider {
         secure_random: &Random,
         key_provider: &Keys,
     }
-}
-
-/// Make [`provider`] the process-wide default of rustls, for code that
-/// builds TLS configurations without naming one (HTTP clients in tests and
-/// tools). Does nothing if a default is installed already.
-pub fn install_default() {
-    let _ = provider().install_default();
 }
 
 fn random(buf: &mut [u8]) -> Result<(), Error> {
@@ -804,7 +800,7 @@ impl KeyProvider for Keys {
                     Key::P384(s)
                 } else if let Ok(s) = ed25519_dalek::SigningKey::from_pkcs8_der(k) {
                     Key::Ed25519(s)
-                } else if pkcs8_is_rsa(k) {
+                } else if crate::rsakey::pkcs8_is_rsa(k) {
                     return Err(rsa_key());
                 } else {
                     return Err(unsupported_key());
@@ -827,21 +823,13 @@ impl KeyProvider for Keys {
     }
 }
 
-/// Whether a PKCS#8 key's algorithm is `rsaEncryption` (1.2.840.113549.1.1.1):
-/// `SEQUENCE { INTEGER 0, SEQUENCE { OID, ... }, ... }`.
-fn pkcs8_is_rsa(k: &[u8]) -> bool {
-    const OID: [u8; 11] = [6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
-    // The algorithm's OID follows the version within the first few bytes,
-    // whatever the outer length's form.
-    k.windows(OID.len()).take(16).any(|w| w == OID)
-}
-
 fn rsa_key() -> Error {
     Error::General(
-        "RSA private keys are not supported: the pure-Rust rsa crate's private-key \
-         operations are not constant-time (RUSTSEC-2023-0071, TD-TLS-RSA-SERVER-KEY). \
-         Use an ECDSA P-256 or P-384, or Ed25519, server key; RSA client certificates \
-         and CAs are fine"
+        "RSA private keys are not supported: zen-serve was built without the ring feature, \
+         and the pure-Rust rsa crate's private-key operations are not constant-time \
+         (RUSTSEC-2023-0071, TD-TLS-RSA-SERVER-KEY). Use an ECDSA P-256 or P-384, or \
+         Ed25519, server key, or a build with the ring feature (the default); RSA client \
+         certificates and CAs are fine"
             .into(),
     )
 }
@@ -1133,6 +1121,7 @@ mod tests {
         ] {
             let e = Keys.load_private_key(der).unwrap_err().to_string();
             assert!(e.contains("TD-TLS-RSA-SERVER-KEY"), "{e}");
+            assert!(e.contains("built without the ring feature"), "{e}");
         }
         let e = Keys
             .load_private_key(PrivateKeyDer::Pkcs8(vec![0x30, 0].into()))

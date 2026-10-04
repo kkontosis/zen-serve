@@ -437,10 +437,11 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         None
     };
     let tls = match &cfg.tls {
-        Some(t) => Some(tls::server_config(
-            t,
-            tls::requests_client_certs(Some(t), cfg.auth.mtls),
-        )?),
+        Some(t) => {
+            let c = tls::server_config(t, tls::requests_client_certs(Some(t), cfg.auth.mtls))?;
+            tracing::info!(provider = tls::PROVIDER, "native TLS");
+            Some(c)
+        }
         None => None,
     };
     if let Some(note) = mtls::startup_note(&cfg) {
