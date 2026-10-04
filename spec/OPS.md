@@ -18,6 +18,21 @@ Pitfalls:
 * **Release builds use LTO and one codegen unit**: small and fast binaries, but a release rebuild after any change takes about 2 minutes. Use debug builds while developing.
 * **Test features:** zen-server's tests depend on zen-server itself with `default-features = false`, so `--no-default-features` really tests the pure build. A test that builds its own reqwest client must call `zen_server::tls::install_default()` first.
 
+### 1.1 The TypeScript packages
+
+| You want | Command | Needs |
+|---|---|---|
+| The WASM module | `scripts/build-wasm.sh` | the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` at the Cargo.lock version |
+| `@zen/client` | `npm ci && npm run build -w @zen/client` | Node 22 |
+| `zen-mount` | `npm run build -w @zen/fuse` | `libfuse-dev`, `pkg-config` and a C compiler when `npm ci` runs (`@cocalc/fuse-native` compiles against libfuse 2); `fusermount` to mount |
+
+Pitfalls:
+* **wasm-bindgen versions must match exactly.** The `wasm-bindgen` crate is pinned (`=0.2.129` in zen-wasm and zen-proto) and the CLI must be the same version; `build-wasm.sh` checks and says how to install it.
+* **A stale WASM module.** After a change in zen-core, zen-proto or zen-wasm, run `scripts/build-wasm.sh` again: the tests load `packages/zen-wasm/pkg`, which isn't rebuilt by cargo.
+* **The client tests spawn `target/debug/zen-serve`** (or `$ZEN_SERVE_BIN`): build it first, after server changes too.
+* **`npm ci` without libfuse 2** skips `@cocalc/fuse-native` (an optional dependency): everything but `zen-mount` works, and its tests skip.
+* **A FUSE mount left behind** by a killed process: `fusermount -u <dir>`.
+
 ## 2. What fills the disk
 
 ### 2.1 In production
@@ -70,4 +85,4 @@ The milestones so far spent most wall-clock time on rebuilds, full test matrices
 8. **Reuse expensive test fixtures:** generated RSA keys, TLS certificates and FoundationDB clusters. Never generate them per test.
 9. **One working tree, one `target/`.** Parallel agents or worktrees each pay for a full build and ~8 GB of disk. If work must run in parallel, give it separate files and let one build verify both.
 10. **Check the environment first when something hangs:** free disk, then the FoundationDB cluster, then the code.
-11. **The client milestones (4–5) don't need FoundationDB at all.** Develop the client library against an embedded server. The server already behaves identically on both backends, which its tests prove.
+11. **The client milestones (4–5) don't need FoundationDB at all.** Iterate with `npx vitest run packages/client/test/<file>`: one file spawns its own embedded server in milliseconds. Develop the client library against an embedded server. The server already behaves identically on both backends, which its tests prove.

@@ -262,3 +262,33 @@ Push after each green step. A new short PR at the end. Steps 4–7 can run as tw
 * Client: `scripts/build-wasm.sh && npm ci && npx biome check && npx tsc --noEmit && npx vitest run && npx playwright test`, against a debug `zen-serve`
 * CI green on `rust`, `pure-rust`, `fdb` and `client`. The FDB suite is unaffected, since the server doesn't change.
 * Watch disk (target/ is 11 GB now; the wasm release build adds about 1 GB): `CARGO_INCREMENTAL=0`.
+
+## Outcome
+
+Done. Differences from the plan above:
+
+* **`@cocalc/fuse-native` has no prebuilt binaries.** It compiles against the system libfuse 2 at `npm ci`, so building `zen-mount` needs `libfuse-dev`, `pkg-config` and a C compiler. It is an optional dependency: without them `npm ci` still succeeds, and only `zen-mount` is missing (its tests skip).
+* **zen-mount has no `--cache-dir` cache yet.** Chunks aren't cached across reads; the option is reserved (`TD-FUSE-REPLICA`). Detaching (no `--foreground`) is implemented but only the foreground mode is tested.
+* **Writes through FUSE.** A truncate that the kernel sends while the file is open for writing goes to that handle, and `O_TRUNC` is honoured at open. Otherwise overwriting a file from one mount made two sibling versions.
+* **The wire layer.** Every `u64` is a JS `bigint` (HLCs exceed 2^53), and byte strings are `Uint8Array`, in the generated TypeScript types as well.
+* **OPAQUE.** A wrong password is detected by the client, because the server's response doesn't open. It still surfaces as the same 401 as every other credential failure.
+* **Streams.** A subscription without `after` starts at the read version when it was made, not at the server's head, so a reconnect before the first event loses nothing. Ephemeral messages are sealed as event bodies under a reserved key token, so they can't be confused with log events, and receivers drop replays by HLC.
+* **One HLC per session for every tree**, corrected once from the server's `time_ms`. The rebase path re-syncs it on `stale_op` and `clock_skew`.
+* **`max_range_items` caps more than reads.** Clears and long-mode range checks are capped by the server too (api.md §6), so a long-mode transaction's ranges must fit one response.
+
+Tests:
+* **zen-core:** header and ACL vectors.
+* **Node: 60 tests, against a spawned embedded server, about 6 s:**
+  * all six sign-in methods, including mTLS with an openssl test PKI and passkeys with PRF through a software authenticator
+  * the ACL chain, every keyslot type, a concurrent header change, rotation
+  * KV and both transaction modes, phantoms included
+  * topics, consumer groups, the DLQ, per-key claims, leaders with fencing
+  * stream resume across forced reconnects, ephemeral messages
+  * the tree: siblings, rebase, multi-commit files with chunk reuse, the change feed
+  * zen-mount through real FUSE mounts: two mounts with a conflict copy, a remount, read-only mode, the CLI
+* **Chromium (Playwright, virtual WebAuthn authenticator with PRF):**
+  * a password sign-in
+  * a passkey registered, then a one-touch sign-in that also unlocks the fs
+  * KV, a two-chunk file, a stream event
+
+New tech debt: `TD-FS-HEADER-SELF-SLOT`, `TD-CLIENT-WASM-OPT`, `TD-FUSE-REPLICA`.
