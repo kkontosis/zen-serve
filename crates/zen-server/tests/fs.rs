@@ -1021,3 +1021,93 @@ async fn changes_across_nodes() {
         .unwrap();
     assert_eq!(c.changes.len(), 1);
 }
+
+async fn chunk_exists(h: &Harness, d: &Dev, c: [u8; 16]) -> bool {
+    let r: Chunks = h
+        .call(
+            "/v1/fs/chunks/get",
+            Some(&d.tok),
+            &ChunksGet {
+                fs: 1,
+                ids: vec![ByteBuf::from(c.to_vec())],
+            },
+        )
+        .await
+        .unwrap();
+    r.chunks[0].data.is_some()
+}
+
+async fn put_chunk(h: &Harness, d: &Dev, c: [u8; 16]) {
+    let commit = Commit {
+        commit_id: rcid(),
+        chunks: vec![ChunkPut {
+            fs: 1,
+            id: c.to_vec(),
+            data: vec![c[0]; 40],
+        }],
+        ..Default::default()
+    };
+    let _: CommitResult = h.call("/v1/commit", Some(&d.tok), &commit).await.unwrap();
+}
+
+/// The grace period of an unreferenced chunk restarts on re-upload and on
+/// every release: the sweeper only acts on a chunk's newest GC candidate,
+/// so an older candidate past the grace period does not delete it.
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_grace_restarts_on_reupload_and_release() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 3;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let st = &h.server.state;
+    // Re-upload.
+    put_chunk(&h, &a, id(0xA1)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    put_chunk(&h, &a, id(0xA1)).await; // restarts the grace period
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // The first candidate is older than the grace period, the second is not.
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        chunk_exists(&h, &a, id(0xA1)).await,
+        "re-upload restarted grace"
+    );
+    // Release, re-reference, release.
+    let t = zfs::hlc(now_ms(), 0);
+    let r = ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"f")),
+            write(id(1), &[], &[id(0xA1)], b"m1"),
+        ],
+    )
+    .await
+    .unwrap();
+    let d1 = r.dots[0].to_vec();
+    let r = ops(&h, &a, vec![write(id(1), &[d1], &[], b"m2")])
+        .await
+        .unwrap(); // released
+    let d2 = r.dots[0].to_vec();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let r = ops(&h, &a, vec![write(id(1), &[d2], &[id(0xA1)], b"m3")])
+        .await
+        .unwrap();
+    let d3 = r.dots[0].to_vec();
+    let _ = ops(&h, &a, vec![write(id(1), &[d3], &[], b"m4")])
+        .await
+        .unwrap(); // released again
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        chunk_exists(&h, &a, id(0xA1)).await,
+        "release restarted grace"
+    );
+    // Once the newest candidate is past the grace period, the chunk goes.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        !chunk_exists(&h, &a, id(0xA1)).await,
+        "collected after grace"
+    );
+}

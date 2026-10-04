@@ -112,6 +112,7 @@ Leases are never deleted: the stored token is what keeps fencing tokens increasi
 | `pack("ck", fs, chunk)` | sealed chunk |
 | `pack("cr", fs, chunk)` | `i64` little-endian, atomic add: number of versions referencing the chunk |
 | `pack("cz", fs, cvs, chunk)` | empty: chunk GC candidate, from upload or the release of a reference |
+| `pack("cp", fs, chunk)` | `cvs(12)` of the chunk's newest GC candidate: only that candidate can delete the chunk, so each upload or release restarts the grace period |
 
 **Node record:**
 

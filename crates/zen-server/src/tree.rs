@@ -254,14 +254,23 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Release one reference to a chunk and make it a GC candidate.
-fn release_chunk(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
-    t.atomic_add(&keys::chunk_refs(fs, chunk), -1);
+/// Make a chunk a GC candidate as of this commit, and point the chunk's
+/// `cp` entry at that candidate: an earlier candidate of the same chunk no
+/// longer counts, so the grace period restarts.
+fn gc_candidate(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
     let (p, s) = keys::chunk_gc(fs)
         .vs_incomplete(0)
         .bytes(chunk)
         .finish_incomplete();
     t.set_versionstamped_key(&p, &s, &[]);
+    // `cvs = stamp ‖ u16(0)`, the same element the candidate key carries.
+    t.set_versionstamped_value(&keys::chunk_gc_ptr(fs, chunk), &[], &[0, 0]);
+}
+
+/// Release one reference to a chunk and make it a GC candidate.
+fn release_chunk(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
+    t.atomic_add(&keys::chunk_refs(fs, chunk), -1);
+    gc_candidate(t, fs, chunk);
 }
 
 type NodeKey = (u32, Id, Id);
@@ -622,11 +631,7 @@ impl<'a> Engine<'a> {
             }
         }
         // A (re-)upload starts the grace period (again).
-        let (p, s) = keys::chunk_gc(c.fs)
-            .vs_incomplete(0)
-            .bytes(&id)
-            .finish_incomplete();
-        t.set_versionstamped_key(&p, &s, &[]);
+        gc_candidate(t, c.fs, &id);
         self.new_chunks.insert((c.fs, id));
         Ok(())
     }
@@ -1229,15 +1234,18 @@ async fn collect_chunks(st: &Shared, fs: u32, before: &[u8; 12]) -> ApiResult<us
     let (n, _) = txn_loop!(st.store, None, |t| {
         let got = t.get_range(&pfx, &end, 500, false).await?;
         let mut bytes = 0i64;
-        let mut seen = HashSet::new();
         for (k, _) in &got {
             t.clear(k);
             let (elems, _) =
                 unpack_prefix(&k[pfx.len()..], 2).map_err(|_| internal("bad gc key"))?;
-            let [Elem::Vs(_), Elem::Bytes(c)] = elems.as_slice() else {
+            let [Elem::Vs(cvs), Elem::Bytes(c)] = elems.as_slice() else {
                 return Err(internal("bad gc key"));
             };
-            if !seen.insert(c.clone()) {
+            // Only the chunk's newest candidate decides: an older one was
+            // superseded by a re-upload or a later release, which restarted
+            // the grace period. A chunk without a pointer predates it.
+            let ptr = t.get(&keys::chunk_gc_ptr(fs, c)).await?;
+            if ptr.is_some_and(|p| p[..] != cvs[..]) {
                 continue;
             }
             let refs = t
@@ -1251,6 +1259,7 @@ async fn collect_chunks(st: &Shared, fs: u32, before: &[u8; 12]) -> ApiResult<us
                     t.clear(&keys::chunk(fs, c));
                 }
                 t.clear(&keys::chunk_refs(fs, c));
+                t.clear(&keys::chunk_gc_ptr(fs, c));
             }
         }
         add_quota(&mut t, fs, bytes, 0);

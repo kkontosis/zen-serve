@@ -302,3 +302,8 @@ pub fn chunk_refs(fs: u32, id: &[u8]) -> Vec<u8> {
 pub fn chunk_gc(fs: u32) -> Key {
     Key::new().str("cz").int(fs.into())
 }
+
+/// A chunk's newest GC candidate: `("cp", fs, chunk)` → `cvs(12)`.
+pub fn chunk_gc_ptr(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("cp").int(fs.into()).bytes(id).finish()
+}
