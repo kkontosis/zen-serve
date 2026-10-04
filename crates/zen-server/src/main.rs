@@ -81,6 +81,12 @@ enum Cmd {
         /// Restore to this database version.
         #[arg(long)]
         version: Option<u64>,
+        /// Cluster file of the database the backup was taken from; with
+        /// --timestamp it translates the time into that database's version.
+        /// Default: the target cluster (right when restoring into the same
+        /// cluster, e.g. a clone with --add-prefix).
+        #[arg(long)]
+        orig_cluster_file: Option<String>,
         /// Restore under this key prefix: a clone served with
         /// `[storage] key_prefix`.
         #[arg(long)]
@@ -275,6 +281,7 @@ async fn main() {
             source,
             timestamp,
             version,
+            orig_cluster_file,
             add_prefix,
         } => {
             let cfg = load(&config);
@@ -289,7 +296,10 @@ async fn main() {
                 s("-w"),
             ];
             if let Some(t) = timestamp {
-                a.extend([s("--timestamp"), t, s("--orig-cluster-file"), cluster]);
+                // fdbrestore maps a timestamp to a version with the metadata
+                // of the backed-up database, not of the target.
+                let orig = orig_cluster_file.unwrap_or(cluster);
+                a.extend([s("--timestamp"), t, s("--orig-cluster-file"), orig]);
             }
             if let Some(v) = version {
                 a.extend([s("-v"), v.to_string()]);

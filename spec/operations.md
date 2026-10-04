@@ -163,10 +163,11 @@ zen-serve backup stop     -c zen.toml
 ```sh
 zen-serve restore -c zen.toml --source file:///srv/zen-backups/backup-… \
     [--timestamp 2026/10/04.12:00:00+0000 | --version V] [--add-prefix P]
+    [--orig-cluster-file /etc/zen/old-fdb.cluster]
 ```
 
 * Without `--add-prefix`, the target cluster must be empty: restore into a new cluster.
-* `--timestamp` picks the newest restorable version at or before that time.
+* `--timestamp` picks the newest restorable version at or before that time. The time is translated into a version with the metadata of the database the backup was taken from, so when the target is a different cluster, pass that database's cluster file as `--orig-cluster-file` (default: the target's). Restoring a clone into the same cluster needs nothing extra.
 * The backup agents must be running while the restore runs.
 
 ### 5.3 Clone at time T

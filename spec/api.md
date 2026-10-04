@@ -79,6 +79,8 @@ A session is checked again on every request: it stops working as soon as an ACL 
 * each `public_origins` entry in its config, or
 * if that list is empty, `http://<Host>` and `https://<Host>` from the request's `Host` header.
 
+  The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. It is for development; a production server sets `public_origins`, and warns at start-up when it is empty.
+
 ## 4. ACL and fs headers
 
 ### 4.1 `POST /v1/acl/put`
@@ -170,7 +172,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
-9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` and `manifest` are at most `max_value_bytes`. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`.
+9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` (the stored version holds both, keyspace.md §3.6), which bounds a file at about `max_value_bytes / 32` chunks. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`.
 
 ## 7. Log
 
