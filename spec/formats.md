@@ -289,12 +289,12 @@ Each operation has a canonical byte form, used for the per-tree chain:
 ```
 move   = 0x01 ‖ u32(fs) ‖ tree ‖ node ‖ parent ‖ u64(hlc) ‖ lp(meta or empty)
 meta   = 0x02 ‖ u32(fs) ‖ tree ‖ node ‖ u64(hlc) ‖ lp(meta)
-write  = 0x03 ‖ u32(fs) ‖ tree ‖ node ‖ dot(12) ‖ u32(r) ‖ r × dot(12)
+write  = 0x03 ‖ u32(fs) ‖ tree ‖ node ‖ u32(r) ‖ r × dot(12)
               ‖ u32(n) ‖ n × chunk_id ‖ lp(manifest)
 ```
 
 * `meta` and `manifest` are the sealed objects, byte for byte.
-* In `write`, the first `dot` is the one the server assigned to the new version, and the `r` dots are `replaces`.
+* In `write`, the `r` dots are `replaces`. The new version's own dot is not part of the chain: it is only known once the commit commits.
 
 The chain starts at 32 zero bytes. Each operation accepted by the server extends it, in arrival order:
 

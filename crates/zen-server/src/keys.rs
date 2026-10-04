@@ -226,3 +226,74 @@ pub fn eph_head(fs: u32) -> Vec<u8> {
 pub fn meta(name: &str) -> Vec<u8> {
     Key::new().str("meta").str(name).finish()
 }
+
+// ---- filesystem trees (keyspace.md §3.6)
+
+/// `("tr", fs)`: tree headers of an fs.
+pub fn trees(fs: u32) -> Key {
+    Key::new().str("tr").int(fs.into())
+}
+
+/// Tree header.
+pub fn tree_header(fs: u32, tree: &[u8]) -> Vec<u8> {
+    trees(fs).bytes(tree).finish()
+}
+
+/// Tree head versionstamp, watched by change long-polls.
+pub fn tree_head(fs: u32, tree: &[u8]) -> Vec<u8> {
+    Key::new().str("th").int(fs.into()).bytes(tree).finish()
+}
+
+/// Node record.
+pub fn node(fs: u32, tree: &[u8], node: &[u8]) -> Vec<u8> {
+    Key::new()
+        .str("tn")
+        .int(fs.into())
+        .bytes(tree)
+        .bytes(node)
+        .finish()
+}
+
+/// `("tc", fs, tree, parent)`: children of a node.
+pub fn children(fs: u32, tree: &[u8], parent: &[u8]) -> Key {
+    Key::new()
+        .str("tc")
+        .int(fs.into())
+        .bytes(tree)
+        .bytes(parent)
+}
+
+/// `("tm", fs, tree)`: the move log.
+pub fn move_log(fs: u32, tree: &[u8]) -> Key {
+    Key::new().str("tm").int(fs.into()).bytes(tree)
+}
+
+/// `("tv", fs, tree)`: the change index.
+pub fn changes(fs: u32, tree: &[u8]) -> Key {
+    Key::new().str("tv").int(fs.into()).bytes(tree)
+}
+
+/// `("tx", fs, tree)`: tombstones.
+pub fn tombstones(fs: u32, tree: &[u8]) -> Key {
+    Key::new().str("tx").int(fs.into()).bytes(tree)
+}
+
+/// `("tf", fs, tree, node)`: content versions of a node.
+pub fn versions(fs: u32, tree: &[u8], node: &[u8]) -> Key {
+    Key::new().str("tf").int(fs.into()).bytes(tree).bytes(node)
+}
+
+/// Sealed chunk.
+pub fn chunk(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("ck").int(fs.into()).bytes(id).finish()
+}
+
+/// Chunk reference count.
+pub fn chunk_refs(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("cr").int(fs.into()).bytes(id).finish()
+}
+
+/// `("cz", fs)`: chunk GC candidates.
+pub fn chunk_gc(fs: u32) -> Key {
+    Key::new().str("cz").int(fs.into())
+}

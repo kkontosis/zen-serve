@@ -226,7 +226,6 @@ fn fs_vectors() -> Result<Value> {
     let chunk0 = vec![0x61u8; 64];
     let sealed_chunk = fs::seal_chunk(&fsk, &chunk_ids[0], &chunk0, &mut DetRng::new("fs-chunk"))?;
     let hlc = fs::hlc(1_790_000_000_123, 7);
-    let dot = [0x55u8; 12];
     let ops = [
         fs::move_bytes(fsk.fs_id, &tree, &node, &fs::ROOT, hlc, &sealed_meta),
         fs::meta_bytes(fsk.fs_id, &tree, &node, hlc + 1, &sealed_meta),
@@ -234,7 +233,6 @@ fn fs_vectors() -> Result<Value> {
             fsk.fs_id,
             &tree,
             &node,
-            &dot,
             &[[0x66; 12]],
             &chunk_ids,
             &sealed_manifest,
@@ -254,6 +252,6 @@ fn fs_vectors() -> Result<Value> {
         "meta": {"rng_seed": "fs-meta", "plaintext": h(&meta.encode()?), "sealed": h(&sealed_meta)},
         "manifest": {"rng_seed": "fs-manifest", "plaintext": h(&manifest.encode()), "sealed": h(&sealed_manifest)},
         "chunk": {"rng_seed": "fs-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_chunk)},
-        "op_chain": {"dot": h(&dot), "replaces": [h(&[0x66; 12])], "steps": chains},
+        "op_chain": {"replaces": [h(&[0x66; 12])], "steps": chains},
     }))
 }

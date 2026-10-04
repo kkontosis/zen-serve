@@ -22,6 +22,7 @@ pub mod state;
 pub mod statics;
 pub mod stream;
 pub mod supervisor;
+pub mod tree;
 mod txn;
 
 use crate::cbor::Cbor;
@@ -52,11 +53,15 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
         api: API_VERSION,
         suites: vec![1],
         formats: vec![1],
-        features: ["kv", "log", "consume", "ephemeral", "static"]
+        features: ["kv", "log", "consume", "ephemeral", "static", "fs"]
             .map(String::from)
             .to_vec(),
         cross_origin_isolation: st.cfg.cross_origin_isolation,
         claimed: st.acl().version > 0,
+        time_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
         limits: Limits {
             max_key_bytes: l.max_key_bytes,
             max_value_bytes: l.max_value_bytes,
@@ -66,6 +71,9 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             max_range_items: l.max_range_items,
             idempotency_ttl_secs: l.idempotency_ttl_secs,
             session_ttl_secs: l.session_ttl_secs,
+            crdt_max_skew_ms: l.crdt_max_skew_ms,
+            crdt_horizon_secs: l.crdt_horizon_secs,
+            crdt_max_redo: l.crdt_max_redo,
         },
     })
 }
@@ -156,6 +164,13 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/consume/dlq/list", post(consume::dlq_list))
         .route("/v1/consume/dlq/retry", post(consume::dlq_retry))
         .route("/v1/consume/dlq/drop", post(consume::dlq_drop))
+        .route("/v1/fs/tree/list", post(tree::tree_list))
+        .route("/v1/fs/tree/get", post(tree::tree_get))
+        .route("/v1/fs/tree/children", post(tree::tree_children))
+        .route("/v1/fs/tree/changes", post(tree::tree_changes))
+        .route("/v1/fs/tree/chain", post(tree::tree_chain))
+        .route("/v1/fs/file/get", post(tree::file_get))
+        .route("/v1/fs/chunks/get", post(tree::chunks_get))
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/stream", get(stream::ws))
         .fallback(statics::fallback)
@@ -227,6 +242,7 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
     if n > 0 {
         tracing::debug!(removed = n, "expired sessions and challenges");
     }
+    tree::sweep(st, now).await?;
     let cutoff = now.saturating_sub(st.cfg.limits.ephemeral_ttl_secs * zen_store::VERSIONS_PER_SEC);
     for f in &st.cfg.fs {
         st.eph.sweep(f.id, cutoff).await?;

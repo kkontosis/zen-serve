@@ -304,19 +304,16 @@ pub fn meta_bytes(fs_id: u32, tree: &Id, node: &Id, hlc: u64, meta: &[u8]) -> Ve
     b
 }
 
-/// Canonical bytes of a `write`: `dot` is the server-assigned dot of the new
-/// version.
+/// Canonical bytes of a `write`.
 pub fn write_bytes(
     fs_id: u32,
     tree: &Id,
     node: &Id,
-    dot: &[u8; DOT_LEN],
     replaces: &[[u8; DOT_LEN]],
     chunks: &[Id],
     manifest: &[u8],
 ) -> Vec<u8> {
     let mut b = op_head(3, fs_id, tree, node);
-    b.extend_from_slice(dot);
     b.extend_from_slice(&(replaces.len() as u32).to_be_bytes());
     for d in replaces {
         b.extend_from_slice(d);

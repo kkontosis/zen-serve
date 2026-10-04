@@ -54,14 +54,14 @@ move {node, parent, hlc, meta?}
   | restore | a move out of `TRASH` |
 
 * `parent` must be `ROOT`, `TRASH` or an existing node of the tree.
-* `node` can't be `ROOT` or `TRASH`. It may be new: this is a creation.
+* `node` can't be `ROOT` or `TRASH`, and can't be its own `parent` (400). It may be new: this is a creation.
 * If `meta` is present, it is also applied as a `meta` operation with the same timestamp (§3.3). It sits in the move only so that create and rename are a single operation.
 
 ### 3.2 Merge rule
 
 The tree is defined as the result of applying **all moves in timestamp order**, starting from an empty tree. Applying one move:
 * Let `old` be the node's current parent, or none.
-* If `parent == node`, or `node` is an ancestor of `parent`, the move is **skipped**: it would create a cycle. The state is unchanged.
+* If `node` is an ancestor of `parent`, the move is **skipped**: it would create a cycle. The state is unchanged.
 * Otherwise the node's parent becomes `parent`.
 
 The result depends only on the *set* of moves, not on the order they arrive in. The server keeps it so with a **move log**, holding each move with the `old` parent it saw:

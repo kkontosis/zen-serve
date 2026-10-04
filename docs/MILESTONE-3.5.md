@@ -203,3 +203,28 @@ Push after each green step, then a new short PR.
 * on the local FDB cluster: `ZEN_TEST_BACKEND=fdb cargo test -p zen-server --features fdb`
 * `cargo run -p zen-core --example gen_vectors --features test-utils` leaves `spec/test-vectors` unchanged after commit (deterministic)
 * CI green on both jobs
+
+## Outcome
+
+Done (server side). Differences from the plan above:
+
+* **The op chain doesn't include a write's own dot.** The dot comes from the commit versionstamp, which isn't known inside the transaction. The chain covers `replaces`, chunks and manifest (formats.md §11.5).
+* **Move-log entries also keep the replaced move timestamp.** Undo must restore it, because trash purge and node states use it.
+* **`parent == node` is refused (400),** not skipped. Only true cycles are skipped.
+* **One `write` per node per commit.** A second one would have to read the first one's pending versionstamped key, which FoundationDB refuses.
+* **A tombstone index (`tx`)** lets the sweeper drop old tombstones without scanning the change index. A cursor older than the dropped ones gets 409 `resync`.
+* **Undo/redo that ends where it started writes nothing,** so no spurious change-feed entries.
+* **Very large trash subtrees are purged leaves first,** in batches of 500 per transaction.
+* **Steps 2 and 3 were one commit,** because the typed `crdt_ops` changed the server's build.
+
+Tests:
+* **zen-core:** `spec/test-vectors/fs.json` (sealed meta/manifest/chunk, op bytes and chain), plus the HLC rules.
+* **zen-server `tests/fs.rs`:**
+  * tree semantics, cycles, LWW meta, concurrent rename+move
+  * late moves with undo/redo
+  * a convergence property test against an in-memory Kleppmann reference, with three seeds of random moves and metas from three devices in shuffled arrival order
+  * siblings and resolution, chunks, idempotent dots
+  * `clock_skew`/`stale_op`/rebase, permissions, the op chain recomputed client-side
+  * change-feed long-poll, sweeper purge, chunk GC and `resync`
+  * changes across two nodes (FDB)
+* All server tests pass on both backends.

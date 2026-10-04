@@ -319,10 +319,16 @@ async fn kv_commit_and_idempotent_replay() {
         "commit_id_reused"
     );
 
-    // crdt_ops are not implemented.
+    // A filesystem op on an unknown node is refused (tests/fs.rs has more).
     let c = Commit {
         commit_id: cid(3),
-        crdt_ops: vec![CborValue::Null],
+        crdt_ops: vec![CrdtOp::Meta {
+            fs: 1,
+            tree: vec![1; 16],
+            node: vec![2; 16],
+            hlc: 1,
+            meta: vec![0; 60],
+        }],
         ..Default::default()
     };
     assert_eq!(
@@ -331,7 +337,7 @@ async fn kv_commit_and_idempotent_replay() {
                 .await
         )
         .0,
-        501
+        409, // hlc 1 is past the horizon: stale_op
     );
 }
 
