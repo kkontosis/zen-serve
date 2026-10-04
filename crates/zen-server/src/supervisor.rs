@@ -302,8 +302,7 @@ async fn supervise(
             _r = stop.wait_for(|s| *s) => true,
         };
         if stopping {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            stop_child(&c.name, &mut child).await;
         }
         pids.lock().expect("pids lock")[slot] = None;
         if stopping {
@@ -317,6 +316,29 @@ async fn supervise(
         }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
+}
+
+/// How long a child gets to exit on SIGTERM before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Stop a child the way `fdbmonitor` does: SIGTERM, a bounded wait, then
+/// SIGKILL.
+async fn stop_child(name: &str, child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let pid = Pid::from_raw(pid as i32);
+        if kill(pid, Signal::SIGTERM).is_ok()
+            && tokio::time::timeout(STOP_GRACE, child.wait()).await.is_ok()
+        {
+            tracing::info!(process = %name, "stopped");
+            return;
+        }
+        tracing::warn!(process = %name, "did not stop on SIGTERM; killing");
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 /// Sleep for `d`; true if asked to stop meanwhile.
