@@ -44,7 +44,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 ## TD-AUTH-LIMITER-CLUSTER
 
 * **Status:** open
-* **Context:** The failed-sign-in limiter of methods 6 and 3 (auth.md §11.3, §8.5) is in each node's memory. A cluster of n nodes allows n times the configured failures, and a restart clears the counts. (A successful OPAQUE sign-in records its time in the credential, so the node of the next `start` forgets failures before it; that only keeps alternating nodes from locking users out.)
+* **Context:** The failed-sign-in limiter of methods 6 and 3 (auth.md §11.3, §8.5), which counts each method separately, is in each node's memory. A cluster of n nodes allows n times the configured failures, and a restart clears the counts. (A successful OPAQUE sign-in records its time in the credential, so the node of the next `start` forgets failures before it; that only keeps alternating nodes from locking users out.)
 * **Why deferred:** A shared limiter means a write on every failed sign-in, which unauthenticated callers could use to load storage. The per-node limiter, with Argon2id on the client, already makes online guessing slow.
 * **What it would take:** A keyspace counter per login-name hash with a time bucket, written with an atomic add (snapshot reads, like the quota counters), swept like sessions; a cap on writes per source address; tests on FoundationDB with several nodes.
 

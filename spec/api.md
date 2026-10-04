@@ -128,7 +128,7 @@ Method 6, the password-derived key (auth.md §11). No session.
 ```
 
 * 403 `method_disabled` if password keys are off. 400 for a name that doesn't normalize.
-* 429 `quota` while the login name is locked after too many failures (auth.md §11.3).
+* 429 `quota` while the login name is locked for method 6 after too many failures (auth.md §11.3; method 3 counts separately).
 * 401 for a dead or spent challenge, or an origin the policy refuses (§3.3).
 * 401 `unauthorized` with one message, "unknown login name or wrong password", for every credential failure: unknown name, bad signature, user no longer a member. Each one counts towards the lock.
 * The session's `device_fp` is the password credential's id, and `method` is `password_key`.
@@ -309,7 +309,7 @@ finish: { state: bytes,               // from start, unchanged
 → Session (§3.2)
 ```
 
-* `start`: 400 for a name that doesn't normalize or a `request` of the wrong size or encoding; 401 for a malformed origin; 429 `quota` while the login name is locked (auth.md §8.5). Every `start` counts as a failed attempt until a `finish` succeeds. An unknown name gets a response of the same shape, and the configured parameters.
+* `start`: 400 for a name that doesn't normalize or a `request` of the wrong size or encoding; 401 for a malformed origin; 429 `quota` while the login name is locked for method 3 (auth.md §8.5; method 6 counts separately). Every `start` counts as a failed attempt until a `finish` succeeds. An unknown name gets a response of the same shape, and the configured parameters.
 * `finish` may go to any node of the cluster. 401 for a state that is expired (60 s), already used, altered or from another cluster; for an origin the policy refuses (§3.3), which may also pin the origin (auth.md §5.2); and, with one message, "unknown login name or wrong password", for every credential failure: an unknown name, a wrong finalization, a credential removed or replaced since `start`, a user no longer a member.
 * The session's `device_fp` is the OPAQUE credential's id, and `method` is `opaque`.
 

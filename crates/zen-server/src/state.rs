@@ -51,8 +51,8 @@ pub struct AppState {
     /// Cluster-wide key for the fake parameters of unknown login names,
     /// once read or created (`cred::params_key`).
     pub params_key: Mutex<Option<[u8; 32]>>,
-    /// Failed password sign-ins per login name, on this node (methods 6
-    /// and 3).
+    /// Failed password sign-ins per method and login name, on this node
+    /// (methods 6 and 3, counted separately).
     pub pw_limiter: crate::password::Limiter,
     /// The cluster's OPAQUE server setup, once read or created
     /// (`opaque::setup`).

@@ -481,3 +481,114 @@ async fn opaque_is_off_by_default() {
     let auth = h.get::<Info>("/v1/info").await.auth.unwrap();
     assert!(!auth.methods.contains(&"opaque".to_string()));
 }
+
+/// A whole method-6 sign-in (auth.md §11.3).
+async fn password_key_sign_in(h: &Harness, name: &str, pw: &[u8]) -> R<Session> {
+    let p: PasswordParams = h
+        .call(
+            "/v1/auth/password/params",
+            None,
+            &PasswordParamsRequest { name: name.into() },
+        )
+        .await?;
+    let core = zen_core::keyslot::Argon2Params {
+        m_cost_kib: p.m_cost_kib,
+        t_cost: p.t_cost,
+        p_cost: p.p_cost,
+    };
+    let key = PasswordKey::derive(pw, &p.salt.clone().try_into().unwrap(), core).unwrap();
+    let c: Challenge = h.call("/v1/auth/challenge", None, &Empty {}).await?;
+    let origin = h.origin();
+    let sig = key.sign_session(&c.challenge, &origin).unwrap();
+    h.call(
+        "/v1/auth/password/session",
+        None,
+        &PasswordSessionRequest {
+            name: name.into(),
+            challenge: c.challenge,
+            origin,
+            sig,
+        },
+    )
+    .await
+}
+
+/// Methods 6 and 3 count failures on a name separately, each with the
+/// full cap (auth.md §8.5): a lock of one leaves the other working, and a
+/// success of one doesn't clear the other's count.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_password_method_has_its_own_limit() {
+    let h = Harness::start_with(|c| {
+        opaque_cfg(c);
+        c.auth.password_max_failures = 3;
+        c.auth.password_lockout_secs = 60;
+    })
+    .await;
+    let users: Vec<User> = (1..=4).map(User::new).collect();
+    let refs: Vec<&User> = users.iter().collect();
+    h.claim(refs[0], &refs[1..]).await;
+    let names = ["ada", "bea", "cy", "dee"];
+    for (u, name) in users.iter().zip(names) {
+        let tok = h.sign_in(u).await.unwrap();
+        set_password_key(&h, &tok, name, b"right").await.unwrap();
+        opaque_set(&h, &tok, name, b"right").await.unwrap();
+    }
+    let origin = h.origin();
+    let opaque_locked = |name: &'static str| {
+        let (h, origin) = (&h, origin.clone());
+        async move {
+            code(
+                opaque_start(h, name, b"right", &origin)
+                    .await
+                    .map(|(_, r)| r),
+            ) == (429, "quota".into())
+        }
+    };
+    let key_locked = |name: &'static str| {
+        let h = &h;
+        async move { code(password_key_sign_in(h, name, b"right").await) == (429, "quota".into()) }
+    };
+
+    // Locking method 6 leaves method 3 working for the same name.
+    for _ in 0..3 {
+        assert_eq!(code(password_key_sign_in(&h, "ada", b"wrong").await).0, 401);
+    }
+    assert!(key_locked("ada").await);
+    opaque_sign_in(&h, "ada", b"right").await.unwrap();
+    assert!(
+        key_locked("ada").await,
+        "an OPAQUE success doesn't unlock method 6"
+    );
+
+    // And the reverse.
+    for _ in 0..3 {
+        assert_eq!(failed_sign_in(&h, "bea", b"wrong").await.0, 401);
+    }
+    assert!(opaque_locked("bea").await);
+    password_key_sign_in(&h, "bea", b"right").await.unwrap();
+    assert!(
+        opaque_locked("bea").await,
+        "a method-6 success doesn't unlock OPAQUE"
+    );
+
+    // A success with one method doesn't clear the other's count.
+    for _ in 0..2 {
+        assert_eq!(code(password_key_sign_in(&h, "cy", b"wrong").await).0, 401);
+    }
+    opaque_sign_in(&h, "cy", b"right").await.unwrap();
+    assert_eq!(code(password_key_sign_in(&h, "cy", b"wrong").await).0, 401);
+    assert!(key_locked("cy").await);
+    for _ in 0..2 {
+        assert_eq!(failed_sign_in(&h, "dee", b"wrong").await.0, 401);
+    }
+    password_key_sign_in(&h, "dee", b"right").await.unwrap();
+    assert_eq!(failed_sign_in(&h, "dee", b"wrong").await.0, 401);
+    assert!(opaque_locked("dee").await);
+
+    // Unknown names are counted per method too.
+    for _ in 0..3 {
+        assert_eq!(code(password_key_sign_in(&h, "ghost", b"x").await).0, 401);
+    }
+    assert_eq!(code(password_key_sign_in(&h, "ghost", b"x").await).0, 429);
+    assert_eq!(failed_sign_in(&h, "ghost", b"x").await.0, 401);
+}

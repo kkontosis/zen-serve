@@ -175,7 +175,7 @@ pub async fn register_finish(
     for oid in &old {
         cred::evict(&st, &user, oid);
     }
-    st.pw_limiter.succeed(&h);
+    st.pw_limiter.succeed(METHOD, &h);
     tracing::info!(id = %cred::hex(&id), replaced = old.len(), "OPAQUE password set");
     Ok(Cbor(CredentialId { id: id.to_vec() }))
 }
@@ -244,12 +244,12 @@ pub async fn login_start(
     let found = lookup(&st, &h).await?;
     // A success on another node clears the failures counted here before it.
     if let Some(t) = found.as_ref().and_then(|f| f.last_used_unix) {
-        st.pw_limiter.succeeded_at(&h, t);
+        st.pw_limiter.succeeded_at(METHOD, &h, t);
     }
-    st.pw_limiter.check(&h)?;
+    st.pw_limiter.check(METHOD, &h)?;
     // A credential response lets the client test one password guess
     // offline, so every start counts as a failure until a finish succeeds.
-    st.pw_limiter.fail(&h);
+    st.pw_limiter.fail(METHOD, &h);
     let s = setup(&st).await?;
     let ctx = op::context(&req.origin);
     let (record, ksf, who) = match found {
@@ -318,7 +318,7 @@ pub async fn login_finish(
         origin: &origin,
     };
     let session = issue_session(&st, user, id, METHOD, Some(signed)).await?;
-    st.pw_limiter.succeed(&state.name_hash);
+    st.pw_limiter.succeed(METHOD, &state.name_hash);
     // The sign-in time, which also tells other nodes' limiters about the
     // success (auth.md §8.5). Only an existing record is updated.
     let now = unix_now();

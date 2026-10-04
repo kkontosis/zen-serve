@@ -118,7 +118,7 @@ pub async fn session(
 ) -> ApiResult<Cbor<Session>> {
     st.require_method(METHOD)?;
     let h = cred::login_hash(&req.name)?;
-    st.pw_limiter.check(&h)?;
+    st.pw_limiter.check(METHOD, &h)?;
     let challenge = check_challenge(&st, &req.challenge)?;
     let origin = SignedOrigin::new(&headers, &req.origin)?;
     // Every way of failing from here on looks the same and counts.
@@ -131,10 +131,10 @@ pub async fn session(
             && acl.members.contains_key(user)
     });
     let Some((user, id, _)) = verified else {
-        st.pw_limiter.fail(&h);
+        st.pw_limiter.fail(METHOD, &h);
         return Err(unauthorized("unknown login name or wrong password"));
     };
-    st.pw_limiter.succeed(&h);
+    st.pw_limiter.succeed(METHOD, &h);
     let signed = Signed {
         challenge,
         origin: &origin,
@@ -198,19 +198,20 @@ pub async fn set(
     for oid in &old {
         cred::evict(&st, &user, oid);
     }
-    st.pw_limiter.succeed(&h);
+    st.pw_limiter.succeed(METHOD, &h);
     tracing::info!(id = %cred::hex(&id), replaced = old.len(), "password key set");
     Ok(Cbor(CredentialId { id: id.to_vec() }))
 }
 
-/// Failed sign-ins per login name, in this node's memory (auth.md §11.3),
-/// shared by the password methods 6 and 3 (auth.md §8.5). After `max`
-/// failures, the name is locked for `lockout` from the last one; a
-/// success clears it.
+/// Failed sign-ins per method and login name, in this node's memory
+/// (auth.md §11.3, §8.5). Each method counts a name on its own, with the
+/// full cap: after `max` failures of one method, the name is locked for
+/// that method for `lockout` from the last one; a success with that
+/// method clears its count.
 pub struct Limiter {
     max: u32,
     lockout: Duration,
-    by_name: Mutex<HashMap<[u8; 32], Failures>>,
+    by_name: Mutex<HashMap<(AuthMethod, [u8; 32]), Failures>>,
 }
 
 /// The failures of one name: how many, and when the last one was.
@@ -233,10 +234,10 @@ impl Limiter {
         }
     }
 
-    /// 429 `quota` while `name` is locked.
-    pub fn check(&self, name: &[u8; 32]) -> ApiResult<()> {
+    /// 429 `quota` while `name` is locked for `method`.
+    pub fn check(&self, method: AuthMethod, name: &[u8; 32]) -> ApiResult<()> {
         let m = self.by_name.lock().expect("limiter lock");
-        match m.get(name) {
+        match m.get(&(method, *name)) {
             Some(f) if f.n >= self.max && f.last.elapsed() < self.lockout => Err(quota(format!(
                 "too many failed sign-ins for this login name; retry in {} s",
                 (self.lockout - f.last.elapsed()).as_secs() + 1
@@ -245,14 +246,14 @@ impl Limiter {
         }
     }
 
-    /// Count a failure.
-    pub fn fail(&self, name: &[u8; 32]) {
+    /// Count a failure of `method` for `name`.
+    pub fn fail(&self, method: AuthMethod, name: &[u8; 32]) {
         let mut m = self.by_name.lock().expect("limiter lock");
         if m.len() >= LIMITER_CAP {
             let lockout = self.lockout;
             m.retain(|_, f| f.last.elapsed() < lockout);
         }
-        let e = m.entry(*name).or_insert(Failures {
+        let e = m.entry((method, *name)).or_insert(Failures {
             n: 0,
             last: Instant::now(),
             last_unix: 0,
@@ -265,17 +266,22 @@ impl Limiter {
         e.last_unix = unix_now();
     }
 
-    /// Clear a name after a success.
-    pub fn succeed(&self, name: &[u8; 32]) {
-        self.by_name.lock().expect("limiter lock").remove(name);
+    /// Clear `method`'s count of a name after a success with it.
+    pub fn succeed(&self, method: AuthMethod, name: &[u8; 32]) {
+        self.by_name
+            .lock()
+            .expect("limiter lock")
+            .remove(&(method, *name));
     }
 
-    /// Clear a name whose last failure here is no newer than a success
-    /// another node recorded at `success_unix` (auth.md §8.5).
-    pub fn succeeded_at(&self, name: &[u8; 32], success_unix: u64) {
+    /// Clear `method`'s count of a name whose last failure here is no newer
+    /// than a success with that method that another node recorded at
+    /// `success_unix` (auth.md §8.5).
+    pub fn succeeded_at(&self, method: AuthMethod, name: &[u8; 32], success_unix: u64) {
         let mut m = self.by_name.lock().expect("limiter lock");
-        if m.get(name).is_some_and(|f| f.last_unix <= success_unix) {
-            m.remove(name);
+        let key = (method, *name);
+        if m.get(&key).is_some_and(|f| f.last_unix <= success_unix) {
+            m.remove(&key);
         }
     }
 }
