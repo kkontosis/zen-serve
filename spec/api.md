@@ -42,12 +42,13 @@ No authentication. Returns:
   limits: { max_key_bytes, max_value_bytes, max_envelope_bytes, max_commit_bytes,
             max_commit_ops, max_range_items, max_range_bytes,
             idempotency_ttl_secs, session_ttl_secs, claim_ttl_ms, ephemeral_ttl_secs,
+            ephemeral_bytes_per_sec, ephemeral_burst_bytes,
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
             chunk_grace_secs } }
 ```
 
-Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
+Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
 
 * **Range reads** (`/v1/kv/range`, `/v1/log/read`, `tree/children`, `tree/changes`, `dlq/list`, stream subscriptions) return at most `max_range_items` items **and** stop once the items returned hold about `max_range_bytes` of keys and values; either cut sets `more`. A range the server must read whole (`expect_ranges`, `clear_ranges`, a file's versions) returns 413 `too_large` past either cap.
 
@@ -317,6 +318,7 @@ Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5
 **Rate limit.** Ephemeral messages bypass the fs quotas, so each device's publishes are limited by a token bucket:
 * `limits.ephemeral_bytes_per_sec` (default 65,536) sustained, with bursts of `limits.ephemeral_burst_bytes` (default 1,048,576). A message costs its `data` length plus 256 bytes. `ephemeral_bytes_per_sec = 0` turns the limit off.
 * `ephemeral_burst_bytes` must be at least `max_envelope_bytes` + 256, so a message of any allowed size can be sent.
+* Both values are advertised in `/v1/info` `limits` (§2), so a client can pace itself.
 * A publish over the limit is refused with `quota` and not delivered. The client waits and retries, or drops the message.
 * The buckets are kept in each node's memory, per device. A device that publishes through several nodes of a cluster gets the limit on each, so the cluster-wide limit is the per-node limit times the number of nodes. A node restart refills them.
 

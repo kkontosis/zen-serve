@@ -125,6 +125,13 @@ pub struct Limits {
     /// Max consumer groups per topic.
     #[serde(default)]
     pub max_groups_per_topic: u32,
+    /// Ephemeral publishes per device and node: sustained bytes per second
+    /// (a message costs its data plus 256 bytes); 0 = no limit.
+    #[serde(default)]
+    pub ephemeral_bytes_per_sec: u64,
+    /// Ephemeral publishes per device and node: burst, in bytes.
+    #[serde(default)]
+    pub ephemeral_burst_bytes: u64,
 }
 
 // ---------------------------------------------------------------- auth

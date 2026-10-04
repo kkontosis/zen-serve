@@ -80,6 +80,8 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             claim_ttl_ms: l.claim_ttl_ms,
             ephemeral_ttl_secs: l.ephemeral_ttl_secs,
             max_groups_per_topic: l.max_groups_per_topic,
+            ephemeral_bytes_per_sec: l.ephemeral_bytes_per_sec,
+            ephemeral_burst_bytes: l.ephemeral_burst_bytes,
         },
     })
 }

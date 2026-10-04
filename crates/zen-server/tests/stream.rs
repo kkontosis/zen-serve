@@ -423,6 +423,15 @@ async fn ephemeral_publishes_are_rate_limited() {
         c.limits.ephemeral_burst_bytes = 2000;
     })
     .await;
+    // Clients can pace themselves: the limit is advertised.
+    let info: Info = h.get("/v1/info").await;
+    assert_eq!(
+        (
+            info.limits.ephemeral_bytes_per_sec,
+            info.limits.ephemeral_burst_bytes
+        ),
+        (1, 2000)
+    );
     let admin = User::new(1);
     let bob = User::new(2);
     h.claim(&admin, &[&bob]).await;
