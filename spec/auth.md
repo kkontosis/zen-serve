@@ -11,13 +11,13 @@ The signed ACL stays the **source of truth for membership, grants and admins**. 
 | Id | Name (`/v1/info`) | Method | `[auth]` flag | Default | Signs the origin | Section |
 |---|---|---|---|---|---|---|
 | 1 | `device_key` | Device keys: a random per-device hybrid key, certified in the signed ACL | `device_keys` | on | yes | §6 |
-| 2 | `passkey` | Passkeys (WebAuthn) | `passkeys` | on | yes (WebAuthn) | §7 (reserved) |
+| 2 | `passkey` | Passkeys (WebAuthn): a key pair held by an authenticator | `passkeys` | on | yes (WebAuthn) | §7 |
 | 3 | `opaque` | Password via OPAQUE (augmented PAKE) | `opaque` | off | — | §8 (reserved) |
 | 4 | `api_token` | API tokens: admin-issued bearer secrets for services and bots | `api_tokens` | off | no | §9 |
 | 5 | `mtls` | TLS client certificates (native TLS or a trusted proxy) | `mtls` | on | no (TLS) | §10 (reserved) |
 | 6 | `password_key` | Password-derived signing key: the password never leaves the client | `password_keys` | on | yes | §11 |
 
-* The id is stored in session records and credentials; the name is used on the wire. Ids 2, 3 and 5 are reserved for methods not implemented yet.
+* The id is stored in session records and credentials; the name is used on the wire. Ids 3 and 5 are reserved for methods not implemented yet.
 * **Method 6 is the primary method**: `/v1/info` names it as `auth.default` whenever it is on.
 * A server **offers** a method when it implements it and its flag is on. `/v1/info` lists exactly the offered methods (§2). A flag that is on for a method the server doesn't implement yet has no effect.
 
@@ -32,6 +32,7 @@ api_tokens    = false   # method 4
 mtls          = true    # method 5
 password_keys = true    # method 6
 # Origin policy (§5): origin_pinning, origin_pinning_always, acl_origins.
+# Method 2 (§7): passkey_rp_id, passkey_require_uv.
 # Method 6 (§11): password_m_cost_kib, password_t_cost, password_p_cost,
 #                 password_max_failures, password_lockout_secs.
 ```
@@ -42,6 +43,7 @@ password_keys = true    # method 6
 auth: { methods: [text],               // offered methods, in id order
         default?: text,                // the method a client offers first
         origins?: {…},                 // the origin policy (§5.5)
+        passkey?: {…},                 // method 2: relying-party id and options (§7.1)
         password_params?: {…} }        // method 6 registration parameters (§11.2)
 ```
 
@@ -63,6 +65,7 @@ A session records the user, the **method** and a **32-byte credential id**:
 | Method | Credential id |
 |---|---|
 | `device_key` | the device fingerprint (`device_fp`, formats.md §7.2) |
+| `passkey` | the passkey's id in the credential store (§4.1) |
 | `password_key` | the id of the user's password credential (§11) |
 | `api_token` | the token's id (§9) |
 
@@ -89,7 +92,13 @@ cred record (CBOR) = { method: u8, created_unix: u64,
                        name_hash?: bytes(32),       // methods with a login name (6; 3 later)
                        salt?: bytes(32), params?: {m_cost_kib, t_cost, p_cost},
                        identity?: bytes,            // method 6: the public identity
-                       issued_by?: bytes(32) }      // API tokens: the issuing admin
+                       issued_by?: bytes(32),       // API tokens: the issuing admin
+                       webauthn_id?: bytes,         // method 2: the WebAuthn credential id
+                       cose_key?: bytes,            // method 2: the COSE public key
+                       alg?: int,                   // method 2: its COSE algorithm
+                       sign_count?: u32,            // method 2: the last signature counter
+                       rp_id?: text,                // method 2: the relying-party id
+                       last_used_unix?: u64 }       // method 2: the last sign-in
 ```
 
 Fields a server doesn't know are ignored, so a method can add its own without breaking older readers.
@@ -99,12 +108,13 @@ Fields a server doesn't know are ignored, so a method can add its own without br
 * **Limits.** A user holds at most 100 stored credentials.
 * **Privacy.** The store never returns keys, salts or secret hashes, only metadata (api.md §3.9). In particular, the public identity of a password-derived key stays on the server: other members never see it, unlike the ACL's user identities. Each credential is readable only by its owner and by admins.
 
-**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
+**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§7.2, §11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
 
 ### 4.1 Credential ids
 
 | Method | Id |
 |---|---|
+| `passkey` | `BLAKE3.derive_key("zen-serve 2026 passkey", WebAuthn credential id)` (§7.2): the owner index (keyspace.md §3.7) finds the user from the id an authenticator returns |
 | `password_key` | random, chosen at registration; a password change gets a new one |
 | `api_token` | `BLAKE3.derive_key("zen-serve 2026 api token", secret)` (§9) |
 
@@ -176,7 +186,7 @@ A sign-in whose origin is in the set is accepted. An origin outside it is accept
 
 ### 5.5 The server's own origins
 
-`origin::own_origins` returns the accepted set in the precedence order above (7a in config order, then the pins, then the ACL's), and whether the `Host` fallback is open. The first entry is the **canonical origin**. Its host, without scheme and port, is the WebAuthn relying-party id that passkeys (§7) use. A server with no canonical origin can't offer passkeys.
+`origin::own_origins` returns the accepted set in the precedence order above (7a in config order, then the pins, then the ACL's), and whether the `Host` fallback is open. The first entry is the **canonical origin**. Its host, without scheme and port, is the WebAuthn relying-party id that passkeys (§7) use. A server with no canonical origin can't offer passkeys, unless `passkey_rp_id` names the rp id (§7.1).
 
 `/v1/info` advertises the same state, so a client can warn when it is talking to a relay or to a server without relay protection:
 
@@ -203,9 +213,90 @@ To sign in, the device signs the challenge and the origin (formats.md §10) and 
 * The signature binds the origin, so a malicious server can't relay a challenge from the real one, as far as the origin policy (§5) knows the server's origins.
 * Adding a device needs an admin-signed ACL change.
 
-## 7. Method 2: passkeys (reserved)
+## 7. Method 2: passkeys
 
-> **Placeholder.** WebAuthn passkeys with a small RustCrypto-based verifier. The relying-party id derives from the origin policy (§5.5). Not implemented; `passkeys = true` has no effect yet.
+WebAuthn passkeys, **on by default**. An authenticator (the platform's passkey manager or a security key) holds the private key; the server stores only the public key. The browser writes the origin it is talking to into every signed message and scopes each passkey to a relying party, so a passkey can't be phished or relayed (§7.6).
+
+```toml
+[auth]
+passkeys = true
+# passkey_rp_id = "example.org"   # default: the host of the canonical origin (§7.1)
+passkey_require_uv = true         # refuse authenticators that didn't verify the user (§7.5)
+```
+
+The server verifies WebAuthn itself, with a small verifier on pure-Rust cryptography: no OpenSSL and no attestation trust (§7.2).
+
+**Algorithms** (`pubKeyCredParams`, in this order): EdDSA (COSE −8, Ed25519) and ES256 (COSE −7, ECDSA on P-256 with SHA-256). RS256 (−257) is not supported (`TD-AUTH-WEBAUTHN-RS256`), so an authenticator that only signs with RSA can't register.
+
+### 7.1 Relying-party id
+
+* The relying-party id (rp id) is `[auth] passkey_rp_id` when set, otherwise the **host of the canonical origin** (§5.5), without scheme or port.
+* **No origin, no passkeys.** A server with neither has no rp id, for example a fresh cluster with no `public_origins`, nothing pinned and no ACL origins. Until it has one, the registration and sign-in requests return 400 with a message saying so, and `/v1/info` has no `auth.passkey.rp_id`. An origin is established by any of: `public_origins` (§5.1), a claim that carries `origin` (§5.2), the first sign-in with another method while pinning is in force (§5.2), or ACL origins (§5.3).
+* `passkey_rp_id` must be a lowercase domain name. Browsers accept an rp id only on an origin whose host is the rp id or one of its subdomains; set it to a parent domain to share passkeys across subdomains. An origin whose host is an IP address can't use passkeys in browsers (`localhost` can).
+* Each passkey records the rp id it was registered under, and its sign-ins are verified against that one. If the canonical origin moves to another host, existing passkeys stay bound to the old rp id: browsers won't offer them on the new host, and sign-in only lists passkeys of the current rp id. Users then register new ones.
+
+`/v1/info` carries `auth.passkey: {rp_id?, user_verification, algorithms}` while the method is on (api.md §2).
+
+### 7.2 Registration
+
+A signed-in user adds a passkey, with a session of any interactive method (not an API token):
+
+1. `POST /v1/auth/passkey/register/begin` (api.md §3.11) returns a challenge, the rp id, the **user handle**, the algorithms, the user's passkeys under that rp id (`excludeCredentials`) and the `userVerification` to ask for. The user handle is the user fingerprint: it names no person, and lets the authenticator return the account with a discoverable sign-in.
+2. The client calls `navigator.credentials.create`. It chooses `user.name` and `user.displayName` itself; the server knows no names. It should ask for a discoverable credential (`residentKey: "preferred"` or `"required"`) so that sign-in needs no user name.
+3. `POST /v1/auth/passkey/register/finish` with the attestation object, the clientDataJSON and an optional label.
+
+The server checks, and returns 400 (401 for the challenge and the origin) otherwise:
+* **clientDataJSON:** `type` is `webauthn.create`; `challenge` is a live challenge this cluster issued, not used yet (it is spent here); `crossOrigin` is not true; `origin` passes the origin policy (§5) in the registration's transaction, which pins it if it is the first, like a sign-in.
+* **Attestation object** (CBOR `{fmt, attStmt, authData}`): `rpIdHash` = SHA-256(rp id); the user-present flag (UP) is set; user-verified (UV) is set when required (§7.5); backed-up (BS) only with backup-eligible (BE); the attested credential is present, with a credential id of 1–1023 bytes and a COSE key of a supported algorithm, and nothing follows except an extension map.
+* **No attestation verification.** `fmt` `"none"` must carry an empty statement. The statement of any other format (`packed`, `tpm`, `apple`, …) is ignored, not verified: the server keeps no attestation roots and treats every passkey as unattested. It can't tell a hardware key from a software one (`TD-AUTH-WEBAUTHN-ATTESTATION`).
+* The credential id isn't registered yet, by anyone (400). The user holds fewer than 100 credentials (429 `quota`).
+
+The passkey is stored in the credential store (§4) with id `BLAKE3.derive_key("zen-serve 2026 passkey", credential id)`, and the credential id, the COSE public key, its algorithm, the signature counter, the rp id, the label and the creation time. The last sign-in time is added on each use.
+
+### 7.3 Sign-in
+
+1. `POST /v1/auth/passkey/session/begin {user?}` (api.md §3.12), no session, returns a challenge, the rp id, `allowCredentials` and the `userVerification` to ask for.
+   * **Without `user`** (preferred): a discoverable sign-in. The list is empty; the authenticator offers the passkeys it holds for the rp id and returns the user handle. No user name is typed.
+   * **With `user`**, a user fingerprint the client remembers: the list holds that member's passkeys under the current rp id, for security keys whose credentials aren't discoverable. A fingerprint that isn't a member gets an empty list, like a member without passkeys. Anyone who knows a member's fingerprint can list the member's credential ids; WebAuthn credential ids are not secrets.
+2. The client calls `navigator.credentials.get`.
+3. `POST /v1/auth/passkey/session {credential_id, authenticator_data, client_data_json, signature, user_handle?}`.
+
+The server checks all of these, or returns 401:
+1. clientDataJSON parses; `type` is `webauthn.get`; `challenge` is a live challenge this cluster issued; `origin` is well formed (§5); `crossOrigin` is not true.
+2. The credential id is a stored passkey; its user is a member of the head ACL; `user_handle`, if sent, is that user's fingerprint.
+3. The challenge isn't used yet, and the origin policy (§5.4) accepts `origin`.
+4. `rpIdHash` = SHA-256(the passkey's rp id); UP is set; UV is set when required (§7.5); BS only with BE.
+5. `signature` verifies over `authenticator_data ‖ SHA-256(client_data_json)` with the stored key: ASN.1 DER for ES256 (either form of `s`), 64 bytes for EdDSA (strict verification).
+6. The signature counter rule (§7.4).
+
+The server then stores the new counter and the sign-in time, and issues the session with `issue_session` and the signed challenge and origin (§13): the challenge is spent and the origin policy applied, pinning a first origin, in the session's transaction. The session's `device_fp` is the passkey's id and `method` is `passkey`.
+
+### 7.4 Signature counter
+
+An authenticator may count its signatures. When the stored counter or the new one is non-zero, the new one must be **greater**; otherwise the passkey may have been cloned, and two copies are signing.
+
+* **Refused and logged.** Such a sign-in gets 401 with a message naming a possible clone, and the server logs a warning with the passkey and user ids. The stored counter is not changed. If the passkey was cloned, the user or an admin removes it (api.md §3.9).
+* Most synced passkeys don't count and always send 0; the rule then never applies.
+* The counter is stored in its own transaction, just before the session's. A sign-in the session's transaction then refuses still leaves the counter advanced, which is correct: the authenticator did advance it.
+
+### 7.5 User verification
+
+`[auth] passkey_require_uv` (default **true**): the authenticator must have verified the user, by PIN or biometric (the UV flag), at registration and at every sign-in. A passkey alone signs in with all of the member's rights, so it should be two factors: the device and the user. The ceremony options ask for `userVerification: "required"`.
+
+Set it to false to accept security keys that only test presence. The options then say `"preferred"`, and presence (UP) is still always required.
+
+### 7.6 Threat notes
+
+* **Phishing and relays.** The browser writes the origin it is on into clientDataJSON, and only lets a page use passkeys of an rp id its host belongs to. The server checks the origin against its policy (§5) and the rp id hash. A look-alike site on another domain can't get an assertion for the rp id at all, and a relayed assertion names the relay's origin. The origin policy's caveats apply (§5.6): while it falls back to the `Host` header, the first sign-in trusts that header.
+* **Not post-quantum.** ES256 and Ed25519 are classical signatures. Whoever holds a passkey's public key (the server, a backup, an export) and a large quantum computer could forge its sign-ins. Methods 1 and 6 sign with a hybrid that includes ML-DSA-65.
+* **Nothing secret on the server.** The store holds public keys only, so a dump allows no offline guessing, unlike password verifiers (§11.4).
+* **No attestation.** Any authenticator, including software that copies keys, can register (§7.2). The counter (§7.4) is the only clone signal, and synced passkeys don't keep one.
+* **Native apps.** App origins (`android:apk-key-hash:…`, `ios:…`) are not web origins; the origin policy refuses them.
+* **A passkey session is a full interactive session.** It can register further passkeys, set a password (§11.2) and manage the user's credentials, like the other interactive methods.
+
+### 7.7 Unlocking data keys
+
+Signing in with a passkey gives server access only. Separately, a client can unlock data keys with the same passkey through the WebAuthn PRF extension: see `TD-AUTH-WEBAUTHN-PRF-KEYSLOT`.
 
 ## 8. Method 3: OPAQUE (reserved)
 
@@ -299,7 +390,7 @@ For method 6 the sign-in key and a passphrase keyslot are independent derivation
 
 ## 13. Adding a method
 
-For implementers of the reserved methods (2, 3, 5). A method:
+For implementers of the reserved methods (3, 5). A method:
 1. Adds itself to `auth::IMPLEMENTED` in zen-server once it works; its `AuthMethod` variant, id, wire name and `[auth]` flag already exist.
 2. Calls `AppState::require_method` first in each of its endpoints.
 3. Stores its credentials with `cred::put`, as a `CredRecord` with its method id and any new optional fields it needs, and finds them with `cred::get`, `cred::owner`, `cred::list` and, for a typed name, `cred::login` (§4.2). Credential removal, listing, the per-user limit and the clean-up when a member leaves the ACL then work unchanged.

@@ -171,6 +171,13 @@ pub struct AuthConfig {
     /// Method 6: how long a locked login name stays locked after its last
     /// failure.
     pub password_lockout_secs: u64,
+    /// Method 2: the WebAuthn relying-party id. Absent: the host of the
+    /// canonical origin (auth.md §5.5). Set it to a registrable suffix of
+    /// that host to share passkeys across subdomains.
+    pub passkey_rp_id: Option<String>,
+    /// Method 2: refuse passkey sign-ins and registrations in which the
+    /// authenticator didn't verify the user (PIN or biometric).
+    pub passkey_require_uv: bool,
 }
 
 impl Default for AuthConfig {
@@ -192,6 +199,8 @@ impl Default for AuthConfig {
             password_p_cost: 1,
             password_max_failures: 10,
             password_lockout_secs: 300,
+            passkey_rp_id: None,
+            passkey_require_uv: true,
         }
     }
 }
@@ -206,6 +215,15 @@ impl AuthConfig {
         }
     }
 
+    /// The `userVerification` passkey ceremonies request.
+    pub fn passkey_user_verification(&self) -> &'static str {
+        if self.passkey_require_uv {
+            "required"
+        } else {
+            "preferred"
+        }
+    }
+
     /// Whether `m` is turned on (implemented or not).
     pub fn enabled(&self, m: AuthMethod) -> bool {
         match m {
@@ -217,6 +235,20 @@ impl AuthConfig {
             AuthMethod::PasswordKey => self.password_keys,
         }
     }
+}
+
+/// Whether `s` can be a WebAuthn relying-party id: a lowercase domain
+/// name of dot-separated labels of `a-z`, `0-9` and inner `-`.
+pub fn valid_rp_id(s: &str) -> bool {
+    s.len() <= 253
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 /// One filesystem.
@@ -411,6 +443,13 @@ impl Config {
         }
         crate::password::check_params(self.auth.password_params())
             .map_err(|e| format!("auth.password_*: {e}"))?;
+        if let Some(rp) = &self.auth.passkey_rp_id
+            && !valid_rp_id(rp)
+        {
+            return Err(format!(
+                "auth.passkey_rp_id: {rp:?} is not a domain name (lowercase, no scheme or port)"
+            ));
+        }
         if self.auth.password_max_failures == 0 {
             return Err("auth.password_max_failures must be at least 1".into());
         }
@@ -452,6 +491,29 @@ mod tests {
             assert!(Config::from_toml(&t).is_err(), "{bad}");
         }
         let t = "data_dir = \"/tmp/x\"\npublic_origins = [\"https://a.example:8443\"]";
+        assert!(Config::from_toml(t).is_ok());
+    }
+
+    #[test]
+    fn passkey_rp_ids_are_domains() {
+        for ok in ["zen.example.org", "localhost", "a-b.c1"] {
+            assert!(valid_rp_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "Zen.example",
+            "https://a.example",
+            "a.example:443",
+            "a..b",
+            "-a.b",
+            "a.",
+            "127.0.0.1:1",
+        ] {
+            assert!(!valid_rp_id(bad), "{bad}");
+        }
+        let t = "data_dir = \"/tmp/x\"\n[auth]\npasskey_rp_id = \"Example.org\"";
+        assert!(Config::from_toml(t).is_err());
+        let t = "data_dir = \"/tmp/x\"\n[auth]\npasskey_rp_id = \"example.org\"";
         assert!(Config::from_toml(t).is_ok());
     }
 

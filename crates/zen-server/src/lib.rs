@@ -20,6 +20,7 @@ pub mod keys;
 pub mod kv;
 pub mod log;
 pub mod origin;
+pub mod passkey;
 pub mod password;
 pub mod state;
 pub mod statics;
@@ -177,6 +178,22 @@ pub fn router(st: Shared) -> Router {
         .route(
             "/v1/auth/password/set",
             post(password::set).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/passkey/register/begin",
+            post(passkey::register_begin).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/passkey/register/finish",
+            post(passkey::register_finish).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/v1/auth/passkey/session/begin",
+            post(passkey::session_begin).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/passkey/session",
+            post(passkey::session).layer(auth_limit),
         )
         .route(
             "/v1/auth/tokens/create",

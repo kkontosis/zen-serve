@@ -57,6 +57,24 @@ pub struct CredRecord {
     /// The admin who issued it (API tokens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_by: Option<ByteBuf>,
+    /// The WebAuthn credential id (`passkey`); the store id is its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webauthn_id: Option<ByteBuf>,
+    /// The credential public key, COSE (`passkey`). Never sent to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cose_key: Option<ByteBuf>,
+    /// The COSE algorithm of `cose_key` (`passkey`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alg: Option<i64>,
+    /// The last signature counter seen (`passkey`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_count: Option<u32>,
+    /// The relying-party id it was registered under (`passkey`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rp_id: Option<String>,
+    /// The last sign-in with it, unix seconds (`passkey`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_unix: Option<u64>,
 }
 
 impl CredRecord {
@@ -81,6 +99,7 @@ impl CredRecord {
             created_unix: self.created_unix,
             expires_unix: self.expires_unix,
             label: self.label.clone(),
+            last_used_unix: self.last_used_unix,
         }
     }
 }

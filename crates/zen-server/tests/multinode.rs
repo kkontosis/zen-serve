@@ -354,3 +354,54 @@ async fn credentials_and_pins_cross_nodes() {
         .unwrap();
     assert_eq!(st.pinned, vec![a.origin()]);
 }
+
+/// A passkey registered on one node signs in on another; its counter is
+/// shared, so a replayed count is refused there too.
+#[tokio::test(flavor = "multi_thread")]
+async fn passkeys_cross_nodes() {
+    use zen_server::webauthn::soft::Authenticator;
+    let Some((a, b, ta, _, _, _)) = two_nodes().await else {
+        return;
+    };
+    let mut key = Authenticator::p256(80);
+    let opts: PasskeyCreation = a
+        .call("/v1/auth/passkey/register/begin", Some(&ta), &Empty {})
+        .await
+        .unwrap();
+    let (attestation_object, client_data_json) =
+        key.create(&opts.rp_id, &opts.challenge, &a.origin());
+    let reg = PasskeyRegister {
+        attestation_object,
+        client_data_json,
+        label: None,
+    };
+    let id: CredentialId = a
+        .call("/v1/auth/passkey/register/finish", Some(&ta), &reg)
+        .await
+        .unwrap();
+    async fn sign_in(h: &Harness, key: &mut Authenticator) -> Result<Session, ApiErr> {
+        let opts: PasskeyRequest = h
+            .call(
+                "/v1/auth/passkey/session/begin",
+                None,
+                &PasskeyBegin::default(),
+            )
+            .await?;
+        let (authenticator_data, client_data_json, signature) =
+            key.get(&opts.rp_id, &opts.challenge, &h.origin());
+        let req = PasskeySession {
+            credential_id: key.credential_id.clone(),
+            authenticator_data,
+            client_data_json,
+            signature,
+            user_handle: None,
+        };
+        h.call("/v1/auth/passkey/session", None, &req).await
+    }
+    let s = sign_in(&b, &mut key).await.unwrap();
+    assert_eq!(s.device_fp, id.id);
+    fs_list(&b, &s.token).await.unwrap();
+    sign_in(&a, &mut key).await.unwrap();
+    key.counter = Some(1);
+    assert_eq!(sign_in(&b, &mut key).await.unwrap_err().0, 401);
+}

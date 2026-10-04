@@ -99,6 +99,24 @@ pub struct AuthInfo {
     /// when that method is on (spec/auth.md §11.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_params: Option<Argon2Params>,
+    /// What a WebAuthn client needs, when passkeys are on
+    /// (spec/auth.md §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passkey: Option<PasskeyInfo>,
+}
+
+/// `/v1/info` `auth.passkey` (spec/auth.md §7).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyInfo {
+    /// The WebAuthn relying-party id; absent until the server knows an
+    /// origin of its own (spec/auth.md §7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rp_id: Option<String>,
+    /// `"required"` or `"preferred"`: the `userVerification` to request.
+    pub user_verification: String,
+    /// Supported COSE algorithms, in order of preference
+    /// (`pubKeyCredParams`).
+    pub algorithms: Vec<i64>,
 }
 
 /// Argon2id parameters of a password-derived key (spec/formats.md §7.5).
@@ -160,7 +178,7 @@ pub struct OriginPins {
 pub enum AuthMethod {
     /// 1: a per-device hybrid key certified in the signed ACL.
     DeviceKey = 1,
-    /// 2: WebAuthn passkeys (reserved).
+    /// 2: WebAuthn passkeys.
     Passkey = 2,
     /// 3: OPAQUE password authentication (reserved).
     Opaque = 3,
@@ -469,6 +487,88 @@ pub struct PasswordSet {
     pub identity: Vec<u8>,
 }
 
+/// `POST /v1/auth/passkey/register/begin` response: the options of
+/// `navigator.credentials.create` the server decides.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyCreation {
+    /// The challenge (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    /// The relying-party id.
+    pub rp_id: String,
+    /// The WebAuthn user handle (`user.id`): the user fingerprint.
+    #[serde(with = "serde_bytes")]
+    pub user_handle: Vec<u8>,
+    /// Supported COSE algorithms, in order of preference.
+    pub algorithms: Vec<i64>,
+    /// Credential ids the user already registered (`excludeCredentials`).
+    pub exclude: Vec<ByteBuf>,
+    /// `"required"` or `"preferred"`.
+    pub user_verification: String,
+}
+
+/// `POST /v1/auth/passkey/register/finish` request: the response of
+/// `navigator.credentials.create`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyRegister {
+    /// `response.attestationObject`.
+    #[serde(with = "serde_bytes")]
+    pub attestation_object: Vec<u8>,
+    /// `response.clientDataJSON`.
+    #[serde(with = "serde_bytes")]
+    pub client_data_json: Vec<u8>,
+    /// A label for listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `POST /v1/auth/passkey/session/begin` request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyBegin {
+    /// A user handle (user fingerprint) to list the passkeys of, for
+    /// authenticators without discoverable credentials. Absent: a
+    /// discoverable sign-in.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user: Option<Vec<u8>>,
+}
+
+/// `POST /v1/auth/passkey/session/begin` response: the options of
+/// `navigator.credentials.get` the server decides.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyRequest {
+    /// The challenge (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    /// The relying-party id.
+    pub rp_id: String,
+    /// `allowCredentials`: the user's credential ids; empty for a
+    /// discoverable sign-in.
+    pub allow: Vec<ByteBuf>,
+    /// `"required"` or `"preferred"`.
+    pub user_verification: String,
+}
+
+/// `POST /v1/auth/passkey/session` request: the response of
+/// `navigator.credentials.get`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeySession {
+    /// `rawId`.
+    #[serde(with = "serde_bytes")]
+    pub credential_id: Vec<u8>,
+    /// `response.authenticatorData`.
+    #[serde(with = "serde_bytes")]
+    pub authenticator_data: Vec<u8>,
+    /// `response.clientDataJSON`.
+    #[serde(with = "serde_bytes")]
+    pub client_data_json: Vec<u8>,
+    /// `response.signature`.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+    /// `response.userHandle`, if the authenticator returned one.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user_handle: Option<Vec<u8>>,
+}
+
 /// A credential id, as returned when one is created.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CredentialId {
@@ -502,6 +602,10 @@ pub struct Credential {
     /// A label chosen at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The last sign-in with it, unix seconds, where the method records
+    /// it (passkeys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_unix: Option<u64>,
 }
 
 /// `POST /v1/auth/credentials/list` response.

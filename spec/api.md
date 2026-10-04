@@ -6,7 +6,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
 * **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
-* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session` and `/v1/auth/password/{params,session}`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin` and `/v1/auth/passkey/session`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
   | Status | `code` | Retry? |
@@ -24,7 +24,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, credentials per user §3.7) | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, credentials per user §3.7, §3.8, §3.11) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -49,6 +49,9 @@ No authentication. Returns:
             chunk_grace_secs },
   auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2)
            origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
+           passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
+                       user_verification: text,         // "required" or "preferred" (auth.md §7.5)
+                       algorithms: [int] },             // COSE algorithms, preferred first: [-8, -7]
            password_params?: { m_cost_kib: u32, t_cost: u32, p_cost: u32 } } }   // auth.md §11.2
 ```
 
@@ -169,7 +172,8 @@ The credential store (auth.md §4). Need a session, not an API token (403).
 ```
 list:   { user?: bytes(32) }   // absent: the caller's own; another member's needs admin (403)
 → { credentials: [{ id: bytes(32), method: text, created_unix: u64,
-                    expires_unix?: u64, label?: text }] }
+                    expires_unix?: u64, label?: text,
+                    last_used_unix?: u64 }] }     // passkeys: the last sign-in
 remove: { id: bytes(32) } → {}
 ```
 
@@ -193,6 +197,51 @@ set: { pinned: [text] } → {}          // replace the pinned set; [] unpins
 ```
 
 `set` takes at most 16 distinct, well-formed origins (400 otherwise). It doesn't end existing sessions.
+
+### 3.11 `POST /v1/auth/passkey/register/begin` and `/v1/auth/passkey/register/finish`
+
+Method 2, passkeys (auth.md §7.2): add a passkey to the caller. Need a session, not an API token (403). 403 `method_disabled` if passkeys are off.
+
+```
+begin:  {} → { challenge: bytes(32),       // a challenge as in §3.1, for clientDataJSON
+               rp_id: text,                // rp.id (auth.md §7.1)
+               user_handle: bytes(32),     // user.id: the caller's user fingerprint
+               algorithms: [int],          // pubKeyCredParams, preferred first: [-8, -7]
+               exclude: [bytes],           // excludeCredentials: the caller's passkeys under rp_id
+               user_verification: text }   // "required" or "preferred"
+finish: { attestation_object: bytes,       // response.attestationObject
+          client_data_json: bytes,         // response.clientDataJSON, as the browser wrote it
+          label?: text }                   // at most 128 bytes
+→ { id: bytes(32) }                        // the passkey's credential id in the store (auth.md §4.1)
+```
+
+* Both return 400 while the server has no rp id (auth.md §7.1), with a message saying how to establish an origin.
+* `finish` returns 401 for a challenge that isn't live or is spent, a malformed origin, or one the origin policy refuses (§3.3). The origin may be pinned (auth.md §5.2).
+* `finish` returns 400 for anything else the verification refuses (auth.md §7.2): the client data's type or challenge, the rp id hash, the flags (user verification per `passkey_require_uv`), an unsupported algorithm, malformed bytes, a label over 128 bytes, or a credential id that is already registered. The attestation statement is not verified.
+* 429 `quota`: the caller holds 100 credentials. The request body may be up to 64 KiB.
+* The passkey is listed and removed through §3.9.
+
+### 3.12 `POST /v1/auth/passkey/session/begin` and `/v1/auth/passkey/session`
+
+Method 2, passkeys (auth.md §7.3): sign in. No session. 403 `method_disabled` if passkeys are off.
+
+```
+begin:   { user?: bytes(32) }               // a user fingerprint; absent: a discoverable sign-in
+→ { challenge: bytes(32),                   // for clientDataJSON
+    rp_id: text,                            // rpId
+    allow: [bytes],                         // allowCredentials: the user's passkeys under rp_id; [] without user
+    user_verification: text }               // "required" or "preferred"
+session: { credential_id: bytes,            // rawId
+           authenticator_data: bytes,       // response.authenticatorData
+           client_data_json: bytes,         // response.clientDataJSON
+           signature: bytes,                // response.signature
+           user_handle?: bytes }            // response.userHandle, if any
+→ Session (§3.2)
+```
+
+* `begin` returns 400 while the server has no rp id (auth.md §7.1), and 400 for a `user` that isn't 32 bytes. A `user` who isn't a member gets an empty `allow`.
+* `session` returns 401 when any check of auth.md §7.3 fails: the challenge (live, issued by this cluster, not spent), the origin (§3.3), an unknown passkey, a user no longer a member, a mismatched `user_handle`, the client data's type, the rp id hash, the flags, the signature, or a signature counter that didn't increase (a possible clone, auth.md §7.4).
+* The session's `device_fp` is the passkey's credential id, and `method` is `passkey`. Any challenge from §3.1 works as well as the one `begin` returns.
 
 ## 4. ACL and fs headers
 

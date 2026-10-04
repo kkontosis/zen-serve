@@ -156,7 +156,7 @@ zen-serve backup stop     -c zen.toml
 
 * The backup runs continuously: snapshots plus mutation logs (FoundationDB's `fdbbackup start -z`).
 * Any version between the first complete snapshot and the newest log is restorable.
-* Backups hold what the database holds: ciphertext and metadata. They also hold hashed sessions and the challenge key, but no bearer tokens. The credential store (auth.md §4) is in them too: API tokens only as hashes, but the public keys of password-derived keys, with their salts, are offline-guessable verifiers (auth.md §11.4). Protect backups accordingly.
+* Backups hold what the database holds: ciphertext and metadata. They also hold hashed sessions and the challenge key, but no bearer tokens. The credential store (auth.md §4) is in them too: API tokens only as hashes, but the public keys of password-derived keys, with their salts, are offline-guessable verifiers (auth.md §11.4). Passkey public keys are not secrets. Protect backups accordingly.
 
 ### 5.2 Restore
 
@@ -190,7 +190,7 @@ zen-serve migrate -c zen-fdb.toml --from-data-dir /var/lib/zen   # embedded → 
 
 * **Format.** A header, then every key-value pair in key order, then a trailer with the count, a source version and a BLAKE3 digest. The digest is checked on import.
 * **Server metadata is not copied** (keyspace.md §3.4): the embedded backend's version clock and the cluster's challenge key. The target keeps its own challenge key, or creates one when it first starts. A challenge lives 60 s, so nothing depends on the key surviving the copy; sessions are copied and keep working.
-* **Sign-in state is data and is copied** (keyspace.md §3.7): stored credentials, the login-name index, the key of the fake password parameters and the pinned origins. So password sign-in, API tokens and the origin pin keep working on the target. A target that is reached under a different origin needs `public_origins`, or its pin replaced (auth.md §5.2).
+* **Sign-in state is data and is copied** (keyspace.md §3.7): stored credentials, the login-name index, the key of the fake password parameters and the pinned origins. So password sign-in, passkeys, API tokens and the origin pin keep working on the target. A target that is reached under a different origin needs `public_origins`, or its pin replaced (auth.md §5.2). Passkeys are bound to their relying-party id, the host they were registered under: on a target with another host they no longer work, and users register new ones (auth.md §7.1).
 * **Consistency.**
   * On the embedded backend an export is one consistent snapshot.
   * On FoundationDB a large export spans several transactions, so it is consistent only while the servers are stopped. It warns otherwise. Use native backup for consistent copies of a live cluster.

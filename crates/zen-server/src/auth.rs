@@ -27,6 +27,7 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 /// `[auth]` flag ([`crate::state::AppState::method_on`]).
 pub const IMPLEMENTED: &[AuthMethod] = &[
     AuthMethod::DeviceKey,
+    AuthMethod::Passkey,
     AuthMethod::ApiToken,
     AuthMethod::PasswordKey,
 ];
@@ -44,18 +45,20 @@ const PREFERENCE: &[AuthMethod] = &[
 
 /// `/v1/info` `auth` (auth.md §2).
 pub async fn info(st: &Shared) -> AuthInfo {
-    let origins = match crate::origin::own_origins(st).await {
-        Ok(o) => Some(OriginInfo {
-            origins: o.origins,
-            pinning: o.pinning,
-            host_fallback: o.host_fallback,
-        }),
-        Err(e) => {
-            tracing::warn!(error = %e.message, "reading the pinned origins failed");
-            None
-        }
-    };
+    let own = crate::origin::own_origins(st)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e.message, "reading the pinned origins failed"))
+        .ok();
+    let passkey = st
+        .method_on(AuthMethod::Passkey)
+        .then(|| crate::passkey::info(st, own.as_ref()));
+    let origins = own.map(|o| OriginInfo {
+        origins: o.origins,
+        pinning: o.pinning,
+        host_fallback: o.host_fallback,
+    });
     AuthInfo {
+        passkey,
         origins,
         methods: AuthMethod::ALL
             .into_iter()
@@ -294,15 +297,33 @@ impl FromRequestParts<Shared> for Caller {
 /// check them: `nonce(12) ‖ u32 expires_unix ‖ MAC(16)` under the cluster's
 /// challenge key. Single use is enforced when a session is created.
 pub async fn challenge(State(st): State<Shared>, Cbor(_): Cbor<Empty>) -> Cbor<Challenge> {
+    Cbor(Challenge {
+        challenge: new_challenge(&st).to_vec(),
+    })
+}
+
+/// A fresh challenge (`/v1/auth/challenge`; passkeys hand one out with
+/// their ceremony options).
+pub fn new_challenge(st: &Shared) -> [u8; 32] {
     let mut c = [0u8; 32];
     c[..12].copy_from_slice(&random32()[..12]);
     let exp = (unix_now() + CHALLENGE_TTL.as_secs()) as u32;
     c[12..16].copy_from_slice(&exp.to_be_bytes());
     let mac = challenge_mac(&st.challenge_key, &c[..16]);
     c[16..].copy_from_slice(&mac);
-    Cbor(Challenge {
-        challenge: c.to_vec(),
-    })
+    c
+}
+
+/// Spend challenge `c` in `t`: 401 if it was used already. The record is
+/// kept until the challenge would have expired (the sweeper).
+pub async fn spend_challenge(t: &mut Box<dyn zen_store::Txn>, c: &[u8; 32]) -> ApiResult<()> {
+    let used = keys::challenge(c);
+    if t.get(&used).await?.is_some() {
+        return Err(unauthorized("challenge already used"));
+    }
+    let exp = u32::from_be_bytes(c[12..16].try_into().expect("4")) as u64;
+    t.set(&used, &exp.to_be_bytes());
+    Ok(())
 }
 
 fn challenge_mac(key: &[u8; 32], body: &[u8]) -> [u8; 16] {
@@ -413,24 +434,14 @@ pub async fn issue_session(
         expires_unix: unix_now() + ttl,
     };
     let hash = token_hash(&token);
-    let used = signed.as_ref().map(|s| {
-        let c = &s.challenge;
-        let exp = u32::from_be_bytes(c[12..16].try_into().expect("4")) as u64;
-        (keys::challenge(c), exp)
-    });
     // Idempotent: a retry after an unknown result finds its own session.
     let sess_key = keys::session(&hash);
     txn_loop!(st.store, None, idempotent, |t| {
         if t.get(&sess_key).await?.is_some() {
             return Ok(());
         }
-        if let Some((used, exp)) = &used {
-            if t.get(used).await?.is_some() {
-                return Err(unauthorized("challenge already used"));
-            }
-            t.set(used, &exp.to_be_bytes());
-        }
         if let Some(s) = &signed {
+            spend_challenge(&mut t, &s.challenge).await?;
             crate::origin::check_in_txn(st, &mut t, s.origin).await?;
         }
         t.set(&sess_key, &encode_session(&info));

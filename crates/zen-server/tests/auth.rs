@@ -74,8 +74,9 @@ async fn info_lists_the_methods_that_are_on() {
     let info: Info = h.get("/v1/info").await;
     let auth = info.auth.unwrap();
     assert!(auth.methods.contains(&"device_key".to_string()));
+    assert!(auth.methods.contains(&"passkey".to_string()));
     // Off by default, or not implemented by this server.
-    for m in ["api_token", "opaque", "passkey", "mtls"] {
+    for m in ["api_token", "opaque", "mtls"] {
         assert!(!auth.methods.contains(&m.to_string()), "{m}");
     }
     assert!(auth.default.is_some());
@@ -779,7 +780,8 @@ async fn password_keys_can_be_turned_off() {
     assert_eq!(code(r), off);
     let auth = h.get::<Info>("/v1/info").await.auth.unwrap();
     assert!(!auth.methods.contains(&"password_key".to_string()));
-    assert_eq!(auth.default.as_deref(), Some("device_key"));
+    // Next in the order of auth.md §2.
+    assert_eq!(auth.default.as_deref(), Some("passkey"));
     assert_eq!(auth.password_params, None);
 }
 

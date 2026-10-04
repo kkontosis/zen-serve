@@ -18,6 +18,20 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** It needs a new keyslot type (formats.md §6) and passkeys are not implemented yet.
 * **What it would take:** A keyslot type 4 whose secret is the PRF output for a fixed, per-slot salt; the slot stores the credential id and the PRF salt; new labels; vectors; and a fallback when the authenticator has no PRF support.
 
+## TD-AUTH-WEBAUTHN-RS256
+
+* **Status:** open
+* **Context:** The passkey verifier (auth.md §7) supports EdDSA (Ed25519) and ES256 (P-256). An authenticator that can only sign with RS256 (COSE −257), such as some older Windows Hello TPM configurations, can't register.
+* **Why deferred:** The verifier is pure Rust, without OpenSSL. The pure-Rust `rsa` crate for the RustCrypto generation this workspace uses (`signature` 3, `sha2` 0.11) is only a release candidate, and writing RSA verification by hand means a big-integer implementation of our own. Current platform authenticators and security keys all offer ES256.
+* **What it would take:** Once `rsa` 0.10 is released: parse COSE RSA keys (kty 3, `n`, `e`, a floor of 2048 bits), verify RSASSA-PKCS1-v1_5 with SHA-256, add −257 last in `pubKeyCredParams` and `/v1/info`, and unit tests with generated keys. Only public-key operations are needed, so the crate's timing advisory on decryption doesn't apply.
+
+## TD-AUTH-WEBAUTHN-ATTESTATION
+
+* **Status:** open
+* **Context:** Passkey registration (auth.md §7.2) doesn't verify attestation statements: `fmt` `"none"` is required to be empty, and every other format's statement is ignored. The server can't restrict passkeys to certain authenticator models, or tell a hardware key from a software authenticator.
+* **Why deferred:** Verifying attestation needs X.509 path validation, the formats' own rules (`packed`, `tpm`, `android-key`, `apple`, `fido-u2f`) and a maintained set of roots, such as the FIDO Metadata Service. Synced passkeys mostly send `"none"` anyway, so it only helps deployments that mandate security keys.
+* **What it would take:** An `[auth] passkey_attestation` policy (`none`, `verify`, `require`) and a configured roots directory or MDS blob; a pure-Rust X.509 verifier; storing the AAGUID and the verified format in the credential record; per-format tests with real attestation samples.
+
 ## TD-AUTH-UNICODE-LOGIN
 
 * **Status:** open

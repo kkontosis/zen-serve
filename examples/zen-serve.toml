@@ -23,7 +23,7 @@ cors_origins = []
 # Sign-in methods (spec/auth.md §2). Each can be turned off on its own.
 [auth]
 device_keys = true     # 1: per-device keys certified in the signed ACL
-passkeys = true        # 2: WebAuthn (not implemented yet)
+passkeys = true        # 2: WebAuthn passkeys
 opaque = false         # 3: OPAQUE passwords (not implemented yet)
 api_tokens = false     # 4: admin-issued bearer tokens for services
 mtls = true            # 5: TLS client certificates (not implemented yet)
@@ -39,6 +39,10 @@ password_t_cost = 3
 password_p_cost = 1
 password_max_failures = 10
 password_lockout_secs = 300
+# Method 2 (spec/auth.md §7): the relying-party id is the canonical origin's
+# host unless set here; user verification (PIN, biometric) is required.
+# passkey_rp_id = "example.org"
+passkey_require_uv = true
 
 [[fs]]
 id = 1   # "/"
