@@ -1,0 +1,21 @@
+[package]
+name = "zen-wasm"
+version = "0.1.0"
+description = "zen-serve WASM bindings for @zen/client: zen-core crypto and zen-proto CBOR wire types"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "=0.2.129"
+zen-core = { path = "../zen-core", features = ["opaque"] }
+zen-proto = { path = "../zen-proto", features = ["ts"] }
+zeroize = "1.8"

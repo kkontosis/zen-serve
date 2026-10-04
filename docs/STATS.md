@@ -104,6 +104,14 @@ FoundationDB 7.3.79 installed by `scripts/install-fdb.sh`:
 
 Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backup/DR tool is 28 MB per copy.
 
+### 4.1 Client (measured)
+
+| Artifact | Size |
+|---|---|
+| `zen_wasm_bg.wasm` (release, LTO, no wasm-opt) | **1.86 MB**, 525 KB gzipped |
+| WASM JS glue and declarations | 265 KB and 92 KB |
+| `@zen/client` npm package (compiled TS) | 78 KB packed, 330 KB unpacked |
+
 ## 5. Timings
 
 ### 5.1 Development (measured on 4 cores)
@@ -117,11 +125,26 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 | Release build of all 5 variants, dependencies cached | ~10 min |
 | CI per push (cached): `rust`, `pure-rust`, `fdb` jobs | 2–4.5 min each, in parallel |
 | FoundationDB suite, after building | ~1–2 min (each test file 3–12 s; `dump.rs` ~10 s because of a deliberate cluster recovery) |
+| WASM module release build (`scripts/build-wasm.sh`), dependencies cached | ~60 s |
+| Client tests: 60 Node tests in 8 files (`npx vitest run`, a server per file, FUSE mounts included) | ~6 s |
+| Browser smoke test (`npx playwright test`) | ~3 s |
 | FoundationDB cluster start (`zen-serve init`) to Healthy | ~10–20 s |
 | `scripts/install-fdb.sh` | ~20–40 s (download and unpack) |
 | Clean build of the workspace with tests, from nothing | about 10–15 min (estimate) |
 
-### 5.2 Runtime operations that are slow by design
+### 5.2 The WASM core (measured, Node 22, one thread)
+
+| Operation | Time |
+|---|---|
+| Instantiating the module | 7 ms |
+| Argon2id 64 MiB, t=1 (the floor; tests) | 103 ms; in Chromium, a password sign-in end to end took 108–369 ms |
+| Argon2id 256 MiB, t=3 (browser recommendation) | ~1.0 s |
+| Argon2id 1 GiB, t=4 (native recommendation) | ~8.2 s: WASM runs it on one thread, so native clients should use native code for it |
+| Hybrid signature (Ed25519 + ML-DSA-65): sign / verify / key from seed | 2.6 / 0.7 / 0.9 ms |
+| Device keyslot (X-Wing encapsulation) | 0.75 ms |
+| Sealing a 64 KiB chunk (XChaCha20-Poly1305) | 0.47 ms, ~140 MB/s |
+
+### 5.3 Runtime operations that are slow by design
 
 | Operation | Cost |
 |---|---|

@@ -1,0 +1,27 @@
+{
+  "name": "@zen/client",
+  "version": "0.1.0",
+  "description": "zen-serve client library: sign-in, keyslots, KV and transactions, logs and consumers, streams, the CRDT filesystem",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "@zen/wasm": "0.1.0"
+  },
+  "sideEffects": false
+}

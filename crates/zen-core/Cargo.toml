@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 # Deterministic RNG and the test-vector generator. Never enable in production builds.
-test-utils = ["dep:serde_json"]
+test-utils = ["dep:serde_json", "dep:zen-proto"]
 # OPAQUE (spec/auth.md §8): the cipher suite and the client side of sign-in
 # method 3. Off by default: it adds an older RustCrypto generation
 # (curve25519-dalek 4, sha2 0.10) to the build.
@@ -25,6 +25,8 @@ ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "zero
 x-wing = { version = "0.1", features = ["zeroize", "hazmat"] }
 zeroize = { version = "1.8", features = ["derive"] }
 serde_json = { version = "1", optional = true }
+# Only for the ACL vectors (test-utils).
+zen-proto = { path = "../zen-proto", optional = true }
 # OPAQUE, RFC 9807: pure Rust, no_std, builds for wasm32. 4.x keeps the
 # RFC's message and record formats; the stored records (ServerRegistration,
 # ServerSetup) must stay readable, so take only 4.x releases.
@@ -38,6 +40,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 hex = "0.4"
 serde_json = "1"
+zen-proto = { path = "../zen-proto" }
 zen-core = { path = ".", features = ["test-utils", "opaque"] }
 
 [[example]]

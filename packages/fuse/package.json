@@ -1,0 +1,28 @@
+{
+  "name": "@zen/fuse",
+  "version": "0.1.0",
+  "description": "zen-mount: mount a zen-serve filesystem as a local directory through FUSE",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "zen-mount": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/mount.d.ts",
+      "default": "./dist/mount.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "@zen/client": "0.1.0"
+  },
+  "optionalDependencies": {
+    "@cocalc/fuse-native": "2.4.3"
+  }
+}

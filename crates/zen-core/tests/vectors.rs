@@ -213,3 +213,50 @@ fn pwkey_vectors_verify_from_files() {
             .is_err()
     );
 }
+
+#[test]
+fn header_vectors_open_from_files() {
+    use zen_core::header::FsHeader;
+    let v = load("header.json");
+    let fs0 = fs_from_file();
+    let h0 = FsHeader::decode(&hx(&v["epoch0"]["header"])).unwrap();
+    assert_eq!((h0.fs_id, h0.current_epoch, h0.slots.len()), (7, 0, 1));
+    let rk: [u8; 32] = hx(&v["epoch0"]["recovery_key"]).try_into().unwrap();
+    let opened = keyslot::open(&h0.slots[0], Unlock::Recovery(&rk)).unwrap();
+    assert_eq!(*opened.to_bundle(), *fs0.to_bundle());
+
+    let h1 = FsHeader::decode(&hx(&v["epoch1"]["header"])).unwrap();
+    assert_eq!(
+        (h1.current_epoch, h1.slots.len(), h1.chain.len()),
+        (1, 2, 1)
+    );
+    let pw = v["epoch1"]["passphrase"].as_str().unwrap().as_bytes();
+    let fs1 = keyslot::open(&h1.slots[1], Unlock::Passphrase(pw)).unwrap();
+    assert_eq!(
+        fs1.to_bundle().to_vec(),
+        hx(&v["epoch1"]["fs_epoch1_bundle"])
+    );
+    assert_eq!(*h1.keys_at(&fs1, 0).unwrap().to_bundle(), *fs0.to_bundle());
+    // Re-encoding gives the same bytes.
+    assert_eq!(h1.encode().unwrap(), hx(&v["epoch1"]["header"]));
+}
+
+#[test]
+fn acl_vector_verifies_from_file() {
+    use zen_proto::acl::{AclDoc, SignedAcl};
+    let v = load("acl.json");
+    let signed: SignedAcl = zen_proto::from_cbor(&hx(&v["signed"])).unwrap();
+    assert_eq!(signed.doc, hx(&v["doc"]));
+    assert_eq!(
+        zen_core::kdf::acl_hash(&signed.doc).to_vec(),
+        hx(&v["hash"])
+    );
+    let doc: AclDoc = zen_proto::from_cbor(&signed.doc).unwrap();
+    // Deterministic CBOR: decoding and re-encoding gives the signed bytes.
+    assert_eq!(zen_proto::to_cbor(&doc), signed.doc);
+    let user = PublicIdentity::decode(&doc.members[0].identity).unwrap();
+    assert_eq!(user.fingerprint().to_vec(), signed.signer);
+    user.verify(labels::SIG_ACL, &signed.doc, &signed.sig)
+        .unwrap();
+    verify_device_cert(&user, &doc.members[0].devices[0]).unwrap();
+}

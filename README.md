@@ -20,6 +20,9 @@ Building blocks:
 | [`crates/zen-proto`](crates/zen-proto) | Wire types of the API (CBOR), shared by server and clients (native + `wasm32`) |
 | [`crates/zen-store`](crates/zen-store) | Storage trait with FoundationDB semantics, tuple encoding, embedded `redb` backend, FoundationDB backend (feature `fdb`) |
 | [`crates/zen-server`](crates/zen-server) | The `zen-serve` binary: auth, signed ACL, KV, commit, event log, consumer groups, WebSocket stream, static files, FoundationDB supervisor, backup/export |
+| [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
+| [`packages/client`](packages/client) | `@zen/client`: the TypeScript client library, Node and browsers ([`docs/CLIENT.md`](docs/CLIENT.md)) |
+| [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
 
 ## Status
@@ -27,7 +30,8 @@ Building blocks:
 * Milestone 1 (`spec/` + `zen-core`): done.
 * Milestone 2 (`zen-server` on the embedded backend, [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md)): done. Server-side CRDT ops return 501 for now.
 * Milestone 3 (FoundationDB backend, supervisor, backup/PITR, [`docs/MILESTONE-3.md`](docs/MILESTONE-3.md)): done.
-* Milestone 3.5 (server-merged CRDT filesystem, [`spec/fs.md`](spec/fs.md), [`docs/MILESTONE-3.5.md`](docs/MILESTONE-3.5.md)): done on the server side; the zen-fs client follows in milestones 4–5.
+* Milestone 3.5 (server-merged CRDT filesystem, [`spec/fs.md`](spec/fs.md), [`docs/MILESTONE-3.5.md`](docs/MILESTONE-3.5.md)): done on the server side.
+* Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
 
 ## Building
 

@@ -131,6 +131,8 @@ off  len   field
 * **OPAQUE export-key slots** open with the password of an OPAQUE credential (sign-in method 3, auth.md §8.6). `credential_id` is the credential's id in the server's credential store, which is also the `device_fp` of its sessions; it lets a client find the slot of the credential it signed in with. `export_key` is the 64-byte export key that OPAQUE gives the client at registration and at every sign-in with that credential (RFC 9807 §6, `export_key`); the server never sees it. A new registration, which a password change is, gives a new export key even for the same password, so the client re-wraps the slot then. The slot's secret is a derivation of its own, so the export key can serve other uses.
 * The **recovery key** is 32 random bytes. Its human-readable encoding (word list or grouped base32) is defined by the client UI spec in a later milestone.
 
+Keyslots are stored in the fs header (§12).
+
 Vectors: `test-vectors/keyslots.json` (types 1–3), `test-vectors/prf_keyslot.json` (type 4), `test-vectors/opaque_keyslot.json` (type 5).
 
 ## 7. Identities and signatures
@@ -332,3 +334,31 @@ The chain starts at 32 zero bytes. Each operation accepted by the server extends
 chain_n = BLAKE3.derive_key("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op_bytes) ‖ device_fp(32))
 ```
 
+
+## 12. fs header
+
+The fs header holds an fs's keyslots (§6) and its epoch chain (§2, §4 kind 3). The server stores it as opaque bytes, with a version for compare-and-set (api.md §4.4); only an admin may write it.
+
+```
+u8  header_version = 1
+u8  suite          = 1
+u32 fs
+u32 current_epoch                  the epoch new data is sealed under
+u16 n_slots       ‖ n_slots × lp(keyslot)            (§6), at most 256
+u16 n_chain       ‖ n_chain × lp(epoch-chain record) (kind 3, §4)
+```
+
+* **The chain.** `chain[i]` is the record written when the fs rotated to epoch `i + 1`: the keys of epoch `i + 1` open it to the keys of epoch `i`. So `n_chain = current_epoch`, and the sealed header of `chain[i]` names `key_epoch = i + 1`. A client holding epoch `e` reads any epoch `≤ e` by walking the chain back.
+* **Slots.** Each slot starts with the §6 prefix (`format_version`, `suite`, `slot_type`, `reserved = 0`, `slot_id`). Clients keep slots of types they don't know, unchanged, and never try to open them. A client finds its slot by type and by what identifies it: `recipient_fp` (device), `credential_id` (passkey PRF, OPAQUE export key), or by trying each passphrase or recovery slot.
+* **Rotation (revocation).** The admin opens a slot, rotates (`chain` gains a record, `current_epoch` += 1), re-wraps the bundle of the new epoch for every slot that keeps access, removes the others, and writes the header with `expect` set to the version read. A slot wrapping an older epoch than `current_epoch` is **stale**: it still reads old data, but a client that opens it must not write, and an admin should re-wrap or remove it.
+* **Checks on decode.** Exact length (no trailing bytes), known header version and suite, `n_chain = current_epoch`, every chain record of kind 3 with the right `key_epoch`, every slot with a valid prefix. A client also checks that a bundle it unwraps names the header's `fs`.
+* **Writing a slot for oneself.** Header writes need admin. A member who wants a slot for a new passkey or password prepares the slot (the bundle never leaves the client unwrapped) and hands it to an admin, who adds it (`TD-FS-HEADER-SELF-SLOT`).
+
+**Leakage and rollback.** The server sees the number of slots, their types and ids, the credential ids and device fingerprints in their parameters, the Argon2id parameters, and the number of epochs. It can't open a slot or forge one that opens to real keys. It can:
+* drop slots or the whole header (denial of service; detectable only out of band),
+* serve an older header: a client then sees an older `current_epoch`, and notices when it meets data sealed under a newer `key_epoch` than its keys can reach. It refuses to write under an epoch older than one it has seen (clients remember the highest epoch per fs),
+* nothing else: a slot or chain record that was tampered with fails to open.
+
+A signed header (by an admin, chained like the ACL) is planned with the authenticated tier (milestone 6).
+
+Vectors: `test-vectors/header.json`. The ACL encoding (§9) has vectors too: `test-vectors/acl.json`.

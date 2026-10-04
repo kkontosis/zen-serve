@@ -153,3 +153,24 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** The embedded backend's `zen.redb` file never shrinks: redb reuses freed pages but zen-serve never calls its compaction, so the file stays at its peak size after large deletions.
 * **Why deferred:** Compaction needs exclusive access to the database file (no open read transactions), which conflicts with the MVCC read window the embedded backend keeps open while serving.
 * **What it would take:** An offline `zen-serve compact` command (servers stopped) calling redb's compaction, or an online path that briefly drains read transactions; a note in operations.md; a test that deletes data and checks the file shrinks.
+
+## TD-FS-HEADER-SELF-SLOT
+
+* **Status:** open
+* **Context:** Only an admin may write the fs header (api.md §4.4), so a member can't add a keyslot for their own new passkey or password, nor re-wrap their OPAQUE slot after a password change. The client prepares the slot and an admin adds it (formats.md §12).
+* **Why deferred:** Letting members write the header needs a rule the server can enforce on opaque bytes: for example, a member may append or replace slots whose credential id is one of their own credentials, and nothing else. Milestone 4 (the client library) did not need it.
+* **What it would take:** Either a structured header endpoint (`fs/slots/put {fs, slot}`, `fs/slots/remove`) where the server checks that the slot's credential id or recipient fingerprint belongs to the caller, or a per-member header section; spec in api.md and formats.md §12; tests for a member adding, replacing and failing to remove another member's slot.
+
+## TD-CLIENT-WASM-OPT
+
+* **Status:** open
+* **Context:** The WASM module of `@zen/client` is 1.86 MB (525 KB gzipped), built with the release profile and not post-processed.
+* **Why deferred:** `wasm-opt` (binaryen) isn't part of the build, and size wasn't a milestone-4 goal.
+* **What it would take:** Run `wasm-opt -Oz` in `scripts/build-wasm.sh` when present (or a size profile with `opt-level = "z"` for zen-wasm), measure the size and the Argon2id and ML-DSA timings before and after, and update docs/STATS.md §4.1. Consider splitting OPAQUE into a second module loaded on demand.
+
+## TD-FUSE-REPLICA
+
+* **Status:** open
+* **Context:** `zen-mount` (packages/fuse) has no local replica: it lists directories from the server (cached until the change feed reports a change), reads file contents by chunk range, and writes a whole new version when a file is closed or synced. It is not POSIX-complete: no hard links, symlinks or xattrs; `mmap` isn't coherent across devices; there is no offline use and no persistent chunk cache (`--cache-dir` is reserved).
+* **Why deferred:** The local replica and the POSIX layer over it are the zen-fs client of milestone 5; milestone 4 needed a working mount on the operations API.
+* **What it would take:** The milestone-5 replica (node table and chunk store on disk, synced through the change feed), then `zen-mount` on top of it, with symlinks (the `symlink` node type exists), xattrs in the sealed meta, and writes of changed chunks only.
