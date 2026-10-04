@@ -405,3 +405,59 @@ async fn passkeys_cross_nodes() {
     key.counter = Some(1);
     assert_eq!(sign_in(&b, &mut key).await.unwrap_err().0, 401);
 }
+
+/// OPAQUE (auth.md §8): the server setup and the sealed login state are
+/// shared, so a sign-in may start on one node and finish on another, and a
+/// success on one node clears the attempts another counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn opaque_sign_in_crosses_nodes() {
+    if !on_fdb() {
+        return;
+    }
+    let a = Harness::start_with(|c| {
+        opaque_cfg(c);
+        c.auth.password_max_failures = 2;
+    })
+    .await;
+    let b = a.peer().await;
+    let alice = User::new(1);
+    a.claim(&alice, &[]).await;
+    let ta = a.sign_in(&alice).await.unwrap();
+    // B has seen the ACL once alice can sign in there.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while b.sign_in(&alice).await.is_err() {
+        assert!(Instant::now() < deadline, "B never saw the ACL");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (id, reg) = opaque_set(&a, &ta, "alice", b"pw").await.unwrap();
+    let origin = a.origin();
+    assert_eq!(b.origin(), origin);
+    // Start on A, finish on B. Each start counts on A; without the
+    // success B records, the third start would be locked.
+    for _ in 0..3 {
+        let (login, r) = opaque_start(&a, "alice", b"pw", &origin).await.unwrap();
+        let (fin, key) = opaque_client_finish(login, b"pw", &r, &origin);
+        assert_eq!(*key.unwrap(), *reg.export_key, "one server setup");
+        let s = opaque_finish(&b, r.state, fin).await.unwrap();
+        assert_eq!(s.device_fp, id.id);
+        fs_list(&b, &s.token).await.unwrap();
+        fs_list(&a, &s.token).await.unwrap();
+    }
+    let (s, _) = opaque_sign_in(&b, "alice", b"pw").await.unwrap();
+    // A state finishes once, on any node.
+    let (login, r) = opaque_start(&b, "alice", b"pw", &origin).await.unwrap();
+    let (fin, _) = opaque_client_finish(login, b"pw", &r, &origin);
+    opaque_finish(&a, r.state.clone(), fin.clone())
+        .await
+        .unwrap();
+    assert_eq!(opaque_finish(&b, r.state, fin).await.unwrap_err().0, 401);
+
+    // A password change on A ends the sessions on B within its cache time.
+    opaque_set(&a, &ta, "alice", b"pw two").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fs_list(&b, &s.token).await.is_ok() {
+        assert!(Instant::now() < deadline, "B kept the session");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    opaque_sign_in(&b, "alice", b"pw two").await.unwrap();
+}
