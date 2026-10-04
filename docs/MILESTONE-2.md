@@ -171,3 +171,15 @@ Push after each green step. Open a new PR at the end with a short description.
   2. `curl -i localhost:8080/` → index.html with security headers
   3. `curl localhost:8080/v1/info`
   4. run the integration test client against it
+
+## Outcome
+
+Done. Differences from the plan above:
+
+* **Consumer push.** It's a long-poll on `POST /v1/consume/next` (`wait_ms`), not frames on the WebSocket. The two give the same wake-on-append behaviour, and the long-poll keeps claims and leases on plain request/response.
+* **API shape.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the stream (spec/api.md §1). The `GET` routes with query strings sketched in `docs/API.md` are superseded.
+* **Commit order.** Commits apply `clear_ranges` before `writes`, so a clear never hits a pending versionstamped write.
+* **Sweeper.** It removes expired idempotency records, sessions and challenges.
+  * Expired claims are not deleted: dispatch ignores them, and the next claim overwrites them.
+  * Leases are kept forever, because their stored token is what keeps fencing tokens increasing.
+* **Sessions** live in server memory. They move into the keyspace together with multi-node FoundationDB (milestone 3).

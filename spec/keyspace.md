@@ -56,7 +56,7 @@ Quota counters are read with snapshot reads, so concurrent commits don't conflic
 
 | Key | Value |
 |---|---|
-| `pack("cg", fs, group)` | group definition, CBOR (API §8.1) |
+| `pack("cg", fs, group)` | `{def, start}` CBOR: the normalized definition (api.md §8.1) and the start offset, which is the cursor of any partition or key that has not committed yet |
 | `pack("ct", fs, topic, group)` | `u8 mode`: index of the groups on a topic, read on append |
 | `pack("cc", fs, group, part)` | `offset`: committed cursor (`sequential` uses part 0; `single_key` uses part 0) |
 | `pack("cl", fs, group, part)` | lease: `holder_fp(32) ‖ u64 token ‖ u64 expires_version` |
@@ -79,4 +79,6 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 | `pack("acl_head")` | `u64 version` of the current ACL |
 | `pack("meta", name)` | backend-private metadata, e.g. `"version"` in the embedded backend |
 
-Sessions, challenges and ephemeral subscriptions are kept in memory, not in the keyspace.
+Sessions, challenges and ephemeral subscriptions are kept in memory, not in the keyspace. (With several zen-serve nodes on FoundationDB, sessions move into the keyspace in milestone 3.)
+
+Leases are never deleted: the stored token is what keeps fencing tokens increasing.

@@ -151,7 +151,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
      `hash = H("zen/v1/range-hash", concat over the range in key order of lp(stored_key) ‖ version(10))`, with `H(label, x) = BLAKE3.derive_key(label, x)`.
    * A range with more than `max_range_items` items returns 413.
    * Any mismatch returns 409 `conflict`.
-5. **Writes**, then **clears**. `writes` are applied in order, so the last write to a key wins.
+5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys, else 413), then `writes`, where the last write to a key wins.
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 
@@ -192,6 +192,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 * `broadcast` stores only the definition. Its members read the log with their own cursors (§7.2, §9).
 * **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0.
 * A `per_key` group starting at `earliest` puts every key's first event on the ready list. A topic with more than 100,000 events returns 413; use `latest` instead.
+* `per_key` and `single_key` groups only see events that have a `key_token`.
 
 ### 8.2 Leases (`sequential`, `partitioned`, `single_key`)
 
@@ -278,6 +279,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `eph` | `id, topic, data, sender: bytes(32)` (device fp) |
 | `err` | `id?, code, message` |
 
+* Consumer delivery is not pushed over the stream: `/v1/consume/next` with `wait_ms` long-polls instead (§8.3).
 * Watches only wake a subscription. The data always comes from a range read after the subscription's cursor, so reconnecting with the last received `offset` loses nothing.
 * Ephemeral data should be sealed by the client with the topic key plus a sequence number (G21). The server forwards it as opaque bytes.
 
