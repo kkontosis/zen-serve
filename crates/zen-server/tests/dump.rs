@@ -97,6 +97,9 @@ async fn export_import_round_trip() {
             .unwrap();
         assert_eq!((hdr.backend.as_str(), st2.keys), ("test", st.keys));
         assert_eq!(everything(&dst).await, everything(src.as_ref()).await);
+        // The pinned sign-in origin is data, not server metadata.
+        let pins = zen_server::keys::origin_pins();
+        assert!(everything(&dst).await.iter().any(|(k, _)| *k == pins));
         // A second import into a non-empty store needs --force.
         assert!(
             dump::import(&dst, std::fs::File::open(&file).unwrap(), false)

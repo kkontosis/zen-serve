@@ -77,6 +77,156 @@ pub struct Info {
     pub time_ms: u64,
     /// Server limits.
     pub limits: Limits,
+    /// Sign-in methods and origin policy (spec/auth.md). Absent from
+    /// servers older than the multi-method sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthInfo>,
+}
+
+/// `/v1/info` `auth`: what a client needs to sign in (spec/auth.md §2).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthInfo {
+    /// The sign-in methods this server offers: enabled and implemented
+    /// ([`AuthMethod::name`]).
+    pub methods: Vec<String>,
+    /// The method a client offers first, if any is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// The origin policy (spec/auth.md §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origins: Option<OriginInfo>,
+    /// The Argon2id parameters to register a password-derived key with,
+    /// when that method is on (spec/auth.md §11.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_params: Option<Argon2Params>,
+    /// What a WebAuthn client needs, when passkeys are on
+    /// (spec/auth.md §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passkey: Option<PasskeyInfo>,
+}
+
+/// `/v1/info` `auth.passkey` (spec/auth.md §7).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyInfo {
+    /// The WebAuthn relying-party id; absent until the server knows an
+    /// origin of its own (spec/auth.md §7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rp_id: Option<String>,
+    /// `"required"` or `"preferred"`: the `userVerification` to request.
+    pub user_verification: String,
+    /// Supported COSE algorithms, in order of preference
+    /// (`pubKeyCredParams`).
+    pub algorithms: Vec<i64>,
+}
+
+/// Argon2id parameters of a password-derived key (spec/formats.md §7.5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Argon2Params {
+    /// Memory, KiB.
+    pub m_cost_kib: u32,
+    /// Passes.
+    pub t_cost: u32,
+    /// Lanes.
+    pub p_cost: u32,
+}
+
+/// `/v1/info` `auth.origins` (spec/auth.md §5.5).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OriginInfo {
+    /// The origins the server accepts and considers its own, canonical
+    /// first. A client that sees another origin is talking to a relay, or
+    /// to a server that isn't set up yet.
+    pub origins: Vec<String>,
+    /// First-contact pinning is in force.
+    pub pinning: bool,
+    /// Other origins are accepted from the request's `Host` header: the
+    /// sign-in relay protection is absent right now.
+    pub host_fallback: bool,
+}
+
+/// `POST /v1/admin/origins/get` response (spec/auth.md §5.6).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OriginState {
+    /// 7a: `public_origins` from the config.
+    pub public_origins: Vec<String>,
+    /// 7b: the pinned origins (kept even while pinning is not in force).
+    pub pinned: Vec<String>,
+    /// 7c: the head ACL's `origins`.
+    pub acl_origins: Vec<String>,
+    /// 7b is in force.
+    pub pinning: bool,
+    /// `origin_pinning_always` is set.
+    pub pinning_always: bool,
+    /// 7c (`acl_origins`) is on.
+    pub acl: bool,
+    /// The union in force, canonical first.
+    pub accepted: Vec<String>,
+    /// Other origins are accepted from the `Host` header.
+    pub host_fallback: bool,
+}
+
+/// `POST /v1/admin/origins/set` request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OriginPins {
+    /// The new pinned set; empty unpins.
+    pub pinned: Vec<String>,
+}
+
+/// A sign-in method (spec/auth.md §1). The discriminant is its id, stored
+/// in session records and credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AuthMethod {
+    /// 1: a per-device hybrid key certified in the signed ACL.
+    DeviceKey = 1,
+    /// 2: WebAuthn passkeys.
+    Passkey = 2,
+    /// 3: OPAQUE password authentication.
+    Opaque = 3,
+    /// 4: admin-issued bearer tokens for services and bots.
+    ApiToken = 4,
+    /// 5: TLS client certificates.
+    Mtls = 5,
+    /// 6: a hybrid key derived from a password on the client.
+    PasswordKey = 6,
+}
+
+impl AuthMethod {
+    /// Every method, by id.
+    pub const ALL: [AuthMethod; 6] = [
+        AuthMethod::DeviceKey,
+        AuthMethod::Passkey,
+        AuthMethod::Opaque,
+        AuthMethod::ApiToken,
+        AuthMethod::Mtls,
+        AuthMethod::PasswordKey,
+    ];
+
+    /// The method's id.
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// The method with this id.
+    pub fn from_id(id: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.id() == id)
+    }
+
+    /// The wire name, as in `/v1/info`.
+    pub fn name(self) -> &'static str {
+        match self {
+            AuthMethod::DeviceKey => "device_key",
+            AuthMethod::Passkey => "passkey",
+            AuthMethod::Opaque => "opaque",
+            AuthMethod::ApiToken => "api_token",
+            AuthMethod::Mtls => "mtls",
+            AuthMethod::PasswordKey => "password_key",
+        }
+    }
+
+    /// The method with this wire name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
 }
 
 /// Server limits (spec/api.md §2).
@@ -174,9 +324,86 @@ pub struct Session {
     /// The user's fingerprint.
     #[serde(with = "serde_bytes")]
     pub user_fp: Vec<u8>,
-    /// The device's fingerprint.
+    /// The device's fingerprint; for methods other than `device_key`, the
+    /// credential id (spec/auth.md §3).
     #[serde(with = "serde_bytes")]
     pub device_fp: Vec<u8>,
+    /// The sign-in method ([`AuthMethod::name`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// Max length of a normalized login name.
+pub const MAX_LOGIN_LEN: usize = 128;
+
+/// Normalize a login name (spec/auth.md §11.1): trim surrounding
+/// whitespace and lowercase ASCII letters. The result must be 1–128 bytes
+/// of `a-z`, `0-9` and `. _ - @ +`; anything else is `None`.
+pub fn normalize_login(name: &str) -> Option<String> {
+    let n = name.trim().to_ascii_lowercase();
+    let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-@+".contains(&b);
+    (!n.is_empty() && n.len() <= MAX_LOGIN_LEN && n.bytes().all(ok)).then_some(n)
+}
+
+/// Max length of an origin.
+pub const MAX_ORIGIN_LEN: usize = 255;
+
+/// Whether `o` is a serialized origin as browsers send it (spec/auth.md
+/// §5): `http://` or `https://`, a lowercase ASCII host (a name, an IPv4
+/// address or a bracketed IPv6 address), an optional port 1–65535, and
+/// nothing else, not even a trailing slash.
+pub fn valid_origin(o: &str) -> bool {
+    if o.len() > MAX_ORIGIN_LEN {
+        return false;
+    }
+    let Some(rest) = o
+        .strip_prefix("https://")
+        .or_else(|| o.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let Some((h, after)) = v6.split_once(']') else {
+            return false;
+        };
+        if h.is_empty()
+            || !h
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return false;
+        }
+        match after {
+            "" => (h, None),
+            p => match p.strip_prefix(':') {
+                Some(p) => (h, Some(p)),
+                None => return false,
+            },
+        }
+    } else {
+        let (h, p) = match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.';
+        if h.is_empty() || !h.bytes().all(ok) {
+            return false;
+        }
+        (h, p)
+    };
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    match port {
+        None => true,
+        Some(p) => {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && !p.starts_with('0')
+                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+        }
+    }
 }
 
 /// The session-signature message: `lp(challenge) ‖ lp(origin)`
@@ -190,6 +417,337 @@ pub fn session_message(challenge: &[u8], origin: &str) -> Vec<u8> {
     m
 }
 
+/// `POST /v1/auth/password/params` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordParamsRequest {
+    /// The login name, as typed.
+    pub name: String,
+}
+
+/// `POST /v1/auth/password/params` response: what the client needs to
+/// derive the key (spec/formats.md §7.5). Unknown names get plausible,
+/// stable fakes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordParams {
+    /// 32-byte salt.
+    #[serde(with = "serde_bytes")]
+    pub salt: Vec<u8>,
+    /// Argon2id memory, KiB.
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+}
+
+impl PasswordParams {
+    /// The Argon2id parameters.
+    pub fn params(&self) -> Argon2Params {
+        Argon2Params {
+            m_cost_kib: self.m_cost_kib,
+            t_cost: self.t_cost,
+            p_cost: self.p_cost,
+        }
+    }
+}
+
+/// `POST /v1/auth/password/session` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordSessionRequest {
+    /// The login name, as typed.
+    pub name: String,
+    /// The challenge.
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    /// The server origin as the client sees it.
+    pub origin: String,
+    /// Signature by the password-derived key, purpose
+    /// `zen/v1/sig/password-session`.
+    #[serde(with = "serde_bytes")]
+    pub sig: Vec<u8>,
+}
+
+/// `POST /v1/auth/password/set` request: register or replace the caller's
+/// password-derived key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordSet {
+    /// The login name, as typed.
+    pub name: String,
+    /// 32-byte salt the client derived the key with.
+    #[serde(with = "serde_bytes")]
+    pub salt: Vec<u8>,
+    /// Argon2id memory, KiB.
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+    /// The key's public identity (spec/formats.md §7.2).
+    #[serde(with = "serde_bytes")]
+    pub identity: Vec<u8>,
+}
+
+/// `POST /v1/auth/passkey/register/begin` response: the options of
+/// `navigator.credentials.create` the server decides.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyCreation {
+    /// The challenge (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    /// The relying-party id.
+    pub rp_id: String,
+    /// The WebAuthn user handle (`user.id`): the user fingerprint.
+    #[serde(with = "serde_bytes")]
+    pub user_handle: Vec<u8>,
+    /// Supported COSE algorithms, in order of preference.
+    pub algorithms: Vec<i64>,
+    /// Credential ids the user already registered (`excludeCredentials`).
+    pub exclude: Vec<ByteBuf>,
+    /// `"required"` or `"preferred"`.
+    pub user_verification: String,
+}
+
+/// `POST /v1/auth/passkey/register/finish` request: the response of
+/// `navigator.credentials.create`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyRegister {
+    /// `response.attestationObject`.
+    #[serde(with = "serde_bytes")]
+    pub attestation_object: Vec<u8>,
+    /// `response.clientDataJSON`.
+    #[serde(with = "serde_bytes")]
+    pub client_data_json: Vec<u8>,
+    /// A label for listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `POST /v1/auth/passkey/session/begin` request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyBegin {
+    /// A user handle (user fingerprint) to list the passkeys of, for
+    /// authenticators without discoverable credentials. Absent: a
+    /// discoverable sign-in.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user: Option<Vec<u8>>,
+}
+
+/// `POST /v1/auth/passkey/session/begin` response: the options of
+/// `navigator.credentials.get` the server decides.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeyRequest {
+    /// The challenge (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    /// The relying-party id.
+    pub rp_id: String,
+    /// `allowCredentials`: the user's credential ids; empty for a
+    /// discoverable sign-in.
+    pub allow: Vec<ByteBuf>,
+    /// `"required"` or `"preferred"`.
+    pub user_verification: String,
+}
+
+/// `POST /v1/auth/passkey/session` request: the response of
+/// `navigator.credentials.get`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasskeySession {
+    /// `rawId`.
+    #[serde(with = "serde_bytes")]
+    pub credential_id: Vec<u8>,
+    /// `response.authenticatorData`.
+    #[serde(with = "serde_bytes")]
+    pub authenticator_data: Vec<u8>,
+    /// `response.clientDataJSON`.
+    #[serde(with = "serde_bytes")]
+    pub client_data_json: Vec<u8>,
+    /// `response.signature`.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+    /// `response.userHandle`, if the authenticator returned one.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user_handle: Option<Vec<u8>>,
+}
+
+/// `POST /v1/auth/opaque/register/start` request (spec/auth.md §8.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueRegisterStart {
+    /// The login name, as typed.
+    pub name: String,
+    /// The OPAQUE `RegistrationRequest` (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub request: Vec<u8>,
+}
+
+/// `POST /v1/auth/opaque/register/start` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueRegistration {
+    /// The OPAQUE `RegistrationResponse` (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub response: Vec<u8>,
+    /// The Argon2id memory to register with (KiB): the server's
+    /// configured parameters.
+    pub m_cost_kib: u32,
+    /// Argon2id passes, likewise.
+    pub t_cost: u32,
+    /// Argon2id lanes, likewise.
+    pub p_cost: u32,
+}
+
+/// `POST /v1/auth/opaque/register/finish` request: the record to store.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueRegisterFinish {
+    /// The login name, as typed: the same as in `start`.
+    pub name: String,
+    /// The OPAQUE `RegistrationUpload` (192 bytes).
+    #[serde(with = "serde_bytes")]
+    pub upload: Vec<u8>,
+    /// The Argon2id memory the client stretched the password with (KiB).
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+}
+
+/// `POST /v1/auth/opaque/login/start` request (spec/auth.md §8.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueLoginStart {
+    /// The login name, as typed.
+    pub name: String,
+    /// The server origin as the client sees it: bound into the OPAQUE
+    /// context (spec/auth.md §8.4).
+    pub origin: String,
+    /// The OPAQUE `CredentialRequest`, KE1 (96 bytes).
+    #[serde(with = "serde_bytes")]
+    pub request: Vec<u8>,
+}
+
+/// `POST /v1/auth/opaque/login/start` response. Unknown names get a fake
+/// response of the same shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueLoginResponse {
+    /// The OPAQUE `CredentialResponse`, KE2 (320 bytes).
+    #[serde(with = "serde_bytes")]
+    pub response: Vec<u8>,
+    /// The server's sealed login state, returned with `finish`: opaque to
+    /// the client.
+    #[serde(with = "serde_bytes")]
+    pub state: Vec<u8>,
+    /// The Argon2id memory of the credential (KiB).
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+}
+
+/// `POST /v1/auth/opaque/login/finish` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueLoginFinish {
+    /// The `state` of the `start` response, unchanged.
+    #[serde(with = "serde_bytes")]
+    pub state: Vec<u8>,
+    /// The OPAQUE `CredentialFinalization`, KE3 (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub finalization: Vec<u8>,
+}
+
+/// `POST /v1/auth/mtls/register` request (spec/auth.md §10.3): bind a TLS
+/// client certificate to a member.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MtlsRegister {
+    /// The member (a user fingerprint); absent: the caller. Another
+    /// member's needs admin.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user: Option<Vec<u8>>,
+    /// The certificate, DER or PEM; absent: the one the caller's connection
+    /// presents. Uploading one needs admin.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub cert: Option<Vec<u8>>,
+    /// A label, for listings (at most 128 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// A credential id, as returned when one is created.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CredentialId {
+    /// 32 bytes.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+}
+
+/// `POST /v1/auth/credentials/list` request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CredentialsList {
+    /// Whose credentials (a user fingerprint); absent: the caller's own.
+    /// Another member's needs admin.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user: Option<Vec<u8>>,
+}
+
+/// One stored credential: metadata only, never secrets or keys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Credential {
+    /// Credential id.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+    /// The sign-in method ([`AuthMethod::name`]).
+    pub method: String,
+    /// Creation time, unix seconds.
+    pub created_unix: u64,
+    /// Expiry, unix seconds, if it expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+    /// A label chosen at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The last sign-in with it, unix seconds, where the method records
+    /// it (passkeys, certificates, OPAQUE).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_unix: Option<u64>,
+}
+
+/// `POST /v1/auth/credentials/list` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Credentials {
+    /// The user's stored credentials, by id.
+    pub credentials: Vec<Credential>,
+}
+
+/// The prefix of an API token (spec/auth.md §9).
+pub const API_TOKEN_PREFIX: &str = "zen_at_";
+
+/// `POST /v1/auth/tokens/create` request (admins).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApiTokenCreate {
+    /// The member the token acts as (user fingerprint).
+    #[serde(with = "serde_bytes")]
+    pub user: Vec<u8>,
+    /// A label, for listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Expiry, unix seconds; absent: never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+}
+
+/// `POST /v1/auth/tokens/create` response. The token is shown only here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApiToken {
+    /// `zen_at_` ‖ base64url(32-byte secret): send as
+    /// `Authorization: Bearer <token>`, or as the stream's `auth` token
+    /// (its UTF-8 bytes).
+    pub token: String,
+    /// The credential id.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+    /// Expiry, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+}
+
 // ---------------------------------------------------------------- ACL, fs
 
 /// `POST /v1/acl/put` request.
@@ -201,6 +759,10 @@ pub struct AclPut {
     /// Claim token, for version 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<String>,
+    /// Version 1 only: the server origin as the claiming client sees it,
+    /// pinned when first-contact pinning is in force (spec/auth.md §5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/acl/put` response.
@@ -1315,6 +1877,65 @@ pub enum Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_methods_have_stable_ids_and_names() {
+        for (i, m) in AuthMethod::ALL.into_iter().enumerate() {
+            assert_eq!(m.id() as usize, i + 1);
+            assert_eq!(AuthMethod::from_id(m.id()), Some(m));
+            assert_eq!(AuthMethod::from_name(m.name()), Some(m));
+        }
+        assert_eq!(AuthMethod::from_id(0), None);
+        assert_eq!(AuthMethod::from_id(7), None);
+    }
+
+    #[test]
+    fn login_names_are_normalized() {
+        assert_eq!(
+            normalize_login("  Ada@Example.org ").as_deref(),
+            Some("ada@example.org")
+        );
+        assert_eq!(normalize_login("bob_1+x-y").as_deref(), Some("bob_1+x-y"));
+        for bad in ["", "   ", "a b", "ada/1", "ádá", "a\u{0}b"] {
+            assert_eq!(normalize_login(bad), None, "{bad:?}");
+        }
+        assert!(normalize_login(&"a".repeat(MAX_LOGIN_LEN)).is_some());
+        assert!(normalize_login(&"a".repeat(MAX_LOGIN_LEN + 1)).is_none());
+    }
+
+    #[test]
+    fn origins_are_validated() {
+        for ok in [
+            "https://zen.example.org",
+            "http://127.0.0.1:8080",
+            "https://[::1]:443",
+            "http://localhost",
+            "https://a-b.example:65535",
+        ] {
+            assert!(valid_origin(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "zen.example.org",
+            "ftp://zen.example.org",
+            "https://",
+            "https://zen.example.org/",
+            "https://zen.example.org/app",
+            "https://Zen.example.org",
+            "HTTPS://zen.example.org",
+            "https://user@zen.example.org",
+            "https://zen.example.org:0",
+            "https://zen.example.org:65536",
+            "https://zen.example.org:080",
+            "https://zen.example.org:",
+            "https://zen.example.org?x",
+            "https://[::1",
+            "https://[::1]x",
+            "https://zen example.org",
+        ] {
+            assert!(!valid_origin(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn frames_roundtrip() {

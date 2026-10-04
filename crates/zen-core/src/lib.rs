@@ -13,6 +13,9 @@ pub mod kdf;
 pub mod keys;
 pub mod keyslot;
 pub mod labels;
+#[cfg(feature = "opaque")]
+pub mod opaque;
+pub mod pwkey;
 pub mod rng;
 pub mod seal;
 pub mod sig;

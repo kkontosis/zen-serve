@@ -7,15 +7,19 @@ use crate::error::{ApiResult, not_found};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use zen_proto::AuthMethod;
 use zen_store::Storage;
 
-/// A signed-in device.
+/// A session (spec/auth.md §3).
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     /// User fingerprint.
     pub user: Fp,
-    /// Device fingerprint.
-    pub device: Fp,
+    /// The device fingerprint (`device_key`) or the credential id (other
+    /// methods): what the rest of the server treats as "the device".
+    pub cred: Fp,
+    /// How the session was created.
+    pub method: AuthMethod,
     /// Expiry, unix seconds.
     pub expires_unix: u64,
 }
@@ -44,6 +48,16 @@ pub struct AppState {
     pub claim: Mutex<Option<String>>,
     /// Ephemeral pub/sub: this node's ring tailers.
     pub eph: EphHub,
+    /// Cluster-wide key for the fake parameters of unknown login names,
+    /// once read or created (`cred::params_key`).
+    pub params_key: Mutex<Option<[u8; 32]>>,
+    /// Failed password sign-ins per method and login name, on this node
+    /// (methods 6 and 3, counted separately).
+    pub pw_limiter: crate::password::Limiter,
+    /// The cluster's OPAQUE server setup, once read or created
+    /// (`opaque::setup`).
+    pub opaque_setup:
+        Mutex<Option<Arc<zen_core::opaque::opaque_ke::ServerSetup<zen_core::opaque::Suite>>>>,
 }
 
 /// Shared handle.
@@ -59,6 +73,12 @@ impl AppState {
         challenge_key: [u8; 32],
     ) -> Self {
         AppState {
+            pw_limiter: crate::password::Limiter::new(
+                cfg.auth.password_max_failures,
+                std::time::Duration::from_secs(cfg.auth.password_lockout_secs),
+            ),
+            params_key: Mutex::new(None),
+            opaque_setup: Mutex::new(None),
             eph: EphHub::new(
                 store.clone(),
                 cfg.limits.ephemeral_bytes_per_sec,
@@ -97,6 +117,23 @@ impl AppState {
     pub fn consume_claim_token(&self) {
         *self.claim.lock().expect("claim lock") = None;
         remove_claim_token(&self.cfg.data_dir);
+    }
+
+    /// Whether sign-in method `m` is implemented and turned on.
+    pub fn method_on(&self, m: AuthMethod) -> bool {
+        self.cfg.auth.enabled(m) && crate::auth::IMPLEMENTED.contains(&m)
+    }
+
+    /// 403 `method_disabled` unless `m` is on.
+    pub fn require_method(&self, m: AuthMethod) -> ApiResult<()> {
+        if self.method_on(m) {
+            Ok(())
+        } else {
+            Err(crate::error::method_disabled(format!(
+                "the sign-in method {} is disabled on this server",
+                m.name()
+            )))
+        }
     }
 
     /// 404 unless `fs` is configured.

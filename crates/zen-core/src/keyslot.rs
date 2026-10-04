@@ -4,20 +4,25 @@
 //! off  len   field
 //!   0    1   format_version (= 1)
 //!   1    1   suite          (= 1)
-//!   2    1   slot_type      (1 = passphrase, 2 = recovery key, 3 = X-Wing device)
+//!   2    1   slot_type      (1 = passphrase, 2 = recovery key, 3 = X-Wing device,
+//!                             4 = WebAuthn PRF, 5 = OPAQUE export key)
 //!   3    1   reserved       (= 0)
 //!   4   16   slot_id        (random)
 //!  20    …   type params:
 //!              passphrase: u32 m_cost_kib || u32 t_cost || u32 p_cost || salt[32]
 //!              recovery:   (none)
 //!              device:     recipient_fp[32] || xwing_ciphertext[1120]
+//!              prf:        credential_id[32] || prf_salt[32]
+//!              opaque:     credential_id[32]
 //!   …   24   nonce
 //!   …   88   AEAD(KEK, bundle[72]) incl. 16-byte tag
 //! ```
 //!
 //! AAD = `"zen/v1/aad/keyslot" || 0x00 || everything before the nonce`.
 //! KEK = `KDF("zen/v1/keyslot-kek", secret, slot_id)` where `secret` is the
-//! Argon2id output, the recovery key, or the X-Wing shared secret.
+//! Argon2id output, the recovery key, the X-Wing shared secret, the
+//! WebAuthn PRF output, or `BLAKE3.derive_key("zen/v1/opaque-keyslot",
+//! export_key)` of an OPAQUE export key.
 
 use crate::encoding::Reader;
 use crate::kdf::{Key32, kdf};
@@ -35,6 +40,11 @@ use zeroize::Zeroizing;
 const TYPE_PASSPHRASE: u8 = 1;
 const TYPE_RECOVERY: u8 = 2;
 const TYPE_DEVICE: u8 = 3;
+const TYPE_WEBAUTHN_PRF: u8 = 4;
+const TYPE_OPAQUE_EXPORT: u8 = 5;
+
+/// Length of an OPAQUE export key (spec/auth.md §8): the output of SHA-512.
+pub const OPAQUE_EXPORT_KEY_LEN: usize = 64;
 
 /// Argon2id parameters stored in a passphrase keyslot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +83,8 @@ impl Argon2Params {
     /// Maximum lanes accepted when creating or opening a slot.
     pub const MAX_P_COST: u32 = 4;
 
-    fn validate_for_open(&self) -> Result<()> {
+    /// Check the opening ceilings: m ≤ 4 GiB, 1 ≤ t ≤ 16, 1 ≤ p ≤ 4.
+    pub fn validate_for_open(&self) -> Result<()> {
         if self.m_cost_kib > Self::MAX_M_COST_KIB
             || !(1..=Self::MAX_T_COST).contains(&self.t_cost)
             || !(1..=Self::MAX_P_COST).contains(&self.p_cost)
@@ -83,7 +94,8 @@ impl Argon2Params {
         Ok(())
     }
 
-    fn validate_for_create(&self) -> Result<()> {
+    /// Check the creation floors (m ≥ 64 MiB) as well as the ceilings.
+    pub fn validate_for_create(&self) -> Result<()> {
         self.validate_for_open()?;
         if self.m_cost_kib < Self::MIN_M_COST_KIB {
             return Err(Error::Param);
@@ -91,7 +103,7 @@ impl Argon2Params {
         Ok(())
     }
 
-    fn derive(&self, passphrase: &[u8], salt: &[u8; 32]) -> Result<Key32> {
+    pub(crate) fn derive(&self, passphrase: &[u8], salt: &[u8; 32]) -> Result<Key32> {
         let params = argon2::Params::new(self.m_cost_kib, self.t_cost, self.p_cost, Some(32))
             .map_err(|_| Error::Param)?;
         let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
@@ -113,6 +125,12 @@ pub enum Unlock<'a> {
     Recovery(&'a [u8; 32]),
     /// A device's X-Wing key.
     Device(&'a DeviceSecret),
+    /// The 32-byte output of a passkey's WebAuthn PRF extension for the
+    /// slot's salt ([`webauthn_prf_params`]).
+    WebAuthnPrf(&'a [u8; 32]),
+    /// The 64-byte export key of an OPAQUE sign-in or registration
+    /// (spec/auth.md §8) with the slot's credential.
+    OpaqueExport(&'a [u8; OPAQUE_EXPORT_KEY_LEN]),
 }
 
 fn slot_prefix(slot_type: u8, slot_id: &[u8; 16]) -> Vec<u8> {
@@ -203,6 +221,96 @@ pub fn create_device(fs: &FsKeys, recipient: &DevicePublic, rng: &mut dyn Rng) -
     wrap(slot, &ss, &slot_id, fs, rng)
 }
 
+/// A passkey's credential id in the server's credential store
+/// (spec/auth.md §4.1), from its WebAuthn credential id (`rawId`):
+/// `BLAKE3.derive_key("zen/v1/passkey-id", rawId)`. WebAuthn PRF
+/// keyslots name their passkey by it.
+pub fn passkey_credential_id(webauthn_id: &[u8]) -> [u8; 32] {
+    blake3::derive_key(crate::labels::PASSKEY_ID, webauthn_id)
+}
+
+/// Create a keyslot that opens with a passkey's WebAuthn PRF output
+/// (spec/formats.md §6, type 4).
+///
+/// * `credential_id`: the passkey's 32-byte credential id in the server's
+///   credential store ([`passkey_credential_id`]), so a client finds the
+///   slot of the passkey it signed in with.
+/// * `prf_salt`: 32 random bytes the client chose for this slot and passed
+///   to the authenticator as the PRF input (`prf.eval.first`).
+/// * `prf_output`: the authenticator's 32-byte PRF result for that salt.
+pub fn create_webauthn_prf(
+    fs: &FsKeys,
+    credential_id: &[u8; 32],
+    prf_salt: &[u8; 32],
+    prf_output: &[u8; 32],
+    rng: &mut dyn Rng,
+) -> Result<Vec<u8>> {
+    let slot_id: [u8; 16] = rng::array(rng)?;
+    let mut slot = slot_prefix(TYPE_WEBAUTHN_PRF, &slot_id);
+    slot.extend_from_slice(credential_id);
+    slot.extend_from_slice(prf_salt);
+    wrap(slot, prf_output, &slot_id, fs, rng)
+}
+
+/// The credential id and PRF salt of a WebAuthn PRF keyslot: what a
+/// client needs to ask the authenticator for the PRF output.
+pub fn webauthn_prf_params(slot: &[u8]) -> Result<([u8; 32], [u8; 32])> {
+    check_prefix(slot)?;
+    let mut r = Reader::new(&slot[2..]);
+    if r.u8()? != TYPE_WEBAUTHN_PRF {
+        return Err(Error::Param);
+    }
+    if r.u8()? != 0 {
+        return Err(Error::Format);
+    }
+    let _slot_id: [u8; 16] = r.array()?;
+    Ok((r.array()?, r.array()?))
+}
+
+/// The slot secret of an OPAQUE export key:
+/// `BLAKE3.derive_key("zen/v1/opaque-keyslot", export_key)`. The export key
+/// is 64 bytes and may serve other uses; the slot uses a 32-byte derivation
+/// of its own.
+fn opaque_slot_secret(export_key: &[u8; OPAQUE_EXPORT_KEY_LEN]) -> Key32 {
+    Zeroizing::new(blake3::derive_key(labels::OPAQUE_KEYSLOT, export_key))
+}
+
+/// Create a keyslot that opens with an OPAQUE export key
+/// (spec/formats.md §6, type 5).
+///
+/// * `credential_id`: the OPAQUE credential's 32-byte id in the server's
+///   credential store, which is also the `device_fp` of its sessions, so
+///   a client finds the slot of the credential it signed in with.
+/// * `export_key`: the 64-byte export key the client got from that
+///   credential's registration or from a sign-in with it. A new
+///   registration (a password change) gives a new export key, so the
+///   client re-wraps its slot then.
+pub fn create_opaque_export(
+    fs: &FsKeys,
+    credential_id: &[u8; 32],
+    export_key: &[u8; OPAQUE_EXPORT_KEY_LEN],
+    rng: &mut dyn Rng,
+) -> Result<Vec<u8>> {
+    let slot_id: [u8; 16] = rng::array(rng)?;
+    let mut slot = slot_prefix(TYPE_OPAQUE_EXPORT, &slot_id);
+    slot.extend_from_slice(credential_id);
+    wrap(slot, &opaque_slot_secret(export_key), &slot_id, fs, rng)
+}
+
+/// The credential id of an OPAQUE export-key keyslot.
+pub fn opaque_export_credential(slot: &[u8]) -> Result<[u8; 32]> {
+    check_prefix(slot)?;
+    let mut r = Reader::new(&slot[2..]);
+    if r.u8()? != TYPE_OPAQUE_EXPORT {
+        return Err(Error::Param);
+    }
+    if r.u8()? != 0 {
+        return Err(Error::Format);
+    }
+    let _slot_id: [u8; 16] = r.array()?;
+    r.array()
+}
+
 /// Unlock a keyslot and return the fs keys it wraps.
 pub fn open(slot: &[u8], unlock: Unlock<'_>) -> Result<FsKeys> {
     check_prefix(slot)?;
@@ -233,7 +341,21 @@ pub fn open(slot: &[u8], unlock: Unlock<'_>) -> Result<FsKeys> {
                 .map_err(|_| Error::Format)?;
             Zeroizing::new(<[u8; 32]>::from(dev.kem().decapsulate(&ct)))
         }
-        (TYPE_PASSPHRASE | TYPE_RECOVERY | TYPE_DEVICE, _) => return Err(Error::Param),
+        (TYPE_WEBAUTHN_PRF, Unlock::WebAuthnPrf(out)) => {
+            let _credential_id: [u8; 32] = r.array()?;
+            let _prf_salt: [u8; 32] = r.array()?;
+            Zeroizing::new(*out)
+        }
+        (TYPE_OPAQUE_EXPORT, Unlock::OpaqueExport(key)) => {
+            let _credential_id: [u8; 32] = r.array()?;
+            opaque_slot_secret(key)
+        }
+        (
+            TYPE_PASSPHRASE | TYPE_RECOVERY | TYPE_DEVICE | TYPE_WEBAUTHN_PRF | TYPE_OPAQUE_EXPORT,
+            _,
+        ) => {
+            return Err(Error::Param);
+        }
         _ => return Err(Error::Format),
     };
     let rest = r.rest();

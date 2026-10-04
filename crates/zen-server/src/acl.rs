@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use zen_core::kdf::acl_hash;
 use zen_core::labels;
 use zen_core::sig::{PublicIdentity, verify_device_cert};
-use zen_proto::acl::{AclDoc, FS_RIGHTS, FsLimit, SignedAcl, TOPIC_RIGHTS};
+use zen_proto::acl::{AclDoc, FS_RIGHTS, FsLimit, MAX_ACL_ORIGINS, SignedAcl, TOPIC_RIGHTS};
 use zen_proto::{
     AclEntries, AclGet, AclPut, AclVersion, ByteBuf, Empty, FsEntry, FsList, Header, HeaderGet,
     HeaderPut, HeaderVersion, from_cbor,
@@ -72,6 +72,8 @@ pub struct AclState {
     topic_grants: Vec<TopicGrant>,
     /// Quotas.
     pub limits: HashMap<u32, FsLimit>,
+    /// Origins the admins vouch for (spec/auth.md §5.3).
+    pub origins: Vec<String>,
 }
 
 impl AclState {
@@ -176,6 +178,21 @@ impl AclState {
                 None => *fs_grants.entry((user, g.fs)).or_insert(0) |= bits,
             }
         }
+        if doc.origins.len() > MAX_ACL_ORIGINS {
+            return Err(bad_request(format!(
+                "an ACL lists at most {MAX_ACL_ORIGINS} origins"
+            )));
+        }
+        let mut origins = Vec::new();
+        for o in &doc.origins {
+            if !zen_proto::valid_origin(o) {
+                return Err(bad_request(format!("invalid origin {o:?}")));
+            }
+            if origins.contains(o) {
+                return Err(bad_request(format!("duplicate origin {o:?}")));
+            }
+            origins.push(o.clone());
+        }
         let mut limits = HashMap::new();
         for l in &doc.limits {
             if l.fs == 0 || !is_fs(l.fs) {
@@ -192,6 +209,7 @@ impl AclState {
                 fs_grants,
                 topic_grants,
                 limits,
+                origins,
             },
             doc,
         ))
@@ -296,6 +314,20 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
     }
     let is_fs = |fs| st.cfg.has_fs(fs);
     let new = validate_successor(&req.acl, &head, &is_fs)?;
+    let removed: Vec<Fp> = head
+        .members
+        .keys()
+        .filter(|u| !new.members.contains_key(*u))
+        .copied()
+        .collect();
+    // The claim may name the origin to pin (auth.md §5.2).
+    let pin = match &req.origin {
+        Some(o) if new.version == 1 => {
+            crate::origin::check_origin(o)?;
+            Some(o.clone())
+        }
+        _ => None,
+    };
     txn_loop!(st.store, None, idempotent, |t| {
         let current = t
             .get(&keys::acl_head())
@@ -312,6 +344,14 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
         }
         t.set(&keys::acl(new.version), &req.acl);
         t.set(&keys::acl_head(), &new.version.to_be_bytes());
+        if let Some(o) = &pin {
+            crate::origin::pin_at_claim(&st.cfg, &mut t, o).await?;
+        }
+        // A member who leaves takes their stored credentials along
+        // (auth.md §4).
+        for user in &removed {
+            crate::cred::delete_user(&mut t, user).await?;
+        }
         Ok(())
     })?;
     let version = new.version;

@@ -79,6 +79,41 @@ fn keyslot_vectors_open_from_files() {
 }
 
 #[test]
+fn prf_keyslot_vector_opens_from_file() {
+    let v = &load("prf_keyslot.json")["webauthn_prf"];
+    let bundle = hx(&load("keys.json")["fs_epoch0"]["bundle"]);
+    let slot = hx(&v["slot"]);
+    let (cred, salt) = keyslot::webauthn_prf_params(&slot).unwrap();
+    assert_eq!(
+        (cred.to_vec(), salt.to_vec()),
+        (hx(&v["credential_id"]), hx(&v["prf_salt"]))
+    );
+    let out: [u8; 32] = hx(&v["prf_output"]).try_into().unwrap();
+    let fs = keyslot::open(&slot, Unlock::WebAuthnPrf(&out)).unwrap();
+    assert_eq!(*fs.to_bundle(), bundle);
+    assert_eq!(slot.len(), 196);
+}
+
+#[test]
+fn opaque_keyslot_vector_opens_from_file() {
+    let v = &load("opaque_keyslot.json")["opaque_export"];
+    let bundle = hx(&load("keys.json")["fs_epoch0"]["bundle"]);
+    let slot = hx(&v["slot"]);
+    assert_eq!(
+        keyslot::opaque_export_credential(&slot).unwrap().to_vec(),
+        hx(&v["credential_id"])
+    );
+    let key: [u8; 64] = hx(&v["export_key"]).try_into().unwrap();
+    assert_eq!(
+        blake3::derive_key(labels::OPAQUE_KEYSLOT, &key).to_vec(),
+        hx(&v["secret"])
+    );
+    let fs = keyslot::open(&slot, Unlock::OpaqueExport(&key)).unwrap();
+    assert_eq!(*fs.to_bundle(), bundle);
+    assert_eq!(slot.len(), 164);
+}
+
+#[test]
 fn signature_vectors_verify_from_files() {
     let s = load("signatures.json");
     let user = PublicIdentity::decode(&hx(&s["user"]["public"])).unwrap();
@@ -142,4 +177,39 @@ fn hlc_clock_rules() {
     c.observe(hlc(5000, 3));
     assert_eq!(c.tick(1001), hlc(5000, 4));
     assert!(c.tick(6000) > hlc(5000, 4));
+}
+
+#[test]
+fn pwkey_vectors_verify_from_files() {
+    use zen_core::keyslot::Argon2Params;
+    use zen_core::pwkey::{self, PasswordKey};
+    let v = load("pwkey.json");
+    let params = Argon2Params {
+        m_cost_kib: v["m_cost_kib"].as_u64().unwrap() as u32,
+        t_cost: v["t_cost"].as_u64().unwrap() as u32,
+        p_cost: v["p_cost"].as_u64().unwrap() as u32,
+    };
+    let salt: [u8; 32] = hx(&v["salt"]).try_into().unwrap();
+    let key =
+        PasswordKey::derive(v["password"].as_str().unwrap().as_bytes(), &salt, params).unwrap();
+    assert_eq!(key.public().encode(), hx(&v["public"]));
+    let public = PublicIdentity::decode(&hx(&v["public"])).unwrap();
+    assert_eq!(public.fingerprint().to_vec(), hx(&v["fingerprint"]));
+    let s = &v["session"];
+    let origin = s["origin"].as_str().unwrap();
+    assert_eq!(
+        pwkey::session_message(&hx(&s["challenge"]), origin),
+        hx(&s["message"])
+    );
+    pwkey::verify_session(&public, &hx(&s["challenge"]), origin, &hx(&s["signature"])).unwrap();
+    // The purpose separates it from a device's session signature.
+    assert!(
+        public
+            .verify(
+                labels::SIG_SESSION,
+                &hx(&s["message"]),
+                &hx(&s["signature"])
+            )
+            .is_err()
+    );
 }

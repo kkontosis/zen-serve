@@ -105,7 +105,8 @@ u8 body_version = 1 ‖ sender_fp[32] ‖ u64(hlc) ‖ lp(causation_id) ‖ payl
 off  len   field
   0    1   format_version = 1
   1    1   suite          = 1
-  2    1   slot_type      1 = passphrase, 2 = recovery key, 3 = X-Wing device
+  2    1   slot_type      1 = passphrase, 2 = recovery key, 3 = X-Wing device, 4 = WebAuthn PRF,
+                          5 = OPAQUE export key
   3    1   reserved       = 0
   4   16   slot_id        random
  20    …   type params
@@ -120,11 +121,17 @@ off  len   field
 | 1 passphrase | `u32 m_cost_kib ‖ u32 t_cost ‖ u32 p_cost ‖ salt[32]` | `Argon2id(passphrase, salt, m, t, p, out=32)` | 176 B |
 | 2 recovery | (none) | the 32-byte recovery key | 132 B |
 | 3 device | `recipient_fp[32] ‖ xwing_ct[1120]` | X-Wing shared secret | 1284 B |
+| 4 WebAuthn PRF | `credential_id[32] ‖ prf_salt[32]` | the passkey's 32-byte PRF output for `prf_salt` | 196 B |
+| 5 OPAQUE export key | `credential_id[32]` | `BLAKE3.derive_key("zen/v1/opaque-keyslot", export_key[64])` | 164 B |
 
 * **Argon2id parameters** are authenticated in the AAD and feed the KEK, so altering them breaks the slot.
 * **Creation** requires m ≥ 65536 KiB (64 MiB), t ≥ 1 and 1 ≤ p ≤ 4. Recommended: native 1 GiB/t=4, browser 256 MiB/t=3, p=1. **Opening** enforces a ceiling of m ≤ 4194304 KiB (4 GiB), 1 ≤ t ≤ 16 and 1 ≤ p ≤ 4, because the stored parameters come from the untrusted server and would otherwise let it make unlocking hang or run out of memory. Within the ceiling, any stored parameters are accepted (lower ones only weaken the user's own slot, and they're authenticated).
 * **Device slots** wrap only to a device key verified by certificate and out-of-band fingerprint (G1). `recipient_fp` lets a device find its own slot.
+* **WebAuthn PRF slots** open with a passkey (auth.md §7.7). `credential_id` is the passkey's id in the server's credential store, `BLAKE3.derive_key("zen/v1/passkey-id", WebAuthn credential id)` (auth.md §4.1), which is also the `device_fp` of its sessions; it lets a client find the slot of a passkey. `prf_salt` is 32 random bytes chosen for the slot, passed to the authenticator as the PRF input (`extensions.prf.eval.first`, or per credential in `evalByCredential`); the secret is the 32-byte result (`prf.results.first`). WebAuthn already domain-separates the PRF input (the browser hashes it with the context `"WebAuthn PRF"`), and the result is specific to the credential and the salt, so the slot needs no label of its own. The server never sees the PRF result: it is a client extension output, not part of the signed authenticator data. A passkey whose authenticator doesn't support PRF can't have a slot; its user keeps another one.
+* **OPAQUE export-key slots** open with the password of an OPAQUE credential (sign-in method 3, auth.md §8.6). `credential_id` is the credential's id in the server's credential store, which is also the `device_fp` of its sessions; it lets a client find the slot of the credential it signed in with. `export_key` is the 64-byte export key that OPAQUE gives the client at registration and at every sign-in with that credential (RFC 9807 §6, `export_key`); the server never sees it. A new registration, which a password change is, gives a new export key even for the same password, so the client re-wraps the slot then. The slot's secret is a derivation of its own, so the export key can serve other uses.
 * The **recovery key** is 32 random bytes. Its human-readable encoding (word list or grouped base32) is defined by the client UI spec in a later milestone.
+
+Vectors: `test-vectors/keyslots.json` (types 1–3), `test-vectors/prf_keyslot.json` (type 4), `test-vectors/opaque_keyslot.json` (type 5).
 
 ## 7. Identities and signatures
 
@@ -175,6 +182,24 @@ The verifier checks the signature with the expected user identity, **and** that 
 
 The membership log that distributes certificates (G1) is the ACL chain (§9).
 
+### 7.5 Password-derived key (sign-in method 6, auth.md §11)
+
+A client derives a hybrid signing key from a password. Only the client ever sees the password.
+
+```
+root     = Argon2id(password, salt[32], m_cost_kib, t_cost, p_cost, out = 32)
+seed     = KDF("zen/v1/password-sig", root, "")
+identity = the identity of `seed` (§7.1)
+```
+
+* `password` is the UTF-8 bytes the user typed, unchanged. The login name is not an input: it only finds the account (auth.md §11.1).
+* `salt` is 32 random bytes chosen by the client at registration. The server stores the salt, the parameters and the **public identity** (§7.2), never the password or `root`.
+* **Argon2id parameters** follow the passphrase keyslot (§6): **registration** requires m ≥ 65536 KiB, t ≥ 1 and 1 ≤ p ≤ 4, and **sign-in** enforces only the ceiling m ≤ 4194304 KiB, 1 ≤ t ≤ 16, 1 ≤ p ≤ 4, because the server supplies the parameters.
+* To sign in, the client signs the session message of §10 with purpose `zen/v1/sig/password-session`. A device signature (`zen/v1/sig/session`) never verifies as a password signature, or the reverse.
+* The public identity is a **verifier**: whoever holds it, the server included, can test password guesses offline at the cost of one Argon2id run each, exactly as with a passphrase keyslot.
+
+Vectors: `test-vectors/pwkey.json`.
+
 ## 8. Not yet specified
 
 These later-milestone formats are out of scope here:
@@ -200,6 +225,7 @@ AclDoc = {
   grants:    [Grant],
   limits:    [{fs: u32, max_keys: u64?, max_bytes: u64?}],
   members:   [{devices: [bytes], identity: bytes}],   // device certs (§7.4), public identity (§7.2)
+  origins?:  [text],               // origins the admins vouch for (auth.md §5.3); omitted when empty
   version:   u64,                  // 1, 2, 3, …
   prev_hash: bytes(32),            // H(previous doc bytes), 32 zero bytes for version 1
 }
@@ -208,6 +234,7 @@ Grant = {fs: u32, topic: bytes?, rights: [text], subject: bytes(32)}
 
 * **Grants.** A grant without `topic` is an **fs grant**, with rights in {`read`, `write`}. A grant with `topic` is a **topic grant** covering every topic id with that byte prefix, with rights in {`read`, `append`, `consume`}. An empty `topic` covers all topics of the fs.
 * **Admins.** Being an admin carries the `admin` right: it can change the ACL and fs headers. It grants no data access by itself.
+* **Origins.** `origins` lists server origins (`scheme://host[:port]`, auth.md §5) that the admins sign for. A server uses them only when its `acl_origins` setting is on (auth.md §5.3). The field is **omitted when empty**, so a document without origins has exactly the bytes, and the hash, it had before the field existed. Readers that don't know the field ignore it.
 
 ### 9.2 Signing and hashing
 
@@ -229,6 +256,7 @@ Verifiers hash and verify the **received bytes of `doc`**. They never re-encode 
    * every grant subject is a member, and every right is valid for its grant kind
    * grant topics are 16·n bytes with n ≤ 16
    * every grant and limit `fs` is a configured, non-zero fs_id
+   * `origins` holds at most 16 distinct entries, each a valid origin (auth.md §5): `http` or `https`, a lowercase host, an optional port, and no path or trailing slash
 
 Clients pin the head they've verified, and refuse a chain that doesn't extend it.
 
@@ -242,6 +270,8 @@ msg     = lp(challenge) ‖ lp(origin)
 ```
 
 `origin` is the UTF-8 `scheme://host[:port]` of the server, as the client sees it.
+
+A password-derived key (§7.5) signs the same `msg` with purpose `zen/v1/sig/password-session`.
 
 ## 11. Filesystem objects (spec/fs.md)
 

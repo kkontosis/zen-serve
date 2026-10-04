@@ -287,3 +287,177 @@ async fn claiming_one_node_removes_every_claim_token_file() {
         "stale claim-token file deleted at start"
     );
 }
+
+/// The credential store, the login-name index, the fake parameters and the
+/// origin pin are shared by every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn credentials_and_pins_cross_nodes() {
+    use zen_core::pwkey::PasswordKey;
+    use zen_core::vectors::FIXTURE_ARGON2;
+    let Some((a, b, ta, _, _, _)) = two_nodes().await else {
+        return;
+    };
+    async fn params(h: &Harness, name: &str) -> PasswordParams {
+        let req = PasswordParamsRequest { name: name.into() };
+        h.call("/v1/auth/password/params", None, &req)
+            .await
+            .unwrap()
+    }
+    // Fakes agree across nodes.
+    assert_eq!(params(&a, "ghost").await, params(&b, "ghost").await);
+
+    // Register on A, sign in on B.
+    let (key, salt) =
+        PasswordKey::create(b"pw", FIXTURE_ARGON2, &mut zen_core::rng::OsRng).unwrap();
+    let set = PasswordSet {
+        name: "alice".into(),
+        salt: salt.to_vec(),
+        m_cost_kib: FIXTURE_ARGON2.m_cost_kib,
+        t_cost: FIXTURE_ARGON2.t_cost,
+        p_cost: FIXTURE_ARGON2.p_cost,
+        identity: key.public().encode(),
+    };
+    let id: CredentialId = a
+        .call("/v1/auth/password/set", Some(&ta), &set)
+        .await
+        .unwrap();
+    assert_eq!(params(&b, "alice").await.salt, salt.to_vec());
+    let c: Challenge = b.call("/v1/auth/challenge", None, &Empty {}).await.unwrap();
+    let origin = b.origin();
+    let req = PasswordSessionRequest {
+        name: "alice".into(),
+        sig: key.sign_session(&c.challenge, &origin).unwrap(),
+        challenge: c.challenge,
+        origin,
+    };
+    let s: Session = b
+        .call("/v1/auth/password/session", None, &req)
+        .await
+        .unwrap();
+    fs_list(&b, &s.token).await.unwrap();
+
+    // Removed on A: B stops accepting the session within its cache time.
+    let _: Empty = a
+        .call("/v1/auth/credentials/remove", Some(&ta), &id)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fs_list(&b, &s.token).await.is_ok() {
+        assert!(Instant::now() < deadline, "B kept the session");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Both nodes see the pin set through A's first sign-in.
+    let st: OriginState = b
+        .call("/v1/admin/origins/get", Some(&ta), &Empty {})
+        .await
+        .unwrap();
+    assert_eq!(st.pinned, vec![a.origin()]);
+}
+
+/// A passkey registered on one node signs in on another; its counter is
+/// shared, so a replayed count is refused there too.
+#[tokio::test(flavor = "multi_thread")]
+async fn passkeys_cross_nodes() {
+    use zen_server::webauthn::soft::Authenticator;
+    let Some((a, b, ta, _, _, _)) = two_nodes().await else {
+        return;
+    };
+    let mut key = Authenticator::p256(80);
+    let opts: PasskeyCreation = a
+        .call("/v1/auth/passkey/register/begin", Some(&ta), &Empty {})
+        .await
+        .unwrap();
+    let (attestation_object, client_data_json) =
+        key.create(&opts.rp_id, &opts.challenge, &a.origin());
+    let reg = PasskeyRegister {
+        attestation_object,
+        client_data_json,
+        label: None,
+    };
+    let id: CredentialId = a
+        .call("/v1/auth/passkey/register/finish", Some(&ta), &reg)
+        .await
+        .unwrap();
+    async fn sign_in(h: &Harness, key: &mut Authenticator) -> Result<Session, ApiErr> {
+        let opts: PasskeyRequest = h
+            .call(
+                "/v1/auth/passkey/session/begin",
+                None,
+                &PasskeyBegin::default(),
+            )
+            .await?;
+        let (authenticator_data, client_data_json, signature) =
+            key.get(&opts.rp_id, &opts.challenge, &h.origin());
+        let req = PasskeySession {
+            credential_id: key.credential_id.clone(),
+            authenticator_data,
+            client_data_json,
+            signature,
+            user_handle: None,
+        };
+        h.call("/v1/auth/passkey/session", None, &req).await
+    }
+    let s = sign_in(&b, &mut key).await.unwrap();
+    assert_eq!(s.device_fp, id.id);
+    fs_list(&b, &s.token).await.unwrap();
+    sign_in(&a, &mut key).await.unwrap();
+    key.counter = Some(1);
+    assert_eq!(sign_in(&b, &mut key).await.unwrap_err().0, 401);
+}
+
+/// OPAQUE (auth.md §8): the server setup and the sealed login state are
+/// shared, so a sign-in may start on one node and finish on another, and a
+/// success on one node clears the attempts another counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn opaque_sign_in_crosses_nodes() {
+    if !on_fdb() {
+        return;
+    }
+    let a = Harness::start_with(|c| {
+        opaque_cfg(c);
+        c.auth.password_max_failures = 2;
+    })
+    .await;
+    let b = a.peer().await;
+    let alice = User::new(1);
+    a.claim(&alice, &[]).await;
+    let ta = a.sign_in(&alice).await.unwrap();
+    // B has seen the ACL once alice can sign in there.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while b.sign_in(&alice).await.is_err() {
+        assert!(Instant::now() < deadline, "B never saw the ACL");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (id, reg) = opaque_set(&a, &ta, "alice", b"pw").await.unwrap();
+    let origin = a.origin();
+    assert_eq!(b.origin(), origin);
+    // Start on A, finish on B. Each start counts on A; without the
+    // success B records, the third start would be locked.
+    for _ in 0..3 {
+        let (login, r) = opaque_start(&a, "alice", b"pw", &origin).await.unwrap();
+        let (fin, key) = opaque_client_finish(login, b"pw", &r, &origin);
+        assert_eq!(*key.unwrap(), *reg.export_key, "one server setup");
+        let s = opaque_finish(&b, r.state, fin).await.unwrap();
+        assert_eq!(s.device_fp, id.id);
+        fs_list(&b, &s.token).await.unwrap();
+        fs_list(&a, &s.token).await.unwrap();
+    }
+    let (s, _) = opaque_sign_in(&b, "alice", b"pw").await.unwrap();
+    // A state finishes once, on any node.
+    let (login, r) = opaque_start(&b, "alice", b"pw", &origin).await.unwrap();
+    let (fin, _) = opaque_client_finish(login, b"pw", &r, &origin);
+    opaque_finish(&a, r.state.clone(), fin.clone())
+        .await
+        .unwrap();
+    assert_eq!(opaque_finish(&b, r.state, fin).await.unwrap_err().0, 401);
+
+    // A password change on A ends the sessions on B within its cache time.
+    opaque_set(&a, &ta, "alice", b"pw two").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fs_list(&b, &s.token).await.is_ok() {
+        assert!(Instant::now() < deadline, "B kept the session");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    opaque_sign_in(&b, "alice", b"pw two").await.unwrap();
+}

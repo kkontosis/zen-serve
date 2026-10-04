@@ -226,6 +226,79 @@ fn keyslots_reject_wrong_secrets() {
         Some(Error::Decrypt)
     );
     assert!(keyslot::open(&dslot, Unlock::Device(&dev)).is_ok());
+
+    // The store id of a passkey (auth.md §4.1).
+    assert_eq!(
+        keyslot::passkey_credential_id(b"raw id"),
+        *blake3::derive_key("zen/v1/passkey-id", b"raw id").as_ref()
+    );
+
+    // WebAuthn PRF: the output for the slot's salt opens it; another
+    // output, an altered credential id or salt, or another method doesn't.
+    let (cred, salt, out) = vectors::fixture_prf();
+    let pslot =
+        keyslot::create_webauthn_prf(&fs, &cred, &salt, &out, &mut DetRng::new("w")).unwrap();
+    assert_eq!(keyslot::webauthn_prf_params(&pslot).unwrap(), (cred, salt));
+    assert!(keyslot::open(&pslot, Unlock::WebAuthnPrf(&out)).is_ok());
+    let mut wrong = out;
+    wrong[31] ^= 1;
+    assert_eq!(
+        keyslot::open(&pslot, Unlock::WebAuthnPrf(&wrong)).err(),
+        Some(Error::Decrypt)
+    );
+    for i in [20, 52] {
+        let mut bad = pslot.clone();
+        bad[i] ^= 1; // the credential id, the salt
+        assert_eq!(
+            keyslot::open(&bad, Unlock::WebAuthnPrf(&out)).err(),
+            Some(Error::Decrypt)
+        );
+    }
+    assert_eq!(
+        keyslot::open(&pslot, Unlock::Recovery(&out)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::open(&rslot, Unlock::WebAuthnPrf(&out)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::webauthn_prf_params(&rslot).err(),
+        Some(Error::Param)
+    );
+    assert!(keyslot::open(&pslot[..pslot.len() - 1], Unlock::WebAuthnPrf(&out)).is_err());
+
+    // OPAQUE export key: the key opens it; another key, an altered
+    // credential id, or another method doesn't.
+    let (ocred, key) = vectors::fixture_opaque_export();
+    let oslot = keyslot::create_opaque_export(&fs, &ocred, &key, &mut DetRng::new("o")).unwrap();
+    assert_eq!(keyslot::opaque_export_credential(&oslot).unwrap(), ocred);
+    assert!(keyslot::open(&oslot, Unlock::OpaqueExport(&key)).is_ok());
+    let mut wrong = key;
+    wrong[63] ^= 1;
+    assert_eq!(
+        keyslot::open(&oslot, Unlock::OpaqueExport(&wrong)).err(),
+        Some(Error::Decrypt)
+    );
+    let mut bad = oslot.clone();
+    bad[20] ^= 1; // the credential id
+    assert_eq!(
+        keyslot::open(&bad, Unlock::OpaqueExport(&key)).err(),
+        Some(Error::Decrypt)
+    );
+    assert_eq!(
+        keyslot::open(&oslot, Unlock::WebAuthnPrf(&out)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::open(&pslot, Unlock::OpaqueExport(&key)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::opaque_export_credential(&pslot).err(),
+        Some(Error::Param)
+    );
+    assert!(keyslot::open(&oslot[..oslot.len() - 1], Unlock::OpaqueExport(&key)).is_err());
 }
 
 #[test]
@@ -296,4 +369,65 @@ fn device_cert_binds_user_and_device() {
     let mut bad = cert.clone();
     bad[40] ^= 1; // inside the device public key
     assert!(sig::verify_device_cert(&user.public(), &bad).is_err());
+}
+
+#[test]
+fn password_key_round_trip_and_separation() {
+    use zen_core::pwkey::{self, PasswordKey};
+    let p = vectors::FIXTURE_ARGON2;
+    let (key, salt) = PasswordKey::create(b"hunter2 hunter2", p, &mut OsRng).unwrap();
+    let again = PasswordKey::derive(b"hunter2 hunter2", &salt, p).unwrap();
+    assert_eq!(key.public(), again.public());
+    let sig = again.sign_session(&[7; 32], "https://a.example").unwrap();
+    pwkey::verify_session(&key.public(), &[7; 32], "https://a.example", &sig).unwrap();
+    // Bound to the challenge and the origin.
+    assert_eq!(
+        pwkey::verify_session(&key.public(), &[8; 32], "https://a.example", &sig),
+        Err(Error::Signature)
+    );
+    assert_eq!(
+        pwkey::verify_session(&key.public(), &[7; 32], "https://b.example", &sig),
+        Err(Error::Signature)
+    );
+    // Another password, or another salt, is another key.
+    let wrong = PasswordKey::derive(b"hunter3 hunter3", &salt, p).unwrap();
+    assert_ne!(wrong.public(), key.public());
+    let other = PasswordKey::derive(b"hunter2 hunter2", &[0; 32], p).unwrap();
+    assert_ne!(other.public(), key.public());
+}
+
+#[test]
+fn password_key_parameter_bounds() {
+    use zen_core::pwkey::PasswordKey;
+    let low = Argon2Params {
+        m_cost_kib: 1024,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    // Creation enforces the floor; sign-in only the ceilings.
+    assert!(matches!(
+        PasswordKey::create(b"pw", low, &mut OsRng),
+        Err(Error::Param)
+    ));
+    assert!(PasswordKey::derive(b"pw", &[1; 32], low).is_ok());
+    let huge = Argon2Params {
+        m_cost_kib: Argon2Params::MAX_M_COST_KIB + 1,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    assert!(matches!(
+        PasswordKey::derive(b"pw", &[1; 32], huge),
+        Err(Error::Param)
+    ));
+    for (t, pc) in [(0, 1), (17, 1), (1, 0), (1, 5)] {
+        let bad = Argon2Params {
+            m_cost_kib: 1024,
+            t_cost: t,
+            p_cost: pc,
+        };
+        assert!(matches!(
+            PasswordKey::derive(b"pw", &[1; 32], bad),
+            Err(Error::Param)
+        ));
+    }
 }

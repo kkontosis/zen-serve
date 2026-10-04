@@ -11,6 +11,7 @@ pub mod cbor;
 pub mod commit;
 pub mod config;
 pub mod consume;
+pub mod cred;
 pub mod dump;
 pub mod eph;
 pub mod error;
@@ -18,12 +19,22 @@ pub mod ids;
 pub mod keys;
 pub mod kv;
 pub mod log;
+pub mod mtls;
+pub mod opaque;
+pub mod origin;
+pub mod passkey;
+pub mod password;
+pub mod rsakey;
 pub mod state;
 pub mod statics;
 pub mod stream;
+#[cfg(feature = "fdb")]
 pub mod supervisor;
+pub mod tls;
+pub mod token;
 pub mod tree;
 mod txn;
+pub mod webauthn;
 
 use crate::cbor::Cbor;
 use crate::config::Config;
@@ -83,6 +94,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             ephemeral_bytes_per_sec: l.ephemeral_bytes_per_sec,
             ephemeral_burst_bytes: l.ephemeral_burst_bytes,
         },
+        auth: Some(auth::info(&st).await),
     })
 }
 
@@ -101,6 +113,7 @@ async fn admin_status(
 /// Storage health for `zen-serve status` and `/v1/admin/status`.
 pub async fn cluster_status(cfg: &Config) -> zen_proto::ClusterStatus {
     match (cfg.backend(), cfg.cluster_file()) {
+        #[cfg(feature = "fdb")]
         (config::Backend::Fdb, Some(file)) => match supervisor::status_json(cfg, &file).await {
             Ok(s) => supervisor::summarize(&s),
             Err(e) => zen_proto::ClusterStatus {
@@ -108,6 +121,12 @@ pub async fn cluster_status(cfg: &Config) -> zen_proto::ClusterStatus {
                 messages: vec![e],
                 ..Default::default()
             },
+        },
+        #[cfg(not(feature = "fdb"))]
+        (config::Backend::Fdb, Some(_)) => zen_proto::ClusterStatus {
+            backend: "fdb".into(),
+            messages: vec!["built without the fdb feature".into()],
+            ..Default::default()
         },
         (config::Backend::Fdb, None) => zen_proto::ClusterStatus {
             backend: "fdb".into(),
@@ -160,6 +179,70 @@ pub fn router(st: Shared) -> Router {
         )
         .route("/v1/auth/session", post(auth::session).layer(auth_limit))
         .route("/v1/auth/logout", post(auth::logout).layer(auth_limit))
+        .route(
+            "/v1/auth/password/params",
+            post(password::params).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/password/session",
+            post(password::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/password/set",
+            post(password::set).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/passkey/register/begin",
+            post(passkey::register_begin).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/passkey/register/finish",
+            post(passkey::register_finish).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/v1/auth/passkey/session/begin",
+            post(passkey::session_begin).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/passkey/session",
+            post(passkey::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/register/start",
+            post(opaque::register_start).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/register/finish",
+            post(opaque::register_finish).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/login/start",
+            post(opaque::login_start).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/login/finish",
+            post(opaque::login_finish).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/mtls/session",
+            post(mtls::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/mtls/register",
+            post(mtls::register).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/tokens/create",
+            post(token::create).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/credentials/list",
+            post(cred::list_endpoint).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/credentials/remove",
+            post(cred::remove_endpoint).layer(auth_limit),
+        )
         .route("/v1/acl/put", post(acl::put).layer(acl_limit))
         .route("/v1/acl/get", post(acl::get))
         .route("/v1/fs/list", post(acl::fs_list))
@@ -188,6 +271,8 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/fs/file/get", post(tree::file_get))
         .route("/v1/fs/chunks/get", post(tree::chunks_get))
         .route("/v1/admin/status", post(admin_status))
+        .route("/v1/admin/origins/get", post(origin::admin_get))
+        .route("/v1/admin/origins/set", post(origin::admin_set))
         .route("/v1/stream", get(stream::ws))
         .fallback(statics::fallback)
         .layer(DefaultBodyLimit::max(limit))
@@ -235,7 +320,7 @@ fn claim_token(cfg: &Config) -> std::io::Result<String> {
 }
 
 /// Background housekeeping (G13): expired idempotency records, sessions,
-/// consumed challenges and the ephemeral ring. Every node runs it; each
+/// consumed challenges, API tokens and the ephemeral ring. Every node runs it; each
 /// sweep is an idempotent transaction.
 async fn sweeper(st: Shared) {
     let period = Duration::from_secs(st.cfg.limits.sweep_interval_secs.max(1));
@@ -257,6 +342,10 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
     let n = auth::sweep(st).await?;
     if n > 0 {
         tracing::debug!(removed = n, "expired sessions and challenges");
+    }
+    let n = token::sweep(st).await?;
+    if n > 0 {
+        tracing::debug!(removed = n, "expired API tokens");
     }
     tree::sweep(st, now).await?;
     let cutoff = now.saturating_sub(st.cfg.limits.ephemeral_ttl_secs * zen_store::VERSIONS_PER_SEC);
@@ -314,6 +403,8 @@ pub struct Server {
     pub state: Shared,
     /// The claim token, while unclaimed.
     pub claim_token: Option<String>,
+    /// Start-up warnings, also printed to stderr.
+    pub warnings: Vec<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -328,16 +419,17 @@ impl Server {
 pub async fn start(cfg: Config) -> Result<Server, String> {
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
-    if cfg.public_origins.is_empty() {
-        tracing::warn!(
-            "public_origins is empty: session origins are derived from the Host header, \
-             which a relaying server controls (api.md §3.3); set public_origins in production"
-        );
+    let warnings: Vec<String> = origin::startup_warning(&cfg).into_iter().collect();
+    for w in &warnings {
+        // On stderr as well as in the log: it must not scroll by unseen.
+        eprintln!("{w}");
+        tracing::warn!("public_origins is empty: sign-in relay protection is weak (auth.md §5)");
     }
     let store = open_store(&cfg)?;
     let challenge_key = auth::challenge_key(store.as_ref())
         .await
         .map_err(|e| format!("challenge key: {}", e.message))?;
+
     let is_fs = |fs| cfg.has_fs(fs);
     let acl = acl::load(store.as_ref(), &is_fs)
         .await
@@ -352,6 +444,17 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         state::remove_claim_token(&cfg.data_dir);
         None
     };
+    let tls = match &cfg.tls {
+        Some(t) => {
+            let c = tls::server_config(t, tls::requests_client_certs(Some(t), cfg.auth.mtls))?;
+            tracing::info!(provider = tls::PROVIDER, "native TLS");
+            Some(c)
+        }
+        None => None,
+    };
+    if let Some(note) = mtls::startup_note(&cfg) {
+        tracing::info!("{note}");
+    }
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.listen))?;
@@ -359,17 +462,35 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
     let st: Shared = Arc::new(AppState::new(cfg, store, acl, claim.clone(), challenge_key));
     tokio::spawn(acl::follow(st.clone()));
     tokio::spawn(sweeper(st.clone()));
-    let app = router(st.clone());
-    let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!(error = %e, "server stopped");
+    // Every handler can see its connection: the peer address, and on TLS
+    // the verified client certificate (`tls::Peer`).
+    let app = router(st.clone()).into_make_service_with_connect_info::<tls::Peer>();
+    let task = match tls {
+        Some(cfg) => {
+            let listener = tls::TlsListener::new(listener, cfg).map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "server stopped");
+                }
+            })
         }
-    });
-    tracing::info!(%addr, "zen-serve listening");
+        None => tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!(error = %e, "server stopped");
+            }
+        }),
+    };
+    let scheme = if st.cfg.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    tracing::info!(%addr, scheme, "zen-serve listening");
     Ok(Server {
         addr,
         state: st,
         claim_token: claim,
+        warnings,
         task,
     })
 }

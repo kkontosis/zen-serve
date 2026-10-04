@@ -88,12 +88,13 @@ Every node of a cluster shares these, so a request can go to any node.
 
 | Key | Value |
 |---|---|
-| `pack("sess", H(token))` | `user_fp(32) ‖ device_fp(32) ‖ u64 expires_unix` |
+| `pack("sess", H(token))` | `user_fp(32) ‖ cred(32) ‖ u64 expires_unix ‖ u8 method` |
 | `pack("chal", challenge)` | `u64 expires_unix`: a consumed challenge, kept until it would have expired |
 | `pack("eph", fs, vs)` | ephemeral message: `u16 len ‖ topic ‖ sender_fp(32) ‖ data` |
 | `pack("eh", fs)` | `versionstamp` of the last ephemeral message; watched by each node's tailer |
 
 * `H(token)` is `BLAKE3.derive_key("zen-serve 2025 session token", token)`, so a dump or backup holds no usable bearer tokens.
+* `cred` is the device fingerprint for a device session and the credential id for the other sign-in methods; `method` is the method id (auth.md §1, §3). A record written before sign-in methods existed is 72 bytes, without `method`, and is a device session.
 * The sweeper deletes expired sessions and consumed challenges, and ephemeral entries older than `limits.ephemeral_ttl_secs` (api.md §9.1).
 
 Leases are never deleted: the stored token is what keeps fencing tokens increasing.
@@ -139,3 +140,22 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * The sweeper visits only the trees in `ts`. A move is the only operation that adds a move-log entry or a `TRASH` child, and tombstones only come from purging a tree that is listed, so a tree outside the index has nothing to sweep (chunk GC is per fs, through `cz`).
 * The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count`. Records written before milestone 3.5 have no `write_count`, which then reads as 0.
 
+### 3.7 Sign-in: credentials and origins (auth.md)
+
+| Key | Value |
+|---|---|
+| `pack("cred", user_fp, id)` | credential record, CBOR (auth.md §4) |
+| `pack("credx", id)` | `user_fp(32)`: a credential's owner, by id. For a passkey, `id` is a hash of the WebAuthn credential id (auth.md §4.1), so this also finds the user from the id an authenticator returns |
+| `pack("login", H(name))` | `user_fp(32) ‖ cred_id(32)`: the login-name index of method 6, by the hash of the normalized name (auth.md §4.2) |
+| `pack("login", H(name), method)` | the same, for the other methods with a login name: `method` is the integer 3 (OPAQUE). Method 6's entry has no method element, as it predates the others |
+| `pack("auth_key", "params")` | 32 random bytes: the key of the fake parameters for unknown login names (auth.md §4.2), created on first use once the cluster is claimed |
+| `pack("auth_key", "opaque")` | the OPAQUE server setup (auth.md §8.1): OPRF seed(64) ‖ AKE private key(32) ‖ fake-record public key(32), created on first use once the cluster is claimed. Losing it invalidates every OPAQUE credential |
+| `pack("origins")` | CBOR `[text]`: the pinned sign-in origins (auth.md §5.2); absent when nothing is pinned |
+
+* `user_fp` and `id` are 32-byte byte-string elements.
+* These keys are data, not server metadata: `export` copies them and `import` restores them. So a restored or migrated cluster keeps its credentials, its pin and its fake parameters.
+* All of them are new: a store from before them simply has none.
+* Passkeys (auth.md §7) add no keys: a passkey is a credential record with the method's optional fields, which older readers ignore. Registering a passkey spends its challenge in `pack("chal", challenge)` (§3.5), like a sign-in.
+* OPAQUE (auth.md §8) adds the setup key and a login-index entry per name; a credential is a record with `opaque_record` and `opaque_ksf`. The login state between the two sign-in rounds is not stored: the client carries it, sealed (auth.md §8.3). The single use of its challenge is recorded in `pack("chal", challenge)` (§3.5).
+* A name used by both password methods has two index entries, each pointing to its own credential. A name belongs to one user across methods (auth.md §4.2).
+* TLS client certificates (auth.md §10) add no keys either: a registration is a credential record whose `id` is the SHA-256 of the certificate's public key (auth.md §4.1), so `credx` finds the member from the certificate a connection presents.

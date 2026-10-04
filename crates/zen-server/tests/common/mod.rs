@@ -2,6 +2,8 @@
 //! signed ACLs and a small CBOR client.
 #![allow(dead_code)]
 
+pub mod pki;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::{SinkExt, StreamExt};
@@ -71,15 +73,33 @@ pub fn signed_acl(
     grants: Vec<Grant>,
     limits: Vec<FsLimit>,
 ) -> (Vec<u8>, Vec<u8>) {
-    let doc = AclDoc {
+    let doc = acl_doc(version, prev_doc, admins, members, grants, limits);
+    sign_doc(signer, &doc)
+}
+
+/// An unsigned ACL doc.
+pub fn acl_doc(
+    version: u64,
+    prev_doc: Option<&[u8]>,
+    admins: &[&User],
+    members: &[&User],
+    grants: Vec<Grant>,
+    limits: Vec<FsLimit>,
+) -> AclDoc {
+    AclDoc {
         admins: admins.iter().map(|u| ByteBuf::from(u.fp())).collect(),
         grants,
         limits,
         members: members.iter().map(|u| u.member()).collect(),
+        origins: Vec::new(),
         version,
         prev_hash: prev_doc.map_or(vec![0; 32], |d| acl_hash(d).to_vec()),
-    };
-    let doc_bytes = to_cbor(&doc);
+    }
+}
+
+/// Sign an ACL doc. Returns the signed ACL and the doc bytes.
+pub fn sign_doc(signer: &User, doc: &AclDoc) -> (Vec<u8>, Vec<u8>) {
+    let doc_bytes = to_cbor(doc);
     let sig = signer.id.sign(labels::SIG_ACL, &doc_bytes).unwrap();
     let signed = SignedAcl {
         doc: doc_bytes.clone(),
@@ -97,6 +117,9 @@ pub struct Harness {
     pub http: reqwest::Client,
     pub base: String,
     pub cfg: Config,
+    /// `Host` header to send, as behind a load balancer (peers send their
+    /// first node's, so all nodes share one origin). `None`: the address.
+    pub host: Option<String>,
 }
 
 /// Whether the tests run on FoundationDB (`ZEN_TEST_BACKEND=fdb`, with
@@ -145,6 +168,8 @@ impl Harness {
     async fn launch(cfg: Config, dir: tempfile::TempDir) -> Self {
         let server = zen_server::start(cfg.clone()).await.unwrap();
         let base = format!("http://{}", server.addr);
+        // The server's rustls provider (reqwest has none of its own).
+        zen_server::tls::install_default();
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         Harness {
             server,
@@ -152,6 +177,7 @@ impl Harness {
             http,
             base,
             cfg,
+            host: None,
         }
     }
 
@@ -168,11 +194,32 @@ impl Harness {
         cfg.data_dir = dir.path().join("data");
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         f(&cfg.data_dir);
-        Self::launch(cfg, dir).await
+        let mut peer = Self::launch(cfg, dir).await;
+        peer.host = Some(self.host_header());
+        peer
     }
 
+    /// The `Host` header this harness sends.
+    pub fn host_header(&self) -> String {
+        self.host
+            .clone()
+            .unwrap_or_else(|| self.server.addr.to_string())
+    }
+
+    /// The origin clients of this harness sign.
     pub fn origin(&self) -> String {
-        self.base.clone()
+        let scheme = if self.base.starts_with("https:") {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{}", self.host_header())
+    }
+
+    /// Talk HTTPS to a server with `[tls]`, through `http`.
+    pub fn use_https(&mut self, http: reqwest::Client) {
+        self.base = format!("https://{}", self.server.addr);
+        self.http = http;
     }
 
     pub async fn call<Q: Serialize, R: DeserializeOwned>(
@@ -181,11 +228,50 @@ impl Harness {
         token: Option<&[u8]>,
         req: &Q,
     ) -> Result<R, ApiErr> {
-        let mut rb = self
+        self.call_host(path, token, req, &self.host_header()).await
+    }
+
+    /// `call` with an explicit `Host` header.
+    pub async fn call_host<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: Option<&[u8]>,
+        req: &Q,
+        host: &str,
+    ) -> Result<R, ApiErr> {
+        let rb = self
             .http
             .post(format!("{}{}", self.base, path))
-            .header("content-type", CBOR)
-            .body(to_cbor(req));
+            .header("host", host);
+        self.send(rb, path, token, req).await
+    }
+
+    /// `call` through another HTTP client, adding `headers`.
+    pub async fn call_via<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        http: &reqwest::Client,
+        headers: &[(&str, &str)],
+        path: &str,
+        token: Option<&[u8]>,
+        req: &Q,
+    ) -> Result<R, ApiErr> {
+        let mut rb = http
+            .post(format!("{}{}", self.base, path))
+            .header("host", self.host_header());
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        self.send(rb, path, token, req).await
+    }
+
+    async fn send<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+        path: &str,
+        token: Option<&[u8]>,
+        req: &Q,
+    ) -> Result<R, ApiErr> {
+        let mut rb = rb.header("content-type", CBOR).body(to_cbor(req));
         if let Some(t) = token {
             rb = rb.header(
                 "authorization",
@@ -217,15 +303,21 @@ impl Harness {
     }
 
     pub async fn sign_in(&self, u: &User) -> Result<Vec<u8>, ApiErr> {
+        self.sign_in_at(u, &self.origin(), &self.host_header())
+            .await
+    }
+
+    /// Device sign-in signing `origin`, sending `host` as the `Host` header.
+    pub async fn sign_in_at(&self, u: &User, origin: &str, host: &str) -> Result<Vec<u8>, ApiErr> {
         let c: Challenge = self.call("/v1/auth/challenge", None, &Empty {}).await?;
-        let origin = self.origin();
+        let origin = origin.to_string();
         let sig = u
             .device
             .signing()
             .sign(labels::SIG_SESSION, &session_message(&c.challenge, &origin))
             .unwrap();
         let s: Session = self
-            .call(
+            .call_host(
                 "/v1/auth/session",
                 None,
                 &SessionRequest {
@@ -235,6 +327,7 @@ impl Harness {
                     cert: u.cert.clone(),
                     sig,
                 },
+                host,
             )
             .await?;
         Ok(s.token)
@@ -245,8 +338,16 @@ impl Harness {
         signed: Vec<u8>,
         claim: Option<String>,
     ) -> Result<AclVersion, ApiErr> {
-        self.call("/v1/acl/put", None, &AclPut { acl: signed, claim })
-            .await
+        self.call(
+            "/v1/acl/put",
+            None,
+            &AclPut {
+                acl: signed,
+                claim,
+                origin: None,
+            },
+        )
+        .await
     }
 
     /// Claim the server with `admin`, granting each user `rights` on fs 1
@@ -331,4 +432,138 @@ pub async fn recv(ws: &mut Ws) -> Frame {
             return from_cbor(&b).unwrap();
         }
     }
+}
+
+// ---- OPAQUE client (auth.md §8)
+
+/// The Argon2id parameters of OPAQUE test servers: the registration floor,
+/// so that fake records for unknown names are as cheap as real ones.
+pub fn opaque_cfg(c: &mut Config) {
+    let p = zen_core::vectors::FIXTURE_ARGON2;
+    c.auth.opaque = true;
+    c.auth.password_m_cost_kib = p.m_cost_kib;
+    c.auth.password_t_cost = p.t_cost;
+    c.auth.password_p_cost = p.p_cost;
+}
+
+/// Register (or replace) the caller's OPAQUE password, with the
+/// parameters the server asks for. Returns the credential id and the
+/// client's result (export key, server key).
+pub async fn opaque_set(
+    h: &Harness,
+    tok: &[u8],
+    name: &str,
+    pw: &[u8],
+) -> Result<(CredentialId, zen_core::opaque::Finished), ApiErr> {
+    use zen_core::opaque::Registration;
+    let (reg, request) = Registration::start(pw, &mut zen_core::rng::OsRng).unwrap();
+    let r: OpaqueRegistration = h
+        .call(
+            "/v1/auth/opaque/register/start",
+            Some(tok),
+            &OpaqueRegisterStart {
+                name: name.into(),
+                request,
+            },
+        )
+        .await?;
+    let p = zen_core::keyslot::Argon2Params {
+        m_cost_kib: r.m_cost_kib,
+        t_cost: r.t_cost,
+        p_cost: r.p_cost,
+    };
+    let done = reg
+        .finish(pw, &r.response, p, &mut zen_core::rng::OsRng)
+        .unwrap();
+    let id = h
+        .call(
+            "/v1/auth/opaque/register/finish",
+            Some(tok),
+            &OpaqueRegisterFinish {
+                name: name.into(),
+                upload: done.message.clone(),
+                m_cost_kib: p.m_cost_kib,
+                t_cost: p.t_cost,
+                p_cost: p.p_cost,
+            },
+        )
+        .await?;
+    Ok((id, done))
+}
+
+/// The first sign-in round, with the origin the client puts in its start
+/// request.
+pub async fn opaque_start(
+    h: &Harness,
+    name: &str,
+    pw: &[u8],
+    origin: &str,
+) -> Result<(zen_core::opaque::Login, OpaqueLoginResponse), ApiErr> {
+    let (login, request) = zen_core::opaque::Login::start(pw, &mut zen_core::rng::OsRng).unwrap();
+    let r = h
+        .call(
+            "/v1/auth/opaque/login/start",
+            None,
+            &OpaqueLoginStart {
+                name: name.into(),
+                origin: origin.into(),
+                request,
+            },
+        )
+        .await?;
+    Ok((login, r))
+}
+
+/// The client's second step with the origin it sees: the finalization to
+/// send and the export key, or 64 zero bytes and no key when the client
+/// can't finish (a wrong password or an unknown name), so the server still
+/// answers.
+pub fn opaque_client_finish(
+    login: zen_core::opaque::Login,
+    pw: &[u8],
+    r: &OpaqueLoginResponse,
+    origin: &str,
+) -> (Vec<u8>, Option<zen_core::opaque::ExportKey>) {
+    let p = zen_core::keyslot::Argon2Params {
+        m_cost_kib: r.m_cost_kib,
+        t_cost: r.t_cost,
+        p_cost: r.p_cost,
+    };
+    match login.finish(pw, &r.response, p, origin, &mut zen_core::rng::OsRng) {
+        Ok(done) => (done.message, Some(done.export_key)),
+        Err(e) => {
+            assert_eq!(e, zen_core::Error::Decrypt);
+            (vec![0; 64], None)
+        }
+    }
+}
+
+/// The second sign-in round.
+pub async fn opaque_finish(
+    h: &Harness,
+    state: Vec<u8>,
+    finalization: Vec<u8>,
+) -> Result<Session, ApiErr> {
+    h.call(
+        "/v1/auth/opaque/login/finish",
+        None,
+        &OpaqueLoginFinish {
+            state,
+            finalization,
+        },
+    )
+    .await
+}
+
+/// A whole OPAQUE sign-in through this harness's origin.
+pub async fn opaque_sign_in(
+    h: &Harness,
+    name: &str,
+    pw: &[u8],
+) -> Result<(Session, zen_core::opaque::ExportKey), ApiErr> {
+    let origin = h.origin();
+    let (login, r) = opaque_start(h, name, pw, &origin).await?;
+    let (fin, key) = opaque_client_finish(login, pw, &r, &origin);
+    let s = opaque_finish(h, r.state, fin).await?;
+    Ok((s, key.expect("a session needs a finished client")))
 }

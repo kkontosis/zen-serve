@@ -41,6 +41,7 @@ macro_rules! ctor {
 ctor!(bad_request, BAD_REQUEST, "bad_request");
 ctor!(unauthorized, UNAUTHORIZED, "unauthorized");
 ctor!(forbidden, FORBIDDEN, "forbidden");
+ctor!(method_disabled, FORBIDDEN, "method_disabled");
 ctor!(not_found, NOT_FOUND, "not_found");
 ctor!(conflict, CONFLICT, "conflict");
 ctor!(too_old, CONFLICT, "too_old");
@@ -51,6 +52,7 @@ ctor!(resync, CONFLICT, "resync");
 ctor!(version_mismatch, CONFLICT, "version_mismatch");
 ctor!(group_exists, CONFLICT, "group_exists");
 ctor!(commit_id_reused, CONFLICT, "commit_id_reused");
+ctor!(name_taken, CONFLICT, "name_taken");
 ctor!(cursor_moved, PRECONDITION_FAILED, "cursor_moved");
 ctor!(not_leader, PRECONDITION_FAILED, "not_leader");
 ctor!(claim_lost, PRECONDITION_FAILED, "claim_lost");

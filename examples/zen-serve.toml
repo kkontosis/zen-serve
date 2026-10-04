@@ -3,8 +3,10 @@
 listen = "127.0.0.1:8080"
 data_dir = "./zen-data"
 
-# Origins clients sign into (scheme://host[:port]). Empty: derived from the
-# Host header, which is fine behind a reverse proxy that preserves it.
+# Origins clients sign into (scheme://host[:port], lowercase, no trailing
+# slash): spec/auth.md §5.1. Set this in production. While it is empty the
+# server prints a warning at start-up, pins the first origin that signs in
+# after the claim, and trusts the Host header until then.
 public_origins = []
 
 # Plaintext static files. Without this, the bundled defaults are served.
@@ -17,6 +19,45 @@ cross_origin_isolation = false
 
 # Extra origins allowed to call the API (G17). Empty: same-origin only.
 cors_origins = []
+
+# Native TLS (spec/operations.md §8). Without [tls], plain HTTP: put the
+# server behind a TLS reverse proxy. The server key: ECDSA P-256/P-384,
+# Ed25519, or RSA (2048-4096 bits) in the default build; the pure-Rust
+# build (--no-default-features) refuses RSA server keys. Client
+# certificates and their CA may also be RSA, in both builds.
+# [tls]
+# cert = "/etc/zen/api.pem"               # PEM chain, the server's certificate first
+# key = "/etc/zen/api.key"
+# client_ca = "/etc/zen/clients-ca.pem"   # ask for client certificates (sign-in method 5)
+
+# Sign-in methods (spec/auth.md §2). Each can be turned off on its own.
+[auth]
+device_keys = true     # 1: per-device keys certified in the signed ACL
+passkeys = true        # 2: WebAuthn passkeys
+opaque = false         # 3: OPAQUE passwords (not implemented yet)
+api_tokens = false     # 4: admin-issued bearer tokens for services
+mtls = true            # 5: TLS client certificates (dormant without [tls] client_ca or a trusted proxy)
+password_keys = true   # 6: password-derived keys, the default method
+# Origin policy (spec/auth.md §5).
+origin_pinning = true            # 7b: pin the first origin while public_origins is empty
+origin_pinning_always = false    # keep 7b alongside public_origins (risky)
+acl_origins = false              # 7c: also accept the origins listed in the signed ACL
+# Method 6 (spec/auth.md §11): Argon2id parameters advertised for registration
+# (and returned for unknown login names), and the failed sign-in limiter.
+password_m_cost_kib = 262144
+password_t_cost = 3
+password_p_cost = 1
+password_max_failures = 10
+password_lockout_secs = 300
+# Method 2 (spec/auth.md §7): the relying-party id is the canonical origin's
+# host unless set here; user verification (PIN, biometric) is required.
+# passkey_rp_id = "example.org"
+passkey_require_uv = true
+# Method 5 (spec/auth.md §10.2): reverse proxies that verify client
+# certificates and forward them in a header. zen-serve trusts them
+# completely: list only the proxies, and have them always set the header.
+mtls_trusted_proxies = []        # e.g. ["10.0.0.5", "fd00:1::/64"]
+mtls_proxy_header = "x-client-cert"
 
 [[fs]]
 id = 1   # "/"

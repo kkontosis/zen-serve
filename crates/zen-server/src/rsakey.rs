@@ -1,0 +1,427 @@
+//! RSA public keys under one policy, for passkeys (auth.md §7) and TLS
+//! certificates and keys (operations.md §8): a modulus of
+//! [`MIN_BITS`]..=[`MAX_BITS`] bits and an odd public exponent in
+//! [`MIN_E`]..=[`MAX_E`].
+//!
+//! Only public-key operations of the `rsa` crate are used. Its private-key
+//! operations are not constant-time (RUSTSEC-2023-0071), so it never holds
+//! an RSA private key (`TD-TLS-RSA-SERVER-KEY`). An RSA TLS server key is
+//! ring's, with the `ring` feature (`tls::ring`), and checked here by its
+//! public part ([`check_spki_der`]).
+
+/// Smallest RSA modulus accepted, in bits.
+pub const MIN_BITS: usize = 2048;
+/// Largest RSA modulus accepted, in bits: larger keys only cost
+/// verification time.
+pub const MAX_BITS: usize = 4096;
+/// Smallest RSA public exponent accepted (as FIPS 186-5).
+pub const MIN_E: u64 = 65537;
+/// Largest RSA public exponent accepted.
+pub const MAX_E: u64 = u32::MAX as u64;
+
+/// Why a key was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Well formed, but outside the policy.
+    Policy(&'static str),
+    /// Not an RSA public key.
+    Malformed,
+}
+
+/// The key with modulus `n` and exponent `e`, big-endian (leading zero
+/// bytes are ignored), checked against the policy.
+pub fn from_components(n: &[u8], e: &[u8]) -> Result<rsa::RsaPublicKey, Refused> {
+    let (n, e64) = policy(n, e)?;
+    let n = rsa::BoxedUint::from_be_slice_vartime(n);
+    let e = rsa::BoxedUint::from(e64);
+    rsa::RsaPublicKey::new_with_max_size(n, e, MAX_BITS).map_err(|_| Refused::Malformed)
+}
+
+/// The policy on a modulus `n` and an exponent `e`, big-endian: the
+/// modulus without leading zeros, and the exponent.
+fn policy<'a>(n: &'a [u8], e: &[u8]) -> Result<(&'a [u8], u64), Refused> {
+    let strip = |b: &[u8]| -> usize { b.iter().position(|&x| x != 0).unwrap_or(b.len()) };
+    let (n, e) = (&n[strip(n)..], &e[strip(e)..]);
+    let bits = match n.first() {
+        Some(top) => n.len() * 8 - top.leading_zeros() as usize,
+        None => 0,
+    };
+    if !(MIN_BITS..=MAX_BITS).contains(&bits) {
+        return Err(Refused::Policy(
+            "an RSA modulus must have 2048 to 4096 bits",
+        ));
+    }
+    if e.len() > 8 {
+        return Err(Refused::Policy("RSA public exponent out of range"));
+    }
+    let mut e8 = [0u8; 8];
+    e8[8 - e.len()..].copy_from_slice(e);
+    let e64 = u64::from_be_bytes(e8);
+    if e64 % 2 == 0 || !(MIN_E..=MAX_E).contains(&e64) {
+        return Err(Refused::Policy(
+            "the RSA public exponent must be odd, at least 65537 and fit 32 bits",
+        ));
+    }
+    if n.last().is_some_and(|b| b & 1 == 0) {
+        return Err(Refused::Malformed);
+    }
+    Ok((n, e64))
+}
+
+/// The key in a DER `RSAPublicKey` (RFC 8017 A.1.1: `SEQUENCE { modulus
+/// INTEGER, publicExponent INTEGER }`), the content of an X.509
+/// `subjectPublicKey` for `rsaEncryption`. Strict DER: minimal lengths and
+/// integers, positive integers, nothing trailing.
+pub fn from_pkcs1_der(der: &[u8]) -> Result<rsa::RsaPublicKey, Refused> {
+    let (n, e) = pkcs1_components(der)?;
+    from_components(n, e)
+}
+
+/// [`from_pkcs1_der`]'s checks, for a key that something other than the
+/// `rsa` crate will use (ring, in `tls::ring`).
+pub fn check_pkcs1_der(der: &[u8]) -> Result<(), Refused> {
+    let (n, e) = pkcs1_components(der)?;
+    policy(n, e).map(|_| ())
+}
+
+/// The policy on the key of a DER `SubjectPublicKeyInfo` for
+/// `rsaEncryption` (RFC 5280 4.1, RFC 3279 2.3.1): `SEQUENCE { SEQUENCE {
+/// OID 1.2.840.113549.1.1.1, NULL }, BIT STRING { 0 unused bits,
+/// RSAPublicKey } }`.
+pub fn check_spki_der(spki: &[u8]) -> Result<(), Refused> {
+    const ALG: [u8; 15] = [
+        0x30, 13, 6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1, 5, 0,
+    ];
+    let (seq, rest) = tlv(spki, 0x30).ok_or(Refused::Malformed)?;
+    if !rest.is_empty() {
+        return Err(Refused::Malformed);
+    }
+    let key = seq.strip_prefix(&ALG[..]).ok_or(Refused::Malformed)?;
+    let (bits, rest) = tlv(key, 0x03).ok_or(Refused::Malformed)?;
+    if !rest.is_empty() {
+        return Err(Refused::Malformed);
+    }
+    check_pkcs1_der(bits.strip_prefix(&[0]).ok_or(Refused::Malformed)?)
+}
+
+/// Whether a PKCS#8 key's algorithm is `rsaEncryption` (1.2.840.113549.1.1.1):
+/// `SEQUENCE { INTEGER 0, SEQUENCE { OID, ... }, ... }`.
+pub fn pkcs8_is_rsa(k: &[u8]) -> bool {
+    const OID: [u8; 11] = [6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
+    // The algorithm's OID follows the version within the first few bytes,
+    // whatever the outer length's form.
+    k.windows(OID.len()).take(16).any(|w| w == OID)
+}
+
+/// The modulus and the exponent of a DER `RSAPublicKey`, strictly.
+fn pkcs1_components(der: &[u8]) -> Result<(&[u8], &[u8]), Refused> {
+    let (seq, rest) = tlv(der, 0x30).ok_or(Refused::Malformed)?;
+    if !rest.is_empty() {
+        return Err(Refused::Malformed);
+    }
+    let (n, rest) = uint(seq).ok_or(Refused::Malformed)?;
+    let (e, rest) = uint(rest).ok_or(Refused::Malformed)?;
+    if !rest.is_empty() {
+        return Err(Refused::Malformed);
+    }
+    Ok((n, e))
+}
+
+/// One DER element with tag `tag`: its content and what follows. Lengths
+/// up to 65535 bytes, minimally encoded.
+fn tlv(b: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (&t, rest) = b.split_first()?;
+    if t != tag {
+        return None;
+    }
+    let (&l0, rest) = rest.split_first()?;
+    let (len, rest) = match l0 {
+        0..=0x7f => (usize::from(l0), rest),
+        0x81 => {
+            let (&l, rest) = rest.split_first()?;
+            if l < 0x80 {
+                return None;
+            }
+            (usize::from(l), rest)
+        }
+        0x82 => {
+            let l = usize::from(u16::from_be_bytes([*rest.first()?, *rest.get(1)?]));
+            if l < 0x100 {
+                return None;
+            }
+            (l, &rest[2..])
+        }
+        _ => return None,
+    };
+    (rest.len() >= len).then(|| rest.split_at(len))
+}
+
+/// A positive DER INTEGER: its magnitude without the sign byte, and what
+/// follows.
+fn uint(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (v, rest) = tlv(b, 0x02)?;
+    match v {
+        [] => None,
+        // A leading zero only before a byte with the top bit set.
+        [0, next, ..] if next & 0x80 == 0 => None,
+        [0, tail @ ..] => Some((tail, rest)),
+        [first, ..] if first & 0x80 != 0 => None,
+        _ => Some((v, rest)),
+    }
+}
+
+/// RSA helpers for tests: keys are generated by
+/// [`crate::webauthn::soft::rsa_key`].
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testing {
+    use rsa::traits::{PrivateKeyParts as _, PublicKeyParts as _};
+
+    /// The OS RNG, for the `rsa` crate's randomized signers (PSS salts).
+    pub struct OsRng;
+
+    impl rsa::rand_core::TryRng for OsRng {
+        type Error = std::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut b = [0; 4];
+            self.try_fill_bytes(&mut b)?;
+            Ok(u32::from_le_bytes(b))
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut b = [0; 8];
+            self.try_fill_bytes(&mut b)?;
+            Ok(u64::from_le_bytes(b))
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            getrandom::fill(dst).expect("OS RNG");
+            Ok(())
+        }
+    }
+
+    impl rsa::rand_core::TryCryptoRng for OsRng {}
+
+    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len < 0x100 {
+            out.extend_from_slice(&[0x81, len as u8]);
+        } else {
+            out.push(0x82);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn int(n: &rsa::BoxedUint) -> Vec<u8> {
+        let b = n.to_be_bytes();
+        let start = b.iter().position(|&x| x != 0).unwrap_or(b.len() - 1);
+        let mut c = Vec::new();
+        if b[start] & 0x80 != 0 {
+            c.push(0);
+        }
+        c.extend_from_slice(&b[start..]);
+        der(0x02, &c)
+    }
+
+    /// A PKCS#1 `RSAPublicKey`, DER.
+    pub fn public_der(k: &rsa::RsaPublicKey) -> Vec<u8> {
+        der(0x30, &[int(k.n()), int(k.e())].concat())
+    }
+
+    /// A PKCS#1 `RSAPrivateKey`, DER.
+    pub fn private_der(k: &rsa::RsaPrivateKey) -> Vec<u8> {
+        let p = k.primes();
+        let (dp, dq) = (k.dp().expect("dp"), k.dq().expect("dq"));
+        let qinv = k.qinv().expect("qinv").retrieve();
+        let body = [
+            der(0x02, &[0]),
+            int(k.n()),
+            int(k.e()),
+            int(k.d()),
+            int(&p[0]),
+            int(&p[1]),
+            int(dp),
+            int(dq),
+            int(&qinv),
+        ]
+        .concat();
+        der(0x30, &body)
+    }
+
+    /// A PKCS#8 `PrivateKeyInfo` for `rsaEncryption`, DER.
+    pub fn pkcs8_der(k: &rsa::RsaPrivateKey) -> Vec<u8> {
+        let alg = der(
+            0x30,
+            &[
+                &[6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1][..],
+                &[5, 0],
+            ]
+            .concat(),
+        );
+        der(
+            0x30,
+            &[der(0x02, &[0]), alg, der(0x04, &private_der(k))].concat(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(v: &[u8]) -> Vec<u8> {
+        let mut c = Vec::new();
+        if v[0] & 0x80 != 0 {
+            c.push(0);
+        }
+        c.extend_from_slice(v);
+        der(0x02, &c)
+    }
+
+    fn der(tag: u8, c: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match c.len() {
+            0..=0x7f => out.push(c.len() as u8),
+            0x80..=0xff => out.extend_from_slice(&[0x81, c.len() as u8]),
+            _ => {
+                out.push(0x82);
+                out.extend_from_slice(&(c.len() as u16).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(c);
+        out
+    }
+
+    fn key(n: &[u8], e: &[u8]) -> Vec<u8> {
+        der(0x30, &[int(n), int(e)].concat())
+    }
+
+    /// An odd modulus of `bits` bits (not a real key: the policy and the
+    /// encoding are all that is checked here).
+    fn modulus(bits: usize) -> Vec<u8> {
+        let mut n = vec![0xff; bits.div_ceil(8)];
+        n[0] = 0xff >> (n.len() * 8 - bits);
+        n
+    }
+
+    #[test]
+    fn policy() {
+        let e = [1, 0, 1];
+        for bits in [2048, 3072, 4096] {
+            assert!(from_pkcs1_der(&key(&modulus(bits), &e)).is_ok(), "{bits}");
+        }
+        for bits in [1024, 2047, 4097] {
+            assert!(
+                matches!(
+                    from_pkcs1_der(&key(&modulus(bits), &e)),
+                    Err(Refused::Policy(_))
+                ),
+                "{bits}"
+            );
+        }
+        for e in [&[3][..], &[1, 0, 0], &[1, 0, 0, 0, 0, 1]] {
+            assert!(matches!(
+                from_pkcs1_der(&key(&modulus(2048), e)),
+                Err(Refused::Policy(_))
+            ));
+        }
+        // Leading zeros of raw components are ignored.
+        assert!(from_components(&[&[0, 0][..], &modulus(2048)].concat(), &[0, 1, 0, 1]).is_ok());
+    }
+
+    #[test]
+    fn real_keys_round_trip() {
+        let k = crate::webauthn::soft::rsa_key(1, 2048);
+        let der = testing::public_der(&k.to_public_key());
+        assert_eq!(from_pkcs1_der(&der).unwrap(), k.to_public_key());
+        let small = crate::webauthn::soft::rsa_key(1, 1024);
+        assert!(matches!(
+            from_pkcs1_der(&testing::public_der(&small.to_public_key())),
+            Err(Refused::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn checks_without_the_rsa_crate() {
+        use rustls::pki_types::alg_id;
+        use rustls::sign::public_key_to_spki;
+        // The same verdicts as from_pkcs1_der.
+        let e = [1, 0, 1];
+        for (bits, e) in [
+            (2048, &e[..]),
+            (4096, &e),
+            (1024, &e),
+            (4097, &e),
+            (2048, &[3]),
+        ] {
+            let k = key(&modulus(bits), e);
+            assert_eq!(
+                check_pkcs1_der(&k),
+                from_pkcs1_der(&k).map(|_| ()),
+                "{bits}"
+            );
+        }
+        // An even modulus is no RSA key.
+        let mut even = modulus(2048);
+        *even.last_mut().unwrap() = 0xfe;
+        assert_eq!(check_pkcs1_der(&key(&even, &e)), Err(Refused::Malformed));
+        // A SubjectPublicKeyInfo, as rustls builds it.
+        let real = crate::webauthn::soft::rsa_key(1, 2048).to_public_key();
+        let spki = public_key_to_spki(&alg_id::RSA_ENCRYPTION, testing::public_der(&real));
+        assert_eq!(check_spki_der(spki.as_ref()), Ok(()));
+        let small = public_key_to_spki(&alg_id::RSA_ENCRYPTION, key(&modulus(1024), &e));
+        assert!(matches!(
+            check_spki_der(small.as_ref()),
+            Err(Refused::Policy(_))
+        ));
+        let ec = public_key_to_spki(&alg_id::ECDSA_P256, testing::public_der(&real));
+        assert_eq!(check_spki_der(ec.as_ref()), Err(Refused::Malformed));
+        let trailing = [spki.as_ref(), &[0]].concat();
+        assert_eq!(check_spki_der(&trailing), Err(Refused::Malformed));
+        // PKCS#8 RSA keys are told apart.
+        let k = crate::webauthn::soft::rsa_key(1, 2048);
+        assert!(pkcs8_is_rsa(&testing::pkcs8_der(&k)));
+        assert!(!pkcs8_is_rsa(&[0x30, 0]));
+    }
+
+    #[test]
+    fn strict_der() {
+        let good = key(&modulus(2048), &[1, 0, 1]);
+        assert!(from_pkcs1_der(&good).is_ok());
+        // Trailing bytes, inside and after the sequence.
+        assert_eq!(
+            from_pkcs1_der(&[good.clone(), vec![0]].concat()).err(),
+            Some(Refused::Malformed)
+        );
+        let inner = [int(&modulus(2048)), int(&[1, 0, 1]), vec![5, 0]].concat();
+        assert_eq!(
+            from_pkcs1_der(&der(0x30, &inner)).err(),
+            Some(Refused::Malformed)
+        );
+        // A negative or non-minimal integer.
+        let neg = [der(0x02, &modulus(2048)), int(&[1, 0, 1])].concat();
+        assert_eq!(
+            from_pkcs1_der(&der(0x30, &neg)).err(),
+            Some(Refused::Malformed)
+        );
+        let padded = [int(&modulus(2048)), der(0x02, &[0, 1, 0, 1])].concat();
+        assert_eq!(
+            from_pkcs1_der(&der(0x30, &padded)).err(),
+            Some(Refused::Malformed)
+        );
+        // A non-minimal length, a wrong tag, truncation.
+        let mut long = good.clone();
+        long.splice(1..4, [0x83, 0x00, 0x01, 0x0a]);
+        assert_eq!(from_pkcs1_der(&long).err(), Some(Refused::Malformed));
+        let mut tag = good.clone();
+        tag[0] = 0x31;
+        assert_eq!(from_pkcs1_der(&tag).err(), Some(Refused::Malformed));
+        assert_eq!(
+            from_pkcs1_der(&good[..good.len() - 1]).err(),
+            Some(Refused::Malformed)
+        );
+        assert_eq!(from_pkcs1_der(&[]).err(), Some(Refused::Malformed));
+    }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "An OPAQUE export-key keyslot (type 5) wrapping the fixture fs bundle (keys.json fs_epoch0.bundle). export_key stands in for an OPAQUE client's 64-byte export key; secret = BLAKE3.derive_key(\"zen/v1/opaque-keyslot\", export_key).",
+  "opaque_export": {
+    "credential_id": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+    "export_key": "00070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9",
+    "rng_seed": "slot-opaque",
+    "secret": "df44c45e9cda26febaa4fab0983931884dbcb63d84b4034fa01c8993b6c170bc",
+    "slot": "01010500d309178b991528f3efbdafd57712d9a0e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3763fcd3dbcaf187674fee0966386d25cc8986c572eaac4d555e608efb2157691a5dcb2ce3ebed50684ee4cb11ba2c66e7121e98a42448e1bac16f16b8fb14f0f15b1b51abb52aee01100f82c39339b92243d4d3549e13beb134aba131b53c6897742298a624ddb3c376d3ed6f69f799f"
+  }
+}

@@ -237,6 +237,57 @@ pub fn eph_head(fs: u32) -> Vec<u8> {
     Key::new().str("eh").int(fs.into()).finish()
 }
 
+/// The pinned sign-in origins (auth.md §5.2): exported with the data, not
+/// server metadata, so a restored or migrated cluster keeps its pin.
+pub fn origin_pins() -> Vec<u8> {
+    Key::new().str("origins").finish()
+}
+
+/// `("cred", user)`: a user's stored credentials (auth.md §4).
+pub fn creds_of(user: &[u8; 32]) -> Vec<u8> {
+    Key::new().str("cred").bytes(user).finish()
+}
+
+/// `("cred")`: every stored credential.
+pub fn creds_prefix() -> Vec<u8> {
+    Key::new().str("cred").finish()
+}
+
+/// A stored credential: `("cred", user, id)` → CBOR record.
+pub fn cred(user: &[u8; 32], id: &[u8; 32]) -> Vec<u8> {
+    Key::new().str("cred").bytes(user).bytes(id).finish()
+}
+
+/// A credential's owner by id: `("credx", id)` → `user_fp(32)`.
+pub fn cred_owner(id: &[u8; 32]) -> Vec<u8> {
+    Key::new().str("credx").bytes(id).finish()
+}
+
+/// The login-name index of a method with a login name (auth.md §4.2):
+/// `("login", H(name))` for method 6, which predates the method element,
+/// and `("login", H(name), method)` for the others (method 3)
+/// → `user_fp(32) ‖ cred_id(32)`.
+pub fn login(method: u8, name_hash: &[u8; 32]) -> Vec<u8> {
+    let k = Key::new().str("login").bytes(name_hash);
+    if method == 6 {
+        k.finish()
+    } else {
+        k.int(method.into()).finish()
+    }
+}
+
+/// The key the fake sign-in parameters for unknown login names are
+/// derived with (auth.md §4.2): 32 random bytes, exported with the data.
+pub fn params_key() -> Vec<u8> {
+    Key::new().str("auth_key").str("params").finish()
+}
+
+/// The OPAQUE server setup (auth.md §8.1): the OPRF seed and the AKE key
+/// pair, exported with the data. Losing it invalidates every OPAQUE record.
+pub fn opaque_setup() -> Vec<u8> {
+    Key::new().str("auth_key").str("opaque").finish()
+}
+
 /// Server metadata.
 pub fn meta(name: &str) -> Vec<u8> {
     Key::new().str("meta").str(name).finish()

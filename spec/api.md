@@ -6,7 +6,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
 * **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
-* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3). Three requests don't need it: `/v1/info`, `/v1/auth/*` and `/v1/acl/put`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin`, `/v1/auth/passkey/session`, `/v1/auth/mtls/session` and `/v1/auth/opaque/login/{start,finish}`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
   | Status | `code` | Retry? |
@@ -14,16 +14,17 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 400 | `bad_request` | no |
   | 401 | `unauthorized` (no or expired session) | after signing in again |
   | 403 | `forbidden` (ACL) | no |
+  | 403 | `method_disabled` (the sign-in method is turned off on this server, auth.md §2) | no |
   | 404 | `not_found` (unknown fs, group, …) | no |
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
   | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
   | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
   | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4) | with a fresh `hlc` (rebase); not for a purged node |
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
-  | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
+  | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1) | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, §3.16, credentials per user §3.7, §3.8, §3.11, §3.13, §3.15) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -45,7 +46,13 @@ No authentication. Returns:
             ephemeral_bytes_per_sec, ephemeral_burst_bytes,
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
-            chunk_grace_secs } }
+            chunk_grace_secs },
+  auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2); a dormant mtls is left out (auth.md §10)
+           origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
+           passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
+                       user_verification: text,         // "required" or "preferred" (auth.md §7.5)
+                       algorithms: [int] },             // COSE algorithms, preferred first: [-8, -7, -257]
+           password_params?: { m_cost_kib: u32, t_cost: u32, p_cost: u32 } } }   // auth.md §11.2
 ```
 
 Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
@@ -54,28 +61,36 @@ Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,0
 
 ## 3. Sessions
 
+The sign-in methods, their configuration, the credential store and the origin policy are specified in [auth.md](auth.md). Every method ends in a session token, except API tokens, which are bearer tokens themselves (auth.md §9).
+
 ### 3.1 `POST /v1/auth/challenge`
 
 `{}` → `{challenge: bytes(32)}`. Challenges are single-use and expire after 60 s. Any node of a cluster accepts a challenge issued by another: a challenge is `nonce(12) ‖ u32 expires_unix ‖ MAC(16)` under a cluster-wide key, and its use is recorded when the session is created. Clients treat it as opaque.
 
 ### 3.2 `POST /v1/auth/session`
 
+Device sign-in (method 1, auth.md §6).
+
 ```
 { challenge: bytes(32), origin: text,
   user: bytes,          // user's public identity (formats.md §7.2)
   cert: bytes,          // device certificate issued by `user` (formats.md §7.4)
   sig: bytes }          // device signature, purpose zen/v1/sig/session (formats.md §10)
-→ { token: bytes(32), expires_unix: u64, user_fp: bytes(32), device_fp: bytes(32) }
+→ Session
+
+Session = { token: bytes(32), expires_unix: u64, user_fp: bytes(32),
+            device_fp: bytes(32),   // the device, or for other methods the credential id (auth.md §3)
+            method?: text }         // the sign-in method (auth.md §1)
 ```
 
-The server checks all of these, or returns 401:
+403 `method_disabled` if device keys are off. Otherwise the server checks all of these, or returns 401:
 * the challenge is live
 * `origin` is one the server accepts (§3.3)
 * `user` is a member of the current ACL
 * `cert` verifies against `user`, and the certified device is listed under that member
 * `sig` verifies with the certified device's signing key
 
-A session is checked again on every request: it stops working as soon as an ACL version removes its device. Sessions are stored (hashed) in the keyspace, so every node of a cluster accepts them. Each node caches a session for up to 10 s.
+A session is checked again on every request (auth.md §3): it stops working as soon as an ACL version removes its device, or its user for other methods, and while its method is turned off. Sessions are stored (hashed) in the keyspace, so every node of a cluster accepts them. Each node caches a session for up to 10 s.
 
 ### 3.4 `POST /v1/auth/logout`
 
@@ -83,11 +98,220 @@ A session is checked again on every request: it stops working as soon as an ACL 
 
 ### 3.3 Origin binding
 
-`origin` is the server origin **as the client sees it**: `scheme://host[:port]`, with no trailing slash. Binding it stops a malicious server from relaying a challenge from the real one. The server accepts:
-* each `public_origins` entry in its config, or
-* if that list is empty, `http://<Host>` and `https://<Host>` from the request's `Host` header.
+`origin` is the server origin **as the client sees it**: `scheme://host[:port]`, lowercase, with no trailing slash (auth.md §5). Binding it stops a malicious server from relaying a challenge from the real one. A malformed origin returns 401. The server accepts the union of (auth.md §5.4):
+* each `public_origins` entry in its config (7a);
+* the **pinned** origins (7b): by default, while `public_origins` is empty, the first origin accepted after the claim is pinned, and only pinned origins are accepted after that;
+* the `origins` of the head ACL, when the server's `acl_origins` setting is on (7c).
 
-  The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. It is for development; a production server sets `public_origins`, and warns at start-up when it is empty.
+An origin outside that union is accepted only by the **`Host` fallback**, as `http://<Host>` or `https://<Host>` of the request: while pinning is in force and nothing is pinned yet (the origin is then pinned), or when pinning is off and the union is empty.
+
+  The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. Pinning narrows that to the first contact after the claim; a claim that carries `origin` (§4.1) closes it. It is for development and first set-up: a production server sets `public_origins`, and prints a multi-line warning at start-up while it is empty. `/v1/info` `auth.origins.host_fallback` says whether the fallback is open right now.
+
+### 3.5 `POST /v1/auth/password/params`
+
+Method 6, the password-derived key (auth.md §11). No session.
+
+```
+{ name: text } → { salt: bytes(32), m_cost_kib: u32, t_cost: u32, p_cost: u32 }
+```
+
+* `name` is normalized (auth.md §4.2); a name that doesn't normalize returns 400.
+* A registered name returns its salt and parameters. An unknown name returns the configured parameters and a fake salt that is the same on every call (auth.md §4.2).
+* 403 `method_disabled` if password keys are off.
+
+### 3.6 `POST /v1/auth/password/session`
+
+```
+{ name: text, challenge: bytes(32), origin: text,
+  sig: bytes }            // password-derived key, purpose zen/v1/sig/password-session (formats.md §7.5, §10)
+→ Session (§3.2)
+```
+
+* 403 `method_disabled` if password keys are off. 400 for a name that doesn't normalize.
+* 429 `quota` while the login name is locked for method 6 after too many failures (auth.md §11.3; method 3 counts separately).
+* 401 for a dead or spent challenge, or an origin the policy refuses (§3.3).
+* 401 `unauthorized` with one message, "unknown login name or wrong password", for every credential failure: unknown name, bad signature, user no longer a member. Each one counts towards the lock.
+* The session's `device_fp` is the password credential's id, and `method` is `password_key`.
+
+### 3.7 `POST /v1/auth/password/set`
+
+Register or replace the caller's password-derived key. Needs a session of the user, not an API token (403).
+
+```
+{ name: text, salt: bytes(32), m_cost_kib: u32, t_cost: u32, p_cost: u32,
+  identity: bytes }       // the key's public identity (formats.md §7.2)
+→ { id: bytes(32) }       // the new credential id
+```
+
+* 400: a name that doesn't normalize, a salt that isn't 32 bytes, parameters outside the registration floor and ceilings (formats.md §7.5), or an identity that doesn't decode.
+* 409 `name_taken`: another user holds the name. 429 `quota`: the user holds 100 credentials.
+* The user's previous password credential, if any, is deleted with its sessions (auth.md §11.2).
+
+### 3.8 `POST /v1/auth/tokens/create`
+
+Method 4, API tokens (auth.md §9). Admins only, signed in interactively (403 otherwise). 403 `method_disabled` if API tokens are off.
+
+```
+{ user: bytes(32),          // the member the token acts as
+  label?: text,             // at most 128 bytes
+  expires_unix?: u64 }      // absent: never
+→ { token: text,            // "zen_at_" ‖ base64url(32-byte secret): shown only here
+    id: bytes(32),          // the credential id
+    expires_unix?: u64 }
+```
+
+* 400: `user` is not a member of the head ACL, `expires_unix` is not in the future, or the label is too long. 429 `quota`: the member holds 100 credentials.
+* **Use.** The token is sent as is, `Authorization: Bearer zen_at_…`, on every request, with no session. On the stream (§9), the `auth` frame's `token` is the UTF-8 bytes of the same text.
+* A request with a token that is unknown, revoked, expired, or whose member left the ACL returns 401, as does any token while the method is off.
+* Tokens are listed and revoked through §3.9. `/v1/auth/logout` with a token returns 400.
+
+### 3.9 `POST /v1/auth/credentials/list` and `/v1/auth/credentials/remove`
+
+The credential store (auth.md §4). Need a session, not an API token (403).
+
+```
+list:   { user?: bytes(32) }   // absent: the caller's own; another member's needs admin (403)
+→ { credentials: [{ id: bytes(32), method: text, created_unix: u64,
+                    expires_unix?: u64, label?: text,
+                    last_used_unix?: u64 }] }     // passkeys, certificates, OPAQUE: the last sign-in
+remove: { id: bytes(32) } → {}
+```
+
+* `list` returns metadata only, never keys, salts or secret hashes. Device keys are not in the store; they are listed in the ACL.
+* `remove` deletes a credential of the caller, or as an admin of any member, and ends its sessions (auth.md §3). An id that doesn't exist, or belongs to another member when the caller isn't an admin, returns 404 `not_found`.
+
+### 3.10 `POST /v1/admin/origins/get` and `/v1/admin/origins/set`
+
+Admins only (403 otherwise). The origin policy (auth.md §5).
+
+```
+get: {} → { public_origins: [text],   // 7a, from the config
+            pinned: [text],           // 7b, the pinned set (kept even while 7b is not in force)
+            acl_origins: [text],      // 7c, the head ACL's origins
+            pinning: bool,            // 7b is in force
+            pinning_always: bool,     // origin_pinning_always is set
+            acl: bool,                // 7c is on
+            accepted: [text],         // the union in force, canonical first
+            host_fallback: bool }     // other origins are accepted from the Host header
+set: { pinned: [text] } → {}          // replace the pinned set; [] unpins
+```
+
+`set` takes at most 16 distinct, well-formed origins (400 otherwise). It doesn't end existing sessions.
+
+### 3.11 `POST /v1/auth/passkey/register/begin` and `/v1/auth/passkey/register/finish`
+
+Method 2, passkeys (auth.md §7.2): add a passkey to the caller. Need a session, not an API token (403). 403 `method_disabled` if passkeys are off.
+
+```
+begin:  {} → { challenge: bytes(32),       // a challenge as in §3.1, for clientDataJSON
+               rp_id: text,                // rp.id (auth.md §7.1)
+               user_handle: bytes(32),     // user.id: the caller's user fingerprint
+               algorithms: [int],          // pubKeyCredParams, preferred first: [-8, -7, -257]
+               exclude: [bytes],           // excludeCredentials: the caller's passkeys under rp_id
+               user_verification: text }   // "required" or "preferred"
+finish: { attestation_object: bytes,       // response.attestationObject
+          client_data_json: bytes,         // response.clientDataJSON, as the browser wrote it
+          label?: text }                   // at most 128 bytes
+→ { id: bytes(32) }                        // the passkey's credential id in the store (auth.md §4.1)
+```
+
+* Both return 400 while the server has no rp id (auth.md §7.1), with a message saying how to establish an origin.
+* `finish` returns 401 for a challenge that isn't live or is spent, a malformed origin, or one the origin policy refuses (§3.3). The origin may be pinned (auth.md §5.2).
+* `finish` returns 400 for anything else the verification refuses (auth.md §7.2): the client data's type or challenge, the rp id hash, the flags (user verification per `passkey_require_uv`), an unsupported algorithm, malformed bytes, a label over 128 bytes, or a credential id that is already registered. The attestation statement is not verified.
+* 429 `quota`: the caller holds 100 credentials. The request body may be up to 64 KiB.
+* The passkey is listed and removed through §3.9.
+
+### 3.12 `POST /v1/auth/passkey/session/begin` and `/v1/auth/passkey/session`
+
+Method 2, passkeys (auth.md §7.3): sign in. No session. 403 `method_disabled` if passkeys are off.
+
+```
+begin:   { user?: bytes(32) }               // a user fingerprint; absent: a discoverable sign-in
+→ { challenge: bytes(32),                   // for clientDataJSON
+    rp_id: text,                            // rpId
+    allow: [bytes],                         // allowCredentials: the user's passkeys under rp_id; [] without user
+    user_verification: text }               // "required" or "preferred"
+session: { credential_id: bytes,            // rawId
+           authenticator_data: bytes,       // response.authenticatorData
+           client_data_json: bytes,         // response.clientDataJSON
+           signature: bytes,                // response.signature
+           user_handle?: bytes }            // response.userHandle, if any
+→ Session (§3.2)
+```
+
+* `begin` returns 400 while the server has no rp id (auth.md §7.1), and 400 for a `user` that isn't 32 bytes. A `user` who isn't a member gets an empty `allow`.
+* `session` returns 401 when any check of auth.md §7.3 fails: the challenge (live, issued by this cluster, not spent), the origin (§3.3), an unknown passkey, a user no longer a member, a mismatched `user_handle`, the client data's type, the rp id hash, the flags, the signature, or a signature counter that didn't increase (a possible clone, auth.md §7.4).
+* The session's `device_fp` is the passkey's credential id, and `method` is `passkey`. Any challenge from §3.1 works as well as the one `begin` returns.
+
+### 3.13 `POST /v1/auth/mtls/register`
+
+Method 5, TLS client certificates (auth.md §10.3): bind a certificate to a member. Needs a session, not an API token (403). 403 `method_disabled` if `mtls` is off. Works while the method is dormant.
+
+```
+{ user?: bytes(32),       // the member; absent: the caller. Another member's needs admin (403)
+  cert?: bytes,           // the certificate, DER or PEM; absent: the one this connection presents.
+                          // Uploading one needs admin (403)
+  label?: text }          // at most 128 bytes
+→ { id: bytes(32) }       // the credential id: SHA-256 of the certificate's SubjectPublicKeyInfo
+```
+
+* Without `cert`, the certificate is the request's own (auth.md §10.4, step 2): the one the native TLS handshake verified, or from a trusted proxy the forwarded one. A request from an untrusted address that carries the proxy header gets 401 (auth.md §10.2).
+* 400: no certificate on the connection and none uploaded, a certificate that doesn't parse, a `user` that isn't 32 bytes or isn't a member of the head ACL, a label over 128 bytes, or a key that is already registered, to anyone.
+* 429 `quota`: the member holds 100 credentials.
+* The registration is listed and removed through §3.9; removing it ends its sessions.
+
+### 3.14 `POST /v1/auth/mtls/session`
+
+Method 5 (auth.md §10.4): sign in with the request connection's client certificate. No session.
+
+```
+{} → Session (§3.2)
+```
+
+* 403 `method_disabled` if `mtls` is off.
+* 401: the method is dormant (neither native client certificates nor a trusted proxy are set up, auth.md §10); no certificate on the connection; the proxy header from an untrusted address, or one that doesn't parse; an unregistered certificate; a user no longer a member.
+* Natively, a certificate that doesn't verify against `[tls] client_ca` (another CA, expired, not for client authentication, a key or signature outside auth.md §10.1, such as RSA below 2048 bits) fails the TLS handshake before any request.
+* The session's `device_fp` is the credential id, and `method` is `mtls`. The token works on any connection and any node, like every session.
+
+### 3.15 `POST /v1/auth/opaque/register/start` and `/v1/auth/opaque/register/finish`
+
+Method 3, OPAQUE (auth.md §8.2): register or replace the caller's OPAQUE password. Need a session of the user, not an API token (403). 403 `method_disabled` if `opaque` is off.
+
+```
+start:  { name: text,
+          request: bytes(32) }        // RegistrationRequest
+→ { response: bytes(64),              // RegistrationResponse
+    m_cost_kib: u32, t_cost: u32, p_cost: u32 }   // Argon2id parameters to register with: the configured ones
+finish: { name: text,                 // the same name as in start
+          upload: bytes(192),         // RegistrationUpload: the record
+          m_cost_kib: u32, t_cost: u32, p_cost: u32 }   // the parameters the client used
+→ { id: bytes(32) }                   // the new credential id
+```
+
+* 400: a name that doesn't normalize (auth.md §4.2), a `request` or `upload` of the wrong size or encoding, parameters outside the registration floor and ceilings (formats.md §6).
+* 409 `name_taken`: another user holds the name, for either password method. 429 `quota`: the user holds 100 credentials (`finish`).
+* `start` stores nothing. `finish` deletes the user's previous OPAQUE credential, if any, with its sessions (auth.md §8.2).
+* The credential is listed and removed through §3.9.
+
+### 3.16 `POST /v1/auth/opaque/login/start` and `/v1/auth/opaque/login/finish`
+
+Method 3 (auth.md §8.3): sign in. No session. 403 `method_disabled` if `opaque` is off.
+
+```
+start:  { name: text,
+          origin: text,               // the server origin as the client sees it (§3.3), in the OPAQUE context
+          request: bytes(96) }        // CredentialRequest (KE1)
+→ { response: bytes(320),             // CredentialResponse (KE2); a fake record's for an unknown name
+    state: bytes,                     // the sealed login state, opaque to the client
+    m_cost_kib: u32, t_cost: u32, p_cost: u32 }   // the credential's Argon2id parameters
+finish: { state: bytes,               // from start, unchanged
+          finalization: bytes(64) }   // CredentialFinalization (KE3)
+→ Session (§3.2)
+```
+
+* `start`: 400 for a name that doesn't normalize or a `request` of the wrong size or encoding; 401 for a malformed origin; 429 `quota` while the login name is locked for method 3 (auth.md §8.5; method 6 counts separately). Every `start` counts as a failed attempt until a `finish` succeeds. An unknown name gets a response of the same shape, and the configured parameters.
+* `finish` may go to any node of the cluster. 401 for a state that is expired (60 s), already used, altered or from another cluster; for an origin the policy refuses (§3.3), which may also pin the origin (auth.md §5.2); and, with one message, "unknown login name or wrong password", for every credential failure: an unknown name, a wrong finalization, a credential removed or replaced since `start`, a user no longer a member.
+* The session's `device_fp` is the OPAQUE credential's id, and `method` is `opaque`.
 
 ## 4. ACL and fs headers
 
@@ -95,11 +319,13 @@ A session is checked again on every request: it stops working as soon as an ACL 
 
 ```
 { acl: bytes,            // signed ACL (formats.md §9)
-  claim?: text }         // the claim token; required exactly for version 1
+  claim?: text,          // the claim token; required exactly for version 1
+  origin?: text }        // version 1 only: the server origin as the claiming client sees it
 → { version: u64 }
 ```
 
 * The ACL is authenticated by its own signature, so this request needs no session.
+* **`origin`** is pinned with the claim when first-contact pinning is in force and nothing is pinned yet (auth.md §5.2); otherwise it is ignored. A malformed `origin` returns 400 and nothing is stored. Later versions ignore it.
 * **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. Once version 1 commits, every node of the cluster forgets its token and deletes its `claim-token` file: the node that accepted it at once, every other node as soon as it sees the new ACL, and a node that was down when it next starts.
 * Validation rules: formats.md §9.3.
 * The version CAS failing returns 409 `version_mismatch`.
@@ -286,7 +512,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 ## 9. WebSocket `/v1/stream`
 
 * Binary frames, each holding one CBOR map with an `op` field.
-* The first frame must be `{op: "auth", token: bytes}`. Nothing else is accepted before it.
+* The first frame must be `{op: "auth", token: bytes}`: a session token, or the UTF-8 bytes of an API token (§3.8). Nothing else is accepted before it.
 
 **Client → server:**
 

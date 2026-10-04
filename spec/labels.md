@@ -23,6 +23,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig-ml-dsa-65` | identity seed | empty | ML-DSA-65 seed ξ |
 | `zen/v1/device-sig` | device secret | empty | device identity seed |
 | `zen/v1/device-kem` | device secret | empty | X-Wing decapsulation seed |
+| `zen/v1/password-sig` | Argon2id output of a password (formats.md §7.5) | empty | identity seed of a password-derived key |
 
 ## Hash labels (`BLAKE3.derive_key(label, data)`)
 
@@ -32,6 +33,8 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/acl-chain` | `H(doc)` of a signed ACL, chaining ACL versions (formats.md §9.2) |
 | `zen/v1/range-hash` | hash of a KV range for `expect_ranges` (api.md §6) |
 | `zen/v1/tree-op-chain` | per-tree chain over filesystem operations (formats.md §11.5) |
+| `zen/v1/passkey-id` | a passkey's credential-store id from its WebAuthn credential id (auth.md §4.1, formats.md §6) |
+| `zen/v1/opaque-keyslot` | the secret of an OPAQUE export-key keyslot from the 64-byte export key (formats.md §6, type 5) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 
@@ -44,6 +47,12 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/fs-meta` | filesystem node meta (kind 4) |
 | `zen/v1/aad/fs-manifest` | filesystem manifest (kind 5) |
 | `zen/v1/aad/fs-chunk` | filesystem chunk (kind 6) |
+
+## OPAQUE (auth.md §8)
+
+| Label | Use |
+|---|---|
+| `zen/v1/opaque` | prefix of the AKE context of an OPAQUE sign-in: `"zen/v1/opaque" ‖ 0x00 ‖ origin` |
 
 ## Signatures
 
@@ -59,6 +68,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig/session` | device | sign-in challenge (formats.md §10) |
 | `zen/v1/sig/event` | device | a single event (later milestone) |
 | `zen/v1/sig/tree-checkpoint` | device | filesystem tree checkpoint over (state hash, count, chain) (fs.md §9, later milestone) |
+| `zen/v1/sig/password-session` | password-derived key | sign-in challenge (formats.md §7.5, §10) |
 
 Signing with a purpose not in this table is an error.
 
