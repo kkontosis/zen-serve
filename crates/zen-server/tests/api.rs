@@ -759,6 +759,19 @@ async fn sequential_gate_and_fencing() {
     let d: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
     assert_eq!(d.events.len(), 1, "delivery gate: max_inflight 1");
     assert_eq!(d.events[0].envelope, vec![0]);
+    // Bob knows the (guessable) token but does not hold the lease.
+    let forged = Commit {
+        commit_id: cid(49),
+        consume: vec![consume(b"audit", &d.events[0], None, None)],
+        ..Default::default()
+    };
+    assert_eq!(
+        code(
+            h.call::<_, CommitResult>("/v1/commit", Some(&bob_tok), &forged)
+                .await
+        ),
+        (412, "not_leader".into())
+    );
     // Skipping ahead is refused.
     let d2: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
     assert_eq!(
@@ -1271,4 +1284,100 @@ async fn sweeper_expires_idempotency_records() {
     // The record is gone, so the same commit_id is a new commit.
     let r2: CommitResult = h.call("/v1/log/append", Some(&tok), &c).await.unwrap();
     assert_ne!(r1.versionstamp, r2.versionstamp);
+}
+
+/// `per_key` delivery walks past claimed keys: with many keys in flight the
+/// ready ones behind them are still handed out, and a long-poll notices a
+/// key freed by another worker's commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_key_many_claims_do_not_hide_ready_keys() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let _: GroupCreated = h
+        .call(
+            "/v1/consume/groups",
+            Some(&tok),
+            &group(b"billing", Mode::PerKey),
+        )
+        .await
+        .unwrap();
+    // 40 keys, one event each (key tokens must be distinct 16-byte values).
+    let keys: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 16]).collect();
+    for (i, k) in keys.iter().enumerate() {
+        let ap = LogAppend {
+            commit_id: cid(i as u8),
+            append: vec![append(&topic(1), Some(k), &[i as u8])],
+        };
+        let _: CommitResult = h.call("/v1/log/append", Some(&tok), &ap).await.unwrap();
+    }
+    // Two events for the last key, so it has pending work after a commit.
+    let ap = LogAppend {
+        commit_id: cid(200),
+        append: vec![append(&topic(1), Some(&keys[39]), &[99])],
+    };
+    let _: CommitResult = h.call("/v1/log/append", Some(&tok), &ap).await.unwrap();
+    let next = NextRequest {
+        fs: 1,
+        group: b"billing".to_vec(),
+        partition: None,
+        token: None,
+        limit: Some(1),
+        wait_ms: None,
+    };
+    let mut got = Vec::new();
+    for _ in 0..40 {
+        let mut d: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
+        assert_eq!(d.events.len(), 1, "every key is handed out once");
+        got.push(d.events.remove(0));
+    }
+    let mut seen: Vec<u8> = got.iter().map(|e| e.envelope[0]).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (0..40).collect::<Vec<u8>>());
+    let none: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
+    assert!(none.events.is_empty(), "everything is claimed");
+    // A long-poll waits while every key is claimed, and wakes when a
+    // sibling's consume step frees a key that has a pending event.
+    let waiter = {
+        let next = NextRequest {
+            wait_ms: Some(10_000),
+            ..next.clone()
+        };
+        let http = h.http.clone();
+        let url = format!("{}/v1/consume/next", h.base);
+        let auth = format!(
+            "Bearer {}",
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &tok)
+        );
+        tokio::spawn(async move {
+            let resp = http
+                .post(url)
+                .header("authorization", auth)
+                .body(to_cbor(&next))
+                .send()
+                .await
+                .unwrap();
+            from_cbor::<Deliveries>(&resp.bytes().await.unwrap()).unwrap()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let last = got.iter().find(|e| e.envelope[0] == 39).unwrap();
+    let ack = Commit {
+        commit_id: cid(201),
+        consume: vec![consume(b"billing", last, None, Some(keys[39].clone()))],
+        ..Default::default()
+    };
+    let _: CommitResult = h.call("/v1/commit", Some(&tok), &ack).await.unwrap();
+    let woke = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the long-poll wakes without a new append")
+        .unwrap();
+    assert_eq!(
+        woke.events
+            .iter()
+            .map(|e| e.envelope[0])
+            .collect::<Vec<_>>(),
+        vec![99]
+    );
 }
