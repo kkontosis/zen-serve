@@ -18,6 +18,7 @@ pub mod ids;
 pub mod keys;
 pub mod kv;
 pub mod log;
+pub mod origin;
 pub mod state;
 pub mod statics;
 pub mod stream;
@@ -83,7 +84,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             ephemeral_bytes_per_sec: l.ephemeral_bytes_per_sec,
             ephemeral_burst_bytes: l.ephemeral_burst_bytes,
         },
-        auth: Some(auth::info(&st)),
+        auth: Some(auth::info(&st).await),
     })
 }
 
@@ -189,6 +190,8 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/fs/file/get", post(tree::file_get))
         .route("/v1/fs/chunks/get", post(tree::chunks_get))
         .route("/v1/admin/status", post(admin_status))
+        .route("/v1/admin/origins/get", post(origin::admin_get))
+        .route("/v1/admin/origins/set", post(origin::admin_set))
         .route("/v1/stream", get(stream::ws))
         .fallback(statics::fallback)
         .layer(DefaultBodyLimit::max(limit))
@@ -315,6 +318,8 @@ pub struct Server {
     pub state: Shared,
     /// The claim token, while unclaimed.
     pub claim_token: Option<String>,
+    /// Start-up warnings, also printed to stderr.
+    pub warnings: Vec<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -329,11 +334,11 @@ impl Server {
 pub async fn start(cfg: Config) -> Result<Server, String> {
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
-    if cfg.public_origins.is_empty() {
-        tracing::warn!(
-            "public_origins is empty: session origins are derived from the Host header, \
-             which a relaying server controls (api.md §3.3); set public_origins in production"
-        );
+    let warnings: Vec<String> = origin::startup_warning(&cfg).into_iter().collect();
+    for w in &warnings {
+        // On stderr as well as in the log: it must not scroll by unseen.
+        eprintln!("{w}");
+        tracing::warn!("public_origins is empty: sign-in relay protection is weak (auth.md §5)");
     }
     let store = open_store(&cfg)?;
     let challenge_key = auth::challenge_key(store.as_ref())
@@ -371,6 +376,7 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         addr,
         state: st,
         claim_token: claim,
+        warnings,
         task,
     })
 }

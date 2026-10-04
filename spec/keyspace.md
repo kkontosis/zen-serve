@@ -140,3 +140,10 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * The sweeper visits only the trees in `ts`. A move is the only operation that adds a move-log entry or a `TRASH` child, and tombstones only come from purging a tree that is listed, so a tree outside the index has nothing to sweep (chunk GC is per fs, through `cz`).
 * The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count`. Records written before milestone 3.5 have no `write_count`, which then reads as 0.
 
+### 3.7 Sign-in: credentials and origins (auth.md)
+
+| Key | Value |
+|---|---|
+| `pack("origins")` | CBOR `[text]`: the pinned sign-in origins (auth.md §5.2); absent when nothing is pinned |
+
+These keys are data, not server metadata: `export` copies them and `import` restores them, so a restored or migrated cluster keeps its pin.

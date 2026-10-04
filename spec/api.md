@@ -47,7 +47,8 @@ No authentication. Returns:
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
             chunk_grace_secs },
-  auth?: { methods: [text], default?: text } }   // sign-in methods (auth.md §2)
+  auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2)
+           origins?: { origins: [text], pinning: bool, host_fallback: bool } } }   // auth.md §5.5
 ```
 
 Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
@@ -93,11 +94,32 @@ A session is checked again on every request (auth.md §3): it stops working as s
 
 ### 3.3 Origin binding
 
-`origin` is the server origin **as the client sees it**: `scheme://host[:port]`, with no trailing slash. Binding it stops a malicious server from relaying a challenge from the real one. The server accepts:
-* each `public_origins` entry in its config, or
-* if that list is empty, `http://<Host>` and `https://<Host>` from the request's `Host` header.
+`origin` is the server origin **as the client sees it**: `scheme://host[:port]`, lowercase, with no trailing slash (auth.md §5). Binding it stops a malicious server from relaying a challenge from the real one. A malformed origin returns 401. The server accepts the union of (auth.md §5.4):
+* each `public_origins` entry in its config (7a);
+* the **pinned** origins (7b): by default, while `public_origins` is empty, the first origin accepted after the claim is pinned, and only pinned origins are accepted after that;
+* the `origins` of the head ACL, when the server's `acl_origins` setting is on (7c).
 
-  The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. It is for development; a production server sets `public_origins`, and warns at start-up when it is empty.
+An origin outside that union is accepted only by the **`Host` fallback**, as `http://<Host>` or `https://<Host>` of the request: while pinning is in force and nothing is pinned yet (the origin is then pinned), or when pinning is off and the union is empty.
+
+  The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. Pinning narrows that to the first contact after the claim; a claim that carries `origin` (§4.1) closes it. It is for development and first set-up: a production server sets `public_origins`, and prints a multi-line warning at start-up while it is empty. `/v1/info` `auth.origins.host_fallback` says whether the fallback is open right now.
+
+### 3.10 `POST /v1/admin/origins/get` and `/v1/admin/origins/set`
+
+Admins only (403 otherwise). The origin policy (auth.md §5).
+
+```
+get: {} → { public_origins: [text],   // 7a, from the config
+            pinned: [text],           // 7b, the pinned set (kept even while 7b is not in force)
+            acl_origins: [text],      // 7c, the head ACL's origins
+            pinning: bool,            // 7b is in force
+            pinning_always: bool,     // origin_pinning_always is set
+            acl: bool,                // 7c is on
+            accepted: [text],         // the union in force, canonical first
+            host_fallback: bool }     // other origins are accepted from the Host header
+set: { pinned: [text] } → {}          // replace the pinned set; [] unpins
+```
+
+`set` takes at most 16 distinct, well-formed origins (400 otherwise). It doesn't end existing sessions.
 
 ## 4. ACL and fs headers
 
@@ -105,11 +127,13 @@ A session is checked again on every request (auth.md §3): it stops working as s
 
 ```
 { acl: bytes,            // signed ACL (formats.md §9)
-  claim?: text }         // the claim token; required exactly for version 1
+  claim?: text,          // the claim token; required exactly for version 1
+  origin?: text }        // version 1 only: the server origin as the claiming client sees it
 → { version: u64 }
 ```
 
 * The ACL is authenticated by its own signature, so this request needs no session.
+* **`origin`** is pinned with the claim when first-contact pinning is in force and nothing is pinned yet (auth.md §5.2); otherwise it is ignored. A malformed `origin` returns 400 and nothing is stored. Later versions ignore it.
 * **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. Once version 1 commits, every node of the cluster forgets its token and deletes its `claim-token` file: the node that accepted it at once, every other node as soon as it sees the new ACL, and a node that was down when it next starts.
 * Validation rules: formats.md §9.3.
 * The version CAS failing returns 409 `version_mismatch`.

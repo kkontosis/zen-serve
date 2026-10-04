@@ -131,3 +131,252 @@ async fn session_records_carry_the_method() {
     assert_eq!(status, 401);
     assert!(e.message.contains("disabled"), "{}", e.message);
 }
+
+// ---- origin policy (auth.md §5)
+
+/// `localhost:<port>`: a second `Host` (and origin) for the same server.
+fn localhost(h: &Harness) -> (String, String) {
+    let host = format!("localhost:{}", h.server.addr.port());
+    (format!("http://{host}"), host)
+}
+
+async fn origin_state(h: &Harness, tok: &[u8]) -> OriginState {
+    h.call("/v1/admin/origins/get", Some(tok), &Empty {})
+        .await
+        .unwrap()
+}
+
+async fn set_pins(h: &Harness, tok: &[u8], pinned: &[&str]) -> R<Empty> {
+    let req = OriginPins {
+        pinned: pinned.iter().map(|s| s.to_string()).collect(),
+    };
+    h.call("/v1/admin/origins/set", Some(tok), &req).await
+}
+
+async fn origin_info(h: &Harness) -> OriginInfo {
+    let info: Info = h.get("/v1/info").await;
+    info.auth.unwrap().origins.unwrap()
+}
+
+/// Claim with `admin` and `bob` as members, the claim naming `origin`.
+async fn claim_with_origin(
+    h: &Harness,
+    admin: &User,
+    bob: &User,
+    origin: Option<&str>,
+) -> R<AclVersion> {
+    let (signed, _) = signed_acl(admin, 1, None, &[admin], &[admin, bob], vec![], vec![]);
+    h.call(
+        "/v1/acl/put",
+        None,
+        &AclPut {
+            acl: signed,
+            claim: h.server.claim_token.clone(),
+            origin: origin.map(String::from),
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_contact_origin_is_pinned() {
+    let h = Harness::start().await;
+    let (admin, bob) = (User::new(1), User::new(2));
+    claim_with_origin(&h, &admin, &bob, None).await.unwrap();
+    let o = origin_info(&h).await;
+    assert!(o.pinning && o.host_fallback && o.origins.is_empty());
+
+    // The first sign-in after the claim pins its origin…
+    let (lo, lh) = localhost(&h);
+    let tok = h.sign_in_at(&admin, &lo, &lh).await.unwrap();
+    let o = origin_info(&h).await;
+    assert_eq!(o.origins, vec![lo.clone()]);
+    assert!(!o.host_fallback);
+    // …and after that the Host header no longer vouches for another one.
+    assert_eq!(code(h.sign_in(&bob).await), (401, "unauthorized".into()));
+    h.sign_in_at(&bob, &lo, &lh).await.unwrap();
+    let s = origin_state(&h, &tok).await;
+    assert_eq!(s.pinned, vec![lo.clone()]);
+    assert_eq!(s.accepted, vec![lo.clone()]);
+    assert!(s.pinning && !s.pinning_always && !s.acl && !s.host_fallback);
+
+    // Only admins see or replace the pins.
+    let bob_tok = h.sign_in_at(&bob, &lo, &lh).await.unwrap();
+    let r: R<OriginState> = h
+        .call("/v1/admin/origins/get", Some(&bob_tok), &Empty {})
+        .await;
+    assert_eq!(code(r).0, 403);
+    assert_eq!(code(set_pins(&h, &bob_tok, &[]).await).0, 403);
+    assert_eq!(
+        code(set_pins(&h, &tok, &["https://x.example/"]).await).0,
+        400
+    );
+
+    // An admin replaces the pinned set.
+    set_pins(&h, &tok, &[&h.origin()]).await.unwrap();
+    h.sign_in(&bob).await.unwrap();
+    assert_eq!(code(h.sign_in_at(&bob, &lo, &lh).await).0, 401);
+    // An empty set unpins: the next sign-in pins again.
+    set_pins(&h, &tok, &[]).await.unwrap();
+    assert!(origin_info(&h).await.host_fallback);
+    h.sign_in_at(&bob, &lo, &lh).await.unwrap();
+    assert_eq!(origin_info(&h).await.origins, vec![lo]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_claim_pins_its_origin() {
+    let h = Harness::start().await;
+    let (admin, bob) = (User::new(1), User::new(2));
+    assert_eq!(
+        code(claim_with_origin(&h, &admin, &bob, Some("https://app.example/")).await).0,
+        400
+    );
+    claim_with_origin(&h, &admin, &bob, Some("https://app.example"))
+        .await
+        .unwrap();
+    assert_eq!(
+        origin_info(&h).await.origins,
+        vec!["https://app.example".to_string()]
+    );
+    // The Host header is no longer enough: the first contact was the claim.
+    assert_eq!(code(h.sign_in(&admin).await).0, 401);
+    h.sign_in_at(&admin, "https://app.example", &h.host_header())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_origins_turn_pinning_off() {
+    let h = Harness::start_with(|c| c.public_origins = vec!["https://app.example".into()]).await;
+    assert!(h.server.warnings.is_empty());
+    let (admin, bob) = (User::new(1), User::new(2));
+    // The claim's origin is not pinned while public_origins is set.
+    claim_with_origin(&h, &admin, &bob, Some("https://other.example"))
+        .await
+        .unwrap();
+    assert_eq!(code(h.sign_in(&admin).await).0, 401);
+    assert_eq!(
+        code(
+            h.sign_in_at(&admin, "https://other.example", &h.host_header())
+                .await
+        )
+        .0,
+        401
+    );
+    let tok = h
+        .sign_in_at(&admin, "https://app.example", &h.host_header())
+        .await
+        .unwrap();
+    let s = origin_state(&h, &tok).await;
+    assert!(!s.pinning && !s.host_fallback);
+    assert!(s.pinned.is_empty());
+    assert_eq!(s.accepted, vec!["https://app.example".to_string()]);
+    let o = origin_info(&h).await;
+    assert!(!o.pinning && !o.host_fallback);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinning_always_adds_the_first_contact() {
+    let h = Harness::start_with(|c| {
+        c.public_origins = vec!["https://app.example".into()];
+        c.auth.origin_pinning_always = true;
+    })
+    .await;
+    let (admin, bob) = (User::new(1), User::new(2));
+    claim_with_origin(&h, &admin, &bob, None).await.unwrap();
+    // Unpinned: the Host header is trusted once, and pinned.
+    let tok = h.sign_in(&admin).await.unwrap();
+    h.sign_in_at(&bob, "https://app.example", &h.host_header())
+        .await
+        .unwrap();
+    let (lo, lh) = localhost(&h);
+    assert_eq!(code(h.sign_in_at(&bob, &lo, &lh).await).0, 401);
+    let s = origin_state(&h, &tok).await;
+    assert!(s.pinning && s.pinning_always);
+    assert_eq!(
+        s.accepted,
+        vec!["https://app.example".to_string(), h.origin()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acl_origins_are_accepted_when_turned_on() {
+    let acl_origin = "https://acl.example";
+    async fn claim(h: &Harness, admin: &User, bob: &User) -> Vec<u8> {
+        let mut doc = acl_doc(1, None, &[admin], &[admin, bob], vec![], vec![]);
+        doc.origins = vec!["https://acl.example".into()];
+        let (signed, bytes) = sign_doc(admin, &doc);
+        h.put_acl(signed, h.server.claim_token.clone())
+            .await
+            .unwrap();
+        bytes
+    }
+    let (admin, bob) = (User::new(1), User::new(2));
+
+    // 7c alone: the ACL's origins replace the Host fallback.
+    let h = Harness::start_with(|c| {
+        c.auth.acl_origins = true;
+        c.auth.origin_pinning = false;
+    })
+    .await;
+    let doc1 = claim(&h, &admin, &bob).await;
+    assert_eq!(code(h.sign_in(&admin).await).0, 401);
+    h.sign_in_at(&admin, acl_origin, &h.host_header())
+        .await
+        .unwrap();
+    // A version without origins brings the fallback back.
+    let (v2, _) = signed_acl(
+        &admin,
+        2,
+        Some(&doc1),
+        &[&admin],
+        &[&admin, &bob],
+        vec![],
+        vec![],
+    );
+    h.put_acl(v2, None).await.unwrap();
+    h.sign_in(&admin).await.unwrap();
+    assert_eq!(
+        code(h.sign_in_at(&admin, acl_origin, &h.host_header()).await).0,
+        401
+    );
+
+    // Off (the default): the ACL's origins are ignored.
+    let h = Harness::start_with(|c| c.auth.origin_pinning = false).await;
+    claim(&h, &admin, &bob).await;
+    assert_eq!(
+        code(h.sign_in_at(&admin, acl_origin, &h.host_header()).await).0,
+        401
+    );
+    h.sign_in(&admin).await.unwrap();
+
+    // With pinning: the union of the pin and the ACL's origins.
+    let h = Harness::start_with(|c| c.auth.acl_origins = true).await;
+    claim(&h, &admin, &bob).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    h.sign_in_at(&bob, acl_origin, &h.host_header())
+        .await
+        .unwrap();
+    let (lo, lh) = localhost(&h);
+    assert_eq!(code(h.sign_in_at(&bob, &lo, &lh).await).0, 401);
+    let s = origin_state(&h, &tok).await;
+    assert_eq!(s.accepted, vec![h.origin(), acl_origin.to_string()]);
+    assert_eq!(s.acl_origins, vec![acl_origin.to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_public_origins_warn_at_start_up() {
+    let h = Harness::start().await;
+    assert_eq!(h.server.warnings.len(), 1);
+    let w = &h.server.warnings[0];
+    assert!(w.contains("WARNING: public_origins is empty"), "{w}");
+    assert!(w.contains("public_origins = [") && w.contains("pinning is on"));
+    assert!(w.lines().count() > 10, "a banner, not a line");
+
+    let mut cfg = h.cfg.clone();
+    cfg.auth.origin_pinning = false;
+    let w = zen_server::origin::startup_warning(&cfg).unwrap();
+    assert!(w.contains("NO protection"), "{w}");
+    cfg.public_origins = vec!["https://zen.example.org".into()];
+    assert_eq!(zen_server::origin::startup_warning(&cfg), None);
+}

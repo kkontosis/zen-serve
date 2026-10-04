@@ -73,6 +73,78 @@ The session response's `device_fp` carries the credential id, and `method` names
 
 Steps 1–3 apply immediately on every node. A removed credential, like a logout, stops working at once on the node that removed it and within 10 s on the others (their session cache).
 
+## 5. Origin policy
+
+Methods 1 and 6 sign the **origin** the client sees, `scheme://host[:port]` (formats.md §10), together with a challenge. That stops a malicious server from relaying a sign-in to the real one: the relay's origin differs, so the server refuses the signature. It works only if the server knows its own origins. Three sources tell it, numbered 7a–7c after the decision that introduced them.
+
+**Origin syntax.** An origin is `http://` or `https://`, then a lowercase ASCII host (a name, an IPv4 address or a bracketed IPv6 address), then optionally `:port` (1–65535, no leading zero), and nothing else: no path, no user info, no trailing slash. This is the form browsers serialize. Sign-ins with a malformed origin are refused (401); configured, pinned and ACL origins must be well formed.
+
+### 5.1 7a: `public_origins`
+
+The explicit list in the config file:
+
+```toml
+public_origins = ["https://zen.example.org"]
+```
+
+**Setting it is the hardening step.** While it is empty, the server still works, but prints a large multi-line warning at start-up on stderr (and in the log): it explains the relay risk, says whether first-contact pinning (7b) is in force, and shows how to set `public_origins`.
+
+**Setting 7a turns 7b off**, unless `origin_pinning_always` is set (§5.2).
+
+### 5.2 7b: pin the origin on first contact
+
+`[auth] origin_pinning` (default **true**). While 7b is **in force**, that is, `origin_pinning` is true and either `public_origins` is empty or `origin_pinning_always` is true:
+
+* The first origin accepted after the cluster is claimed is **pinned**: stored in the keyspace (keyspace.md §3.7). After that, only pinned origins are accepted from this source, and the `Host` header no longer vouches for any origin.
+* **At the claim.** The claim request (`/v1/acl/put` for version 1, api.md §4.1) may carry `origin`, the origin as the claiming client sees it. The server pins it in the same transaction, if nothing is pinned yet. A malformed `origin` fails the claim with 400. While 7b is not in force, the field is ignored.
+* **Otherwise at the first sign-in.** Without an origin in the claim, the first successful sign-in pins the origin it signed, whichever source accepted it. A cluster claimed before pinning existed is pinned at its next first sign-in. Pinning happens in the sign-in's transaction, so two first contacts through different origins conflict, and the second is refused.
+* **Until the pin exists**, the origin is checked against the `Host` header, exactly as the development fallback of api.md §3.3. A relayed first contact pins the relay's origin. Admins check the pin with `/v1/admin/origins/get` and correct it with `/v1/admin/origins/set` (api.md §3.10). An empty set unpins, and the next sign-in pins again.
+
+**`origin_pinning_always`** (default false) keeps 7b in force even with `public_origins` set: the listed origins **and** the pinned first contact are both accepted. **This is risky**: until the first sign-in, any origin that matches the `Host` header is accepted and pinned, so a relay that gets there first is accepted permanently, next to the configured origins. Use it only while moving a deployment to a new origin, and check the pin.
+
+The pinned set is kept, though unused, while 7b is not in force.
+
+### 5.3 7c: origins in the signed ACL
+
+`[auth] acl_origins` (default **false**). When on, the `origins` listed in the **head** ACL (formats.md §9.1) are accepted. They are admin-signed, so they change only with a new ACL version, and every client walking the chain sees them.
+
+### 5.4 Precedence
+
+The accepted set is the **union** of:
+1. `public_origins` (7a),
+2. the pinned origins, while 7b is in force,
+3. the head ACL's `origins`, while 7c is on.
+
+A sign-in whose origin is in the set is accepted. An origin outside it is accepted only by the **`Host` fallback**: the origin is `http://<Host>` or `https://<Host>` of the request, and either
+* 7b is in force and nothing is pinned yet (the origin is then pinned), or
+* 7b is not in force and the set is empty (development: no relay protection at all).
+
+| `public_origins` | 7b `origin_pinning` | `…_always` | 7c `acl_origins` | Accepted |
+|---|---|---|---|---|
+| empty | on | — | off | the pin; before it, the `Host` origin (then pinned) |
+| empty | off | — | off | the `Host` origin (no relay protection) |
+| set | on or off | off | off | `public_origins` only |
+| set | on | on | off | `public_origins` ∪ the pin; before the pin, the `Host` origin too (then pinned) |
+| any | any | any | on | as above ∪ the head ACL's `origins`; with 7b out of force, listed ACL origins also close the `Host` fallback |
+
+### 5.5 The server's own origins
+
+`origin::own_origins` returns the accepted set in the precedence order above (7a in config order, then the pins, then the ACL's), and whether the `Host` fallback is open. The first entry is the **canonical origin**. Its host, without scheme and port, is the WebAuthn relying-party id that passkeys (§7) use. A server with no canonical origin can't offer passkeys.
+
+`/v1/info` advertises the same state, so a client can warn when it is talking to a relay or to a server without relay protection:
+
+```
+auth.origins: { origins: [text],       // accepted origins, canonical first
+                pinning: bool,         // 7b is in force
+                host_fallback: bool }  // other origins are accepted from the Host header
+```
+
+### 5.6 Threat notes
+
+* The origin binding protects against a malicious server relaying a sign-in. It doesn't protect against a compromised client or a compromised server.
+* With `public_origins` empty, the very first contact trusts the `Host` header. The claim, which comes from the operator holding the claim token, is the safest first contact; that is why it may carry the origin.
+* Origins are compared byte for byte. A deployment reachable under several names lists all of them (7a or 7c), or pins all of them through the admin endpoint.
+
 ## 6. Method 1: device keys
 
 A device holds a random 32-byte device secret (formats.md §7.1). Its user identity certifies it with a device certificate (formats.md §7.4), which an admin adds to the member's entry of the signed ACL.
@@ -81,7 +153,7 @@ To sign in, the device signs the challenge and the origin (formats.md §10) and 
 
 **Threats.**
 * The device secret is the credential: whoever copies it can sign in as the device until an admin removes the certificate from the ACL.
-* The signature binds the origin, so a malicious server can't relay a challenge from the real one (§5).
+* The signature binds the origin, so a malicious server can't relay a challenge from the real one, as far as the origin policy (§5) knows the server's origins.
 * Adding a device needs an admin-signed ACL change.
 
 ## 7. Method 2: passkeys (reserved)

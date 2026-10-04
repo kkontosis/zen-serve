@@ -14,8 +14,8 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Directory for the database and the claim token.
     pub data_dir: PathBuf,
-    /// Accepted origins for session signatures (api.md §3.3). Empty: derive
-    /// from the `Host` header.
+    /// 7a: accepted origins for sign-in signatures (auth.md §5.1). Empty:
+    /// pin the first contact, or derive from the `Host` header.
     #[serde(default)]
     pub public_origins: Vec<String>,
     /// Configured filesystems.
@@ -149,6 +149,16 @@ pub struct AuthConfig {
     pub mtls: bool,
     /// Method 6: password-derived keys, the default method.
     pub password_keys: bool,
+    /// 7b: pin the first origin that signs in after the claim, and accept
+    /// only pinned origins after that. In force only while
+    /// `public_origins` is empty, unless `origin_pinning_always`.
+    pub origin_pinning: bool,
+    /// Keep 7b in force even when `public_origins` is set: the listed
+    /// origins and the pinned first contact are both accepted. Risky: the
+    /// first contact still trusts the `Host` header.
+    pub origin_pinning_always: bool,
+    /// 7c: also accept the `origins` listed in the head ACL.
+    pub acl_origins: bool,
 }
 
 impl Default for AuthConfig {
@@ -160,6 +170,9 @@ impl Default for AuthConfig {
             api_tokens: false,
             mtls: true,
             password_keys: true,
+            origin_pinning: true,
+            origin_pinning_always: false,
+            acl_origins: false,
         }
     }
 }
@@ -360,6 +373,14 @@ impl Config {
                 "limits.ephemeral_burst_bytes must be at least max_envelope_bytes + {EPH_MSG_OVERHEAD}"
             ));
         }
+        for o in &self.public_origins {
+            if !zen_proto::valid_origin(o) {
+                return Err(format!(
+                    "public_origins: {o:?} is not an origin (scheme://host[:port], lowercase, \
+                     no trailing slash)"
+                ));
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fs {
             if f.id == 0 {
@@ -389,6 +410,16 @@ mod tests {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             Config::from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    #[test]
+    fn public_origins_must_be_origins() {
+        for bad in ["https://a.example/", "a.example", "https://A.example"] {
+            let t = format!("data_dir = \"/tmp/x\"\npublic_origins = [\"{bad}\"]");
+            assert!(Config::from_toml(&t).is_err(), "{bad}");
+        }
+        let t = "data_dir = \"/tmp/x\"\npublic_origins = [\"https://a.example:8443\"]";
+        assert!(Config::from_toml(t).is_ok());
     }
 
     #[test]

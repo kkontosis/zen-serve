@@ -115,6 +115,9 @@ pub struct Harness {
     pub http: reqwest::Client,
     pub base: String,
     pub cfg: Config,
+    /// `Host` header to send, as behind a load balancer (peers send their
+    /// first node's, so all nodes share one origin). `None`: the address.
+    pub host: Option<String>,
 }
 
 /// Whether the tests run on FoundationDB (`ZEN_TEST_BACKEND=fdb`, with
@@ -170,6 +173,7 @@ impl Harness {
             http,
             base,
             cfg,
+            host: None,
         }
     }
 
@@ -186,11 +190,21 @@ impl Harness {
         cfg.data_dir = dir.path().join("data");
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         f(&cfg.data_dir);
-        Self::launch(cfg, dir).await
+        let mut peer = Self::launch(cfg, dir).await;
+        peer.host = Some(self.host_header());
+        peer
     }
 
+    /// The `Host` header this harness sends.
+    pub fn host_header(&self) -> String {
+        self.host
+            .clone()
+            .unwrap_or_else(|| self.server.addr.to_string())
+    }
+
+    /// The origin clients of this harness sign.
     pub fn origin(&self) -> String {
-        self.base.clone()
+        format!("http://{}", self.host_header())
     }
 
     pub async fn call<Q: Serialize, R: DeserializeOwned>(
@@ -199,10 +213,22 @@ impl Harness {
         token: Option<&[u8]>,
         req: &Q,
     ) -> Result<R, ApiErr> {
+        self.call_host(path, token, req, &self.host_header()).await
+    }
+
+    /// `call` with an explicit `Host` header.
+    pub async fn call_host<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: Option<&[u8]>,
+        req: &Q,
+        host: &str,
+    ) -> Result<R, ApiErr> {
         let mut rb = self
             .http
             .post(format!("{}{}", self.base, path))
             .header("content-type", CBOR)
+            .header("host", host)
             .body(to_cbor(req));
         if let Some(t) = token {
             rb = rb.header(
@@ -235,15 +261,21 @@ impl Harness {
     }
 
     pub async fn sign_in(&self, u: &User) -> Result<Vec<u8>, ApiErr> {
+        self.sign_in_at(u, &self.origin(), &self.host_header())
+            .await
+    }
+
+    /// Device sign-in signing `origin`, sending `host` as the `Host` header.
+    pub async fn sign_in_at(&self, u: &User, origin: &str, host: &str) -> Result<Vec<u8>, ApiErr> {
         let c: Challenge = self.call("/v1/auth/challenge", None, &Empty {}).await?;
-        let origin = self.origin();
+        let origin = origin.to_string();
         let sig = u
             .device
             .signing()
             .sign(labels::SIG_SESSION, &session_message(&c.challenge, &origin))
             .unwrap();
         let s: Session = self
-            .call(
+            .call_host(
                 "/v1/auth/session",
                 None,
                 &SessionRequest {
@@ -253,6 +285,7 @@ impl Harness {
                     cert: u.cert.clone(),
                     sig,
                 },
+                host,
             )
             .await?;
         Ok(s.token)
@@ -263,8 +296,16 @@ impl Harness {
         signed: Vec<u8>,
         claim: Option<String>,
     ) -> Result<AclVersion, ApiErr> {
-        self.call("/v1/acl/put", None, &AclPut { acl: signed, claim })
-            .await
+        self.call(
+            "/v1/acl/put",
+            None,
+            &AclPut {
+                acl: signed,
+                claim,
+                origin: None,
+            },
+        )
+        .await
     }
 
     /// Claim the server with `admin`, granting each user `rights` on fs 1

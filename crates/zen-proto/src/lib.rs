@@ -92,6 +92,51 @@ pub struct AuthInfo {
     /// The method a client offers first, if any is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// The origin policy (spec/auth.md §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origins: Option<OriginInfo>,
+}
+
+/// `/v1/info` `auth.origins` (spec/auth.md §5.5).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OriginInfo {
+    /// The origins the server accepts and considers its own, canonical
+    /// first. A client that sees another origin is talking to a relay, or
+    /// to a server that isn't set up yet.
+    pub origins: Vec<String>,
+    /// First-contact pinning is in force.
+    pub pinning: bool,
+    /// Other origins are accepted from the request's `Host` header: the
+    /// sign-in relay protection is absent right now.
+    pub host_fallback: bool,
+}
+
+/// `POST /v1/admin/origins/get` response (spec/auth.md §5.6).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OriginState {
+    /// 7a: `public_origins` from the config.
+    pub public_origins: Vec<String>,
+    /// 7b: the pinned origins (kept even while pinning is not in force).
+    pub pinned: Vec<String>,
+    /// 7c: the head ACL's `origins`.
+    pub acl_origins: Vec<String>,
+    /// 7b is in force.
+    pub pinning: bool,
+    /// `origin_pinning_always` is set.
+    pub pinning_always: bool,
+    /// 7c (`acl_origins`) is on.
+    pub acl: bool,
+    /// The union in force, canonical first.
+    pub accepted: Vec<String>,
+    /// Other origins are accepted from the `Host` header.
+    pub host_fallback: bool,
+}
+
+/// `POST /v1/admin/origins/set` request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OriginPins {
+    /// The new pinned set; empty unpins.
+    pub pinned: Vec<String>,
 }
 
 /// A sign-in method (spec/auth.md §1). The discriminant is its id, stored
@@ -338,6 +383,10 @@ pub struct AclPut {
     /// Claim token, for version 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<String>,
+    /// Version 1 only: the server origin as the claiming client sees it,
+    /// pinned when first-contact pinning is in force (spec/auth.md §5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/acl/put` response.

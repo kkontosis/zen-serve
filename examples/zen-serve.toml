@@ -3,8 +3,10 @@
 listen = "127.0.0.1:8080"
 data_dir = "./zen-data"
 
-# Origins clients sign into (scheme://host[:port]). Empty: derived from the
-# Host header, which is fine behind a reverse proxy that preserves it.
+# Origins clients sign into (scheme://host[:port], lowercase, no trailing
+# slash): spec/auth.md §5.1. Set this in production. While it is empty the
+# server prints a warning at start-up, pins the first origin that signs in
+# after the claim, and trusts the Host header until then.
 public_origins = []
 
 # Plaintext static files. Without this, the bundled defaults are served.
@@ -26,6 +28,10 @@ opaque = false         # 3: OPAQUE passwords (not implemented yet)
 api_tokens = false     # 4: admin-issued bearer tokens for services
 mtls = true            # 5: TLS client certificates (not implemented yet)
 password_keys = true   # 6: password-derived keys, the default method
+# Origin policy (spec/auth.md §5).
+origin_pinning = true            # 7b: pin the first origin while public_origins is empty
+origin_pinning_always = false    # keep 7b alongside public_origins (risky)
+acl_origins = false              # 7c: also accept the origins listed in the signed ACL
 
 [[fs]]
 id = 1   # "/"

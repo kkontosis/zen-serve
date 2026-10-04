@@ -6,6 +6,7 @@ use crate::cbor::Cbor;
 use crate::error::*;
 use crate::ids::{random32, unix_now};
 use crate::keys;
+use crate::origin::SignedOrigin;
 use crate::state::{CachedSession, SessionInfo, Shared};
 use crate::txn::txn_loop;
 use axum::extract::{FromRequestParts, State};
@@ -16,7 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zen_core::labels;
 use zen_core::sig::{PublicIdentity, verify_device_cert};
-use zen_proto::{AuthInfo, AuthMethod, Challenge, Empty, Session, SessionRequest, session_message};
+use zen_proto::{
+    AuthInfo, AuthMethod, Challenge, Empty, OriginInfo, Session, SessionRequest, session_message,
+};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
@@ -36,8 +39,20 @@ const PREFERENCE: &[AuthMethod] = &[
 ];
 
 /// `/v1/info` `auth` (auth.md §2).
-pub fn info(st: &Shared) -> AuthInfo {
+pub async fn info(st: &Shared) -> AuthInfo {
+    let origins = match crate::origin::own_origins(st).await {
+        Ok(o) => Some(OriginInfo {
+            origins: o.origins,
+            pinning: o.pinning,
+            host_fallback: o.host_fallback,
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e.message, "reading the pinned origins failed");
+            None
+        }
+    };
     AuthInfo {
+        origins,
         methods: AuthMethod::ALL
             .into_iter()
             .filter(|m| st.method_on(*m))
@@ -72,6 +87,15 @@ impl Caller {
     /// Whether the user is an admin.
     pub fn is_admin(&self) -> bool {
         self.acl.admins.contains(&self.user)
+    }
+
+    /// 403 unless the caller is an admin.
+    pub fn require_admin(&self) -> ApiResult<()> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(forbidden("admins only"))
+        }
     }
 
     /// 403 unless the caller has `right` on `fs`.
@@ -276,16 +300,6 @@ pub async fn challenge_key(store: &dyn zen_store::Storage) -> ApiResult<[u8; 32]
     Ok(k)
 }
 
-fn origin_ok(st: &Shared, headers: &HeaderMap, origin: &str) -> bool {
-    if !st.cfg.public_origins.is_empty() {
-        return st.cfg.public_origins.iter().any(|o| o == origin);
-    }
-    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
-        return false;
-    };
-    origin == format!("http://{host}") || origin == format!("https://{host}")
-}
-
 /// A live challenge from a request field, or 401.
 pub fn check_challenge(st: &Shared, c: &[u8]) -> ApiResult<[u8; 32]> {
     let challenge: [u8; 32] = c.try_into().map_err(|_| unauthorized("bad challenge"))?;
@@ -303,9 +317,7 @@ pub async fn session(
 ) -> ApiResult<Cbor<Session>> {
     st.require_method(AuthMethod::DeviceKey)?;
     let challenge = check_challenge(&st, &req.challenge)?;
-    if !origin_ok(&st, &headers, &req.origin) {
-        return Err(unauthorized("origin not accepted"));
-    }
+    let origin = SignedOrigin::new(&headers, &req.origin)?;
     let user = PublicIdentity::decode(&req.user).map_err(|_| unauthorized("bad identity"))?;
     let user_fp = user.fingerprint();
     let acl = st.acl();
@@ -327,25 +339,32 @@ pub async fn session(
             &req.sig,
         )
         .map_err(|_| unauthorized("bad session signature"))?;
-    issue_session(
-        &st,
-        user_fp,
-        device_fp,
-        AuthMethod::DeviceKey,
-        Some(&challenge),
-    )
-    .await
+    let signed = Signed {
+        challenge,
+        origin: &origin,
+    };
+    issue_session(&st, user_fp, device_fp, AuthMethod::DeviceKey, Some(signed)).await
+}
+
+/// What a sign-in signed: the challenge it spends and the origin it names.
+pub struct Signed<'a> {
+    /// The challenge.
+    pub challenge: [u8; 32],
+    /// The origin, checked against the policy (auth.md §5).
+    pub origin: &'a SignedOrigin,
 }
 
 /// Create a session for `user`, signed in with credential `cred` by
-/// `method`, spending `challenge` if the method signed one. Every sign-in
-/// method ends here (auth.md §3).
+/// `method`. A method that signs a challenge and an origin passes them in
+/// `signed`: the challenge is spent and the origin checked, and pinned
+/// when it is the first (auth.md §5.2), in the session's transaction.
+/// Every sign-in method ends here (auth.md §3).
 pub async fn issue_session(
     st: &Shared,
     user: Fp,
     cred: Fp,
     method: AuthMethod,
-    challenge: Option<&[u8; 32]>,
+    signed: Option<Signed<'_>>,
 ) -> ApiResult<Cbor<Session>> {
     let token = random32();
     let ttl = st.cfg.limits.session_ttl_secs;
@@ -356,7 +375,8 @@ pub async fn issue_session(
         expires_unix: unix_now() + ttl,
     };
     let hash = token_hash(&token);
-    let used = challenge.map(|c| {
+    let used = signed.as_ref().map(|s| {
+        let c = &s.challenge;
         let exp = u32::from_be_bytes(c[12..16].try_into().expect("4")) as u64;
         (keys::challenge(c), exp)
     });
@@ -371,6 +391,9 @@ pub async fn issue_session(
                 return Err(unauthorized("challenge already used"));
             }
             t.set(used, &exp.to_be_bytes());
+        }
+        if let Some(s) = &signed {
+            crate::origin::check_in_txn(st, &mut t, s.origin).await?;
         }
         t.set(&sess_key, &encode_session(&info));
         Ok(())

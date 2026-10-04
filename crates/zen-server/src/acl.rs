@@ -314,6 +314,14 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
     }
     let is_fs = |fs| st.cfg.has_fs(fs);
     let new = validate_successor(&req.acl, &head, &is_fs)?;
+    // The claim may name the origin to pin (auth.md §5.2).
+    let pin = match &req.origin {
+        Some(o) if new.version == 1 => {
+            crate::origin::check_origin(o)?;
+            Some(o.clone())
+        }
+        _ => None,
+    };
     txn_loop!(st.store, None, idempotent, |t| {
         let current = t
             .get(&keys::acl_head())
@@ -330,6 +338,9 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
         }
         t.set(&keys::acl(new.version), &req.acl);
         t.set(&keys::acl_head(), &new.version.to_be_bytes());
+        if let Some(o) = &pin {
+            crate::origin::pin_at_claim(&st.cfg, &mut t, o).await?;
+        }
         Ok(())
     })?;
     let version = new.version;

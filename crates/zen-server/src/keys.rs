@@ -237,6 +237,12 @@ pub fn eph_head(fs: u32) -> Vec<u8> {
     Key::new().str("eh").int(fs.into()).finish()
 }
 
+/// The pinned sign-in origins (auth.md §5.2): exported with the data, not
+/// server metadata, so a restored or migrated cluster keeps its pin.
+pub fn origin_pins() -> Vec<u8> {
+    Key::new().str("origins").finish()
+}
+
 /// Server metadata.
 pub fn meta(name: &str) -> Vec<u8> {
     Key::new().str("meta").str(name).finish()
