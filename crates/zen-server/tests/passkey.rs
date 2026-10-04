@@ -102,7 +102,7 @@ async fn register_and_sign_in() {
     assert!(auth.methods.contains(&"passkey".to_string()));
     assert_eq!(auth.default.as_deref(), Some("password_key"));
     let pk = auth.passkey.unwrap();
-    assert_eq!(pk.algorithms, [-8, -7]);
+    assert_eq!(pk.algorithms, [-8, -7, -257]);
     assert_eq!(pk.user_verification, "required");
     // Nothing is pinned until the first sign-in, so no relying-party id.
     assert_eq!(pk.rp_id, None);
@@ -112,9 +112,13 @@ async fn register_and_sign_in() {
     let rp = info.auth.unwrap().passkey.unwrap().rp_id;
     assert_eq!(rp.as_deref(), Some("127.0.0.1"));
 
-    for (n, mut a) in [Authenticator::p256(20), Authenticator::ed25519(21)]
-        .into_iter()
-        .enumerate()
+    for (n, mut a) in [
+        Authenticator::p256(20),
+        Authenticator::ed25519(21),
+        Authenticator::rsa(22),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let opts = register_begin(&h, &bob_dev).await.unwrap();
         assert_eq!(opts.rp_id, "127.0.0.1");
@@ -145,7 +149,7 @@ async fn register_and_sign_in() {
 
     // Non-discoverable: the user's credential ids, for this rp id only.
     let opts = begin(&h, Some(&bob)).await.unwrap();
-    assert_eq!(opts.allow.len(), 2);
+    assert_eq!(opts.allow.len(), 3);
     assert!(begin(&h, Some(&admin)).await.unwrap().allow.is_empty());
     assert!(
         begin(&h, Some(&User::new(9)))
@@ -158,7 +162,7 @@ async fn register_and_sign_in() {
     // Listed through the generic endpoint, with the last use; metadata
     // only.
     let list = creds(&h, &bob_dev, None).await.unwrap().credentials;
-    assert_eq!(list.len(), 2);
+    assert_eq!(list.len(), 3);
     for c in &list {
         assert_eq!(c.method, "passkey");
         assert_eq!(c.label.as_deref(), Some("laptop"));
@@ -176,6 +180,39 @@ async fn register_and_sign_in() {
     // An unknown credential.
     let mut stranger = Authenticator::p256(99);
     assert_eq!(code(sign_in(&h, &mut stranger).await).0, 401);
+}
+
+/// An RSA-only authenticator (RS256): registered, signed in with, its
+/// counter enforced, and refused when its key is outside the policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn rs256_passkeys() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let dev = h.sign_in(&admin).await.unwrap();
+    let mut a = Authenticator::rsa(23);
+    let id = register(&h, &dev, &mut a, Some("windows hello"))
+        .await
+        .unwrap();
+    let s = sign_in(&h, &mut a).await.unwrap();
+    assert_eq!(s.device_fp, id.id);
+    grv(&h, &s.token).await.unwrap();
+    // Another key under the same credential id is refused.
+    let mut wrong = Authenticator::rsa(24);
+    wrong.credential_id = a.credential_id.clone();
+    wrong.counter = Some(100);
+    assert_eq!(code(sign_in(&h, &mut wrong).await).0, 401);
+    a.counter = Some(0);
+    assert_eq!(code(sign_in(&h, &mut a).await).0, 401);
+
+    // A 1024-bit key is refused at registration.
+    let mut weak = Authenticator::rsa(25);
+    weak.key = zen_server::webauthn::soft::Key::Rsa(Box::new(zen_server::webauthn::soft::rsa_key(
+        25, 1024,
+    )));
+    let (s, e) = register(&h, &dev, &mut weak, None).await.unwrap_err();
+    assert_eq!(s, 400);
+    assert!(e.message.contains("2048"), "{}", e.message);
 }
 
 #[tokio::test(flavor = "multi_thread")]

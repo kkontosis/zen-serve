@@ -22,7 +22,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-AUTH-WEBAUTHN-RS256
 
-* **Status:** open
+* **Status:** resolved, by the commit "spec: RS256 passkeys (auth.md §7)": the user accepted the release-candidate dependency. RS256 verification uses `rsa` pinned to `=0.10.0-rc.18`, with the key policy of auth.md §7 (2048–4096-bit modulus, odd exponent from 65537 to 2³² − 1). Follow-up: move to the `rsa` 0.10 release once it is out, and re-run the passkey tests.
 * **Context:** The passkey verifier (auth.md §7) supports EdDSA (Ed25519) and ES256 (P-256). An authenticator that can only sign with RS256 (COSE −257), such as some older Windows Hello TPM configurations, can't register.
 * **Why deferred:** The verifier is pure Rust, without OpenSSL. The pure-Rust `rsa` crate for the RustCrypto generation this workspace uses (`signature` 3, `sha2` 0.11) is only a release candidate, and writing RSA verification by hand means a big-integer implementation of our own. Current platform authenticators and security keys all offer ES256.
 * **What it would take:** Once `rsa` 0.10 is released: parse COSE RSA keys (kty 3, `n`, `e`, a floor of 2048 bits), verify RSASSA-PKCS1-v1_5 with SHA-256, add −257 last in `pubKeyCredParams` and `/v1/info`, and unit tests with generated keys. Only public-key operations are needed, so the crate's timing advisory on decryption doesn't apply.

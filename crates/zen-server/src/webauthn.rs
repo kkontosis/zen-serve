@@ -11,9 +11,11 @@
 //!   signature over `authData ‖ SHA-256(clientDataJSON)` with the stored
 //!   key, and the signature counter ([`check_counter`]).
 //!
-//! Algorithms: ES256 (COSE -7, ECDSA P-256 with SHA-256) and EdDSA (COSE
-//! -8, Ed25519). RS256 is not supported: the pure-Rust `rsa` crate is only
-//! a release candidate for this generation of RustCrypto.
+//! Algorithms: ES256 (COSE -7, ECDSA P-256 with SHA-256), EdDSA (COSE -8,
+//! Ed25519) and RS256 (COSE -257, RSASSA-PKCS1-v1_5 with SHA-256, for
+//! authenticators that only sign with RSA). RSA keys must have a modulus of
+//! [`RSA_MIN_BITS`]..=[`RSA_MAX_BITS`] bits and an odd public exponent of
+//! at least 65537 that fits 32 bits.
 //!
 //! The challenge's freshness and single use, and the origin policy, are the
 //! server's (`auth::check_challenge`, `auth::issue_session`); this module
@@ -31,9 +33,22 @@ use std::fmt;
 pub const ALG_ES256: i64 = -7;
 /// COSE algorithm: EdDSA (Ed25519).
 pub const ALG_EDDSA: i64 = -8;
+/// COSE algorithm: RSASSA-PKCS1-v1_5 with SHA-256.
+pub const ALG_RS256: i64 = -257;
 /// Supported COSE algorithms, in order of preference
-/// (`pubKeyCredParams`).
-pub const ALGORITHMS: [i64; 2] = [ALG_EDDSA, ALG_ES256];
+/// (`pubKeyCredParams`). RS256 comes last: browsers pick the first one an
+/// authenticator supports, and only RSA-only authenticators need it.
+pub const ALGORITHMS: [i64; 3] = [ALG_EDDSA, ALG_ES256, ALG_RS256];
+
+/// Smallest RSA modulus accepted, in bits.
+pub const RSA_MIN_BITS: usize = 2048;
+/// Largest RSA modulus accepted, in bits: larger keys only cost
+/// verification time.
+pub const RSA_MAX_BITS: usize = 4096;
+/// Smallest RSA public exponent accepted (as FIPS 186-5).
+pub const RSA_MIN_E: u64 = 65537;
+/// Largest RSA public exponent accepted.
+pub const RSA_MAX_E: u64 = u32::MAX as u64;
 
 /// Max length of a credential id (WebAuthn Level 3).
 pub const MAX_CREDENTIAL_ID: usize = 1023;
@@ -77,6 +92,9 @@ pub enum Error {
     UserVerification,
     /// A public key with an algorithm or curve this verifier doesn't support.
     Algorithm,
+    /// A supported algorithm with a key outside the policy (RSA size or
+    /// exponent).
+    KeyPolicy(&'static str),
     /// The signature doesn't verify.
     Signature,
     /// The signature counter didn't increase: a possibly cloned
@@ -103,6 +121,7 @@ impl fmt::Display for Error {
                 "the authenticator did not verify the user, and this server requires it",
             ),
             Error::Algorithm => f.write_str("unsupported public key algorithm"),
+            Error::KeyPolicy(what) => write!(f, "public key refused: {what}"),
             Error::Signature => f.write_str("bad passkey signature"),
             Error::Counter { stored, got } => write!(
                 f,
@@ -198,6 +217,13 @@ pub enum CoseKey {
     },
     /// EdDSA: an Ed25519 public key.
     Ed25519([u8; 32]),
+    /// RS256: an RSA public key, big-endian without leading zeros.
+    Rs256 {
+        /// Modulus.
+        n: Vec<u8>,
+        /// Public exponent.
+        e: Vec<u8>,
+    },
 }
 
 const COSE_KTY: i64 = 1;
@@ -207,11 +233,24 @@ const COSE_X: i64 = -2;
 const COSE_Y: i64 = -3;
 const KTY_OKP: i64 = 1;
 const KTY_EC2: i64 = 2;
+const KTY_RSA: i64 = 3;
+const COSE_RSA_N: i64 = -1;
+const COSE_RSA_E: i64 = -2;
 const CRV_P256: i64 = 1;
 const CRV_ED25519: i64 = 6;
 
 fn int(v: &Value) -> Option<i64> {
     v.as_integer().and_then(|i| i64::try_from(i).ok())
+}
+
+/// A big-endian unsigned integer from a COSE byte string, without its
+/// leading zeros.
+fn uint_bytes(v: Option<&Value>) -> Result<Vec<u8>> {
+    let b = v
+        .and_then(Value::as_bytes)
+        .ok_or(Error::Malformed("COSE RSA key"))?;
+    let start = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+    Ok(b[start..].to_vec())
 }
 
 fn bytes32(v: Option<&Value>) -> Result<[u8; 32]> {
@@ -259,6 +298,15 @@ impl CoseKey {
                 key.ed25519()?;
                 Ok(key)
             }
+            // Label -1 is `n` for RSA, not a curve.
+            (Some(KTY_RSA), Some(ALG_RS256), _) => {
+                let key = CoseKey::Rs256 {
+                    n: uint_bytes(get(COSE_RSA_N)?)?,
+                    e: uint_bytes(get(COSE_RSA_E)?)?,
+                };
+                key.rsa()?;
+                Ok(key)
+            }
             _ => Err(Error::Algorithm),
         }
     }
@@ -268,7 +316,41 @@ impl CoseKey {
         match self {
             CoseKey::Es256 { .. } => ALG_ES256,
             CoseKey::Ed25519(_) => ALG_EDDSA,
+            CoseKey::Rs256 { .. } => ALG_RS256,
         }
+    }
+
+    /// The RSA key, checked against the policy: a modulus of
+    /// [`RSA_MIN_BITS`]..=[`RSA_MAX_BITS`] bits, an odd exponent in
+    /// [`RSA_MIN_E`]..=[`RSA_MAX_E`] (and below the modulus).
+    fn rsa(&self) -> Result<rsa::RsaPublicKey> {
+        let CoseKey::Rs256 { n, e } = self else {
+            return Err(Error::Algorithm);
+        };
+        let bits = match n.first() {
+            Some(top) => n.len() * 8 - top.leading_zeros() as usize,
+            None => 0,
+        };
+        if !(RSA_MIN_BITS..=RSA_MAX_BITS).contains(&bits) {
+            return Err(Error::KeyPolicy(
+                "an RSA modulus must have 2048 to 4096 bits",
+            ));
+        }
+        if e.len() > 8 {
+            return Err(Error::KeyPolicy("RSA public exponent out of range"));
+        }
+        let mut e8 = [0u8; 8];
+        e8[8 - e.len()..].copy_from_slice(e);
+        let e64 = u64::from_be_bytes(e8);
+        if e64 % 2 == 0 || !(RSA_MIN_E..=RSA_MAX_E).contains(&e64) {
+            return Err(Error::KeyPolicy(
+                "the RSA public exponent must be odd, at least 65537 and fit 32 bits",
+            ));
+        }
+        let n = rsa::BoxedUint::from_be_slice_vartime(n);
+        let e = rsa::BoxedUint::from(e64);
+        rsa::RsaPublicKey::new_with_max_size(n, e, RSA_MAX_BITS)
+            .map_err(|_| Error::Malformed("RSA public key"))
     }
 
     fn p256(&self) -> Result<p256::ecdsa::VerifyingKey> {
@@ -293,7 +375,8 @@ impl CoseKey {
 
     /// Verify a WebAuthn signature over `msg`: ASN.1 DER for ES256 (either
     /// form of `s`, as authenticators produce both), 64 bytes for EdDSA
-    /// (strict verification).
+    /// (strict verification), and for RS256 exactly as many bytes as the
+    /// modulus.
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> Result<()> {
         match self {
             CoseKey::Es256 { .. } => {
@@ -306,6 +389,16 @@ impl CoseKey {
                     ed25519_dalek::Signature::from_slice(sig).map_err(|_| Error::Signature)?;
                 self.ed25519()?
                     .verify_strict(msg, &sig)
+                    .map_err(|_| Error::Signature)
+            }
+            CoseKey::Rs256 { n, .. } => {
+                use rsa::signature::Verifier;
+                if sig.len() != n.len() {
+                    return Err(Error::Signature);
+                }
+                let sig = rsa::pkcs1v15::Signature::try_from(sig).map_err(|_| Error::Signature)?;
+                rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(self.rsa()?)
+                    .verify(msg, &sig)
                     .map_err(|_| Error::Signature)
             }
         }
@@ -555,6 +648,49 @@ pub mod soft {
         P256(p256::ecdsa::SigningKey),
         /// EdDSA.
         Ed25519(ed25519_dalek::SigningKey),
+        /// RS256.
+        Rsa(Box<rsa::RsaPrivateKey>),
+    }
+
+    /// A deterministic RNG for RSA key generation (BLAKE3 in XOF mode).
+    struct XofRng(blake3::OutputReader);
+
+    impl rsa::rand_core::TryRng for XofRng {
+        type Error = std::convert::Infallible;
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+            let mut b = [0; 4];
+            self.0.fill(&mut b);
+            Ok(u32::from_le_bytes(b))
+        }
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            let mut b = [0; 8];
+            self.0.fill(&mut b);
+            Ok(u64::from_le_bytes(b))
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+            self.0.fill(dst);
+            Ok(())
+        }
+    }
+
+    impl rsa::rand_core::TryCryptoRng for XofRng {}
+
+    /// An RSA key of `bits` from a seed byte. Generated once per process:
+    /// key generation is slow.
+    pub fn rsa_key(seed: u8, bits: usize) -> rsa::RsaPrivateKey {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static KEYS: OnceLock<Mutex<HashMap<(u8, usize), rsa::RsaPrivateKey>>> = OnceLock::new();
+        let keys = KEYS.get_or_init(Default::default);
+        if let Some(k) = keys.lock().expect("keys").get(&(seed, bits)) {
+            return k.clone();
+        }
+        let mut h = blake3::Hasher::new_derive_key("zen/test/webauthn-rsa");
+        h.update(&[seed]);
+        h.update(&(bits as u64).to_be_bytes());
+        let k = rsa::RsaPrivateKey::new(&mut XofRng(h.finalize_xof()), bits).expect("RSA key");
+        keys.lock().expect("keys").insert((seed, bits), k.clone());
+        k
     }
 
     /// A software authenticator holding one credential.
@@ -592,6 +728,16 @@ pub mod soft {
             }
         }
 
+        /// An RS256 credential (2048 bits) from a seed byte.
+        pub fn rsa(seed: u8) -> Self {
+            Authenticator {
+                key: Key::Rsa(Box::new(rsa_key(seed, 2048))),
+                credential_id: vec![seed; 24],
+                counter: Some(0),
+                flags: FLAG_UP | FLAG_UV,
+            }
+        }
+
         /// The COSE public key.
         pub fn cose_key(&self) -> Vec<u8> {
             let i = |n: i64| Value::Integer(n.into());
@@ -616,6 +762,19 @@ pub mod soft {
                         Value::Bytes(k.verifying_key().to_bytes().to_vec()),
                     ),
                 ],
+                Key::Rsa(k) => {
+                    use rsa::traits::PublicKeyParts as _;
+                    let strip = |b: Box<[u8]>| {
+                        let i = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+                        b[i..].to_vec()
+                    };
+                    vec![
+                        (i(COSE_KTY), i(KTY_RSA)),
+                        (i(COSE_ALG), i(ALG_RS256)),
+                        (i(COSE_RSA_N), Value::Bytes(strip(k.n().to_be_bytes()))),
+                        (i(COSE_RSA_E), Value::Bytes(strip(k.e().to_be_bytes()))),
+                    ]
+                }
             };
             zen_proto::to_cbor(&Value::Map(map))
         }
@@ -681,6 +840,11 @@ pub mod soft {
                 Key::Ed25519(k) => {
                     use ed25519_dalek::Signer as _;
                     k.sign(&msg).to_bytes().to_vec()
+                }
+                Key::Rsa(k) => {
+                    use rsa::signature::SignatureEncoding as _;
+                    let k = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new((**k).clone());
+                    k.sign(&msg).to_vec()
                 }
             }
         }
@@ -750,8 +914,12 @@ mod tests {
     }
 
     #[test]
-    fn register_and_sign_in_es256_and_eddsa() {
-        for mut a in [Authenticator::p256(3), Authenticator::ed25519(4)] {
+    fn register_and_sign_in_es256_eddsa_and_rs256() {
+        for mut a in [
+            Authenticator::p256(3),
+            Authenticator::ed25519(4),
+            Authenticator::rsa(5),
+        ] {
             let r = register(&mut a);
             let c = r.credential();
             assert_eq!(c.credential_id, a.credential_id);
@@ -1012,6 +1180,139 @@ mod tests {
         }
     }
 
+    /// A COSE RSA key with these components.
+    fn rsa_cose(n: &[u8], e: &[u8]) -> Vec<u8> {
+        let i = |n: i64| Value::Integer(n.into());
+        zen_proto::to_cbor(&Value::Map(vec![
+            (i(COSE_KTY), i(KTY_RSA)),
+            (i(COSE_ALG), i(ALG_RS256)),
+            (i(COSE_RSA_N), Value::Bytes(n.to_vec())),
+            (i(COSE_RSA_E), Value::Bytes(e.to_vec())),
+        ]))
+    }
+
+    /// An odd modulus-shaped number of exactly `bits` bits.
+    fn modulus(bits: usize) -> Vec<u8> {
+        let mut n = vec![0xA5; bits.div_ceil(8)];
+        let top = bits % 8;
+        n[0] = if top == 0 { 0xC5 } else { (1 << (top - 1)) | 1 };
+        *n.last_mut().unwrap() |= 1;
+        n
+    }
+
+    #[test]
+    fn rs256_signatures_and_tampering() {
+        let mut a = Authenticator::rsa(12);
+        let r = register(&mut a);
+        let c = r.credential();
+        assert_eq!(c.public_key.alg(), ALG_RS256);
+        let key = c.public_key.clone();
+        let stored = Stored {
+            key: &key,
+            rp_id: RP,
+            sign_count: 0,
+        };
+        let (ad, cd, sig) = a.get(RP, &CH, ORIGIN);
+        assert_eq!(sig.len(), 256);
+        verify_assertion(&stored, &ad, &cd, &sig, &want(&CH)).unwrap();
+        let check = |ad: &[u8], cd: &[u8], sig: &[u8]| {
+            verify_assertion(&stored, ad, cd, sig, &want(&CH)).unwrap_err()
+        };
+        // Tampered data, signature; a shorter or longer signature.
+        let mut bad = ad.clone();
+        bad[33] ^= 0x80;
+        assert_eq!(check(&bad, &cd, &sig), Error::Signature);
+        let mut bad = cd.clone();
+        bad[2] ^= 1;
+        assert!(verify_assertion(&stored, &ad, &bad, &sig, &want(&CH)).is_err());
+        let mut bad = sig.clone();
+        bad[100] ^= 1;
+        assert_eq!(check(&ad, &cd, &bad), Error::Signature);
+        assert_eq!(check(&ad, &cd, &sig[1..]), Error::Signature);
+        let mut long = vec![0];
+        long.extend_from_slice(&sig);
+        assert_eq!(check(&ad, &cd, &long), Error::Signature);
+        assert_eq!(check(&ad, &cd, &[]), Error::Signature);
+        // Another RSA key's signature.
+        let other = Authenticator::rsa(13);
+        assert_eq!(check(&ad, &cd, &other.sign(&ad, &cd)), Error::Signature);
+        // An ECDSA signature for an RSA key.
+        let ec = Authenticator::p256(14);
+        assert_eq!(check(&ad, &cd, &ec.sign(&ad, &cd)), Error::Signature);
+    }
+
+    #[test]
+    fn rsa_key_policy() {
+        let e = [1, 0, 1];
+        // Modulus size: 2048 to 4096 bits, leading zero bytes ignored.
+        for (bits, ok) in [
+            (1024, false),
+            (2047, false),
+            (2048, true),
+            (3072, true),
+            (4096, true),
+            (4097, false),
+            (8192, false),
+        ] {
+            let r = CoseKey::decode(&rsa_cose(&modulus(bits), &e));
+            assert_eq!(r.is_ok(), ok, "{bits} bits: {r:?}");
+            if !ok {
+                assert!(matches!(r.unwrap_err(), Error::KeyPolicy(_)), "{bits}");
+            }
+        }
+        let mut padded = vec![0, 0];
+        padded.extend(modulus(2048));
+        assert!(CoseKey::decode(&rsa_cose(&padded, &e)).is_ok());
+        let mut padded = vec![0];
+        padded.extend(modulus(2040));
+        assert!(CoseKey::decode(&rsa_cose(&padded, &e)).is_err());
+        // An even modulus.
+        let mut even = modulus(2048);
+        *even.last_mut().unwrap() &= !1;
+        assert!(CoseKey::decode(&rsa_cose(&even, &e)).is_err());
+        // Exponent: odd, 65537 ..= 2^32 - 1.
+        let n = modulus(2048);
+        for (e, ok) in [
+            (vec![1, 0, 1], true),
+            (vec![0, 1, 0, 1], true),
+            (vec![0xFF, 0xFF, 0xFF, 0xFF], true),
+            (vec![3], false),
+            (vec![0xFF, 0xFF], false),
+            (vec![1, 0, 0], false),
+            (vec![1, 0, 0, 0, 1], false),
+            (vec![1; 9], false),
+            (vec![], false),
+            (vec![1], false),
+        ] {
+            let r = CoseKey::decode(&rsa_cose(&n, &e));
+            assert_eq!(r.is_ok(), ok, "e = {e:02x?}: {r:?}");
+        }
+        // Missing or mistyped components.
+        let i = |n: i64| Value::Integer(n.into());
+        let no_e = zen_proto::to_cbor(&Value::Map(vec![
+            (i(COSE_KTY), i(KTY_RSA)),
+            (i(COSE_ALG), i(ALG_RS256)),
+            (i(COSE_RSA_N), Value::Bytes(n.clone())),
+        ]));
+        assert!(matches!(
+            CoseKey::decode(&no_e).unwrap_err(),
+            Error::Malformed(_)
+        ));
+        let int_e = zen_proto::to_cbor(&Value::Map(vec![
+            (i(COSE_KTY), i(KTY_RSA)),
+            (i(COSE_ALG), i(ALG_RS256)),
+            (i(COSE_RSA_N), Value::Bytes(n)),
+            (i(COSE_RSA_E), i(65537)),
+        ]));
+        assert!(matches!(
+            CoseKey::decode(&int_e).unwrap_err(),
+            Error::Malformed(_)
+        ));
+        // A real key round-trips.
+        let a = Authenticator::rsa(5);
+        assert_eq!(CoseKey::decode(&a.cose_key()).unwrap().alg(), ALG_RS256);
+    }
+
     #[test]
     fn unsupported_and_bad_keys_are_refused() {
         let i = |n: i64| Value::Integer(n.into());
@@ -1020,14 +1321,16 @@ mod tests {
                 pairs.into_iter().map(|(k, v)| (i(k), v)).collect(),
             ))
         };
-        // RS256.
-        let rsa = key(vec![
-            (COSE_KTY, i(3)),
-            (COSE_ALG, i(-257)),
-            (-1, Value::Bytes(vec![1; 256])),
-            (-2, Value::Bytes(vec![1, 0, 1])),
-        ]);
-        assert_eq!(CoseKey::decode(&rsa).unwrap_err(), Error::Algorithm);
+        // RSA with another algorithm: PS256 (-37), RS512 (-259).
+        for alg in [-37, -259] {
+            let rsa = key(vec![
+                (COSE_KTY, i(KTY_RSA)),
+                (COSE_ALG, i(alg)),
+                (COSE_RSA_N, Value::Bytes(vec![0xC1; 256])),
+                (COSE_RSA_E, Value::Bytes(vec![1, 0, 1])),
+            ]);
+            assert_eq!(CoseKey::decode(&rsa).unwrap_err(), Error::Algorithm);
+        }
         // ES256 on another curve, a mismatched algorithm, a point off the
         // curve, a short coordinate, a duplicate label.
         let ec = |crv: i64, alg: i64, x: Vec<u8>, y: Vec<u8>| {

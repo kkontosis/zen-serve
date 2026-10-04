@@ -229,7 +229,13 @@ passkey_require_uv = true         # refuse authenticators that didn't verify the
 
 The server verifies WebAuthn itself, with a small verifier on pure-Rust cryptography: no OpenSSL and no attestation trust (§7.2).
 
-**Algorithms** (`pubKeyCredParams`, in this order): EdDSA (COSE −8, Ed25519) and ES256 (COSE −7, ECDSA on P-256 with SHA-256). RS256 (−257) is not supported (`TD-AUTH-WEBAUTHN-RS256`), so an authenticator that only signs with RSA can't register.
+**Algorithms** (`pubKeyCredParams`, in this order): EdDSA (COSE −8, Ed25519), ES256 (COSE −7, ECDSA on P-256 with SHA-256) and RS256 (COSE −257, RSASSA-PKCS1-v1_5 with SHA-256). RS256 comes last, for authenticators that only sign with RSA, such as some Windows Hello TPMs; browsers pick the first algorithm an authenticator supports.
+
+**RSA key policy.** An RS256 key (COSE `kty` 3, `n` and `e` as big-endian byte strings, leading zero bytes ignored) is refused at registration (400) unless:
+* the modulus has **2048 to 4096 bits** and is odd: smaller keys are too weak, larger ones only cost verification time;
+* the public exponent `e` is **odd, at least 65537 and at most 2³² − 1**, and below the modulus. Authenticators use 65537.
+
+An RS256 signature must be exactly as long as the modulus, and its padding is checked in full.
 
 ### 7.1 Relying-party id
 
@@ -269,7 +275,7 @@ The server checks all of these, or returns 401:
 2. The credential id is a stored passkey; its user is a member of the head ACL; `user_handle`, if sent, is that user's fingerprint.
 3. The challenge isn't used yet, and the origin policy (§5.4) accepts `origin`.
 4. `rpIdHash` = SHA-256(the passkey's rp id); UP is set; UV is set when required (§7.5); BS only with BE.
-5. `signature` verifies over `authenticator_data ‖ SHA-256(client_data_json)` with the stored key: ASN.1 DER for ES256 (either form of `s`), 64 bytes for EdDSA (strict verification).
+5. `signature` verifies over `authenticator_data ‖ SHA-256(client_data_json)` with the stored key: ASN.1 DER for ES256 (either form of `s`), 64 bytes for EdDSA (strict verification), the modulus length for RS256.
 6. The signature counter rule (§7.4).
 
 The server then stores the new counter and the sign-in time, and issues the session with `issue_session` and the signed challenge and origin (§13): the challenge is spent and the origin policy applied, pinning a first origin, in the session's transaction. The session's `device_fp` is the passkey's id and `method` is `passkey`.
@@ -291,7 +297,7 @@ Set it to false to accept security keys that only test presence. The options the
 ### 7.6 Threat notes
 
 * **Phishing and relays.** The browser writes the origin it is on into clientDataJSON, and only lets a page use passkeys of an rp id its host belongs to. The server checks the origin against its policy (§5) and the rp id hash. A look-alike site on another domain can't get an assertion for the rp id at all, and a relayed assertion names the relay's origin. The origin policy's caveats apply (§5.6): while it falls back to the `Host` header, the first sign-in trusts that header.
-* **Not post-quantum.** ES256 and Ed25519 are classical signatures. Whoever holds a passkey's public key (the server, a backup, an export) and a large quantum computer could forge its sign-ins. Methods 1 and 6 sign with a hybrid that includes ML-DSA-65.
+* **Not post-quantum.** ES256, Ed25519 and RSA are classical signatures. Whoever holds a passkey's public key (the server, a backup, an export) and a large quantum computer could forge its sign-ins. Methods 1 and 6 sign with a hybrid that includes ML-DSA-65.
 * **Nothing secret on the server.** The store holds public keys only, so a dump allows no offline guessing, unlike password verifiers (§11.4).
 * **No attestation.** Any authenticator, including software that copies keys, can register (§7.2). The counter (§7.4) is the only clone signal, and synced passkeys don't keep one.
 * **Native apps.** App origins (`android:apk-key-hash:…`, `ios:…`) are not web origins; the origin policy refuses them.

@@ -51,7 +51,7 @@ No authentication. Returns:
            origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
            passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
                        user_verification: text,         // "required" or "preferred" (auth.md §7.5)
-                       algorithms: [int] },             // COSE algorithms, preferred first: [-8, -7]
+                       algorithms: [int] },             // COSE algorithms, preferred first: [-8, -7, -257]
            password_params?: { m_cost_kib: u32, t_cost: u32, p_cost: u32 } } }   // auth.md §11.2
 ```
 
@@ -206,7 +206,7 @@ Method 2, passkeys (auth.md §7.2): add a passkey to the caller. Need a session,
 begin:  {} → { challenge: bytes(32),       // a challenge as in §3.1, for clientDataJSON
                rp_id: text,                // rp.id (auth.md §7.1)
                user_handle: bytes(32),     // user.id: the caller's user fingerprint
-               algorithms: [int],          // pubKeyCredParams, preferred first: [-8, -7]
+               algorithms: [int],          // pubKeyCredParams, preferred first: [-8, -7, -257]
                exclude: [bytes],           // excludeCredentials: the caller's passkeys under rp_id
                user_verification: text }   // "required" or "preferred"
 finish: { attestation_object: bytes,       // response.attestationObject
