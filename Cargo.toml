@@ -7,6 +7,14 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/kkontosis/zen-serve"
 
+# Release builds: smaller and faster (whole-program optimization, symbols
+# stripped). Panics still unwind, so one failing request can't stop the
+# server; opt-level 3 keeps signature checks and TLS fast.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
 # Crypto is unusably slow unoptimized (Argon2id at 64 MiB, ML-DSA), even in tests.
 [profile.dev.package."*"]
 opt-level = 3

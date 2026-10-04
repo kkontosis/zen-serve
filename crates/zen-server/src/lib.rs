@@ -28,6 +28,7 @@ pub mod rsakey;
 pub mod state;
 pub mod statics;
 pub mod stream;
+#[cfg(feature = "fdb")]
 pub mod supervisor;
 pub mod tls;
 pub mod token;
@@ -112,6 +113,7 @@ async fn admin_status(
 /// Storage health for `zen-serve status` and `/v1/admin/status`.
 pub async fn cluster_status(cfg: &Config) -> zen_proto::ClusterStatus {
     match (cfg.backend(), cfg.cluster_file()) {
+        #[cfg(feature = "fdb")]
         (config::Backend::Fdb, Some(file)) => match supervisor::status_json(cfg, &file).await {
             Ok(s) => supervisor::summarize(&s),
             Err(e) => zen_proto::ClusterStatus {
@@ -119,6 +121,12 @@ pub async fn cluster_status(cfg: &Config) -> zen_proto::ClusterStatus {
                 messages: vec![e],
                 ..Default::default()
             },
+        },
+        #[cfg(not(feature = "fdb"))]
+        (config::Backend::Fdb, Some(_)) => zen_proto::ClusterStatus {
+            backend: "fdb".into(),
+            messages: vec!["built without the fdb feature".into()],
+            ..Default::default()
         },
         (config::Backend::Fdb, None) => zen_proto::ClusterStatus {
             backend: "fdb".into(),

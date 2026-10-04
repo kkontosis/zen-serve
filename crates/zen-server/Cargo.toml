@@ -16,8 +16,14 @@ default = ["ring"]
 # ring builds C and assembly: it needs a C compiler. Without it
 # (`--no-default-features`) the provider is `tls::rustcrypto`, pure Rust.
 ring = ["rustls/ring"]
-# FoundationDB backend and supervisor commands (needs libfdb_c).
-fdb = ["zen-store/fdb"]
+# FoundationDB backend and supervisor commands (needs libfdb_c). Without it
+# the binary has the embedded backend only, and no init/join/token/backup/
+# restore commands.
+fdb = ["zen-store/fdb", "dep:nix"]
+# Never call a C compiler, even when one is installed: blake3's portable
+# code instead of its SIMD assembly. Use with `--no-default-features`
+# (without ring); ring needs a C compiler regardless (spec/operations.md §8.4).
+pure = ["blake3/pure"]
 # A software WebAuthn authenticator (`webauthn::soft`), for tests.
 test-utils = []
 
@@ -67,7 +73,7 @@ zen-store = { path = "../zen-store" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for the supervised FoundationDB processes (a safe `kill` wrapper).
-nix = { version = "0.30", default-features = false, features = ["signal"] }
+nix = { version = "0.30", default-features = false, features = ["signal"], optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }

@@ -2,6 +2,8 @@
 //! single-node cluster, and a killed `fdbserver` is restarted. Runs with
 //! `ZEN_TEST_BACKEND=fdb` (needs the FoundationDB binaries).
 
+#![cfg(feature = "fdb")]
+
 mod common;
 
 use std::time::{Duration, Instant};

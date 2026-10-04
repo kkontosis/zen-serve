@@ -2,8 +2,11 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use zen_server::config::{Backend, Config};
+#[cfg(feature = "fdb")]
+use zen_server::config::Backend;
+use zen_server::config::Config;
 use zen_server::dump;
+#[cfg(feature = "fdb")]
 use zen_server::supervisor::{self, Supervisor};
 use zen_store::embedded::{Embedded, Options};
 
@@ -28,6 +31,7 @@ enum Cmd {
         config: PathBuf,
     },
     /// Create a FoundationDB cluster on this node, then serve.
+    #[cfg(feature = "fdb")]
     Init {
         /// Path to zen-serve.toml.
         #[arg(long, short)]
@@ -38,6 +42,7 @@ enum Cmd {
     },
     /// Add this node to a cluster, then serve. The token comes from
     /// `zen-serve token` on any node.
+    #[cfg(feature = "fdb")]
     Join {
         /// Join token.
         token: String,
@@ -49,6 +54,7 @@ enum Cmd {
         no_api: bool,
     },
     /// Print the join token of this node's cluster.
+    #[cfg(feature = "fdb")]
     Token {
         /// Path to zen-serve.toml.
         #[arg(long, short)]
@@ -62,12 +68,14 @@ enum Cmd {
     },
     /// FoundationDB continuous backup (needs `[backup] agents = true` on at
     /// least one node).
+    #[cfg(feature = "fdb")]
     Backup {
         #[command(subcommand)]
         cmd: BackupCmd,
     },
     /// Restore a FoundationDB backup (point in time with --timestamp or
     /// --version). Without --add-prefix the cluster must be empty.
+    #[cfg(feature = "fdb")]
     Restore {
         /// Path to zen-serve.toml.
         #[arg(long, short)]
@@ -127,6 +135,7 @@ enum Cmd {
     },
 }
 
+#[cfg(feature = "fdb")]
 #[derive(Subcommand)]
 enum BackupCmd {
     /// Start a continuous backup.
@@ -175,6 +184,16 @@ fn load(path: &PathBuf) -> Config {
     Config::from_toml(&text).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())))
 }
 
+/// The FoundationDB process supervisor (nothing without the `fdb` feature).
+#[cfg(not(feature = "fdb"))]
+struct Supervisor;
+
+#[cfg(not(feature = "fdb"))]
+impl Supervisor {
+    async fn shutdown(self) {}
+}
+
+#[cfg(feature = "fdb")]
 fn supervise(cfg: &Config) -> Supervisor {
     Supervisor::start(cfg).unwrap_or_else(|e| fail(e))
 }
@@ -229,9 +248,13 @@ async fn main() {
     match Cli::parse().cmd {
         Cmd::Serve { config } => {
             let cfg = load(&config);
+            #[cfg(feature = "fdb")]
             let sup = supervisor::managed(&cfg).then(|| supervise(&cfg));
+            #[cfg(not(feature = "fdb"))]
+            let sup: Option<Supervisor> = None;
             run(cfg, sup, true).await;
         }
+        #[cfg(feature = "fdb")]
         Cmd::Init { config, no_api } => {
             let cfg = load(&config);
             supervisor::write_cluster_file(&cfg, &supervisor::new_cluster_file(&cfg))
@@ -244,6 +267,7 @@ async fn main() {
             print_token(&cfg);
             run(cfg, Some(sup), !no_api).await;
         }
+        #[cfg(feature = "fdb")]
         Cmd::Join {
             token,
             config,
@@ -255,6 +279,7 @@ async fn main() {
             let sup = supervise(&cfg);
             run(cfg, Some(sup), !no_api).await;
         }
+        #[cfg(feature = "fdb")]
         Cmd::Token { config } => print_token(&load(&config)),
         Cmd::Status { config } => {
             let cfg = load(&config);
@@ -275,7 +300,9 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "fdb")]
         Cmd::Backup { cmd } => backup(cmd).await,
+        #[cfg(feature = "fdb")]
         Cmd::Restore {
             config,
             source,
@@ -362,6 +389,7 @@ async fn main() {
     }
 }
 
+#[cfg(feature = "fdb")]
 fn cluster_arg(cfg: &Config) -> String {
     match cfg.cluster_file() {
         Some(p) => p.display().to_string(),
@@ -369,16 +397,19 @@ fn cluster_arg(cfg: &Config) -> String {
     }
 }
 
+#[cfg(feature = "fdb")]
 fn require_fdb(cfg: &Config) {
     if cfg.backend() != Backend::Fdb {
         fail("this needs the FoundationDB backend ([storage] backend = \"fdb\")");
     }
 }
 
+#[cfg(feature = "fdb")]
 fn s(x: &str) -> String {
     x.to_owned()
 }
 
+#[cfg(feature = "fdb")]
 async fn backup(cmd: BackupCmd) {
     let (cfg, args) = match cmd {
         BackupCmd::Start {
@@ -422,6 +453,7 @@ async fn backup(cmd: BackupCmd) {
         .unwrap_or_else(|e| fail(e));
 }
 
+#[cfg(feature = "fdb")]
 fn print_token(cfg: &Config) {
     let path = supervisor::cluster_file(cfg);
     let contents = std::fs::read_to_string(&path)

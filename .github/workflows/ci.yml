@@ -46,7 +46,7 @@ jobs:
         env:
           CC: "false"
           CXX: "false"
-        run: cargo check -p zen-server --no-default-features --features blake3/pure
+        run: cargo check -p zen-server --no-default-features --features pure
 
   # The FoundationDB backend, the supervisor and every server test against
   # a real cluster that zen-serve itself starts.

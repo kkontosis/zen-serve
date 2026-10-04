@@ -36,7 +36,7 @@ cargo build -p zen-server --release                          # the default build
 cargo build -p zen-server --release --no-default-features    # pure Rust
 ```
 
-The **default build** needs a **C compiler** (`cc`/`gcc` or `clang`): its native TLS runs on rustls's [ring](https://github.com/briansmith/ring) provider, which builds C and assembly. That build also accepts RSA server keys. The **pure-Rust build** (`--no-default-features`) uses zen-serve's own TLS provider on RustCrypto instead and needs no C compiler; its server key must be ECDSA or Ed25519. Both offer the post-quantum hybrid key exchange and the same client-certificate sign-in. Add `--features fdb` to either for the FoundationDB backend. See [`spec/operations.md`](spec/operations.md) §8.4.
+The **default build** needs a **C compiler** (`cc`/`gcc` or `clang`): its native TLS runs on rustls's [ring](https://github.com/briansmith/ring) provider, which builds C and assembly. That build also accepts RSA server keys. The **pure-Rust build** (`--no-default-features`) uses zen-serve's own TLS provider on RustCrypto instead and needs no C compiler; its server key must be ECDSA or Ed25519. Both offer the post-quantum hybrid key exchange and the same client-certificate sign-in. Add `--features fdb` to either for the FoundationDB backend; without it the binary is embedded-only, with no FoundationDB commands and no `libfdb_c`. `--no-default-features --features pure` builds without calling a C compiler at all. See [`spec/operations.md`](spec/operations.md) §8.4.
 
 ## Running
 
