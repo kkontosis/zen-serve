@@ -16,7 +16,7 @@ use zen_proto::{
     AclEntries, AclGet, AclPut, AclVersion, ByteBuf, Empty, FsEntry, FsList, Header, HeaderGet,
     HeaderPut, HeaderVersion, from_cbor,
 };
-use zen_store::{Storage, stamp_of};
+use zen_store::Storage;
 
 /// Read KV / read events.
 pub const R_READ: u8 = 1;
@@ -403,19 +403,26 @@ pub async fn header_put(
         return Err(version_mismatch("header version mismatch"));
     }
     t.set_versionstamped_value(&key, &[], &req.header);
-    let v = t.commit().await.map_err(|e| match e {
+    let stamp = t.commit().await.map_err(|e| match e {
         zen_store::Error::Conflict => version_mismatch("header changed concurrently"),
         e => e.into(),
     })?;
     Ok(Cbor(HeaderVersion {
-        version: stamp_of(v).to_vec(),
+        version: stamp.to_vec(),
     }))
 }
 
 /// Keep the in-memory ACL in sync with storage (other nodes, M3).
 pub async fn follow(st: Shared) {
     loop {
-        let w = st.store.watch(&keys::acl_head());
+        let w = match st.store.watch(&keys::acl_head()).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "ACL watch failed");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         let is_fs = |fs| st.cfg.has_fs(fs);
         match load(st.store.as_ref(), &is_fs).await {
             Ok(a) if a.version > st.acl().version => st.set_acl(a),

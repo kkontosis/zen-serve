@@ -6,11 +6,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# FoundationDB backend: needs libfdb_c (scripts/install-fdb.sh).
+fdb = ["dep:foundationdb", "dep:tracing"]
+# The backend conformance suite, for tests.
+testing = []
+
 [dependencies]
 async-trait = "0.1"
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3", "embedded-fdb-include"], optional = true }
+tracing = { version = "0.1", optional = true }
 redb = "4.3"
-tokio = { version = "1", features = ["sync", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "sync", "rt", "time"] }
 
 [dev-dependencies]
+getrandom = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+zen-store = { path = ".", features = ["testing"] }

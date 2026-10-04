@@ -295,7 +295,7 @@ async fn subscription(
         loop {
             recheck(&st, &token, fs, &target)?;
             // Watch first, then read: an append between the two still wakes us.
-            let w = st.store.watch(&head_key);
+            let w = st.store.watch(&head_key).await?;
             let more = match &target {
                 Target::Topic(t) => {
                     let (events, more) =

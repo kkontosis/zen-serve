@@ -44,6 +44,7 @@ ctor!(forbidden, FORBIDDEN, "forbidden");
 ctor!(not_found, NOT_FOUND, "not_found");
 ctor!(conflict, CONFLICT, "conflict");
 ctor!(too_old, CONFLICT, "too_old");
+ctor!(commit_unknown, CONFLICT, "commit_unknown");
 ctor!(version_mismatch, CONFLICT, "version_mismatch");
 ctor!(group_exists, CONFLICT, "group_exists");
 ctor!(commit_id_reused, CONFLICT, "commit_id_reused");
@@ -60,6 +61,9 @@ impl From<zen_store::Error> for ApiError {
         match e {
             zen_store::Error::Conflict => conflict("transaction conflict"),
             zen_store::Error::TooOld => too_old("read version too old"),
+            zen_store::Error::CommitUnknown => {
+                commit_unknown("the commit may or may not have been applied")
+            }
             other => {
                 tracing::error!(error = %other, "storage error");
                 internal("storage error")

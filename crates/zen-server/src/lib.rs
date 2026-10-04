@@ -174,7 +174,11 @@ async fn sweeper(st: Shared) {
             .lock()
             .expect("challenge lock")
             .retain(|_, e| *e > now);
-        match commit::sweep(&st, st.store.now_version()).await {
+        let swept = match st.store.now_version().await {
+            Ok(now) => commit::sweep(&st, now).await,
+            Err(e) => Err(e.into()),
+        };
+        match swept {
             Ok(n) if n > 0 => tracing::debug!(removed = n, "expired idempotency records"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e.message, "sweep failed"),

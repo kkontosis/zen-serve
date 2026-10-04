@@ -13,7 +13,7 @@
 
 use crate::tuple::Key;
 use crate::{
-    Error, KeyValue, Result, STAMP_LEN, Storage, Txn, Version, Watch, key_after, stamp_of,
+    Error, KeyValue, Result, STAMP_LEN, Stamp, Storage, Txn, Version, Watch, key_after, stamp_of,
 };
 use redb::{Database, ReadOnlyTable, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::{BTreeMap, VecDeque};
@@ -165,7 +165,7 @@ impl Embedded {
         }
     }
 
-    fn commit_blocking(&self, t: EmbeddedTxn) -> Result<Version> {
+    fn commit_blocking(&self, t: EmbeddedTxn) -> Result<Stamp> {
         let mut st = self.0.state.lock().expect("state lock");
         let rv = t.snap.version;
         let now = unix_micros();
@@ -263,7 +263,7 @@ impl Embedded {
         }
         drop(st);
         self.notify(&written);
-        Ok(version)
+        Ok(stamp)
     }
 }
 
@@ -281,7 +281,7 @@ impl Storage for Embedded {
         }))
     }
 
-    fn watch(&self, key: &[u8]) -> Watch {
+    async fn watch(&self, key: &[u8]) -> Result<Watch> {
         let n = {
             let mut w = self.0.watches.lock().expect("watch lock");
             match w.get(key).and_then(Weak::upgrade) {
@@ -295,15 +295,15 @@ impl Storage for Embedded {
         };
         let mut fut = Box::pin(n.clone().notified_owned());
         fut.as_mut().enable();
-        Watch::new(async move {
+        Ok(Watch::new(async move {
             fut.await;
             drop(n);
-        })
+        }))
     }
 
-    fn now_version(&self) -> Version {
+    async fn now_version(&self) -> Result<Version> {
         let st = self.0.state.lock().expect("state lock");
-        st.last.max(unix_micros())
+        Ok(st.last.max(unix_micros()))
     }
 }
 
@@ -529,9 +529,9 @@ impl Txn for EmbeddedTxn {
         self.ops.push(Op::Add(key.to_vec(), delta));
     }
 
-    async fn commit(self: Box<Self>) -> Result<Version> {
+    async fn commit(self: Box<Self>) -> Result<Stamp> {
         if self.ops.is_empty() {
-            return Ok(self.snap.version);
+            return Ok(stamp_of(self.snap.version));
         }
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.commit_blocking(*self))
