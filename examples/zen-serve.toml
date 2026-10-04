@@ -20,6 +20,13 @@ cross_origin_isolation = false
 # Extra origins allowed to call the API (G17). Empty: same-origin only.
 cors_origins = []
 
+# Native TLS (spec/operations.md §8). Without [tls], plain HTTP: put the
+# server behind a TLS reverse proxy. Keys: ECDSA P-256/P-384 or Ed25519.
+# [tls]
+# cert = "/etc/zen/api.pem"               # PEM chain, the server's certificate first
+# key = "/etc/zen/api.key"
+# client_ca = "/etc/zen/clients-ca.pem"   # client certificates, for sign-in method 5
+
 # Sign-in methods (spec/auth.md §2). Each can be turned off on its own.
 [auth]
 device_keys = true     # 1: per-device keys certified in the signed ACL

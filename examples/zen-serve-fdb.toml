@@ -12,6 +12,13 @@ listen = "0.0.0.0:8080"
 data_dir = "/var/lib/zen"
 public_origins = ["https://zen.example.org"]
 
+# TLS for the API, on this node (spec/operations.md §8); [fdb] tls_* below
+# is the database's own TLS, unrelated. Without [tls]: plain HTTP behind a
+# TLS reverse proxy.
+# [tls]
+# cert = "/etc/zen/api.pem"
+# key = "/etc/zen/api.key"
+
 [[fs]]
 id = 1
 

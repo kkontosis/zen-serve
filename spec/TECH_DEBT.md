@@ -61,3 +61,17 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** A user can list and remove stored credentials (auth.md §4), which ends the sessions they created, but can't list their individual sessions or end one session other than the current one (logout). Device sessions end only through logout, expiry or an ACL change.
 * **Why deferred:** Sessions are keyed by the hash of their token, with no index by user, so listing them needs a new index written on every sign-in. Removing the credential already covers "sign out everywhere" for every method except device keys.
 * **What it would take:** An index `pack("sessu", user_fp, H(token))`, written with each session and swept with it; `/v1/auth/sessions/list` and `/remove` (own, or admin for any member) returning method, credential id, creation and expiry; spec and tests, including cross-node cache expiry.
+
+## TD-TLS-RSA
+
+* **Status:** open
+* **Context:** Native TLS (operations.md §8) runs on a rustls crypto provider of zen-serve's own on RustCrypto. It signs and verifies ECDSA (P-256, P-384) and Ed25519 only. A server key on RSA can't be loaded; a client certificate signed by an RSA CA, or a client with an RSA key, can't sign in natively (auth.md §10.1). Many organisations' client CAs are RSA.
+* **Why deferred:** The same as `TD-AUTH-WEBAUTHN-RS256`: the pure-Rust `rsa` crate for this RustCrypto generation is only a release candidate, and ring or aws-lc-rs would bring C and assembly. The trusted-proxy mode (auth.md §10.2) accepts RSA certificates, since the proxy verifies them.
+* **What it would take:** Once `rsa` 0.10 is released: RSA-PSS and PKCS#1 v1.5 verification (SHA-256/384/512) in `tls::provider`'s `WebPkiSupportedAlgorithms`, with a floor of 2048 bits; RSA server keys (PKCS#1 and PKCS#8) with RSA-PSS signing; tests with generated RSA CAs and keys.
+
+## TD-TLS-ACME
+
+* **Status:** open
+* **Context:** Native TLS reads `[tls] cert` and `key` once, at start-up (operations.md §8.1). Renewing a certificate needs a restart, and obtaining one is up to the operator.
+* **Why deferred:** ACME (RFC 8555) needs an HTTP-01 or TLS-ALPN-01 responder, account keys, storage of certificates shared by a cluster's nodes, and renewal scheduling: a feature of its own. A restart after renewal, or a reverse proxy that does ACME, covers the need meanwhile.
+* **What it would take:** First, reloading: a `ResolvesServerCert` that re-reads the files on change (or on SIGHUP), keeping the old certificate when the new files don't load. Then ACME with TLS-ALPN-01 on the API port, account key and certificates in the keyspace so every node serves the same one, one node renewing under a lease, and tests against a local ACME test server (Pebble).

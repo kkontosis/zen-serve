@@ -208,7 +208,18 @@ impl Harness {
 
     /// The origin clients of this harness sign.
     pub fn origin(&self) -> String {
-        format!("http://{}", self.host_header())
+        let scheme = if self.base.starts_with("https:") {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{}", self.host_header())
+    }
+
+    /// Talk HTTPS to a server with `[tls]`, through `http`.
+    pub fn use_https(&mut self, http: reqwest::Client) {
+        self.base = format!("https://{}", self.server.addr);
+        self.http = http;
     }
 
     pub async fn call<Q: Serialize, R: DeserializeOwned>(
@@ -228,12 +239,39 @@ impl Harness {
         req: &Q,
         host: &str,
     ) -> Result<R, ApiErr> {
-        let mut rb = self
+        let rb = self
             .http
             .post(format!("{}{}", self.base, path))
-            .header("content-type", CBOR)
-            .header("host", host)
-            .body(to_cbor(req));
+            .header("host", host);
+        self.send(rb, path, token, req).await
+    }
+
+    /// `call` through another HTTP client, adding `headers`.
+    pub async fn call_via<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        http: &reqwest::Client,
+        headers: &[(&str, &str)],
+        path: &str,
+        token: Option<&[u8]>,
+        req: &Q,
+    ) -> Result<R, ApiErr> {
+        let mut rb = http
+            .post(format!("{}{}", self.base, path))
+            .header("host", self.host_header());
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        self.send(rb, path, token, req).await
+    }
+
+    async fn send<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+        path: &str,
+        token: Option<&[u8]>,
+        req: &Q,
+    ) -> Result<R, ApiErr> {
+        let mut rb = rb.header("content-type", CBOR).body(to_cbor(req));
         if let Some(t) = token {
             rb = rb.header(
                 "authorization",

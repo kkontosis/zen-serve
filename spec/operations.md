@@ -1,6 +1,6 @@
 # Operations
 
-How to run zen-serve: a single node on the embedded backend, or a FoundationDB cluster that zen-serve supervises itself. Also covers backup, point-in-time restore, export/import and migration.
+How to run zen-serve: a single node on the embedded backend, or a FoundationDB cluster that zen-serve supervises itself. Also covers backup, point-in-time restore, export/import, migration and TLS (§8).
 
 ## 1. Backends
 
@@ -84,7 +84,7 @@ Two unrelated settings:
 
 | Setting | Who connects | Typical value |
 |---|---|---|
-| `listen` (top level) | clients and browsers: the zen-serve API | `0.0.0.0:8080`, or `127.0.0.1:8080` behind a reverse proxy |
+| `listen` (top level) | clients and browsers: the zen-serve API | `0.0.0.0:443` with `[tls]` (§8), or `127.0.0.1:8080` behind a reverse proxy |
 | `[fdb] listen_ip`, `public_ip`, `port` | only FoundationDB peers: other nodes' `fdbserver`s, zen-serve's own database client, `fdbcli`, backup agents | `127.0.0.1` (single node) or a private / WireGuard address |
 
 zen-serve never proxies FoundationDB traffic. Exposing the API does not expose the database.
@@ -201,3 +201,32 @@ zen-serve migrate -c zen-fdb.toml --from-data-dir /var/lib/zen   # embedded → 
 ## 7. Upgrades (G22)
 
 The FoundationDB version is pinned by `scripts/install-fdb.sh` and the `foundationdb` crate's API version (7.3). Rolling upgrades with the multi-version client, orchestrated by `zen-serve upgrade`, come later. Until then, upgrade every node together with the cluster stopped.
+
+## 8. TLS on the API listener
+
+zen-serve can terminate TLS itself, or stay on plain HTTP behind a reverse proxy that does. Both are supported; without `[tls]` the listener speaks plain HTTP, as before.
+
+### 8.1 Native TLS
+
+```toml
+listen = "0.0.0.0:443"            # binding a port below 1024 needs CAP_NET_BIND_SERVICE
+public_origins = ["https://zen.example.org"]
+
+[tls]
+cert = "/etc/zen/api.pem"         # PEM chain, the server's certificate first
+key = "/etc/zen/api.key"          # PEM private key
+# client_ca = "/etc/zen/clients-ca.pem"   # client certificates, for sign-in method 5 (auth.md §10)
+```
+
+* **TLS 1.3 only**, ALPN `http/1.1`. WebSocket (`/v1/stream`) runs over the same connection type. Current browsers and HTTP libraries all speak TLS 1.3.
+* **Pure Rust**: rustls with a crypto provider on RustCrypto (`tls::provider` in zen-server): no OpenSSL and no C or assembly.
+* **Key exchange**, preferred first: the post-quantum hybrid **`X25519MLKEM768`**, then `X25519` and `secp256r1`. Browsers that support the hybrid get it; others fall back. **Ciphers**: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.
+* **The server key**: ECDSA P-256 or P-384 (PKCS#8 or SEC1 PEM), or Ed25519 (PKCS#8). RSA keys are not supported (`TD-TLS-RSA`). The chain may contain RSA-signed CA certificates, since only clients verify it: a Let's Encrypt ECDSA certificate works.
+* **Start-up checks.** A file that can't be read, a key that doesn't match the certificate, or a `client_ca` without certificates stops the start with a message naming the setting.
+* **Rotation.** The files are read at start-up: restart zen-serve after renewing the certificate. Automatic certificates (ACME) and reloading without a restart are deferred (`TD-TLS-ACME`).
+* **Limits.** A handshake must finish within 10 s; at most 1024 run at once, and further connections wait in the kernel's accept queue.
+* Every node of a cluster has its own `[tls]`.
+
+### 8.2 Behind a reverse proxy
+
+A proxy that only terminates TLS needs nothing special: zen-serve listens on HTTP, on an address only the proxy reaches, with `public_origins` set to the public `https://` origin.

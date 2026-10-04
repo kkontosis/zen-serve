@@ -39,6 +39,9 @@ pub struct Config {
     /// CORS allowlist (G17). Empty: same-origin only.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Native TLS on `listen` (operations.md §8). Absent: plain HTTP.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     /// Sign-in methods and origin policy (spec/auth.md §2).
     #[serde(default)]
     pub auth: AuthConfig,
@@ -121,6 +124,22 @@ impl Default for FdbConfig {
             auto_redundancy: true,
         }
     }
+}
+
+/// `[tls]`: native TLS on the API listener (operations.md §8).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain, the server's certificate first.
+    pub cert: PathBuf,
+    /// PEM private key: ECDSA P-256 or P-384 (PKCS#8 or SEC1), or Ed25519
+    /// (PKCS#8).
+    pub key: PathBuf,
+    /// PEM CA certificates that client certificates must chain to. Set,
+    /// with `[auth] mtls` on, the server asks for client certificates
+    /// (optional at the TLS layer): native mTLS sign-in (auth.md §10).
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
 }
 
 /// `[backup]`: FoundationDB native continuous backup (operations.md).
@@ -381,6 +400,7 @@ impl Config {
             csp: default_csp(),
             cross_origin_isolation: false,
             cors_origins: Vec::new(),
+            tls: None,
             auth: AuthConfig::default(),
             limits: LimitsConfig::default(),
             storage: StorageConfig::default(),

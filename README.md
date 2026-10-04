@@ -35,7 +35,9 @@ Building blocks:
 cargo run -p zen-server -- serve --config examples/zen-serve.toml
 ```
 
-On first start the server prints a one-time **claim token**. The first signed ACL (`POST /v1/acl/put`) must carry it, and that pins the first admin. Plain HTTP only for now: put it behind a TLS reverse proxy.
+On first start the server prints a one-time **claim token**. The first signed ACL (`POST /v1/acl/put`) must carry it, and that pins the first admin.
+
+Without `[tls]` the server speaks plain HTTP, for a TLS reverse proxy in front. With `[tls]` it terminates TLS itself: TLS 1.3 on pure-Rust rustls (no OpenSSL), with the post-quantum hybrid key exchange `X25519MLKEM768`. See [`spec/operations.md`](spec/operations.md) §8.
 
 On FoundationDB, with zen-serve running the `fdbserver` processes itself:
 
@@ -46,7 +48,7 @@ zen-serve init -c examples/zen-serve-fdb.toml          # first node; prints a jo
 zen-serve join <token> -c zen-serve-fdb.toml           # every further node
 ```
 
-See [`spec/operations.md`](spec/operations.md) for clusters, backup and point-in-time restore, export/import and migration.
+See [`spec/operations.md`](spec/operations.md) for clusters, backup and point-in-time restore, export/import, migration and TLS.
 
 ## Development
 

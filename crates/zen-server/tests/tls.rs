@@ -1,13 +1,16 @@
-//! The pure-Rust rustls provider (`tls::provider`) in real handshakes.
+//! Native TLS: the pure-Rust rustls provider (`tls::provider`) in real
+//! handshakes, and the HTTPS listener (operations.md §8).
 
 mod common;
 
 use common::pki::*;
+use common::*;
 use rustls::pki_types::ServerName;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{CipherSuite, NamedGroup, RootCertStore, ServerConfig};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zen_proto::*;
 use zen_server::tls::provider::{self, SECP256R1, X25519, X25519MLKEM768};
 
 /// What a handshake negotiated.
@@ -207,4 +210,66 @@ async fn the_client_checks_the_server_certificate() {
         .await
         .is_err()
     );
+}
+
+// ---------------------------------------------------------------- listener
+
+/// A server with `[tls]` (no client CA), and the harness talking HTTPS.
+async fn https_harness(ca: &Ca) -> (Harness, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = tls_config(dir.path(), &ca.server(), None);
+    let mut h = Harness::start_with(|c| c.tls = Some(tls)).await;
+    h.use_https(https_client(ca, None));
+    (h, dir)
+}
+
+#[tokio::test]
+async fn the_api_is_served_over_https() {
+    let ca = Ca::new("ca");
+    let (h, _dir) = https_harness(&ca).await;
+    let info: Info = h.get("/v1/info").await;
+    assert_eq!(info.api, 1);
+    // Claim and sign in, as over HTTP; the origin is https://.
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    assert!(h.origin().starts_with("https://"));
+    let tok = h.sign_in(&admin).await.unwrap();
+    let _: ReadVersion = h.call("/v1/grv", Some(&tok), &Empty {}).await.unwrap();
+    // Plain HTTP on the TLS port gets nowhere.
+    let plain = reqwest::Client::builder().no_proxy().build().unwrap();
+    let r = plain
+        .get(format!("http://{}/v1/info", h.server.addr))
+        .send()
+        .await;
+    assert!(r.is_err() || !r.unwrap().status().is_success());
+}
+
+#[tokio::test]
+async fn bad_tls_settings_stop_the_start() {
+    let ca = Ca::new("ca");
+    let dir = tempfile::tempdir().unwrap();
+    let good = tls_config(dir.path(), &ca.server(), None);
+    let start = |tls: zen_server::config::TlsConfig| async {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = zen_server::config::Config::with_data_dir(d.path().join("data"));
+        cfg.listen = "127.0.0.1:0".parse().unwrap();
+        cfg.tls = Some(tls);
+        zen_server::start(cfg).await.err().unwrap_or_default()
+    };
+    // A missing file.
+    let mut t = good.clone();
+    t.cert = dir.path().join("missing.pem");
+    assert!(start(t).await.contains("tls.cert"));
+    // A key that isn't the certificate's.
+    let other = dir.path().join("other.key");
+    std::fs::write(&other, Key::p256().pem()).unwrap();
+    let mut t = good.clone();
+    t.key = other;
+    assert!(start(t).await.contains("tls.cert / tls.key"));
+    // A client CA file without certificates.
+    let empty = dir.path().join("empty.pem");
+    std::fs::write(&empty, "").unwrap();
+    let mut t = good.clone();
+    t.client_ca = Some(empty);
+    assert!(start(t).await.contains("tls.client_ca"));
 }

@@ -409,6 +409,13 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         state::remove_claim_token(&cfg.data_dir);
         None
     };
+    let tls = match &cfg.tls {
+        Some(t) => Some(tls::server_config(
+            t,
+            tls::requests_client_certs(Some(t), cfg.auth.mtls),
+        )?),
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.listen))?;
@@ -416,13 +423,30 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
     let st: Shared = Arc::new(AppState::new(cfg, store, acl, claim.clone(), challenge_key));
     tokio::spawn(acl::follow(st.clone()));
     tokio::spawn(sweeper(st.clone()));
-    let app = router(st.clone());
-    let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!(error = %e, "server stopped");
+    // Every handler can see its connection: the peer address, and on TLS
+    // the verified client certificate (`tls::Peer`).
+    let app = router(st.clone()).into_make_service_with_connect_info::<tls::Peer>();
+    let task = match tls {
+        Some(cfg) => {
+            let listener = tls::TlsListener::new(listener, cfg).map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "server stopped");
+                }
+            })
         }
-    });
-    tracing::info!(%addr, "zen-serve listening");
+        None => tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!(error = %e, "server stopped");
+            }
+        }),
+    };
+    let scheme = if st.cfg.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    tracing::info!(%addr, scheme, "zen-serve listening");
     Ok(Server {
         addr,
         state: st,

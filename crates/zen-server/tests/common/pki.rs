@@ -5,7 +5,9 @@
 use base64::Engine;
 use ecdsa::signature::Signer as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zen_server::config::TlsConfig;
 
 /// A private key for rcgen and rustls.
 #[derive(Clone)]
@@ -236,6 +238,21 @@ impl Ca {
         params.serial_number = Some(serial());
         let cert = params.signed_by(&key, &self.issuer).unwrap().der().clone();
         Ident { cert, key }
+    }
+}
+
+/// `[tls]` for a test server, its files in `dir`: `server`'s certificate
+/// and key, and `client_ca` if given.
+pub fn tls_config(dir: &Path, server: &Ident, client_ca: Option<&Ca>) -> TlsConfig {
+    let write = |name: &str, text: String| -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p
+    };
+    TlsConfig {
+        cert: write("server.pem", server.pem()),
+        key: write("server.key", server.key.pem()),
+        client_ca: client_ca.map(|ca| write("client-ca.pem", ca.pem())),
     }
 }
 
