@@ -2,6 +2,8 @@
 //! signed ACLs and a small CBOR client.
 #![allow(dead_code)]
 
+pub mod pki;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::{SinkExt, StreamExt};
@@ -166,6 +168,8 @@ impl Harness {
     async fn launch(cfg: Config, dir: tempfile::TempDir) -> Self {
         let server = zen_server::start(cfg.clone()).await.unwrap();
         let base = format!("http://{}", server.addr);
+        // The server's pure-Rust rustls provider (reqwest has none of its own).
+        zen_server::tls::provider::install_default();
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         Harness {
             server,

@@ -26,6 +26,7 @@ pub mod state;
 pub mod statics;
 pub mod stream;
 pub mod supervisor;
+pub mod tls;
 pub mod token;
 pub mod tree;
 mod txn;

@@ -24,13 +24,24 @@ futures = "0.3"
 blake3 = "1.8"
 ciborium = "0.2"
 ecdsa = { version = "0.17", default-features = false, features = ["der"] }
-ed25519-dalek = { version = "3.0", default-features = false }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["pkcs8"] }
 serde_json = "1"
 getrandom = "0.4"
 include_dir = "0.7"
 mime_guess = "2"
 # WebAuthn (spec/auth.md §7): ES256 verification, pure Rust.
-p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+# Native TLS and client certificates (spec/auth.md §10): rustls with a
+# crypto provider of our own on RustCrypto (`tls::provider`), pure Rust.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.11", default-features = false }
+hmac = "0.13"
+ml-kem = { version = "0.3", default-features = false, features = ["zeroize"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = { version = "0.11", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "process", "io-util"] }
@@ -47,7 +58,8 @@ zen-store = { path = "../zen-store" }
 nix = { version = "0.30", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false }
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tempfile = "3"
 tokio-tungstenite = "0.30"
 zen-core = { path = "../zen-core", features = ["test-utils"] }
