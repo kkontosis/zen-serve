@@ -312,6 +312,12 @@ impl Server {
 pub async fn start(cfg: Config) -> Result<Server, String> {
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
+    if cfg.public_origins.is_empty() {
+        tracing::warn!(
+            "public_origins is empty: session origins are derived from the Host header, \
+             which a relaying server controls (api.md §3.3); set public_origins in production"
+        );
+    }
     let store = open_store(&cfg)?;
     let challenge_key = auth::challenge_key(store.as_ref())
         .await

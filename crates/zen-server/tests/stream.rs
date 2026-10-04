@@ -388,3 +388,27 @@ async fn static_files_aliases_fallback_and_safety() {
     let info: Info = from_cbor(&r.bytes().await.unwrap()).unwrap();
     assert!(info.cross_origin_isolation);
 }
+
+/// Frames larger than an ephemeral message can be are refused before auth:
+/// the socket is closed instead of buffering them.
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_frames_close_the_stream() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let h = Harness::start().await;
+    let url = format!("ws://{}/v1/stream", h.server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let big = vec![0u8; h.cfg.limits.max_envelope_bytes as usize + 65_536];
+    let _ = ws.send(Message::Binary(big.into())).await;
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("server closes the socket");
+    assert!(closed);
+}

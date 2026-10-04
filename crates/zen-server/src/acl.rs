@@ -199,13 +199,19 @@ impl AclState {
 }
 
 /// Validate a signed ACL as the successor of `head` (formats.md §9.3).
+///
+/// The cheap checks come first (chain position, then one signature by an
+/// admin of the head); only a doc that passes them has every device
+/// certificate verified. `/v1/acl/put` needs no session, so this keeps an
+/// unauthenticated caller from making the server verify thousands of
+/// certificates per request.
 pub fn validate_successor(
     signed: &[u8],
     head: &AclState,
     is_fs: &(dyn Fn(u32) -> bool + Sync),
 ) -> ApiResult<AclState> {
     let s: SignedAcl = from_cbor(signed).map_err(|e| bad_request(format!("signed ACL: {e}")))?;
-    let (new, doc) = AclState::from_doc(&s.doc, is_fs)?;
+    let doc: AclDoc = from_cbor(&s.doc).map_err(|e| bad_request(format!("ACL doc: {e}")))?;
     if doc.version != head.version + 1 {
         return Err(version_mismatch(format!(
             "ACL version must be {}",
@@ -225,15 +231,27 @@ pub fn validate_successor(
         .as_slice()
         .try_into()
         .map_err(|_| bad_request("signer must be 32 bytes"))?;
-    let authority = if head.version == 0 { &new } else { head };
-    if !authority.admins.contains(&signer) {
-        return Err(forbidden("ACL signer is not an admin"));
-    }
-    let identity = &authority.members[&signer].identity;
+    let not_admin = || forbidden("ACL signer is not an admin");
+    let identity = if head.version == 0 {
+        // Version 1 is signed by an admin of itself (plus the claim token).
+        if !doc.admins.iter().any(|a| a.as_slice() == signer) {
+            return Err(not_admin());
+        }
+        doc.members
+            .iter()
+            .filter_map(|m| PublicIdentity::decode(&m.identity).ok())
+            .find(|i| i.fingerprint() == signer)
+            .ok_or_else(not_admin)?
+    } else {
+        if !head.admins.contains(&signer) {
+            return Err(not_admin());
+        }
+        head.members[&signer].identity.clone()
+    };
     identity
         .verify(labels::SIG_ACL, &s.doc, &s.sig)
         .map_err(|_| forbidden("ACL signature does not verify"))?;
-    Ok(new)
+    Ok(AclState::from_doc(&s.doc, is_fs)?.0)
 }
 
 /// Load the current ACL from storage (trusted: it was validated on write).
@@ -263,9 +281,8 @@ pub async fn load(
 /// `POST /v1/acl/put`.
 pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult<Cbor<AclVersion>> {
     let head = st.acl();
-    let is_fs = |fs| st.cfg.has_fs(fs);
-    let new = validate_successor(&req.acl, &head, &is_fs)?;
     if head.version == 0 {
+        // Checked before anything costly: this request needs no session.
         let ok = {
             let claim = st.claim.lock().expect("claim lock");
             match (&*claim, &req.claim) {
@@ -277,6 +294,8 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
             return Err(forbidden("version 1 requires the claim token"));
         }
     }
+    let is_fs = |fs| st.cfg.has_fs(fs);
+    let new = validate_successor(&req.acl, &head, &is_fs)?;
     txn_loop!(st.store, None, idempotent, |t| {
         let current = t
             .get(&keys::acl_head())

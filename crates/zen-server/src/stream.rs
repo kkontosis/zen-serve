@@ -24,7 +24,14 @@ const MAX_SUBS: usize = 256;
 
 /// `GET /v1/stream`.
 pub async fn ws(State(st): State<Shared>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |sock| run(st, sock))
+    // A client frame carries at most one ephemeral message (an envelope's
+    // worth of data plus a topic id); the socket is unauthenticated until
+    // its first frame, so the buffer is bounded accordingly.
+    let max = st.cfg.limits.max_envelope_bytes as usize + 4096;
+    upgrade
+        .max_message_size(max)
+        .max_frame_size(max)
+        .on_upgrade(move |sock| run(st, sock))
 }
 
 fn err_frame(id: Option<u32>, e: &ApiError) -> Frame {
