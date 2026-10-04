@@ -199,6 +199,81 @@ async fn client_certificates_are_optional_and_verified() {
 }
 
 #[tokio::test]
+async fn rsa_chains_and_client_keys_verify() {
+    // An RSA CA: the client verifies its signature on the (EC) server
+    // certificate, the server its signature on client certificates.
+    let ca = Ca::with_key("rsa ca", Key::rsa(1, 2048));
+    let server = server_config(&ca.server(), Some(&ca));
+    // An RSA client key: certificate and RSA-PSS handshake signature.
+    let rsa_client = ca.issue("rsa client", Usage::Client, Key::rsa(2, 2048));
+    let got = handshake(server.clone(), client_config(&ca, Some(&rsa_client)))
+        .await
+        .unwrap();
+    assert_eq!(got.client_cert, Some(rsa_client.cert.to_vec()));
+    // An EC client key under the RSA CA.
+    let ec_client = ca.client("ec client");
+    let got = handshake(server.clone(), client_config(&ca, Some(&ec_client)))
+        .await
+        .unwrap();
+    assert_eq!(got.client_cert, Some(ec_client.cert.to_vec()));
+    // PKCS#1 v1.5 with SHA-512, and a 3072-bit RSA key under an EC CA.
+    let ca512 = Ca::with_key("rsa ca sha512", Key::rsa_sha512(3, 3072));
+    let ec_ca = Ca::new("ec ca");
+    for (ca, client) in [
+        (&ca512, ca512.client("under sha512")),
+        (
+            &ec_ca,
+            ec_ca.issue("rsa 3072", Usage::Client, Key::rsa(4, 3072)),
+        ),
+    ] {
+        let got = handshake(
+            server_config(&ca.server(), Some(ca)),
+            client_config(ca, Some(&client)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.client_cert, Some(client.cert.to_vec()));
+    }
+}
+
+#[tokio::test]
+async fn small_rsa_keys_are_refused() {
+    let ca = Ca::new("ca");
+    let small_ca = Ca::with_key("small ca", Key::rsa(5, 1024));
+    // The server refuses a client chain signed by a 1024-bit CA (the
+    // client trusts the server's certificate here).
+    let client = small_ca.client("client");
+    let server = server_config(&ca.server(), Some(&small_ca));
+    let r = handshake(server.clone(), client_config(&ca, Some(&client))).await;
+    let e = r.unwrap_err();
+    assert!(
+        e.contains("BadSignature") && e.ends_with("client: None"),
+        "{e}"
+    );
+    // ... and a 1024-bit client key under a good CA.
+    let small = ca.issue("small", Usage::Client, Key::rsa(6, 1024));
+    let server = server_config(&ca.server(), Some(&ca));
+    let e = handshake(server, client_config(&ca, Some(&small)))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("BadSignature") && e.ends_with("client: None"),
+        "{e}"
+    );
+    // The client refuses a server certificate from a 1024-bit CA.
+    let r = handshake(
+        server_config(&small_ca.server(), None),
+        client_config(&small_ca, None),
+    )
+    .await;
+    let e = r.unwrap_err();
+    assert!(
+        e.contains(r#"client: Some("invalid peer certificate: BadSignature")"#),
+        "{e}"
+    );
+}
+
+#[tokio::test]
 async fn the_client_checks_the_server_certificate() {
     let ca = Ca::new("ca");
     let other = Ca::new("other");
@@ -266,6 +341,27 @@ async fn bad_tls_settings_stop_the_start() {
     let mut t = good.clone();
     t.key = other;
     assert!(start(t).await.contains("tls.cert / tls.key"));
+    // An RSA server key: refused, naming the reason (PKCS#8 and PKCS#1).
+    let rsa_server = ca.issue("rsa server", Usage::Server, Key::rsa(7, 2048));
+    let rsa = tls_config(dir.path(), &rsa_server, None);
+    let e = start(rsa.clone()).await;
+    assert!(e.contains("TD-TLS-RSA-SERVER-KEY"), "{e}");
+    let pkcs1 = dir.path().join("rsa1.key");
+    let Key::Rsa(k, ..) = &rsa_server.key else {
+        unreachable!()
+    };
+    std::fs::write(
+        &pkcs1,
+        pem(
+            "RSA PRIVATE KEY",
+            &zen_server::rsakey::testing::private_der(k),
+        ),
+    )
+    .unwrap();
+    let mut t = rsa;
+    t.key = pkcs1;
+    let e = start(t).await;
+    assert!(e.contains("TD-TLS-RSA-SERVER-KEY"), "{e}");
     // A client CA file without certificates.
     let empty = dir.path().join("empty.pem");
     std::fs::write(&empty, "").unwrap();

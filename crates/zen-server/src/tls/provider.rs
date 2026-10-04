@@ -6,10 +6,14 @@
 //! * **Key exchange**, preferred first: the post-quantum hybrid
 //!   `X25519MLKEM768` (draft-ietf-tls-ecdhe-mlkem), then `X25519` and
 //!   `secp256r1`.
-//! * **Signatures** (certificates and handshakes): ECDSA on P-256 and
-//!   P-384, and Ed25519. RSA is not supported (`TD-TLS-RSA`).
-//! * **Private keys**: ECDSA P-256 or P-384 (PKCS#8 or SEC1), or Ed25519
-//!   (PKCS#8).
+//! * **Signatures** verified (certificate chains and handshakes): ECDSA
+//!   on P-256 and P-384, Ed25519, and RSA (PKCS#1 v1.5 for certificates,
+//!   PSS for both, with SHA-256/384/512) under the [`crate::rsakey`]
+//!   policy: 2048 to 4096 bits.
+//! * **Private keys** (signing): ECDSA P-256 or P-384 (PKCS#8 or SEC1), or
+//!   Ed25519 (PKCS#8). RSA keys are refused: the `rsa` crate's private-key
+//!   operations are not constant-time (RUSTSEC-2023-0071,
+//!   `TD-TLS-RSA-SERVER-KEY`).
 //!
 //! The glue follows rustls's own providers; the primitives are RustCrypto's.
 
@@ -588,6 +592,120 @@ impl SignatureVerificationAlgorithm for EcdsaVerify {
     }
 }
 
+/// RSA signatures (RFC 8017) by an `rsaEncryption` key: PKCS#1 v1.5, or
+/// PSS with MGF1 on the same hash and a salt as long as the hash (TLS 1.3's
+/// `rsa_pss_rsae_*`, and the X.509 `RSASSA-PSS` parameters webpki accepts).
+#[derive(Debug)]
+struct RsaVerify {
+    pss: bool,
+    hash: RsaHash,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RsaHash {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl SignatureVerificationAlgorithm for RsaVerify {
+    fn verify_signature(
+        &self,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), InvalidSignature> {
+        use rsa::traits::PublicKeyParts as _;
+        // The X.509 subjectPublicKey of rsaEncryption is a PKCS#1
+        // RSAPublicKey; the size and exponent policy applies to every key.
+        let key = crate::rsakey::from_pkcs1_der(public_key).map_err(|_| InvalidSignature)?;
+        if signature.len() != key.size() {
+            return Err(InvalidSignature);
+        }
+        fn check<V: rsa::signature::Verifier<S>, S: for<'a> TryFrom<&'a [u8]>>(
+            v: V,
+            message: &[u8],
+            signature: &[u8],
+        ) -> Result<(), InvalidSignature> {
+            let sig = S::try_from(signature).map_err(|_| InvalidSignature)?;
+            v.verify(message, &sig).map_err(|_| InvalidSignature)
+        }
+        use rsa::{pkcs1v15, pss};
+        match (self.pss, self.hash) {
+            (false, RsaHash::Sha256) => check::<_, pkcs1v15::Signature>(
+                pkcs1v15::VerifyingKey::<Sha256>::new(key),
+                message,
+                signature,
+            ),
+            (false, RsaHash::Sha384) => check::<_, pkcs1v15::Signature>(
+                pkcs1v15::VerifyingKey::<Sha384>::new(key),
+                message,
+                signature,
+            ),
+            (false, RsaHash::Sha512) => check::<_, pkcs1v15::Signature>(
+                pkcs1v15::VerifyingKey::<sha2::Sha512>::new(key),
+                message,
+                signature,
+            ),
+            (true, RsaHash::Sha256) => check::<_, pss::Signature>(
+                pss::VerifyingKey::<Sha256>::new(key),
+                message,
+                signature,
+            ),
+            (true, RsaHash::Sha384) => check::<_, pss::Signature>(
+                pss::VerifyingKey::<Sha384>::new(key),
+                message,
+                signature,
+            ),
+            (true, RsaHash::Sha512) => check::<_, pss::Signature>(
+                pss::VerifyingKey::<sha2::Sha512>::new(key),
+                message,
+                signature,
+            ),
+        }
+    }
+
+    fn public_key_alg_id(&self) -> AlgorithmIdentifier {
+        alg_id::RSA_ENCRYPTION
+    }
+
+    fn signature_alg_id(&self) -> AlgorithmIdentifier {
+        match (self.pss, self.hash) {
+            (false, RsaHash::Sha256) => alg_id::RSA_PKCS1_SHA256,
+            (false, RsaHash::Sha384) => alg_id::RSA_PKCS1_SHA384,
+            (false, RsaHash::Sha512) => alg_id::RSA_PKCS1_SHA512,
+            (true, RsaHash::Sha256) => alg_id::RSA_PSS_SHA256,
+            (true, RsaHash::Sha384) => alg_id::RSA_PSS_SHA384,
+            (true, RsaHash::Sha512) => alg_id::RSA_PSS_SHA512,
+        }
+    }
+}
+
+static RSA_PKCS1_SHA256: RsaVerify = RsaVerify {
+    pss: false,
+    hash: RsaHash::Sha256,
+};
+static RSA_PKCS1_SHA384: RsaVerify = RsaVerify {
+    pss: false,
+    hash: RsaHash::Sha384,
+};
+static RSA_PKCS1_SHA512: RsaVerify = RsaVerify {
+    pss: false,
+    hash: RsaHash::Sha512,
+};
+static RSA_PSS_SHA256: RsaVerify = RsaVerify {
+    pss: true,
+    hash: RsaHash::Sha256,
+};
+static RSA_PSS_SHA384: RsaVerify = RsaVerify {
+    pss: true,
+    hash: RsaHash::Sha384,
+};
+static RSA_PSS_SHA512: RsaVerify = RsaVerify {
+    pss: true,
+    hash: RsaHash::Sha512,
+};
+
 #[derive(Debug)]
 struct Ed25519Verify;
 
@@ -641,6 +759,12 @@ static SIGNATURE_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorith
         &ECDSA_P384_SHA256,
         &ECDSA_P384_SHA384,
         &ED25519,
+        &RSA_PKCS1_SHA256,
+        &RSA_PKCS1_SHA384,
+        &RSA_PKCS1_SHA512,
+        &RSA_PSS_SHA256,
+        &RSA_PSS_SHA384,
+        &RSA_PSS_SHA512,
     ],
     mapping: &[
         (
@@ -652,6 +776,14 @@ static SIGNATURE_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorith
             &[&ECDSA_P256_SHA256, &ECDSA_P384_SHA256],
         ),
         (SignatureScheme::ED25519, &[&ED25519]),
+        // rustls allows only the PSS schemes in TLS 1.3 handshakes; the
+        // PKCS#1 ones serve certificate chains.
+        (SignatureScheme::RSA_PSS_SHA512, &[&RSA_PSS_SHA512]),
+        (SignatureScheme::RSA_PSS_SHA384, &[&RSA_PSS_SHA384]),
+        (SignatureScheme::RSA_PSS_SHA256, &[&RSA_PSS_SHA256]),
+        (SignatureScheme::RSA_PKCS1_SHA512, &[&RSA_PKCS1_SHA512]),
+        (SignatureScheme::RSA_PKCS1_SHA384, &[&RSA_PKCS1_SHA384]),
+        (SignatureScheme::RSA_PKCS1_SHA256, &[&RSA_PKCS1_SHA256]),
     ],
 };
 
@@ -672,6 +804,8 @@ impl KeyProvider for Keys {
                     Key::P384(s)
                 } else if let Ok(s) = ed25519_dalek::SigningKey::from_pkcs8_der(k) {
                     Key::Ed25519(s)
+                } else if pkcs8_is_rsa(k) {
+                    return Err(rsa_key());
                 } else {
                     return Err(unsupported_key());
                 }
@@ -686,10 +820,30 @@ impl KeyProvider for Keys {
                     return Err(unsupported_key());
                 }
             }
+            PrivateKeyDer::Pkcs1(_) => return Err(rsa_key()),
             _ => return Err(unsupported_key()),
         };
         Ok(Arc::new(key))
     }
+}
+
+/// Whether a PKCS#8 key's algorithm is `rsaEncryption` (1.2.840.113549.1.1.1):
+/// `SEQUENCE { INTEGER 0, SEQUENCE { OID, ... }, ... }`.
+fn pkcs8_is_rsa(k: &[u8]) -> bool {
+    const OID: [u8; 11] = [6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
+    // The algorithm's OID follows the version within the first few bytes,
+    // whatever the outer length's form.
+    k.windows(OID.len()).take(16).any(|w| w == OID)
+}
+
+fn rsa_key() -> Error {
+    Error::General(
+        "RSA private keys are not supported: the pure-Rust rsa crate's private-key \
+         operations are not constant-time (RUSTSEC-2023-0071, TD-TLS-RSA-SERVER-KEY). \
+         Use an ECDSA P-256 or P-384, or Ed25519, server key; RSA client certificates \
+         and CAs are fine"
+            .into(),
+    )
 }
 
 fn unsupported_key() -> Error {
@@ -905,6 +1059,86 @@ mod tests {
                  34007208d5b887185865"
             )
         );
+    }
+
+    #[test]
+    fn rsa_signatures_verify() {
+        use crate::rsakey::testing::{OsRng, public_der};
+        use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _, Signer as _};
+        use rsa::{pkcs1v15, pss};
+        let k = crate::webauthn::soft::rsa_key(7, 2048);
+        let public = public_der(&k.to_public_key());
+        let msg = b"the transcript";
+        let sign = |alg: &RsaVerify, m: &[u8]| -> Vec<u8> {
+            let k = k.clone();
+            match (alg.pss, alg.hash) {
+                (false, RsaHash::Sha256) => pkcs1v15::SigningKey::<Sha256>::new(k).sign(m).to_vec(),
+                (false, RsaHash::Sha384) => pkcs1v15::SigningKey::<Sha384>::new(k).sign(m).to_vec(),
+                (false, RsaHash::Sha512) => pkcs1v15::SigningKey::<sha2::Sha512>::new(k)
+                    .sign(m)
+                    .to_vec(),
+                (true, RsaHash::Sha256) => pss::SigningKey::<Sha256>::new(k)
+                    .sign_with_rng(&mut OsRng, m)
+                    .to_vec(),
+                (true, RsaHash::Sha384) => pss::SigningKey::<Sha384>::new(k)
+                    .sign_with_rng(&mut OsRng, m)
+                    .to_vec(),
+                (true, RsaHash::Sha512) => pss::SigningKey::<sha2::Sha512>::new(k)
+                    .sign_with_rng(&mut OsRng, m)
+                    .to_vec(),
+            }
+        };
+        let all = [
+            &RSA_PKCS1_SHA256,
+            &RSA_PKCS1_SHA384,
+            &RSA_PKCS1_SHA512,
+            &RSA_PSS_SHA256,
+            &RSA_PSS_SHA384,
+            &RSA_PSS_SHA512,
+        ];
+        for alg in all {
+            let sig = sign(alg, msg);
+            alg.verify_signature(&public, msg, &sig).unwrap();
+            assert!(alg.verify_signature(&public, b"another", &sig).is_err());
+            let mut bad = sig.clone();
+            bad[100] ^= 1;
+            assert!(alg.verify_signature(&public, msg, &bad).is_err());
+            assert!(alg.verify_signature(&public, msg, &sig[1..]).is_err());
+            let long = [&[0u8][..], &sig].concat();
+            assert!(alg.verify_signature(&public, msg, &long).is_err());
+            // Under no other algorithm.
+            for other in all {
+                if !std::ptr::eq(alg, other) {
+                    assert!(other.verify_signature(&public, msg, &sig).is_err());
+                }
+            }
+        }
+        // A key below 2048 bits is refused even with a valid signature.
+        let small = crate::webauthn::soft::rsa_key(7, 1024);
+        let sig = pkcs1v15::SigningKey::<Sha256>::new(small.clone()).sign(msg);
+        let small_der = public_der(&small.to_public_key());
+        assert!(
+            RSA_PKCS1_SHA256
+                .verify_signature(&small_der, msg, &sig.to_vec())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rsa_private_keys_are_refused() {
+        let k = crate::webauthn::soft::rsa_key(7, 2048);
+        for der in [
+            PrivateKeyDer::Pkcs1(crate::rsakey::testing::private_der(&k).into()),
+            PrivateKeyDer::Pkcs8(crate::rsakey::testing::pkcs8_der(&k).into()),
+        ] {
+            let e = Keys.load_private_key(der).unwrap_err().to_string();
+            assert!(e.contains("TD-TLS-RSA-SERVER-KEY"), "{e}");
+        }
+        let e = Keys
+            .load_private_key(PrivateKeyDer::Pkcs8(vec![0x30, 0].into()))
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("RSA private"), "{e}");
     }
 
     #[test]

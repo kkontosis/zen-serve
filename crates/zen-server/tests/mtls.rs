@@ -166,6 +166,32 @@ async fn native_sign_in_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rsa_client_certificates_sign_in_natively() {
+    // An RSA CA and an RSA client key, as many organisations have.
+    let ca = Ca::with_key("corporate ca", Key::rsa(11, 2048));
+    let (h, _dir) = native(&ca, |_| {}).await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let cert = ca.issue("admin", Usage::Client, Key::rsa(12, 2048));
+    let with_cert = https_client(&ca, Some(&cert));
+    let tok = h.sign_in(&admin).await.unwrap();
+    let id = register(&h, &with_cert, &[], &tok, &MtlsRegister::default())
+        .await
+        .unwrap();
+    assert_eq!(id.id, cert.spki_sha256());
+    let s = mtls_session(&h, &with_cert, &[]).await.unwrap();
+    assert_eq!(s.device_fp, id.id);
+    grv(&h, &s.token).await.unwrap();
+    // A 1024-bit key under the same CA doesn't get through the handshake.
+    let small = https_client(
+        &ca,
+        Some(&ca.issue("small", Usage::Client, Key::rsa(13, 1024))),
+    );
+    let url = format!("{}/v1/info", h.base);
+    assert!(small.get(&url).send().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn foreign_and_expired_certificates_fail_the_handshake() {
     let ca = Ca::new("ca");
     let (h, _dir) = native(&ca, |_| {}).await;

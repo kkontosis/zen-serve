@@ -40,15 +40,15 @@ pub const ALG_RS256: i64 = -257;
 /// authenticator supports, and only RSA-only authenticators need it.
 pub const ALGORITHMS: [i64; 3] = [ALG_EDDSA, ALG_ES256, ALG_RS256];
 
-/// Smallest RSA modulus accepted, in bits.
-pub const RSA_MIN_BITS: usize = 2048;
-/// Largest RSA modulus accepted, in bits: larger keys only cost
-/// verification time.
-pub const RSA_MAX_BITS: usize = 4096;
+/// Smallest RSA modulus accepted, in bits (the shared policy of
+/// [`crate::rsakey`]).
+pub const RSA_MIN_BITS: usize = crate::rsakey::MIN_BITS;
+/// Largest RSA modulus accepted, in bits.
+pub const RSA_MAX_BITS: usize = crate::rsakey::MAX_BITS;
 /// Smallest RSA public exponent accepted (as FIPS 186-5).
-pub const RSA_MIN_E: u64 = 65537;
+pub const RSA_MIN_E: u64 = crate::rsakey::MIN_E;
 /// Largest RSA public exponent accepted.
-pub const RSA_MAX_E: u64 = u32::MAX as u64;
+pub const RSA_MAX_E: u64 = crate::rsakey::MAX_E;
 
 /// Max length of a credential id (WebAuthn Level 3).
 pub const MAX_CREDENTIAL_ID: usize = 1023;
@@ -327,30 +327,10 @@ impl CoseKey {
         let CoseKey::Rs256 { n, e } = self else {
             return Err(Error::Algorithm);
         };
-        let bits = match n.first() {
-            Some(top) => n.len() * 8 - top.leading_zeros() as usize,
-            None => 0,
-        };
-        if !(RSA_MIN_BITS..=RSA_MAX_BITS).contains(&bits) {
-            return Err(Error::KeyPolicy(
-                "an RSA modulus must have 2048 to 4096 bits",
-            ));
-        }
-        if e.len() > 8 {
-            return Err(Error::KeyPolicy("RSA public exponent out of range"));
-        }
-        let mut e8 = [0u8; 8];
-        e8[8 - e.len()..].copy_from_slice(e);
-        let e64 = u64::from_be_bytes(e8);
-        if e64 % 2 == 0 || !(RSA_MIN_E..=RSA_MAX_E).contains(&e64) {
-            return Err(Error::KeyPolicy(
-                "the RSA public exponent must be odd, at least 65537 and fit 32 bits",
-            ));
-        }
-        let n = rsa::BoxedUint::from_be_slice_vartime(n);
-        let e = rsa::BoxedUint::from(e64);
-        rsa::RsaPublicKey::new_with_max_size(n, e, RSA_MAX_BITS)
-            .map_err(|_| Error::Malformed("RSA public key"))
+        crate::rsakey::from_components(n, e).map_err(|r| match r {
+            crate::rsakey::Refused::Policy(why) => Error::KeyPolicy(why),
+            crate::rsakey::Refused::Malformed => Error::Malformed("RSA public key"),
+        })
     }
 
     fn p256(&self) -> Result<p256::ecdsa::VerifyingKey> {

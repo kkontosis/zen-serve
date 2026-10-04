@@ -133,7 +133,7 @@ pub struct TlsConfig {
     /// PEM certificate chain, the server's certificate first.
     pub cert: PathBuf,
     /// PEM private key: ECDSA P-256 or P-384 (PKCS#8 or SEC1), or Ed25519
-    /// (PKCS#8).
+    /// (PKCS#8). Not RSA (`TD-TLS-RSA-SERVER-KEY`).
     pub key: PathBuf,
     /// PEM CA certificates that client certificates must chain to. Set,
     /// with `[auth] mtls` on, the server asks for client certificates

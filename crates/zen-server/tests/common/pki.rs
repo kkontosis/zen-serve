@@ -15,6 +15,14 @@ pub enum Key {
     P256(p256::ecdsa::SigningKey, Vec<u8>),
     P384(p384::ecdsa::SigningKey, Vec<u8>),
     Ed25519(ed25519_dalek::SigningKey, Vec<u8>),
+    /// An RSA key (PKCS#1 `RSAPublicKey`), signing certificates with
+    /// PKCS#1 v1.5 and the given algorithm's hash. The server refuses RSA
+    /// private keys; test clients sign handshakes with it ([`RsaClientKey`]).
+    Rsa(
+        Arc<rsa::RsaPrivateKey>,
+        Vec<u8>,
+        &'static rcgen::SignatureAlgorithm,
+    ),
 }
 
 fn random<const N: usize>() -> [u8; N] {
@@ -57,6 +65,23 @@ impl Key {
         Key::Ed25519(sk, public)
     }
 
+    /// An RSA key of `bits` (generated once per process and seed),
+    /// signing certificates with SHA-256.
+    pub fn rsa(seed: u8, bits: usize) -> Key {
+        Self::rsa_with(seed, bits, &rcgen::PKCS_RSA_SHA256)
+    }
+
+    /// [`Key::rsa`], signing certificates with SHA-512.
+    pub fn rsa_sha512(seed: u8, bits: usize) -> Key {
+        Self::rsa_with(seed, bits, &rcgen::PKCS_RSA_SHA512)
+    }
+
+    fn rsa_with(seed: u8, bits: usize, alg: &'static rcgen::SignatureAlgorithm) -> Key {
+        let k = zen_server::webauthn::soft::rsa_key(seed, bits);
+        let public = zen_server::rsakey::testing::public_der(&k.to_public_key());
+        Key::Rsa(Arc::new(k), public, alg)
+    }
+
     /// The private key as rustls loads it: PKCS#8 for P-256 and Ed25519,
     /// SEC1 for P-384 (both fixed layouts, assembled by hand).
     pub fn der(&self) -> PrivateKeyDer<'static> {
@@ -81,6 +106,9 @@ impl Key {
                 v.extend_from_slice(sk.as_bytes());
                 PrivateKeyDer::Pkcs8(v.into())
             }
+            Key::Rsa(k, ..) => {
+                PrivateKeyDer::Pkcs8(zen_server::rsakey::testing::pkcs8_der(k).into())
+            }
         }
     }
 
@@ -97,7 +125,7 @@ impl Key {
 impl rcgen::PublicKeyData for Key {
     fn der_bytes(&self) -> &[u8] {
         match self {
-            Key::P256(_, p) | Key::P384(_, p) | Key::Ed25519(_, p) => p,
+            Key::P256(_, p) | Key::P384(_, p) | Key::Ed25519(_, p) | Key::Rsa(_, p, _) => p,
         }
     }
 
@@ -106,6 +134,7 @@ impl rcgen::PublicKeyData for Key {
             Key::P256(..) => &rcgen::PKCS_ECDSA_P256_SHA256,
             Key::P384(..) => &rcgen::PKCS_ECDSA_P384_SHA384,
             Key::Ed25519(..) => &rcgen::PKCS_ED25519,
+            Key::Rsa(_, _, alg) => alg,
         }
     }
 }
@@ -122,7 +151,86 @@ impl rcgen::SigningKey for Key {
                 s.to_der().as_bytes().to_vec()
             }
             Key::Ed25519(k, _) => ed25519_dalek::Signer::sign(k, msg).to_bytes().to_vec(),
+            Key::Rsa(k, _, alg) => {
+                use rsa::signature::{SignatureEncoding as _, Signer as _};
+                let k = (**k).clone();
+                if std::ptr::eq(*alg, &rcgen::PKCS_RSA_SHA512) {
+                    rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(k)
+                        .sign(msg)
+                        .to_vec()
+                } else {
+                    rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(k)
+                        .sign(msg)
+                        .to_vec()
+                }
+            }
         })
+    }
+}
+
+/// A test client's RSA key for TLS 1.3 handshakes: RSA-PSS with SHA-256.
+/// (The server's own provider refuses RSA private keys.)
+#[derive(Clone)]
+pub struct RsaClientKey(Arc<rsa::RsaPrivateKey>, Vec<u8>);
+
+impl std::fmt::Debug for RsaClientKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RsaClientKey")
+    }
+}
+
+impl rustls::sign::SigningKey for RsaClientKey {
+    fn choose_scheme(
+        &self,
+        offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered
+            .contains(&rustls::SignatureScheme::RSA_PSS_SHA256)
+            .then(|| Box::new(self.clone()) as Box<dyn rustls::sign::Signer>)
+    }
+
+    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+        Some(rustls::sign::public_key_to_spki(
+            &rustls::pki_types::alg_id::RSA_ENCRYPTION,
+            &self.1,
+        ))
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::RSA
+    }
+}
+
+impl rustls::sign::Signer for RsaClientKey {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _};
+        let k = rsa::pss::SigningKey::<sha2::Sha256>::new((*self.0).clone());
+        Ok(
+            k.sign_with_rng(&mut zen_server::rsakey::testing::OsRng, message)
+                .to_vec(),
+        )
+    }
+
+    fn scheme(&self) -> rustls::SignatureScheme {
+        rustls::SignatureScheme::RSA_PSS_SHA256
+    }
+}
+
+/// Always present one certificate and key.
+#[derive(Debug)]
+struct Fixed(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for Fixed {
+    fn resolve(
+        &self,
+        _: &[&[u8]],
+        _: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 
@@ -275,6 +383,14 @@ pub fn client_config_with(
         .unwrap()
         .with_root_certificates(roots);
     match ident {
+        Some(Ident {
+            cert,
+            key: Key::Rsa(k, public, _),
+        }) => {
+            let key = Arc::new(RsaClientKey(k.clone(), public.clone()));
+            let ck = rustls::sign::CertifiedKey::new(vec![cert.clone()], key);
+            b.with_client_cert_resolver(Arc::new(Fixed(Arc::new(ck))))
+        }
         Some(i) => b
             .with_client_auth_cert(vec![i.cert.clone()], i.key.der())
             .unwrap(),
