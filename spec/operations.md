@@ -219,9 +219,9 @@ key = "/etc/zen/api.key"          # PEM private key
 ```
 
 * **TLS 1.3 only**, ALPN `http/1.1`. WebSocket (`/v1/stream`) runs over the same connection type. Current browsers and HTTP libraries all speak TLS 1.3.
-* **Pure Rust**: rustls with a crypto provider on RustCrypto (`tls::provider` in zen-server): no OpenSSL and no C or assembly.
+* **Pure Rust**: rustls with a crypto provider on RustCrypto (`tls::provider` in zen-server): no OpenSSL and no C or assembly. The provider's glue is zen-serve's own and hasn't had an independent security review yet (`TD-TLS-PROVIDER-AUDIT`); an optional ring or aws-lc-rs provider is `TD-TLS-RING-PROVIDER`.
 * **Key exchange**, preferred first: the post-quantum hybrid **`X25519MLKEM768`**, then `X25519` and `secp256r1`. Browsers that support the hybrid get it; others fall back. **Ciphers**: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.
-* **The server key**: ECDSA P-256 or P-384 (PKCS#8 or SEC1 PEM), or Ed25519 (PKCS#8). RSA keys are not supported (`TD-TLS-RSA`). The chain may contain RSA-signed CA certificates, since only clients verify it: a Let's Encrypt ECDSA certificate works.
+* **The server key must be ECDSA or Ed25519**: P-256 or P-384 (PKCS#8 or SEC1 PEM), or Ed25519 (PKCS#8). An RSA server key stops the start with a message saying so: the pure-Rust `rsa` crate's private-key operations are not constant-time, and the server would be open to the Marvin timing attack (RUSTSEC-2023-0071, `TD-TLS-RSA-SERVER-KEY`). Ask your CA for an ECDSA certificate; the chain above it may be RSA-signed, since only clients verify it (a Let's Encrypt ECDSA certificate works). RSA **client** certificates and client CAs are fine (§8.2).
 * **Start-up checks.** A file that can't be read, a key that doesn't match the certificate, or a `client_ca` without certificates stops the start with a message naming the setting.
 * **Rotation.** The files are read at start-up: restart zen-serve after renewing the certificate. Automatic certificates (ACME) and reloading without a restart are deferred (`TD-TLS-ACME`).
 * **Limits.** A handshake must finish within 10 s; at most 1024 run at once, and further connections wait in the kernel's accept queue.
@@ -229,7 +229,7 @@ key = "/etc/zen/api.key"          # PEM private key
 
 ### 8.2 Client certificates
 
-With `client_ca` set and `[auth] mtls` on, the listener asks clients for a certificate from that CA, without requiring one, for sign-in method 5 (auth.md §10.1). A client that presents a certificate the CA didn't issue, or an expired one, fails the handshake. The client CA, its certificates and the clients' keys must be ECDSA (P-256, P-384) or Ed25519.
+With `client_ca` set and `[auth] mtls` on, the listener asks clients for a certificate from that CA, without requiring one, for sign-in method 5 (auth.md §10.1). A client that presents a certificate the CA didn't issue, or an expired one, fails the handshake. The client CA, its certificates and the clients' keys may be ECDSA (P-256, P-384), Ed25519, or RSA of 2048 to 4096 bits (auth.md §10.1); a smaller RSA key, or a larger one, fails the handshake. Only the server's own key must not be RSA (§8.1).
 
 A small CA with OpenSSL:
 

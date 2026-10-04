@@ -270,7 +270,7 @@ Method 5 (auth.md §10.4): sign in with the request connection's client certific
 
 * 403 `method_disabled` if `mtls` is off.
 * 401: the method is dormant (neither native client certificates nor a trusted proxy are set up, auth.md §10); no certificate on the connection; the proxy header from an untrusted address, or one that doesn't parse; an unregistered certificate; a user no longer a member.
-* Natively, a certificate that doesn't verify against `[tls] client_ca` (another CA, expired, not for client authentication) fails the TLS handshake before any request.
+* Natively, a certificate that doesn't verify against `[tls] client_ca` (another CA, expired, not for client authentication, a key or signature outside auth.md §10.1, such as RSA below 2048 bits) fails the TLS handshake before any request.
 * The session's `device_fp` is the credential id, and `method` is `mtls`. The token works on any connection and any node, like every session.
 
 ## 4. ACL and fs headers

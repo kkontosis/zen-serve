@@ -21,7 +21,8 @@ cross_origin_isolation = false
 cors_origins = []
 
 # Native TLS (spec/operations.md §8). Without [tls], plain HTTP: put the
-# server behind a TLS reverse proxy. Keys: ECDSA P-256/P-384 or Ed25519.
+# server behind a TLS reverse proxy. The server key: ECDSA P-256/P-384 or
+# Ed25519, not RSA. Client certificates and their CA may also be RSA.
 # [tls]
 # cert = "/etc/zen/api.pem"               # PEM chain, the server's certificate first
 # key = "/etc/zen/api.key"

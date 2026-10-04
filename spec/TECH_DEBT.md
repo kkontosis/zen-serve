@@ -64,7 +64,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-TLS-RSA
 
-* **Status:** open
+* **Status:** resolved for verification, by the commit "spec: RSA client certificates and CAs in native TLS (auth.md §10.1, operations.md §8)": the user accepted the release-candidate dependency. `tls::provider` verifies RSA PKCS#1 v1.5 and PSS signatures (SHA-256/384/512) with `rsa` pinned to `=0.10.0-rc.18`, under the passkey key policy (2048–4096 bits, odd exponent from 65537 to 2³² − 1, `rsakey`). RSA **server keys** (signing) stay open as `TD-TLS-RSA-SERVER-KEY`. Follow-up: the `rsa` 0.10 release, as `TD-AUTH-WEBAUTHN-RS256`.
 * **Context:** Native TLS (operations.md §8) runs on a rustls crypto provider of zen-serve's own on RustCrypto. It signs and verifies ECDSA (P-256, P-384) and Ed25519 only. A server key on RSA can't be loaded; a client certificate signed by an RSA CA, or a client with an RSA key, can't sign in natively (auth.md §10.1). Many organisations' client CAs are RSA.
 * **Why deferred:** The same as `TD-AUTH-WEBAUTHN-RS256`: the pure-Rust `rsa` crate for this RustCrypto generation is only a release candidate, and ring or aws-lc-rs would bring C and assembly. The trusted-proxy mode (auth.md §10.2) accepts RSA certificates, since the proxy verifies them.
 * **What it would take:** Once `rsa` 0.10 is released: RSA-PSS and PKCS#1 v1.5 verification (SHA-256/384/512) in `tls::provider`'s `WebPkiSupportedAlgorithms`, with a floor of 2048 bits; RSA server keys (PKCS#1 and PKCS#8) with RSA-PSS signing; tests with generated RSA CAs and keys.
@@ -89,3 +89,24 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** A client certificate signs in only after it is registered to a member, by the member from a connection that presents it or by an admin (auth.md §10.3). There is no way to map certificates to members by their subject or subject alternative name, for example "any certificate of this CA whose SAN email is alice@example.org is Alice".
 * **Why deferred:** A mapping by name makes the CA, not the signed ACL, decide who is who, and needs a policy for name formats, multiple matches and CAs shared with other services. Registration by key is explicit and keeps the ACL authoritative.
 * **What it would take:** An admin-set mapping per member (a SAN email or URI, or a subject DN, matched exactly) in the credential store or in the signed ACL; a lookup by the presented certificate's names when its key isn't registered, natively only, or with the proxy forwarding the names; a decision whether a match registers the key automatically; spec and tests.
+
+## TD-TLS-RSA-SERVER-KEY
+
+* **Status:** open
+* **Context:** Native TLS refuses an RSA server key at start-up (operations.md §8.1). Deployments whose CA only issues RSA server certificates must get an ECDSA one, or terminate TLS at a proxy.
+* **Why deferred:** Signing with an RSA key is a private-key operation, and the pure-Rust `rsa` crate's are not constant-time. Its own README for `0.10.0-rc.18` says the crate "is vulnerable to the Marvin Attack which could enable private key recovery by a network attacker" (RUSTSEC-2023-0071), with mitigation tracked in RustCrypto/RSA#390; the private-key path still reduces with variable-time arithmetic (`rem_vartime` in `rsa_decrypt`), and random blinding masks but doesn't remove the leak. A TLS server signs on demand for anyone who connects, which is the setting the attack needs. ECDSA and Ed25519 server certificates are available from every public CA.
+* **What it would take:** An `rsa` release whose changelog states constant-time private-key operations (and the advisory marked fixed), then: PKCS#1 and PKCS#8 RSA key loading in `tls::provider`'s `KeyProvider`, a `SigningKey` offering `rsa_pss_rsae_sha256/384/512` only (TLS 1.3), PSS signing with the OS RNG, the same 2048–4096-bit policy, and tests with an RSA server certificate. Or an optional ring/aws-lc-rs provider (`TD-TLS-RING-PROVIDER`).
+
+## TD-TLS-RING-PROVIDER
+
+* **Status:** open
+* **Context:** Native TLS uses only zen-serve's own rustls provider on RustCrypto (`tls::provider`). rustls's own providers, ring and aws-lc-rs, are far more widely deployed and tested, and sign with RSA in constant time, but neither is pure Rust: both build C and assembly.
+* **Why deferred:** The project keeps its dependencies pure Rust. The custom provider is small glue over RustCrypto primitives, and covers what the server needs, apart from RSA server keys.
+* **What it would take:** An optional cargo feature (off by default) that selects `rustls::crypto::ring::default_provider()` (or aws-lc-rs, with its `prefer-post-quantum` hybrid) instead of `tls::provider`, everywhere a provider is built (`tls::server_config`, the client verifier); a start-up log line naming the provider; CI running the TLS and mTLS tests with each provider; and a note in operations.md §8 on what the feature brings in (C, assembly, `unsafe`).
+
+## TD-TLS-PROVIDER-AUDIT
+
+* **Status:** open
+* **Context:** `tls/provider.rs` connects rustls to RustCrypto: the AEAD record layer, HKDF and HMAC, the key exchanges (including the X25519MLKEM768 hybrid), signature verification (ECDSA, Ed25519, RSA) and signing. Mistakes there could break TLS's confidentiality or authentication for native TLS and for mTLS sign-in. Its tests are known-answer tests for HMAC and HKDF, round trips and tamper checks, and handshakes between rustls clients and servers on the same provider, which can't catch a mistake made the same way on both sides.
+* **Why deferred:** An independent review needs people outside this work. Deployments that need assurance meanwhile can terminate TLS at a proxy (operations.md §8.3), or use `TD-TLS-RING-PROVIDER` once it exists.
+* **What it would take:** A security review of `tls/provider.rs` and `rsakey.rs` against rustls's own providers and the RFCs (8446 record protection and key schedule inputs, draft-ietf-tls-ecdhe-mlkem share and secret layout, RFC 8017 verification, key and point validation); interoperability tests against independent implementations (for example OpenSSL 3.5 or BoringSSL clients and servers, with the hybrid, every suite and each signature algorithm, in CI); TLS 1.3 test vectors (RFC 8448) where the provider API allows.

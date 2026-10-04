@@ -365,7 +365,11 @@ Two ways for a certificate to arrive, usable together:
 With `[tls] client_ca` set and `mtls` on, the API listener asks every client for a certificate (operations.md §8):
 * **Optional at the TLS layer.** A client without a certificate still connects, so browsers and the other sign-in methods work on the same port.
 * **Verified when sent.** A certificate must chain to a CA in `client_ca`, be valid now (not before, not after), and allow client authentication (extended key usage `clientAuth`, if the extension is present). Otherwise the **handshake fails**: the client gets a TLS alert, not an HTTP response. A browser that offers a wrong certificate therefore can't reach the server on that connection at all.
-* **Keys and signatures**: ECDSA on P-256 or P-384, and Ed25519, for the client certificate, its CA and the handshake signature. RSA is not supported (`TD-TLS-RSA`): a certificate signed by an RSA CA fails the handshake, and a client with an RSA key finds no signature scheme it may use, so it can't present its certificate. Use mode 2 for RSA certificates.
+* **Keys and signatures**, for the client certificate, its CA chain and the handshake signature:
+  * ECDSA on P-256 or P-384, and Ed25519;
+  * RSA with a 2048- to 4096-bit modulus and an odd public exponent from 65537 to 2³² − 1, the policy of passkeys (§7): PKCS#1 v1.5 or PSS signatures with SHA-256, SHA-384 or SHA-512 on certificates, and PSS in the handshake, as TLS 1.3 requires.
+
+  A key or CA outside these fails the handshake: a 1024-bit RSA CA, for example. RSA verification uses the pure-Rust `rsa` crate's release candidate (`TD-AUTH-WEBAUTHN-RS256` has the follow-up); only its public-key operations are used.
 * **No revocation checks.** zen-serve reads no CRLs and asks no OCSP responder (`TD-AUTH-MTLS-REVOCATION`). To revoke a certificate, remove its registration (§10.3); to revoke a whole CA, remove it from `client_ca` and restart.
 * With `mtls` off, the listener doesn't ask for certificates, and `client_ca` is not read.
 
@@ -415,7 +419,7 @@ Removing the registration through `/v1/auth/credentials/remove` (api.md §3.9) e
 
 * **Relay-proof natively.** In TLS 1.3 the client signs the handshake transcript, which includes the server's key share and certificate, so a sign-in can't be relayed through a server that doesn't hold the real server's key. The session token itself is a bearer secret, like every session (§3).
 * **The proxy mode trusts the proxy.** Whoever can send requests from a trusted address, or misconfigure the proxy to pass a client's header through, can sign in as any member whose certificate they have, and certificates are public. Keep `mtls_trusted_proxies` to the proxies themselves, and the network between them and zen-serve private.
-* **Not post-quantum for authentication.** The client's signature is ECDSA or Ed25519 (natively; whatever the proxy accepts in mode 2). A large quantum computer that recovers a certificate's private key from its public key could sign in with it. The **key exchange** of native TLS is post-quantum hybrid (`X25519MLKEM768`, operations.md §8), which protects the session token and the traffic against later decryption, not the sign-in against forgery. Methods 1 and 6 sign with a hybrid including ML-DSA-65.
+* **Not post-quantum for authentication.** The client's signature is ECDSA, Ed25519 or RSA (natively; whatever the proxy accepts in mode 2). A large quantum computer that recovers a certificate's private key from its public key could sign in with it. The **key exchange** of native TLS is post-quantum hybrid (`X25519MLKEM768`, operations.md §8), which protects the session token and the traffic against later decryption, not the sign-in against forgery. Methods 1 and 6 sign with a hybrid including ML-DSA-65.
 * **No revocation** (§10.1): a stolen certificate key works until its registration is removed or the certificate expires (natively; in mode 2, as the proxy checks).
 * **Expiry** is checked at the TLS layer natively, and by the proxy in mode 2; zen-serve doesn't check it in mode 2.
 * **Linkability.** The credential id is a public function of the certificate, and it is the session's device id, which other members can see (for example as the `sender` of ephemeral messages, api.md §9). Someone holding the certificate can tell it signed in.
