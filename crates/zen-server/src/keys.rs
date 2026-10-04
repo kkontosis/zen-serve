@@ -94,6 +94,16 @@ pub fn topic_groups(fs: u32, topic: &[u8]) -> Key {
     Key::new().str("ct").int(fs.into()).bytes(topic)
 }
 
+/// `("lp", fs, group, part)`: a partitioned group's index of its topic's
+/// events by partition, `… vs → ∅`, written on append (keyspace.md §3.3).
+pub fn partition_index(fs: u32, group: &[u8], part: u32) -> Key {
+    Key::new()
+        .str("lp")
+        .int(fs.into())
+        .bytes(group)
+        .int(part.into())
+}
+
 /// Committed cursor of a partition.
 pub fn cursor(fs: u32, group: &[u8], part: u32) -> Vec<u8> {
     Key::new()

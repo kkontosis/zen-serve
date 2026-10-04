@@ -1381,3 +1381,97 @@ async fn per_key_many_claims_do_not_hide_ready_keys() {
         vec![99]
     );
 }
+
+/// A partitioned group finds a sparse partition's next event through its
+/// partition index: events from before the group existed are scanned once,
+/// later ones cost one read however long the topic grows.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_sparse_partition_in_a_long_topic() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    // Key tokens of all-even bytes land in partition 0 of 2; `[1; 16]` in 1.
+    let even = |j: usize| vec![((j % 100) as u8) * 2; 16];
+    let bulk = |n: u8, c: u8| LogAppend {
+        commit_id: cid(c),
+        append: (0..300)
+            .map(|j| append(&topic(1), Some(&even(j)), &[n]))
+            .collect(),
+    };
+    let one = |n: u8, c: u8| LogAppend {
+        commit_id: cid(c),
+        append: vec![append(&topic(1), Some(&[1u8; 16]), &[n])],
+    };
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &bulk(0, 1))
+        .await
+        .unwrap();
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &one(7, 2))
+        .await
+        .unwrap();
+    let mut g = group(b"parts", Mode::Partitioned);
+    g.partitions = Some(2);
+    let _: GroupCreated = h.call("/v1/consume/groups", Some(&tok), &g).await.unwrap();
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &bulk(1, 3))
+        .await
+        .unwrap();
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &one(8, 4))
+        .await
+        .unwrap();
+    // Only appends after the creation are indexed, by partition.
+    let store = h.server.state.store.clone();
+    let count = |part: u32| {
+        let store = store.clone();
+        async move {
+            let pfx = zen_server::keys::partition_index(1, b"parts", part).finish();
+            let mut t = store.begin(None).await.unwrap();
+            t.snapshot_get_range(&pfx, &zen_server::keys::end_of(&pfx), 10_000, false)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!((count(0).await, count(1).await), (300, 1));
+    // Partition 1 gets its two events in order, across the scan/index seam.
+    let lease: Lease = h
+        .call(
+            "/v1/consume/lease",
+            Some(&tok),
+            &LeaseRequest {
+                fs: 1,
+                group: b"parts".to_vec(),
+                partition: Some(1),
+                token: None,
+                ttl_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+    let next = NextRequest {
+        fs: 1,
+        group: b"parts".to_vec(),
+        partition: Some(1),
+        token: Some(lease.token),
+        limit: Some(5),
+        wait_ms: None,
+    };
+    let mut got = Vec::new();
+    for c in 10..13u8 {
+        let d: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
+        let Some(ev) = d.events.first() else {
+            break;
+        };
+        got.push(ev.envelope[0]);
+        let ack = Commit {
+            commit_id: cid(c),
+            consume: vec![consume(b"parts", ev, Some(1), None)],
+            ..Default::default()
+        };
+        let _: CommitResult = h.call("/v1/commit", Some(&tok), &ack).await.unwrap();
+    }
+    assert_eq!(got, vec![7, 8]);
+}

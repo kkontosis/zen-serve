@@ -209,7 +209,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 * A group is **immutable** (G8). Creating it again with identical parameters returns `created: false`. Different parameters return 409 `group_exists`.
 * Needs topic `consume`.
 * `broadcast` stores only the definition. Its members read the log with their own cursors (§7.2, §9).
-* **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0.
+* **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0. Appends after the group's creation are indexed by partition (keyspace.md §3.3), so finding a partition's next event costs one read; events from before the creation are scanned once.
 * A `per_key` group starting at `earliest` puts every key's first event on the ready list. A topic with more than 100,000 events returns 413; use `latest` instead.
 * `per_key` and `single_key` groups only see events that have a `key_token`.
 

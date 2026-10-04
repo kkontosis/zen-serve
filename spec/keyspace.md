@@ -56,8 +56,9 @@ Quota counters are read with snapshot reads, so concurrent commits don't conflic
 
 | Key | Value |
 |---|---|
-| `pack("cg", fs, group)` | `{def, start}` CBOR: the normalized definition (api.md §8.1) and the start offset, which is the cursor of any partition or key that has not committed yet |
-| `pack("ct", fs, topic, group)` | `u8 mode`: index of the groups on a topic, read on append |
+| `pack("cg", fs, group)` | `{def, start, indexed_from?}` CBOR: the normalized definition (api.md §8.1), the start offset (the cursor of any partition or key that has not committed yet), and for `partitioned` the newest offset at creation: events after it are in the group's partition index, older ones are scanned |
+| `pack("ct", fs, topic, group)` | `u8 mode ‖ [u32 partitions]`: index of the groups on a topic, read on append; the partition count is present for `partitioned` groups |
+| `pack("lp", fs, group, part, vs)` | empty: a `partitioned` group's index of its topic's events by partition, written on append for every event after `indexed_from` |
 | `pack("cc", fs, group, part)` | `offset`: committed cursor (`sequential` uses part 0; `single_key` uses part 0) |
 | `pack("cl", fs, group, part)` | lease: `holder_fp(32) ‖ u64 token ‖ u64 expires_version` |
 | `pack("kc", fs, group, key)` | `offset ‖ u64 last_claim_token`: last committed offset for one key (`per_key`) |

@@ -184,31 +184,45 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     Ok(())
 }
 
-/// Per-key groups on a topic, read once per commit (conflict-tracked, so a
-/// concurrent group creation and append serialize).
-async fn per_key_groups(
+/// A group on a topic that indexes appends: `per_key` (ready list), or
+/// `partitioned` with its partition count (partition index).
+#[derive(Clone)]
+enum Indexing {
+    PerKey(Vec<u8>),
+    Partitioned(Vec<u8>, u32),
+}
+
+/// Indexing groups on a topic, read once per commit (conflict-tracked, so
+/// a concurrent group creation and append serialize).
+async fn topic_groups(
     t: &mut Box<dyn Txn>,
-    cache: &mut HashMap<(u32, Vec<u8>), Vec<Vec<u8>>>,
+    cache: &mut HashMap<(u32, Vec<u8>), Vec<Indexing>>,
     fs: u32,
     topic: &[u8],
-) -> ApiResult<Vec<Vec<u8>>> {
+) -> ApiResult<Vec<Indexing>> {
     if let Some(g) = cache.get(&(fs, topic.to_vec())) {
         return Ok(g.clone());
     }
     let prefix = keys::topic_groups(fs, topic).finish();
-    let groups: Vec<Vec<u8>> = t
-        .get_range(&prefix, &keys::end_of(&prefix), 10_000, false)
-        .await?
-        .into_iter()
-        .filter(|(_, v)| v.first() == Some(&Mode::PerKey.byte()))
-        .filter_map(|(k, _)| {
-            let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 1).ok()?;
-            match elems.into_iter().next() {
-                Some(zen_store::tuple::Elem::Bytes(g)) => Some(g),
-                _ => None,
-            }
-        })
-        .collect();
+    let groups: Vec<Indexing> =
+        t.get_range(&prefix, &keys::end_of(&prefix), 10_000, false)
+            .await?
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 1).ok()?;
+                let Some(zen_store::tuple::Elem::Bytes(g)) = elems.into_iter().next() else {
+                    return None;
+                };
+                match (v.first().copied(), v.get(1..5)) {
+                    (Some(m), _) if m == Mode::PerKey.byte() => Some(Indexing::PerKey(g)),
+                    // A `ct` entry without a partition count predates the index.
+                    (Some(m), Some(n)) if m == Mode::Partitioned.byte() => Some(
+                        Indexing::Partitioned(g, u32::from_be_bytes(n.try_into().ok()?)),
+                    ),
+                    _ => None,
+                }
+            })
+            .collect();
     cache.insert((fs, topic.to_vec()), groups.clone());
     Ok(groups)
 }
@@ -324,19 +338,29 @@ pub async fn execute(
             t.set_versionstamped_value(&keys::topic_head(fs, topic), &[], &ix);
             t.set_versionstamped_value(&keys::fs_head(fs), &[], &ix);
             delta.entry(fs).or_default().0 += (a.envelope.len() + topic.len()) as i64;
-            if let Some(k) = key {
-                for g in per_key_groups(&mut t, &mut groups, fs, topic).await? {
-                    if !readied.insert((fs, g.clone(), k.to_vec())) {
-                        continue;
+            for g in topic_groups(&mut t, &mut groups, fs, topic).await? {
+                match (g, key) {
+                    (Indexing::PerKey(g), Some(k)) => {
+                        if !readied.insert((fs, g.clone(), k.to_vec())) {
+                            continue;
+                        }
+                        let ptr = keys::ready_ptr(fs, &g, k);
+                        if t.get(&ptr).await?.is_none() {
+                            let (p, s) = keys::ready_prefix(fs, &g)
+                                .vs_incomplete(i)
+                                .bytes(k)
+                                .finish_incomplete();
+                            t.set_versionstamped_key(&p, &s, &[]);
+                            t.set_versionstamped_value(&ptr, &[], &ix);
+                        }
                     }
-                    let ptr = keys::ready_ptr(fs, &g, k);
-                    if t.get(&ptr).await?.is_none() {
-                        let (p, s) = keys::ready_prefix(fs, &g)
+                    (Indexing::PerKey(_), None) => {}
+                    (Indexing::Partitioned(g, n), key) => {
+                        let part = crate::consume::partition_of(key, n);
+                        let (p, s) = keys::partition_index(fs, &g, part)
                             .vs_incomplete(i)
-                            .bytes(k)
                             .finish_incomplete();
                         t.set_versionstamped_key(&p, &s, &[]);
-                        t.set_versionstamped_value(&ptr, &[], &ix);
                     }
                 }
             }

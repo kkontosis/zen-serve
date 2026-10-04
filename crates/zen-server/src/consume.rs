@@ -37,11 +37,22 @@ pub struct StoredGroup {
     pub def: GroupDef,
     /// Cursor of a partition or key that never committed.
     pub start: ByteBuf,
+    /// `partitioned`: events after this offset are in the group's
+    /// partition index (`lp`); older ones are found by scanning the log.
+    /// Absent for groups created before the index existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_from: Option<ByteBuf>,
 }
 
 impl StoredGroup {
     fn start(&self) -> Offset {
         self.start.as_slice().try_into().unwrap_or(ZERO_OFFSET)
+    }
+
+    fn indexed_from(&self) -> Option<Offset> {
+        self.indexed_from
+            .as_ref()
+            .and_then(|o| o.as_slice().try_into().ok())
     }
 
     fn max_attempts(&self) -> u32 {
@@ -242,23 +253,45 @@ pub async fn next_eligible(
         }
         (Mode::Partitioned, Sub::Part(p)) => {
             let n = g.def.partitions.unwrap_or(1);
+            let ix = g.indexed_from();
             let mut from = *after;
-            loop {
-                let (b, e) = keys::after_offset(keys::log_prefix(fs, topic), &from);
-                let got = range(t, &b, &e, 256, track).await?;
-                let done = got.len() < 256;
-                for (k, v) in got {
-                    let o = tail_offset(&k)?;
-                    let (key, _) = decode_entry(&v);
-                    if partition_of(key.as_deref(), n) == *p {
-                        return Ok(Some((o, v)));
+            // Events up to `indexed_from` predate the group's partition
+            // index: scan them (bounded by the topic's size at creation).
+            if ix.is_none_or(|ix| from < ix) {
+                loop {
+                    let (b, e) = keys::after_offset(keys::log_prefix(fs, topic), &from);
+                    let got = range(t, &b, &e, 256, track).await?;
+                    let done = got.len() < 256;
+                    for (k, v) in got {
+                        let o = tail_offset(&k)?;
+                        if ix.is_some_and(|ix| o > ix) {
+                            break;
+                        }
+                        let (key, _) = decode_entry(&v);
+                        if partition_of(key.as_deref(), n) == *p {
+                            return Ok(Some((o, v)));
+                        }
+                        from = o;
                     }
-                    from = o;
+                    if done || ix.is_some_and(|ix| from >= ix) {
+                        break;
+                    }
                 }
-                if done {
+                let Some(ix) = ix else {
                     return Ok(None);
-                }
+                };
+                from = from.max(ix);
             }
+            let (b, e) = keys::after_offset(keys::partition_index(fs, &g.def.group, *p), &from);
+            let Some((k, _)) = range(t, &b, &e, 1, track).await?.into_iter().next() else {
+                return Ok(None);
+            };
+            let o = tail_offset(&k)?;
+            let entry = t
+                .snapshot_get(&keys::log_prefix(fs, topic).vs(&o).finish())
+                .await?
+                .ok_or_else(|| internal("partition index points at a missing event"))?;
+            Ok(Some((o, entry)))
         }
         _ => Err(bad_request("invalid partition or key for this group")),
     }
@@ -377,11 +410,14 @@ pub async fn create_group(
         }
         let log = keys::log_prefix(fs, &def.topic).finish();
         let log_end = keys::end_of(&log);
+        // The newest event; a conflict-tracked read, so a concurrent append
+        // either lands before it (and is scanned) or after (and is indexed).
+        let last = match t.get_range(&log, &log_end, 1, true).await?.pop() {
+            Some((k, _)) => tail_offset(&k)?,
+            None => ZERO_OFFSET,
+        };
         let start = match def.start {
-            Some(Start::Latest) => match t.get_range(&log, &log_end, 1, true).await?.pop() {
-                Some((k, _)) => tail_offset(&k)?,
-                None => ZERO_OFFSET,
-            },
+            Some(Start::Latest) => last,
             _ => ZERO_OFFSET,
         };
         if def.mode == Mode::PerKey && start == ZERO_OFFSET {
@@ -413,16 +449,22 @@ pub async fn create_group(
                 t.set(&keys::ready_ptr(fs, &def.group, key), o);
             }
         }
+        let partitioned = def.mode == Mode::Partitioned;
         let stored = StoredGroup {
             def: def.clone(),
             start: ByteBuf::from(start.to_vec()),
+            indexed_from: partitioned.then(|| ByteBuf::from(last.to_vec())),
         };
         t.set(&key, &to_cbor(&stored));
+        let mut ct = vec![def.mode.byte()];
+        if partitioned {
+            ct.extend_from_slice(&def.partitions.unwrap_or(1).to_be_bytes());
+        }
         t.set(
             &keys::topic_groups(fs, &def.topic)
                 .bytes(&def.group)
                 .finish(),
-            &[def.mode.byte()],
+            &ct,
         );
         Ok(true)
     })?;
