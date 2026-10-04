@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub use ciborium::Value as CborValue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub use serde_bytes::ByteBuf;
 
