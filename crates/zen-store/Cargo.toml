@@ -1,0 +1,16 @@
+[package]
+name = "zen-store"
+version = "0.1.0"
+description = "zen-serve storage: an FDB-shaped transactional KV trait, tuple encoding, and the embedded redb backend"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+redb = "4.3"
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
