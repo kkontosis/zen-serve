@@ -132,8 +132,9 @@ impl Default for FdbConfig {
 pub struct TlsConfig {
     /// PEM certificate chain, the server's certificate first.
     pub cert: PathBuf,
-    /// PEM private key: ECDSA P-256 or P-384 (PKCS#8 or SEC1), or Ed25519
-    /// (PKCS#8). Not RSA (`TD-TLS-RSA-SERVER-KEY`).
+    /// PEM private key: ECDSA P-256 or P-384 (PKCS#8 or SEC1), Ed25519
+    /// (PKCS#8), or with the `ring` feature RSA (PKCS#1 or PKCS#8, 2048 to
+    /// 4096 bits). The pure-Rust build refuses RSA (`TD-TLS-RSA-SERVER-KEY`).
     pub key: PathBuf,
     /// PEM CA certificates that client certificates must chain to. Set,
     /// with `[auth] mtls` on, the server asks for client certificates

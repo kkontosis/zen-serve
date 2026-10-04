@@ -29,6 +29,15 @@ Building blocks:
 * Milestone 3 (FoundationDB backend, supervisor, backup/PITR, [`docs/MILESTONE-3.md`](docs/MILESTONE-3.md)): done.
 * Milestone 3.5 (server-merged CRDT filesystem, [`spec/fs.md`](spec/fs.md), [`docs/MILESTONE-3.5.md`](docs/MILESTONE-3.5.md)): done on the server side; the zen-fs client follows in milestones 4–5.
 
+## Building
+
+```sh
+cargo build -p zen-server --release                          # the default build
+cargo build -p zen-server --release --no-default-features    # pure Rust
+```
+
+The **default build** needs a **C compiler** (`cc`/`gcc` or `clang`): its native TLS runs on rustls's [ring](https://github.com/briansmith/ring) provider, which builds C and assembly. That build also accepts RSA server keys. The **pure-Rust build** (`--no-default-features`) uses zen-serve's own TLS provider on RustCrypto instead and needs no C compiler; its server key must be ECDSA or Ed25519. Both offer the post-quantum hybrid key exchange and the same client-certificate sign-in. Add `--features fdb` to either for the FoundationDB backend. See [`spec/operations.md`](spec/operations.md) §8.4.
+
 ## Running
 
 ```sh
@@ -37,7 +46,7 @@ cargo run -p zen-server -- serve --config examples/zen-serve.toml
 
 On first start the server prints a one-time **claim token**. The first signed ACL (`POST /v1/acl/put`) must carry it, and that pins the first admin.
 
-Without `[tls]` the server speaks plain HTTP, for a TLS reverse proxy in front. With `[tls]` it terminates TLS itself: TLS 1.3 on pure-Rust rustls (no OpenSSL), with the post-quantum hybrid key exchange `X25519MLKEM768`, and optionally TLS client certificates for sign-in. See [`spec/operations.md`](spec/operations.md) §8 and [`spec/auth.md`](spec/auth.md) §10.
+Without `[tls]` the server speaks plain HTTP, for a TLS reverse proxy in front. With `[tls]` it terminates TLS itself: TLS 1.3 on rustls (no OpenSSL), with the post-quantum hybrid key exchange `X25519MLKEM768`, and optionally TLS client certificates for sign-in. See [`spec/operations.md`](spec/operations.md) §8 and [`spec/auth.md`](spec/auth.md) §10.
 
 On FoundationDB, with zen-serve running the `fdbserver` processes itself:
 
@@ -54,7 +63,9 @@ See [`spec/operations.md`](spec/operations.md) for clusters, backup and point-in
 
 ```sh
 cargo test                                                     # includes byte-exact test vectors
+cargo test --all --no-default-features                         # the pure-Rust build
 cargo clippy --all-targets -- -D warnings                      # --all-features needs libfdb_c
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown
 cargo run -p zen-core --example gen_vectors --features test-utils   # regenerate spec/test-vectors
 ```
