@@ -241,15 +241,21 @@ pub async fn load(
     store: &dyn Storage,
     is_fs: &(dyn Fn(u32) -> bool + Sync),
 ) -> ApiResult<AclState> {
-    let mut t = store.begin(None).await?;
-    let Some(head) = t.get(&keys::acl_head()).await? else {
+    // Retried: FoundationDB answers `too_old` during recoveries.
+    let (signed, _) = txn_loop!(store, None, |t| {
+        let Some(head) = t.get(&keys::acl_head()).await? else {
+            return Ok(None);
+        };
+        let v = u64::from_be_bytes(head.try_into().map_err(|_| internal("bad acl_head"))?);
+        Ok(Some(
+            t.get(&keys::acl(v))
+                .await?
+                .ok_or_else(|| internal("missing ACL"))?,
+        ))
+    })?;
+    let Some(signed) = signed else {
         return Ok(AclState::default());
     };
-    let v = u64::from_be_bytes(head.try_into().map_err(|_| internal("bad acl_head"))?);
-    let signed = t
-        .get(&keys::acl(v))
-        .await?
-        .ok_or_else(|| internal("missing ACL"))?;
     let s: SignedAcl = from_cbor(&signed).map_err(internal)?;
     Ok(AclState::from_doc(&s.doc, is_fs)?.0)
 }
