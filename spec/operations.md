@@ -30,7 +30,10 @@ zen-serve pins one FoundationDB release (G22): **7.3.79**. To install it:
 sudo scripts/install-fdb.sh            # into /opt/foundationdb, sha256-checked
 ```
 
-The script unpacks Apple's official client and server packages, and verifies each against its pinned sha256. No service is installed or started: zen-serve runs the processes itself. As root it also links `libfdb_c.so` into `/usr/lib`, so builds and binaries find it.
+The script unpacks Apple's official client and server packages (their optimized, stripped release builds), and verifies each against its pinned sha256. No service is installed or started: zen-serve runs the processes itself. As root it also links `libfdb_c.so` into `/usr/lib`, so builds and binaries find it.
+
+* **Every component is installed by default.** Opt-outs: `--no-backup` (`fdbbackup`, `fdbrestore`, `backup_agent`; zen-serve's `backup` and `restore` need them), `--no-dr` (`fdbdr`, `dr_agent`), `--no-fdbmonitor` (zen-serve supervises `fdbserver` itself).
+* **The backup and DR tools are one program under five names**; it picks its role from the name it is run as. `--dedupe=MODE` stores it once: `auto` (the default) tries a reflink (a copy-on-write clone, on btrfs, XFS, ZFS or bcachefs), then a hard link, then a symlink, and falls back to a copy; `reflink`, `hard` and `soft` force one kind, `none` keeps five copies. Every name stays and works. This takes the installation from about 277 MB to about 171 MB.
 
 zen-serve looks for the binaries (`fdbserver`, `fdbcli`, `fdbbackup`, `fdbrestore`, `backup_agent`) in `[fdb] bin_dir`. If that is unset, it searches `/opt/foundationdb/…`, the Debian package locations, then `PATH`.
 
@@ -319,9 +322,13 @@ zen-server has a Cargo feature **`ring`**, on by default, that chooses the TLS c
 cargo build -p zen-server --release                                   # default: ring (needs a C compiler)
 cargo build -p zen-server --release --no-default-features             # pure Rust
 cargo build -p zen-server --release --no-default-features --features fdb
+cargo build -p zen-server --release --no-default-features --features pure   # no C compiler call at all
 ```
 
+* **Without `fdb`** the binary has the embedded backend only: the FoundationDB commands (`init`, `join`, `token`, `backup`, `restore`) and the process supervisor are left out, and `libfdb_c` is neither linked nor needed. `serve`, `status`, `export`, `import` and `migrate` (into another embedded store) remain.
+* **Release builds** use whole-program optimization, one codegen unit and stripped symbols (`[profile.release]` in the workspace `Cargo.toml`); panics still unwind, so one failing request can't stop the server.
+
 * ring brings C, assembly and `unsafe` code into the build. Its RSA verification alone would take 2048- to 8192-bit keys and public exponents from 3, so zen-serve applies the policy of auth.md §10.1 in front of it.
-* The pure-Rust build needs no C compiler. With one installed, `blake3` still assembles its SIMD code; adding `--features blake3/pure` turns that off too, so that nothing calls a C compiler (FoundationDB's `libfdb_c` is a C library either way).
+* The pure-Rust build needs no C compiler. With one installed, `blake3` still assembles its SIMD code; adding `--features pure` (zen-server's shorthand for blake3's `pure`) turns that off too, so that nothing calls a C compiler (FoundationDB's `libfdb_c` is a C library either way).
 * Passkey RS256 verification (auth.md §7) uses the `rsa` crate in both builds.
 * The two builds speak the same TLS and accept the same client certificates; only RSA server keys and the extra `secp384r1` group differ.

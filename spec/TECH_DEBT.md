@@ -104,6 +104,13 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** The project keeps its dependencies pure Rust. The custom provider is small glue over RustCrypto primitives, and covers what the server needs, apart from RSA server keys.
 * **What it would take:** An optional cargo feature (off by default) that selects `rustls::crypto::ring::default_provider()` (or aws-lc-rs, with its `prefer-post-quantum` hybrid) instead of `tls::provider`, everywhere a provider is built (`tls::server_config`, the client verifier); a start-up log line naming the provider; CI running the TLS and mTLS tests with each provider; and a note in operations.md §8 on what the feature brings in (C, assembly, `unsafe`).
 
+## TD-TLS-RING-X25519
+
+* **Status:** open (user decision: a follow-up)
+* **Context:** In the default (ring) build, the `X25519MLKEM768` hybrid group is zen-serve's own (`tls/rustcrypto.rs`), and its X25519 half runs on `x25519-dalek`, while ring's own X25519 group serves plain `X25519`. The hybrid could compute its X25519 share and secret with ring instead, leaving only ML-KEM and the share/secret concatenation as zen-serve's code in that build.
+* **Why deferred:** The hybrid works and is tested against itself and, through the shared X25519 group, against ring; moving its X25519 half is a refinement that narrows `TD-TLS-PROVIDER-AUDIT` rather than a fix.
+* **What it would take:** A ring-build variant of the hybrid group that drives `rustls::crypto::ring::kx_group::X25519` (`start`/`complete`) for the classical half and `ml-kem` for the rest, the same share and secret layout (draft-ietf-tls-ecdhe-mlkem), handshake tests between the two builds' hybrids, and narrowing `TD-TLS-PROVIDER-AUDIT` accordingly.
+
 ## TD-TLS-PROVIDER-AUDIT
 
 * **Status:** open
