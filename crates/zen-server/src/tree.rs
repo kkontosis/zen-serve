@@ -28,8 +28,6 @@ use zen_store::{Storage, Txn, VERSIONS_PER_SEC, Version, key_after, stamp_of};
 const MAX_WAIT_MS: u32 = 30_000;
 /// Fixed part of a node record after `changed`.
 const REC_FIXED: usize = 1 + 16 + 8 + 32 + 8 + 32 + 4;
-/// Guard against corrupt (cyclic) parent chains.
-const MAX_DEPTH: usize = 100_000;
 
 /// An operation timestamp `(hlc, device)`, ordered by hlc then device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -362,7 +360,9 @@ impl<'a> Engine<'a> {
         anc: Id,
         mut n: Id,
     ) -> ApiResult<bool> {
-        for _ in 0..MAX_DEPTH {
+        // One read per ancestor of `n`: bounded by `crdt_max_depth`, which
+        // also bounds how deep a move may place a node (fs.md §3.4).
+        for _ in 0..=self.st.cfg.limits.crdt_max_depth {
             if n == anc {
                 return Ok(true);
             }
@@ -378,7 +378,7 @@ impl<'a> Engine<'a> {
                 None => return Ok(false),
             }
         }
-        Err(internal("tree too deep or corrupt"))
+        Err(bad_request("the parent is deeper than crdt_max_depth"))
     }
 
     async fn header(&mut self, t: &mut Box<dyn Txn>, fs: u32, tree: Id) -> ApiResult<&mut Header> {
@@ -888,11 +888,18 @@ pub async fn tree_children(
     let got = t
         .snapshot_get_range(&begin, &keys::end_of(&pfx), limit + 1, false)
         .await?;
-    let more = got.len() > limit;
+    let mut more = got.len() > limit;
+    let max_bytes = st.cfg.limits.max_range_bytes as usize;
+    let mut bytes = 0usize;
     let mut nodes = Vec::new();
     for (k, _) in got.into_iter().take(limit) {
+        if bytes >= max_bytes {
+            more = true; // continue after the last node returned
+            break;
+        }
         let n = tail_id(&k, pfx.len())?;
         if let Some(r) = load_node(&mut t, req.fs, &tree, &n).await? {
+            bytes += 12 + REC_FIXED + r.meta.as_ref().map_or(0, |m| m.1.len());
             nodes.push(r.state(&n));
         }
     }
@@ -923,9 +930,15 @@ async fn read_changes(st: &Shared, req: &TreeChanges, tree: &Id) -> ApiResult<Ch
     let got = t
         .snapshot_get_range(&begin, &keys::end_of(&pfx), limit + 1, false)
         .await?;
-    let more = got.len() > limit;
+    let mut more = got.len() > limit;
+    let max_bytes = st.cfg.limits.max_range_bytes as usize;
+    let mut bytes = 0usize;
     let mut changes = Vec::new();
     for (k, v) in got.into_iter().take(limit) {
+        if bytes >= max_bytes {
+            more = true; // the cursor is the last change returned
+            break;
+        }
         let (elems, _) =
             unpack_prefix(&k[pfx.len()..], 2).map_err(|_| internal("bad change key"))?;
         let [Elem::Vs(o), Elem::Bytes(n)] = elems.as_slice() else {
@@ -936,7 +949,10 @@ async fn read_changes(st: &Shared, req: &TreeChanges, tree: &Id) -> ApiResult<Ch
             None
         } else {
             match load_node(&mut t, req.fs, tree, &node).await? {
-                Some(r) => Some(r.state(&node)),
+                Some(r) => {
+                    bytes += 12 + REC_FIXED + r.meta.as_ref().map_or(0, |m| m.1.len());
+                    Some(r.state(&node))
+                }
                 None => continue,
             }
         };
@@ -1012,9 +1028,22 @@ pub async fn file_get(
     let (tree, node) = (id16(&req.tree, "tree")?, id16(&req.node, "node")?);
     let mut t = read_txn(&st, req.read_version).await?;
     let pfx = keys::versions(req.fs, &tree, &node).finish();
-    let got = t
-        .snapshot_get_range(&pfx, &keys::end_of(&pfx), 10_000, false)
-        .await?;
+    let l = &st.cfg.limits;
+    let (got, capped) = crate::kv::read_capped(
+        &mut t,
+        &pfx,
+        &keys::end_of(&pfx),
+        l.max_range_items as usize + 1,
+        false,
+        l.max_range_bytes as usize,
+        false,
+    )
+    .await?;
+    if capped || got.len() > l.max_range_items as usize {
+        return Err(too_large(
+            "too many content versions; resolve some siblings",
+        ));
+    }
     let mut versions = Vec::new();
     for (k, v) in got {
         let (elems, _) =

@@ -26,10 +26,15 @@ id = 2   # "/home/user"
 
 [limits]
 max_value_bytes = 90000
+max_range_items = 10000      # items per range read …
+max_range_bytes = 8000000    # … and bytes; past either the response says `more`
 idempotency_ttl_secs = 86400
 session_ttl_secs = 86400
+claim_ttl_ms = 30000         # per_key claims
+max_groups_per_topic = 64
 # CRDT filesystem (spec/fs.md §3.4, §6).
 crdt_max_skew_ms = 60000
 crdt_horizon_secs = 604800   # late operations and trash are kept 7 days
 crdt_max_redo = 1000
+crdt_max_depth = 1000
 chunk_grace_secs = 86400

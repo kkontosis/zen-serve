@@ -408,6 +408,17 @@ pub async fn create_group(
                 Err(group_exists("a different group with this name exists"))
             };
         }
+        // Every append pays for the groups on its topic (ready lists,
+        // partition indexes), so their number is capped.
+        let ct = keys::topic_groups(fs, &def.topic).finish();
+        let max_groups = st.cfg.limits.max_groups_per_topic as usize;
+        let n = t
+            .get_range(&ct, &keys::end_of(&ct), max_groups + 1, false)
+            .await?
+            .len();
+        if n >= max_groups {
+            return Err(quota("too many consumer groups on this topic"));
+        }
         let log = keys::log_prefix(fs, &def.topic).finish();
         let log_end = keys::end_of(&log);
         // The newest event; a conflict-tracked read, so a concurrent append
@@ -841,9 +852,10 @@ pub async fn dlq_list(
         .clamp(1, st.cfg.limits.max_range_items) as usize;
     let (b, e) = keys::after_offset(keys::dlq_prefix(req.fs, &req.group), &after);
     let mut t = st.store.begin(None).await?;
-    let items = t
-        .snapshot_get_range(&b, &e, limit, false)
+    let max_bytes = st.cfg.limits.max_range_bytes as usize;
+    let items = crate::kv::read_capped(&mut t, &b, &e, limit, false, max_bytes, false)
         .await?
+        .0
         .into_iter()
         .map(|(k, v)| decode_dlq(tail_offset(&k)?, &v))
         .collect::<ApiResult<_>>()?;

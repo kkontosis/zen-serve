@@ -306,8 +306,9 @@ async fn subscription(
             let w = st.store.watch(&head_key).await?;
             let more = match &target {
                 Target::Topic(t) => {
+                    let max = st.cfg.limits.max_range_bytes as usize;
                     let (events, more) =
-                        read_topic(st.store.as_ref(), fs, t, None, &cursor, BATCH).await?;
+                        read_topic(st.store.as_ref(), fs, t, None, &cursor, BATCH, max).await?;
                     for (o, e) in events {
                         cursor = o;
                         let f = Frame::Ev {
@@ -324,8 +325,9 @@ async fn subscription(
                     more
                 }
                 Target::Prefix(p) => {
+                    let max = st.cfg.limits.max_range_bytes as usize;
                     let (events, last, more) =
-                        read_prefix(st.store.as_ref(), fs, p, &cursor, BATCH).await?;
+                        read_prefix(st.store.as_ref(), fs, p, &cursor, BATCH, max).await?;
                     let caller = resolve(&st, &token).await?;
                     for (topic, e) in events {
                         if caller.require_topic(fs, &topic, R_READ).is_err() {

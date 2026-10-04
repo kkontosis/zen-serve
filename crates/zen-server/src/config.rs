@@ -151,6 +151,9 @@ pub struct LimitsConfig {
     pub max_commit_ops: u32,
     /// Max items per range read.
     pub max_range_items: u32,
+    /// Max bytes (keys + values) one range read returns; a read stops there
+    /// with `more`, a range that must be read whole returns 413.
+    pub max_range_bytes: u64,
     /// Idempotency record lifetime.
     pub idempotency_ttl_secs: u64,
     /// Session lifetime.
@@ -169,6 +172,10 @@ pub struct LimitsConfig {
     pub crdt_max_redo: u32,
     /// How long an unreferenced chunk is kept.
     pub chunk_grace_secs: u64,
+    /// Max consumer groups per topic.
+    pub max_groups_per_topic: u32,
+    /// Max depth of a move's new parent (ancestors walked per move).
+    pub crdt_max_depth: u32,
 }
 
 impl Default for LimitsConfig {
@@ -180,6 +187,7 @@ impl Default for LimitsConfig {
             max_commit_bytes: 8_000_000,
             max_commit_ops: 10_000,
             max_range_items: 10_000,
+            max_range_bytes: 8_000_000,
             idempotency_ttl_secs: 86_400,
             session_ttl_secs: 86_400,
             claim_ttl_ms: 30_000,
@@ -189,6 +197,8 @@ impl Default for LimitsConfig {
             crdt_horizon_secs: 7 * 86_400,
             crdt_max_redo: 1000,
             chunk_grace_secs: 86_400,
+            max_groups_per_topic: 64,
+            crdt_max_depth: 1000,
         }
     }
 }
@@ -274,6 +284,9 @@ impl Config {
         // u16 (keyspace.md §2).
         if self.limits.max_commit_ops > u16::MAX as u32 {
             return Err("limits.max_commit_ops must be at most 65535".into());
+        }
+        if self.limits.crdt_max_depth == 0 || self.limits.max_range_items == 0 {
+            return Err("limits.crdt_max_depth and max_range_items must be at least 1".into());
         }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fs {

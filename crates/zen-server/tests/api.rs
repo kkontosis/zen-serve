@@ -1475,3 +1475,153 @@ async fn partitioned_sparse_partition_in_a_long_topic() {
     }
     assert_eq!(got, vec![7, 8]);
 }
+
+/// `max_range_bytes` cuts range reads short with `more` (and refuses ranges
+/// the server must read whole), `max_groups_per_topic` caps groups, and
+/// the unauthenticated endpoints take only small bodies.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_bytes_group_cap_and_body_limits() {
+    let h = Harness::start_with(|c| {
+        c.limits.max_range_bytes = 300;
+        c.limits.max_groups_per_topic = 2;
+    })
+    .await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let info: Info = h.get("/v1/info").await;
+    assert_eq!(info.limits.max_range_bytes, 300);
+    assert_eq!(info.limits.max_groups_per_topic, 2);
+    assert_eq!(info.limits.claim_ttl_ms, 30_000);
+    // Five 200-byte values: a range read returns two at a time.
+    let c = Commit {
+        commit_id: cid(1),
+        writes: (0..5u8)
+            .map(|i| Write {
+                fs: 1,
+                key: vec![b'k', i],
+                value: Some(vec![i; 200]),
+            })
+            .collect(),
+        append: (0..5u8)
+            .map(|i| append(&topic(1), None, &[i; 200]))
+            .collect(),
+        ..Default::default()
+    };
+    let _: CommitResult = h.call("/v1/commit", Some(&tok), &c).await.unwrap();
+    let mut begin = b"k".to_vec();
+    let mut keys = Vec::new();
+    let mut pages = 0;
+    loop {
+        let r: KvItems = h
+            .call(
+                "/v1/kv/range",
+                Some(&tok),
+                &KvRange {
+                    fs: 1,
+                    begin: begin.clone(),
+                    end: Some(b"l".to_vec()),
+                    limit: Some(10),
+                    reverse: None,
+                    read_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        assert!(r.items.len() <= 2, "{} items", r.items.len());
+        keys.extend(r.items.iter().map(|i| i.key.clone()));
+        if !r.more {
+            break;
+        }
+        begin = r.items.last().unwrap().key.clone();
+        begin.push(0);
+    }
+    assert_eq!(keys.len(), 5);
+    assert_eq!(pages, 3);
+    let whole = |c: Commit| {
+        let (h, tok) = (&h, &tok);
+        async move { h.call::<_, CommitResult>("/v1/commit", Some(tok), &c).await }
+    };
+    let range = FsRange {
+        fs: 1,
+        begin: b"k".to_vec(),
+        end: Some(b"l".to_vec()),
+    };
+    let r = whole(Commit {
+        commit_id: cid(2),
+        expect_ranges: vec![ExpectRange {
+            fs: 1,
+            begin: range.begin.clone(),
+            end: range.end.clone(),
+            hash: vec![0; 32],
+        }],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(code(r), (413, "too_large".into()));
+    let r = whole(Commit {
+        commit_id: cid(3),
+        clear_ranges: vec![range],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(code(r), (413, "too_large".into()));
+    let ev: LogEvents = h
+        .call(
+            "/v1/log/read",
+            Some(&tok),
+            &LogRead {
+                fs: 1,
+                topic: topic(1),
+                after: None,
+                key_token: None,
+                limit: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ev.more && ev.events.len() < 5, "{} events", ev.events.len());
+    // Two groups fit; the third is over the cap.
+    for name in [&b"g1"[..], b"g2"] {
+        let _: GroupCreated = h
+            .call(
+                "/v1/consume/groups",
+                Some(&tok),
+                &group(name, Mode::Sequential),
+            )
+            .await
+            .unwrap();
+    }
+    let r: R<GroupCreated> = h
+        .call(
+            "/v1/consume/groups",
+            Some(&tok),
+            &group(b"g3", Mode::Sequential),
+        )
+        .await;
+    assert_eq!(code(r), (429, "quota".into()));
+    // Body limits on the unauthenticated endpoints. The server answers as
+    // soon as the limit is passed and may close before the rest of the body
+    // is written, so a write error is retried a few times.
+    for (path, size) in [
+        ("/v1/acl/put", (1 << 20) + 2048),
+        ("/v1/auth/session", 18 << 10),
+    ] {
+        let mut status = None;
+        for _ in 0..5 {
+            let r = h
+                .http
+                .post(format!("{}{}", h.base, path))
+                .header("content-type", CBOR)
+                .body(vec![0u8; size])
+                .send()
+                .await;
+            if let Ok(resp) = r {
+                status = Some(resp.status().as_u16());
+                break;
+            }
+        }
+        assert_eq!(status, Some(413), "{path}");
+    }
+}

@@ -1166,3 +1166,30 @@ async fn operations_on_purged_nodes_are_stale() {
         .unwrap();
     assert_eq!(parent_of(&get(&h, &a, &[id(2)]).await[&id(2)]), Some(ROOT));
 }
+
+/// A move whose parent has more than `crdt_max_depth` ancestors is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn depth_is_bounded() {
+    let (h, a, _) = two_devices(|c| c.limits.crdt_max_depth = 3).await;
+    let t = zfs::hlc(now_ms(), 0);
+    // ROOT → 1 → 2 → 3 → 4: node 4's parent has three ancestors below ROOT.
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, None),
+            mv(id(2), id(1), t + 1, None),
+            mv(id(3), id(2), t + 2, None),
+            mv(id(4), id(3), t + 3, None),
+        ],
+    )
+    .await
+    .unwrap();
+    let e = ops(&h, &a, vec![mv(id(5), id(4), t + 4, None)])
+        .await
+        .expect_err("too deep");
+    assert_eq!(e.0, 400);
+    assert!(get(&h, &a, &[id(5)]).await.is_empty());
+    let info: Info = h.get("/v1/info").await;
+    assert_eq!(info.limits.crdt_max_depth, 3);
+}

@@ -40,9 +40,16 @@ No authentication. Returns:
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
   limits: { max_key_bytes, max_value_bytes, max_envelope_bytes, max_commit_bytes,
-            max_commit_ops, max_range_items, idempotency_ttl_secs, session_ttl_secs,
-            crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo } }
+            max_commit_ops, max_range_items, max_range_bytes,
+            idempotency_ttl_secs, session_ttl_secs, claim_ttl_ms, ephemeral_ttl_secs,
+            max_groups_per_topic,
+            crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
+            chunk_grace_secs } }
 ```
+
+Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
+
+* **Range reads** (`/v1/kv/range`, `/v1/log/read`, `tree/children`, `tree/changes`, `dlq/list`, stream subscriptions) return at most `max_range_items` items **and** stop once the items returned hold about `max_range_bytes` of keys and values; either cut sets `more`. A range the server must read whole (`expect_ranges`, `clear_ranges`, a file's versions) returns 413 `too_large` past either cap.
 
 ## 3. Sessions
 
@@ -127,8 +134,8 @@ put: {fs, header: bytes, expect: bytes(10)?} → {version: bytes(10)}
 * `keys` and range bounds are **stored keys** (formats.md §3.2). `value` is the sealed value, without the stored versionstamp; `version` is that versionstamp.
 * `/v1/kv/get` returns one item per requested key, in request order, with `value` and `version` null for a missing key.
 * `/v1/kv/range` reads `[begin, end)`, with `end` absent meaning the end of the fs.
-  * `limit` defaults to and is capped by `max_range_items`.
-  * `more` means the limit cut the range short. To continue, set `begin` to the last key ‖ `0x00` (or `end` to the last key, when `reverse`).
+  * `limit` defaults to and is capped by `max_range_items`; `max_range_bytes` caps the response as well (§2).
+  * `more` means a limit cut the range short. To continue, set `begin` to the last key ‖ `0x00` (or `end` to the last key, when `reverse`).
 * **Snapshots.** Reads at the same `read_version` see one consistent snapshot. If `read_version` is absent, the server takes a fresh one and returns it.
   * A `read_version` must come from `/v1/grv` or an earlier read response.
   * A read version older than about 5 s returns 409 `too_old`.
@@ -160,15 +167,15 @@ CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), 
 The whole commit is **one storage transaction**: all of it applies, or none of it.
 
 1. **Idempotency.** If `commit_id` already committed, the stored result is returned and nothing is applied again. The record is kept for `idempotency_ttl_secs` (default 24 h, G13). A `commit_id` reused by a different device returns 409 `commit_id_reused`.
-2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`, and consumes need topic `consume`. Then sizes and quotas are checked.
+2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`, and consumes need topic `consume`. Then sizes and quotas are checked: at most `max_commit_ops` operations, and at most `max_commit_bytes` counting every payload plus 512 bytes per operation for its keys and index entries.
 3. **Short mode.** With `read_version`, the transaction runs at that version, and every `read_conflicts` range conflicts with any write committed after it. That gives full serializability, including phantoms. Anything else the server reads (cursors, leases, idempotency) is checked the same way. A conflict returns 409 `conflict`.
 4. **Long mode.**
    * Each `expect` key is re-read: its version must equal `version`, or the key must be absent when `version` is null.
    * Each `expect_ranges` range is re-read, and its hash must equal `hash`, where
      `hash = H("zen/v1/range-hash", concat over the range in key order of lp(stored_key) ‖ version(10))`, with `H(label, x) = BLAKE3.derive_key(label, x)`.
-   * A range with more than `max_range_items` items returns 413.
+   * A range with more than `max_range_items` items, or more than `max_range_bytes` of keys and values, returns 413.
    * Any mismatch returns 409 `conflict`.
-5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys, else 413), then `writes`, where the last write to a key wins.
+5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys and `max_range_bytes`, else 413), then `writes`, where the last write to a key wins.
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
@@ -207,6 +214,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 ```
 
 * A group is **immutable** (G8). Creating it again with identical parameters returns `created: false`. Different parameters return 409 `group_exists`.
+* A topic holds at most `max_groups_per_topic` groups (every append pays for each one); the next creation returns 429 `quota`.
 * Needs topic `consume`.
 * `broadcast` stores only the definition. Its members read the log with their own cursors (§7.2, §9).
 * **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0. Appends after the group's creation are indexed by partition (keyspace.md §3.3), so finding a partition's next event costs one read; events from before the creation are scanned once.
@@ -351,6 +359,6 @@ NodeState = { node: bytes(16),
   * `cursor` is the offset of the last change returned. Pass it as `after` next time; it is absent when nothing was returned and no `after` was given.
   * With `wait_ms` (at most 30,000), an empty result waits for the next change of the tree.
   * 409 `resync`: start again without `after`.
-* **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`. `nodes` and `ids` take at most 1,000 and 64 entries.
+* **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`; `max_range_bytes` of node records also sets `more` (§2). `nodes` and `ids` take at most 1,000 and 64 entries. `file/get` returns 413 when a node's versions exceed either cap.
 * **`read_version`** works as in KV reads (§5): several reads at one version see one snapshot.
 

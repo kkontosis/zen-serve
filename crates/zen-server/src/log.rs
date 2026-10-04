@@ -20,6 +20,7 @@ pub async fn read_topic(
     key: Option<&[u8]>,
     after: &Offset,
     limit: usize,
+    max_bytes: usize,
 ) -> ApiResult<(Vec<(Offset, Event)>, bool)> {
     let mut t = store.begin(None).await?;
     let prefix = match key {
@@ -27,10 +28,12 @@ pub async fn read_topic(
         None => keys::log_prefix(fs, topic),
     };
     let (b, e) = keys::after_offset(prefix, after);
-    let mut got = t.snapshot_get_range(&b, &e, limit + 1, false).await?;
-    let more = got.len() > limit;
+    let (mut got, capped) =
+        crate::kv::read_capped(&mut t, &b, &e, limit + 1, false, max_bytes, false).await?;
+    let mut more = capped || got.len() > limit;
     got.truncate(limit);
     let mut out = Vec::with_capacity(got.len());
+    let mut bytes = 0usize;
     for (k, v) in got {
         let o: Offset = k[k.len() - 12..].try_into().expect("12 bytes");
         let entry = match key {
@@ -40,6 +43,12 @@ pub async fn read_topic(
                 .ok_or_else(|| internal("index points at a missing event"))?,
             None => v,
         };
+        // Through the per-key index the bodies are fetched one by one.
+        bytes += entry.len();
+        if key.is_some() && bytes > max_bytes && !out.is_empty() {
+            more = true;
+            break;
+        }
         let (key_token, envelope) = decode_entry(&entry);
         out.push((
             o,
@@ -62,15 +71,21 @@ pub async fn read_prefix(
     prefix: &[u8],
     after: &Offset,
     limit: usize,
+    max_bytes: usize,
 ) -> ApiResult<(Vec<(Vec<u8>, Event)>, Offset, bool)> {
     let mut t = store.begin(None).await?;
     let (b, e) = keys::after_offset(keys::gl_prefix(fs), after);
     let got = t.snapshot_get_range(&b, &e, limit, false).await?;
-    let more = got.len() == limit;
+    let mut more = got.len() == limit;
     let mut last = *after;
     let mut out = Vec::new();
+    let mut bytes = 0usize;
     for (k, topic) in got {
         let o: Offset = k[k.len() - 12..].try_into().expect("12 bytes");
+        if bytes >= max_bytes {
+            more = true;
+            break;
+        }
         last = o;
         if !topic.starts_with(prefix) {
             continue;
@@ -81,6 +96,7 @@ pub async fn read_prefix(
         else {
             continue;
         };
+        bytes += entry.len();
         let (key_token, envelope) = decode_entry(&entry);
         out.push((
             topic,
@@ -114,6 +130,7 @@ pub async fn read(
         req.key_token.as_deref(),
         &after,
         limit,
+        st.cfg.limits.max_range_bytes as usize,
     )
     .await?;
     Ok(Cbor(LogEvents {

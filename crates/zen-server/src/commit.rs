@@ -57,6 +57,10 @@ fn replay(rec: &[u8], device: &[u8; 32]) -> ApiResult<CommitResult> {
 /// Stateless checks: sizes, ids, permissions.
 fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     let l = &st.cfg.limits;
+    // Besides its payload, every operation costs keys, index entries,
+    // versionstamp operands and conflict ranges in the storage transaction;
+    // this keeps a full commit under FoundationDB's 10 MB.
+    const OP_OVERHEAD: usize = 512;
     if req.commit_id.len() != COMMIT_ID_LEN {
         return Err(bad_request("commit_id must be 16 bytes"));
     }
@@ -72,7 +76,7 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     if ops > l.max_commit_ops as usize {
         return Err(too_large("too many operations"));
     }
-    let mut bytes = 0usize;
+    let mut bytes = ops * OP_OVERHEAD;
     let key_ok = |k: &[u8]| -> ApiResult<()> {
         if k.len() > l.max_key_bytes as usize {
             Err(too_large("key too long"))
@@ -239,6 +243,7 @@ pub async fn execute(
     let cid_key = keys::commit_record(&req.commit_id);
     let limits = caller.acl.limits.clone();
     let max_range = st.cfg.limits.max_range_items as usize;
+    let max_bytes = st.cfg.limits.max_range_bytes as usize;
     // Last write per key wins; clears apply first (api.md §6).
     let mut writes: BTreeMap<(u32, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
     for w in &req.writes {
@@ -267,8 +272,10 @@ pub async fn execute(
         }
         for e in &req.expect_ranges {
             let (b, end) = keys::kv_range(e.fs, &e.begin, e.end.as_deref());
-            let got = t.get_range(&b, &end, max_range + 1, false).await?;
-            if got.len() > max_range {
+            let (got, capped) =
+                crate::kv::read_capped(&mut t, &b, &end, max_range + 1, false, max_bytes, true)
+                    .await?;
+            if capped || got.len() > max_range {
                 return Err(too_large("expect_ranges range too long"));
             }
             let prefix_len = keys::kv_prefix(e.fs).len();
@@ -285,8 +292,10 @@ pub async fn execute(
         let mut delta: HashMap<u32, (i64, i64)> = HashMap::new();
         for c in &req.clear_ranges {
             let (b, e) = keys::kv_range(c.fs, &c.begin, c.end.as_deref());
-            let got = t.snapshot_get_range(&b, &e, max_range + 1, false).await?;
-            if got.len() > max_range {
+            let (got, capped) =
+                crate::kv::read_capped(&mut t, &b, &e, max_range + 1, false, max_bytes, false)
+                    .await?;
+            if capped || got.len() > max_range {
                 return Err(too_large("clear range too long; clear in parts"));
             }
             let prefix_len = keys::kv_prefix(c.fs).len();

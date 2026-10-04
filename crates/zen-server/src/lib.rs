@@ -69,11 +69,17 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             max_commit_bytes: l.max_commit_bytes,
             max_commit_ops: l.max_commit_ops,
             max_range_items: l.max_range_items,
+            max_range_bytes: l.max_range_bytes,
             idempotency_ttl_secs: l.idempotency_ttl_secs,
             session_ttl_secs: l.session_ttl_secs,
             crdt_max_skew_ms: l.crdt_max_skew_ms,
             crdt_horizon_secs: l.crdt_horizon_secs,
             crdt_max_redo: l.crdt_max_redo,
+            crdt_max_depth: l.crdt_max_depth,
+            chunk_grace_secs: l.chunk_grace_secs,
+            claim_ttl_ms: l.claim_ttl_ms,
+            ephemeral_ttl_secs: l.ephemeral_ttl_secs,
+            max_groups_per_topic: l.max_groups_per_topic,
         },
     })
 }
@@ -139,12 +145,20 @@ async fn isolation_headers(State(st): State<Shared>, req: Request, next: Next) -
 /// The HTTP router.
 pub fn router(st: Shared) -> Router {
     let limit = st.cfg.limits.max_commit_bytes as usize + 1_000_000;
+    // Requests that need no session get bodies no larger than they need:
+    // a sign-in is ~12 KB of identity, certificate and signature; a signed
+    // ACL of a few hundred members fits in 1 MiB.
+    let auth_limit = DefaultBodyLimit::max(16 * 1024);
+    let acl_limit = DefaultBodyLimit::max(1024 * 1024);
     let mut r = Router::new()
         .route("/v1/info", get(info))
-        .route("/v1/auth/challenge", post(auth::challenge))
-        .route("/v1/auth/session", post(auth::session))
-        .route("/v1/auth/logout", post(auth::logout))
-        .route("/v1/acl/put", post(acl::put))
+        .route(
+            "/v1/auth/challenge",
+            post(auth::challenge).layer(auth_limit),
+        )
+        .route("/v1/auth/session", post(auth::session).layer(auth_limit))
+        .route("/v1/auth/logout", post(auth::logout).layer(auth_limit))
+        .route("/v1/acl/put", post(acl::put).layer(acl_limit))
         .route("/v1/acl/get", post(acl::get))
         .route("/v1/fs/list", post(acl::fs_list))
         .route("/v1/fs/header/get", post(acl::header_get))
