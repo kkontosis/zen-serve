@@ -156,7 +156,7 @@ zen-serve backup stop     -c zen.toml
 
 * The backup runs continuously: snapshots plus mutation logs (FoundationDB's `fdbbackup start -z`).
 * Any version between the first complete snapshot and the newest log is restorable.
-* Backups hold what the database holds: ciphertext and metadata. They also hold hashed sessions and the challenge key, but no bearer tokens. The credential store (auth.md §4) is in them too: API tokens only as hashes, but the public keys of password-derived keys, with their salts, are offline-guessable verifiers (auth.md §11.4). Passkey public keys are not secrets. Protect backups accordingly.
+* Backups hold what the database holds: ciphertext and metadata. They also hold hashed sessions and the challenge key, but no bearer tokens. The credential store (auth.md §4) is in them too: API tokens only as hashes, but the public keys of password-derived keys, with their salts, are offline-guessable verifiers (auth.md §11.4). Passkey public keys and the key fingerprints of registered TLS client certificates are not secrets. Protect backups accordingly.
 
 ### 5.2 Restore
 
@@ -190,7 +190,7 @@ zen-serve migrate -c zen-fdb.toml --from-data-dir /var/lib/zen   # embedded → 
 
 * **Format.** A header, then every key-value pair in key order, then a trailer with the count, a source version and a BLAKE3 digest. The digest is checked on import.
 * **Server metadata is not copied** (keyspace.md §3.4): the embedded backend's version clock and the cluster's challenge key. The target keeps its own challenge key, or creates one when it first starts. A challenge lives 60 s, so nothing depends on the key surviving the copy; sessions are copied and keep working.
-* **Sign-in state is data and is copied** (keyspace.md §3.7): stored credentials, the login-name index, the key of the fake password parameters and the pinned origins. So password sign-in, passkeys, API tokens and the origin pin keep working on the target. A target that is reached under a different origin needs `public_origins`, or its pin replaced (auth.md §5.2). Passkeys are bound to their relying-party id, the host they were registered under: on a target with another host they no longer work, and users register new ones (auth.md §7.1).
+* **Sign-in state is data and is copied** (keyspace.md §3.7): stored credentials, the login-name index, the key of the fake password parameters and the pinned origins. So password sign-in, passkeys, API tokens, registered client certificates and the origin pin keep working on the target. A target that is reached under a different origin needs `public_origins`, or its pin replaced (auth.md §5.2). Passkeys are bound to their relying-party id, the host they were registered under: on a target with another host they no longer work, and users register new ones (auth.md §7.1).
 * **Consistency.**
   * On the embedded backend an export is one consistent snapshot.
   * On FoundationDB a large export spans several transactions, so it is consistent only while the servers are stopped. It warns otherwise. Use native backup for consistent copies of a live cluster.
@@ -215,7 +215,7 @@ public_origins = ["https://zen.example.org"]
 [tls]
 cert = "/etc/zen/api.pem"         # PEM chain, the server's certificate first
 key = "/etc/zen/api.key"          # PEM private key
-# client_ca = "/etc/zen/clients-ca.pem"   # client certificates, for sign-in method 5 (auth.md §10)
+# client_ca = "/etc/zen/clients-ca.pem"   # client certificates for sign-in (§8.2)
 ```
 
 * **TLS 1.3 only**, ALPN `http/1.1`. WebSocket (`/v1/stream`) runs over the same connection type. Current browsers and HTTP libraries all speak TLS 1.3.
@@ -227,6 +227,71 @@ key = "/etc/zen/api.key"          # PEM private key
 * **Limits.** A handshake must finish within 10 s; at most 1024 run at once, and further connections wait in the kernel's accept queue.
 * Every node of a cluster has its own `[tls]`.
 
-### 8.2 Behind a reverse proxy
+### 8.2 Client certificates
+
+With `client_ca` set and `[auth] mtls` on, the listener asks clients for a certificate from that CA, without requiring one, for sign-in method 5 (auth.md §10.1). A client that presents a certificate the CA didn't issue, or an expired one, fails the handshake. The client CA, its certificates and the clients' keys must be ECDSA (P-256, P-384) or Ed25519.
+
+A small CA with OpenSSL:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+    -subj "/CN=zen clients" -keyout clients-ca.key -out clients-ca.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=alice" \
+    -keyout alice.key -out alice.csr
+openssl x509 -req -in alice.csr -CA clients-ca.pem -CAkey clients-ca.key -days 365 \
+    -extfile <(printf 'extendedKeyUsage=clientAuth') -out alice.pem
+openssl pkcs12 -export -in alice.pem -inkey alice.key -out alice.p12   # to import into a browser
+```
+
+The certificate signs in only after it is registered to a member (auth.md §10.3, api.md §3.13): the member registers it from a connection that presents it, or an admin uploads `alice.pem`.
+
+### 8.3 Behind a reverse proxy
 
 A proxy that only terminates TLS needs nothing special: zen-serve listens on HTTP, on an address only the proxy reaches, with `public_origins` set to the public `https://` origin.
+
+A proxy can also verify client certificates and forward them, for method 5's **trusted-proxy mode** (auth.md §10.2). With nginx:
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; "" close; }
+map $ssl_client_verify $zen_client_cert { SUCCESS $ssl_client_escaped_cert; default ""; }
+
+server {
+    listen 443 ssl;
+    server_name zen.example.org;
+    ssl_certificate         /etc/nginx/zen.pem;
+    ssl_certificate_key     /etc/nginx/zen.key;
+    ssl_client_certificate  /etc/nginx/clients-ca.pem;
+    ssl_verify_client       optional;      # clients without a certificate still get in
+
+    location / {
+        proxy_pass http://10.0.0.10:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;              # /v1/stream
+        proxy_set_header Connection $connection_upgrade;
+        # Always set, on every request: an empty value removes the header,
+        # including one the client sent itself.
+        proxy_set_header X-Client-Cert $zen_client_cert;
+    }
+}
+```
+
+```toml
+# zen-serve, on 10.0.0.10
+listen = "10.0.0.10:8080"
+public_origins = ["https://zen.example.org"]
+
+[auth]
+mtls_trusted_proxies = ["10.0.0.5"]    # the nginx host
+# mtls_proxy_header = "x-client-cert"  # the default
+```
+
+> **Warning: zen-serve trusts the proxy's verification completely.** It doesn't check the forwarded certificate's chain or dates. Anything that can send a request from a trusted address, with any value in the header, can sign in as any member whose certificate it knows, and certificates are not secret.
+> * List **only the proxies** in `mtls_trusted_proxies`, never a client network, and never `0.0.0.0/0`.
+> * The proxy must **set or clear the header on every request** it forwards (`proxy_set_header`, as above), never pass a client's value through.
+> * No other client or service may reach zen-serve from a trusted address. With the proxy on the same host and `127.0.0.1` trusted, every local process is trusted too.
+> * A request that carries the header from any other address is refused with 401 and logged (auth.md §10.2), which shows a proxy whose address is missing from the list.
+
+Other proxies: Caddy (`header_up X-Client-Cert {http.request.tls.client.certificate_der_base64}`), HAProxy (`http-request set-header X-Client-Cert %[ssl_c_der,base64]` when `ssl_c_verify` is 0) and Traefik (`passTLSClientCert` with `pem: true`, header `X-Forwarded-Tls-Client-Cert`, set as `mtls_proxy_header`) all send formats zen-serve reads.
+
+zen-serve itself may also listen with `[tls]` behind the proxy: the proxy's own certificate, if it presents one, is not taken for a user's.

@@ -29,6 +29,7 @@ pub const IMPLEMENTED: &[AuthMethod] = &[
     AuthMethod::DeviceKey,
     AuthMethod::Passkey,
     AuthMethod::ApiToken,
+    AuthMethod::Mtls,
     AuthMethod::PasswordKey,
 ];
 
@@ -42,6 +43,13 @@ const PREFERENCE: &[AuthMethod] = &[
     AuthMethod::Opaque,
     AuthMethod::Mtls,
 ];
+
+/// Whether the server offers `m` (auth.md §2): it is on, and for mTLS
+/// not dormant, that is a client certificate can reach the server at all
+/// (auth.md §10).
+pub fn offered(st: &Shared, m: AuthMethod) -> bool {
+    st.method_on(m) && (m != AuthMethod::Mtls || crate::mtls::configured(&st.cfg))
+}
 
 /// `/v1/info` `auth` (auth.md §2).
 pub async fn info(st: &Shared) -> AuthInfo {
@@ -62,12 +70,12 @@ pub async fn info(st: &Shared) -> AuthInfo {
         origins,
         methods: AuthMethod::ALL
             .into_iter()
-            .filter(|m| st.method_on(*m))
+            .filter(|m| offered(st, *m))
             .map(|m| m.name().to_string())
             .collect(),
         default: PREFERENCE
             .iter()
-            .find(|m| st.method_on(**m))
+            .find(|m| offered(st, **m))
             .map(|m| m.name().to_string()),
         password_params: st
             .method_on(AuthMethod::PasswordKey)

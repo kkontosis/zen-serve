@@ -25,7 +25,7 @@ cors_origins = []
 # [tls]
 # cert = "/etc/zen/api.pem"               # PEM chain, the server's certificate first
 # key = "/etc/zen/api.key"
-# client_ca = "/etc/zen/clients-ca.pem"   # client certificates, for sign-in method 5
+# client_ca = "/etc/zen/clients-ca.pem"   # ask for client certificates (sign-in method 5)
 
 # Sign-in methods (spec/auth.md §2). Each can be turned off on its own.
 [auth]
@@ -33,7 +33,7 @@ device_keys = true     # 1: per-device keys certified in the signed ACL
 passkeys = true        # 2: WebAuthn passkeys
 opaque = false         # 3: OPAQUE passwords (not implemented yet)
 api_tokens = false     # 4: admin-issued bearer tokens for services
-mtls = true            # 5: TLS client certificates (not implemented yet)
+mtls = true            # 5: TLS client certificates (dormant without [tls] client_ca or a trusted proxy)
 password_keys = true   # 6: password-derived keys, the default method
 # Origin policy (spec/auth.md §5).
 origin_pinning = true            # 7b: pin the first origin while public_origins is empty
@@ -50,6 +50,11 @@ password_lockout_secs = 300
 # host unless set here; user verification (PIN, biometric) is required.
 # passkey_rp_id = "example.org"
 passkey_require_uv = true
+# Method 5 (spec/auth.md §10.2): reverse proxies that verify client
+# certificates and forward them in a header. zen-serve trusts them
+# completely: list only the proxies, and have them always set the header.
+mtls_trusted_proxies = []        # e.g. ["10.0.0.5", "fd00:1::/64"]
+mtls_proxy_header = "x-client-cert"
 
 [[fs]]
 id = 1   # "/"

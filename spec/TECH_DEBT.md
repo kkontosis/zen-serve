@@ -75,3 +75,17 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** Native TLS reads `[tls] cert` and `key` once, at start-up (operations.md §8.1). Renewing a certificate needs a restart, and obtaining one is up to the operator.
 * **Why deferred:** ACME (RFC 8555) needs an HTTP-01 or TLS-ALPN-01 responder, account keys, storage of certificates shared by a cluster's nodes, and renewal scheduling: a feature of its own. A restart after renewal, or a reverse proxy that does ACME, covers the need meanwhile.
 * **What it would take:** First, reloading: a `ResolvesServerCert` that re-reads the files on change (or on SIGHUP), keeping the old certificate when the new files don't load. Then ACME with TLS-ALPN-01 on the API port, account key and certificates in the keyspace so every node serves the same one, one node renewing under a lease, and tests against a local ACME test server (Pebble).
+
+## TD-AUTH-MTLS-REVOCATION
+
+* **Status:** open
+* **Context:** Native mTLS (auth.md §10.1) checks the chain to `client_ca`, the dates and the key usage, but not revocation: no CRLs, no OCSP.
+* **Why deferred:** Every certificate must also be registered to a member, and removing the registration revokes it for zen-serve at once (and ends its sessions). CRL distribution and OCSP fetching need network access, caching and a failure policy (fail open or closed) that a small deployment rarely wants.
+* **What it would take:** `[tls] client_crl` files, passed to the client verifier (`with_crls` on rustls's `WebPkiClientVerifier` builder), re-read on change; optionally OCSP for the client chain with a cache and a configurable failure policy; tests with a revoked certificate. In the proxy mode, revocation stays the proxy's job.
+
+## TD-AUTH-MTLS-SUBJECT-MAPPING
+
+* **Status:** open
+* **Context:** A client certificate signs in only after it is registered to a member, by the member from a connection that presents it or by an admin (auth.md §10.3). There is no way to map certificates to members by their subject or subject alternative name, for example "any certificate of this CA whose SAN email is alice@example.org is Alice".
+* **Why deferred:** A mapping by name makes the CA, not the signed ACL, decide who is who, and needs a policy for name formats, multiple matches and CAs shared with other services. Registration by key is explicit and keeps the ACL authoritative.
+* **What it would take:** An admin-set mapping per member (a SAN email or URI, or a subject DN, matched exactly) in the credential store or in the signed ACL; a lookup by the presented certificate's names when its key isn't registered, natively only, or with the proxy forwarding the names; a decision whether a match registers the key automatically; spec and tests.

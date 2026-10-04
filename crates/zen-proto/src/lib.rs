@@ -569,6 +569,23 @@ pub struct PasskeySession {
     pub user_handle: Option<Vec<u8>>,
 }
 
+/// `POST /v1/auth/mtls/register` request (spec/auth.md §10.3): bind a TLS
+/// client certificate to a member.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MtlsRegister {
+    /// The member (a user fingerprint); absent: the caller. Another
+    /// member's needs admin.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user: Option<Vec<u8>>,
+    /// The certificate, DER or PEM; absent: the one the caller's connection
+    /// presents. Uploading one needs admin.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub cert: Option<Vec<u8>>,
+    /// A label, for listings (at most 128 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// A credential id, as returned when one is created.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CredentialId {

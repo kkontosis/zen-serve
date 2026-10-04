@@ -6,7 +6,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
 * **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
-* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin` and `/v1/auth/passkey/session`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin`, `/v1/auth/passkey/session` and `/v1/auth/mtls/session`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
   | Status | `code` | Retry? |
@@ -24,7 +24,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, credentials per user §3.7, §3.8, §3.11) | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, credentials per user §3.7, §3.8, §3.11, §3.13) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -47,7 +47,7 @@ No authentication. Returns:
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
             chunk_grace_secs },
-  auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2)
+  auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2); a dormant mtls is left out (auth.md §10)
            origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
            passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
                        user_verification: text,         // "required" or "preferred" (auth.md §7.5)
@@ -173,7 +173,7 @@ The credential store (auth.md §4). Need a session, not an API token (403).
 list:   { user?: bytes(32) }   // absent: the caller's own; another member's needs admin (403)
 → { credentials: [{ id: bytes(32), method: text, created_unix: u64,
                     expires_unix?: u64, label?: text,
-                    last_used_unix?: u64 }] }     // passkeys: the last sign-in
+                    last_used_unix?: u64 }] }     // passkeys and certificates: the last sign-in
 remove: { id: bytes(32) } → {}
 ```
 
@@ -242,6 +242,36 @@ session: { credential_id: bytes,            // rawId
 * `begin` returns 400 while the server has no rp id (auth.md §7.1), and 400 for a `user` that isn't 32 bytes. A `user` who isn't a member gets an empty `allow`.
 * `session` returns 401 when any check of auth.md §7.3 fails: the challenge (live, issued by this cluster, not spent), the origin (§3.3), an unknown passkey, a user no longer a member, a mismatched `user_handle`, the client data's type, the rp id hash, the flags, the signature, or a signature counter that didn't increase (a possible clone, auth.md §7.4).
 * The session's `device_fp` is the passkey's credential id, and `method` is `passkey`. Any challenge from §3.1 works as well as the one `begin` returns.
+
+### 3.13 `POST /v1/auth/mtls/register`
+
+Method 5, TLS client certificates (auth.md §10.3): bind a certificate to a member. Needs a session, not an API token (403). 403 `method_disabled` if `mtls` is off. Works while the method is dormant.
+
+```
+{ user?: bytes(32),       // the member; absent: the caller. Another member's needs admin (403)
+  cert?: bytes,           // the certificate, DER or PEM; absent: the one this connection presents.
+                          // Uploading one needs admin (403)
+  label?: text }          // at most 128 bytes
+→ { id: bytes(32) }       // the credential id: SHA-256 of the certificate's SubjectPublicKeyInfo
+```
+
+* Without `cert`, the certificate is the request's own (auth.md §10.4, step 2): the one the native TLS handshake verified, or from a trusted proxy the forwarded one. A request from an untrusted address that carries the proxy header gets 401 (auth.md §10.2).
+* 400: no certificate on the connection and none uploaded, a certificate that doesn't parse, a `user` that isn't 32 bytes or isn't a member of the head ACL, a label over 128 bytes, or a key that is already registered, to anyone.
+* 429 `quota`: the member holds 100 credentials.
+* The registration is listed and removed through §3.9; removing it ends its sessions.
+
+### 3.14 `POST /v1/auth/mtls/session`
+
+Method 5 (auth.md §10.4): sign in with the request connection's client certificate. No session.
+
+```
+{} → Session (§3.2)
+```
+
+* 403 `method_disabled` if `mtls` is off.
+* 401: the method is dormant (neither native client certificates nor a trusted proxy are set up, auth.md §10); no certificate on the connection; the proxy header from an untrusted address, or one that doesn't parse; an unregistered certificate; a user no longer a member.
+* Natively, a certificate that doesn't verify against `[tls] client_ca` (another CA, expired, not for client authentication) fails the TLS handshake before any request.
+* The session's `device_fp` is the credential id, and `method` is `mtls`. The token works on any connection and any node, like every session.
 
 ## 4. ACL and fs headers
 

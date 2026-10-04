@@ -197,6 +197,14 @@ pub struct AuthConfig {
     /// Method 2: refuse passkey sign-ins and registrations in which the
     /// authenticator didn't verify the user (PIN or biometric).
     pub passkey_require_uv: bool,
+    /// Method 5: reverse proxies (addresses or CIDR blocks) trusted to
+    /// verify client certificates and forward them in
+    /// `mtls_proxy_header` (auth.md §10.2). Empty: no proxy mode.
+    pub mtls_trusted_proxies: Vec<String>,
+    /// Method 5: the request header a trusted proxy forwards the verified
+    /// client certificate in: URL-escaped PEM (nginx
+    /// `$ssl_client_escaped_cert`) or base64 DER.
+    pub mtls_proxy_header: String,
 }
 
 impl Default for AuthConfig {
@@ -220,6 +228,8 @@ impl Default for AuthConfig {
             password_lockout_secs: 300,
             passkey_rp_id: None,
             passkey_require_uv: true,
+            mtls_trusted_proxies: Vec::new(),
+            mtls_proxy_header: "x-client-cert".into(),
         }
     }
 }
@@ -468,6 +478,20 @@ impl Config {
         {
             return Err(format!(
                 "auth.passkey_rp_id: {rp:?} is not a domain name (lowercase, no scheme or port)"
+            ));
+        }
+        for p in &self.auth.mtls_trusted_proxies {
+            crate::mtls::Cidr::parse(p).ok_or_else(|| {
+                format!(
+                    "auth.mtls_trusted_proxies: {p:?} is not an IP address or CIDR block \
+                     (e.g. \"10.0.0.5\", \"10.0.0.0/8\", \"::1/128\")"
+                )
+            })?;
+        }
+        let h = &self.auth.mtls_proxy_header;
+        if axum::http::HeaderName::from_bytes(h.as_bytes()).is_err() || h.to_lowercase() != *h {
+            return Err(format!(
+                "auth.mtls_proxy_header: {h:?} is not a lowercase HTTP header name"
             ));
         }
         if self.auth.password_max_failures == 0 {

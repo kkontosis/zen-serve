@@ -37,7 +37,7 @@ cargo run -p zen-server -- serve --config examples/zen-serve.toml
 
 On first start the server prints a one-time **claim token**. The first signed ACL (`POST /v1/acl/put`) must carry it, and that pins the first admin.
 
-Without `[tls]` the server speaks plain HTTP, for a TLS reverse proxy in front. With `[tls]` it terminates TLS itself: TLS 1.3 on pure-Rust rustls (no OpenSSL), with the post-quantum hybrid key exchange `X25519MLKEM768`. See [`spec/operations.md`](spec/operations.md) §8.
+Without `[tls]` the server speaks plain HTTP, for a TLS reverse proxy in front. With `[tls]` it terminates TLS itself: TLS 1.3 on pure-Rust rustls (no OpenSSL), with the post-quantum hybrid key exchange `X25519MLKEM768`, and optionally TLS client certificates for sign-in. See [`spec/operations.md`](spec/operations.md) §8 and [`spec/auth.md`](spec/auth.md) §10.
 
 On FoundationDB, with zen-serve running the `fdbserver` processes itself:
 

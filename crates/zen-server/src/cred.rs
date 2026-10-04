@@ -54,7 +54,8 @@ pub struct CredRecord {
     /// clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<ByteBuf>,
-    /// The admin who issued it (API tokens).
+    /// The admin who issued it (API tokens) or bound it to another member
+    /// (`mtls`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_by: Option<ByteBuf>,
     /// The WebAuthn credential id (`passkey`); the store id is its hash.
@@ -72,7 +73,7 @@ pub struct CredRecord {
     /// The relying-party id it was registered under (`passkey`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rp_id: Option<String>,
-    /// The last sign-in with it, unix seconds (`passkey`).
+    /// The last sign-in with it, unix seconds (`passkey`, `mtls`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_unix: Option<u64>,
 }

@@ -19,6 +19,7 @@ pub mod ids;
 pub mod keys;
 pub mod kv;
 pub mod log;
+pub mod mtls;
 pub mod origin;
 pub mod passkey;
 pub mod password;
@@ -195,6 +196,14 @@ pub fn router(st: Shared) -> Router {
         .route(
             "/v1/auth/passkey/session",
             post(passkey::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/mtls/session",
+            post(mtls::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/mtls/register",
+            post(mtls::register).layer(auth_limit),
         )
         .route(
             "/v1/auth/tokens/create",
@@ -416,6 +425,9 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         )?),
         None => None,
     };
+    if let Some(note) = mtls::startup_note(&cfg) {
+        tracing::info!("{note}");
+    }
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.listen))?;

@@ -14,12 +14,12 @@ The signed ACL stays the **source of truth for membership, grants and admins**. 
 | 2 | `passkey` | Passkeys (WebAuthn): a key pair held by an authenticator | `passkeys` | on | yes (WebAuthn) | §7 |
 | 3 | `opaque` | Password via OPAQUE (augmented PAKE) | `opaque` | off | — | §8 (reserved) |
 | 4 | `api_token` | API tokens: admin-issued bearer secrets for services and bots | `api_tokens` | off | no | §9 |
-| 5 | `mtls` | TLS client certificates (native TLS or a trusted proxy) | `mtls` | on | no (TLS) | §10 (reserved) |
+| 5 | `mtls` | TLS client certificates (native TLS or a trusted proxy) | `mtls` | on, dormant until configured | no (TLS) | §10 |
 | 6 | `password_key` | Password-derived signing key: the password never leaves the client | `password_keys` | on | yes | §11 |
 
-* The id is stored in session records and credentials; the name is used on the wire. Ids 3 and 5 are reserved for methods not implemented yet.
+* The id is stored in session records and credentials; the name is used on the wire. Id 3 is reserved for a method not implemented yet.
 * **Method 6 is the primary method**: `/v1/info` names it as `auth.default` whenever it is on.
-* A server **offers** a method when it implements it and its flag is on. `/v1/info` lists exactly the offered methods (§2). A flag that is on for a method the server doesn't implement yet has no effect.
+* A server **offers** a method when it implements it and its flag is on; method 5 also needs a way for client certificates to reach the server, and is **dormant** without one (§10). `/v1/info` lists exactly the offered methods (§2). A flag that is on for a method the server doesn't implement yet has no effect.
 
 ## 2. Configuration and `/v1/info`
 
@@ -33,6 +33,7 @@ mtls          = true    # method 5
 password_keys = true    # method 6
 # Origin policy (§5): origin_pinning, origin_pinning_always, acl_origins.
 # Method 2 (§7): passkey_rp_id, passkey_require_uv.
+# Method 5 (§10): mtls_trusted_proxies, mtls_proxy_header; native TLS is [tls].
 # Method 6 (§11): password_m_cost_kib, password_t_cost, password_p_cost,
 #                 password_max_failures, password_lockout_secs.
 ```
@@ -40,7 +41,7 @@ password_keys = true    # method 6
 `/v1/info` (api.md §2) carries:
 
 ```
-auth: { methods: [text],               // offered methods, in id order
+auth: { methods: [text],               // offered methods, in id order (a dormant mtls is left out)
         default?: text,                // the method a client offers first
         origins?: {…},                 // the origin policy (§5.5)
         passkey?: {…},                 // method 2: relying-party id and options (§7.1)
@@ -68,6 +69,7 @@ A session records the user, the **method** and a **32-byte credential id**:
 | `passkey` | the passkey's id in the credential store (§4.1) |
 | `password_key` | the id of the user's password credential (§11) |
 | `api_token` | the token's id (§9) |
+| `mtls` | the SHA-256 of the certificate's public key (§10.3) |
 
 The rest of the server treats the credential id as **"the device"**: fencing-token holders (api.md §8.2), the device of idempotency records (api.md §6), the device in the filesystem op chain (formats.md §11.5), and the ephemeral rate limit and `sender` (api.md §9). The id is stable for as long as the credential exists, so all sessions of one password credential act as one device. A client that needs distinct devices, for example to hold separate leases from two machines, uses device keys.
 
@@ -92,13 +94,13 @@ cred record (CBOR) = { method: u8, created_unix: u64,
                        name_hash?: bytes(32),       // methods with a login name (6; 3 later)
                        salt?: bytes(32), params?: {m_cost_kib, t_cost, p_cost},
                        identity?: bytes,            // method 6: the public identity
-                       issued_by?: bytes(32),       // API tokens: the issuing admin
+                       issued_by?: bytes(32),       // API tokens: the issuing admin; method 5: the admin who bound it
                        webauthn_id?: bytes,         // method 2: the WebAuthn credential id
                        cose_key?: bytes,            // method 2: the COSE public key
                        alg?: int,                   // method 2: its COSE algorithm
                        sign_count?: u32,            // method 2: the last signature counter
                        rp_id?: text,                // method 2: the relying-party id
-                       last_used_unix?: u64 }       // method 2: the last sign-in
+                       last_used_unix?: u64 }       // methods 2 and 5: the last sign-in
 ```
 
 Fields a server doesn't know are ignored, so a method can add its own without breaking older readers.
@@ -108,7 +110,7 @@ Fields a server doesn't know are ignored, so a method can add its own without br
 * **Limits.** A user holds at most 100 stored credentials.
 * **Privacy.** The store never returns keys, salts or secret hashes, only metadata (api.md §3.9). In particular, the public identity of a password-derived key stays on the server: other members never see it, unlike the ACL's user identities. Each credential is readable only by its owner and by admins.
 
-**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§7.2, §11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
+**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§7.2, §10.3, §11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
 
 ### 4.1 Credential ids
 
@@ -117,6 +119,7 @@ Fields a server doesn't know are ignored, so a method can add its own without br
 | `passkey` | `BLAKE3.derive_key("zen/v1/passkey-id", WebAuthn credential id)` (§7.2): the owner index (keyspace.md §3.7) finds the user from the id an authenticator returns |
 | `password_key` | random, chosen at registration; a password change gets a new one |
 | `api_token` | `BLAKE3.derive_key("zen-serve 2026 api token", secret)` (§9) |
+| `mtls` | `SHA-256(SubjectPublicKeyInfo)` of the certificate, DER (§10.3): the owner index finds the user from the certificate a connection presents |
 
 Device keys are not in the store: their id is the device fingerprint, and the ACL holds them.
 
@@ -326,9 +329,92 @@ Bearer secrets for services and bots, **off by default** (`[auth] api_tokens = f
 * The server stores only a hash, so a dump or backup holds no usable tokens.
 * A token never unlocks data keys (§12). A service that needs to read data also needs the fs keys, from a keyslot.
 
-## 10. Method 5: TLS client certificates (reserved)
+## 10. Method 5: TLS client certificates
 
-> **Placeholder.** Sign-in with a TLS client certificate, either terminated by zen-serve itself (native TLS) or by a trusted reverse proxy that forwards the verified certificate. Not implemented; `mtls = true` has no effect yet.
+Sign-in with a TLS client certificate, **on by default** but **dormant** until a certificate can reach the server. The certificate is checked twice: the TLS layer verifies it (zen-serve itself, or a reverse proxy zen-serve trusts), and the server then looks it up among the certificates **registered** to members. A certificate that verifies but isn't registered signs no one in.
+
+```toml
+[tls]                                    # native TLS (operations.md §8)
+cert = "/etc/zen/api.pem"
+key = "/etc/zen/api.key"
+client_ca = "/etc/zen/clients-ca.pem"    # mode 1: ask for client certificates from this CA
+
+[auth]
+mtls = true
+mtls_trusted_proxies = ["10.0.0.5", "fd00:1::/64"]   # mode 2: proxies that verify certificates
+mtls_proxy_header = "x-client-cert"                 # the header they forward them in
+```
+
+Two ways for a certificate to arrive, usable together:
+
+| Mode | Set up with | Who verifies the chain and the expiry |
+|---|---|---|
+| 1, native (§10.1) | `[tls]` with `client_ca` | zen-serve, in the TLS handshake |
+| 2, trusted proxy (§10.2) | `[auth] mtls_trusted_proxies` | the proxy; zen-serve trusts its word |
+
+**Dormant.** With `mtls` on but neither mode set up, the method can't work. The server logs that once at start-up, `/v1/info` leaves `mtls` out of `auth.methods`, and `/v1/auth/mtls/session` returns 401 saying so. Registration (§10.3) still works, so an admin can bind certificates before turning a mode on. Sessions the method issued earlier keep working while `mtls` is on: dormancy only stops new sign-ins. Turning `mtls` off refuses them, like any method that is off (§2).
+
+### 10.1 Native TLS
+
+With `[tls] client_ca` set and `mtls` on, the API listener asks every client for a certificate (operations.md §8):
+* **Optional at the TLS layer.** A client without a certificate still connects, so browsers and the other sign-in methods work on the same port.
+* **Verified when sent.** A certificate must chain to a CA in `client_ca`, be valid now (not before, not after), and allow client authentication (extended key usage `clientAuth`, if the extension is present). Otherwise the **handshake fails**: the client gets a TLS alert, not an HTTP response. A browser that offers a wrong certificate therefore can't reach the server on that connection at all.
+* **Keys and signatures**: ECDSA on P-256 or P-384, and Ed25519, for the client certificate, its CA and the handshake signature. RSA is not supported (`TD-TLS-RSA`): a certificate signed by an RSA CA fails the handshake, and a client with an RSA key finds no signature scheme it may use, so it can't present its certificate. Use mode 2 for RSA certificates.
+* **No revocation checks.** zen-serve reads no CRLs and asks no OCSP responder (`TD-AUTH-MTLS-REVOCATION`). To revoke a certificate, remove its registration (§10.3); to revoke a whole CA, remove it from `client_ca` and restart.
+* With `mtls` off, the listener doesn't ask for certificates, and `client_ca` is not read.
+
+The verified end-entity certificate is attached to the connection, and every request on that connection can use it.
+
+### 10.2 Trusted proxy
+
+zen-serve speaks plain HTTP (or TLS without `client_ca`) behind a reverse proxy that terminates the clients' TLS, verifies their certificates itself, and forwards the verified certificate in a request header (operations.md §8.3).
+* `[auth] mtls_trusted_proxies`: the proxies' addresses, as IP addresses or CIDR blocks (`"10.0.0.5"`, `"10.0.0.0/8"`, `"fd00::/8"`). An address with bits set past the prefix is refused at start-up. IPv4-mapped IPv6 peers count as their IPv4 address.
+* `[auth] mtls_proxy_header` (default `x-client-cert`): the header's name, lowercase.
+* **Formats.** The header carries the whole certificate, as either:
+  * PEM, URL-escaped: nginx's `$ssl_client_escaped_cert`;
+  * base64 DER, optionally URL-escaped: Caddy's `{http.request.tls.client.certificate_der_base64}`, HAProxy's `%[ssl_c_der,base64]`, Traefik's `X-Forwarded-Tls-Client-Cert`.
+
+  Of a chain, the first certificate counts: the first PEM block, or the base64 text up to the first comma. An empty header means no certificate. A fingerprint alone (such as nginx's `$ssl_client_fingerprint`, a SHA-1 of the certificate) is not enough: the server needs the public key (§10.3).
+* **From a trusted proxy**, the header is the only source: no header means no certificate, even when the proxy's own connection presents one (that certificate is the proxy's, not the user's). A header that doesn't parse gets 401, and a warning in the log.
+* **From any other address**, while proxy mode is set up, a request to an mTLS endpoint that carries the header is **refused** with 401, and the server logs a warning (at most one a minute). Refusing rather than ignoring makes a misconfigured proxy, or a client trying to name someone's certificate, visible. Without proxy mode the header means nothing and is ignored. Other endpoints never read it.
+
+**zen-serve trusts the proxy completely.** It doesn't check the forwarded certificate's chain, dates or key usage: the proxy must have done that, and must have required the client to prove possession of the key in the handshake. Certificates are not secrets, so a header that a client could set itself would let anyone sign in as anyone. The proxy must therefore **always set or clear the header** on every request it forwards, and nothing else may reach zen-serve from a trusted address: no other clients and no other services on the proxy's host. operations.md §8.3 has an nginx example.
+
+### 10.3 Binding certificates to members
+
+A certificate signs in only after it is **registered** to a member, with `POST /v1/auth/mtls/register` (api.md §3.13). Each registration is a credential (§4).
+* **By the member**, signed in with any interactive method (not an API token), on a connection that presents the certificate: natively or through the trusted proxy. Presenting it proves possession of the key.
+* **By an admin**, for any member: the same way, or by uploading the certificate (PEM or DER). An uploaded certificate needs no proof of possession; it must still pass the TLS layer at each sign-in. The record notes the admin in `issued_by`.
+* Refused (400): no certificate on the connection and none uploaded, a certificate that doesn't parse, a user who isn't a member, a label over 128 bytes, or a key that is registered already, to anyone. 429 `quota` past 100 credentials.
+
+**The credential id is `SHA-256(SubjectPublicKeyInfo)`**, the DER public-key structure of the certificate: the key's fingerprint, the same value as the `pin-sha256` of RFC 7469 before base64. A certificate renewed **with the same key** (a new serial, new dates, even a new subject) keeps working without a new registration. A renewal with a new key needs one. Choosing the key rather than the whole certificate also means one key can be registered only once, whichever certificates carry it. An operator can compute the id with `openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der | sha256sum`.
+
+The id is the session's "device" (§3), so all sessions of one certificate key act as one device.
+
+Mapping certificates to members by their subject or SAN, without a registration, is not supported (`TD-AUTH-MTLS-SUBJECT-MAPPING`).
+
+### 10.4 Sign-in
+
+`POST /v1/auth/mtls/session` with `{}` and no session (api.md §3.14) turns the certificate of the request's connection into an ordinary session (§3):
+1. 403 `method_disabled` if `mtls` is off; 401 if the method is dormant.
+2. The certificate: in mode 2 from a trusted proxy's header, otherwise the one the handshake verified (§10.2). None: 401.
+3. Its id (§10.3) is a registered `mtls` credential, and its user is a member of the head ACL. Otherwise 401.
+4. The sign-in time is stored, and the session issued with `issue_session` and **no signed origin** (§13): the handshake, not a signature, binds the sign-in. The session's `device_fp` is the credential id and `method` is `mtls`.
+
+**Why a session endpoint, rather than the certificate on every request.** Every method ends in the same bearer session, so the rest of the server (the stream, idempotency, fencing, sessions across nodes) needs nothing new. The session token then works on any connection and any node, including nodes without native TLS. The certificate is checked once per sign-in, so a removed registration ends its sessions as for any credential (§3, step 4), and a certificate that expires ends nothing until the next sign-in, at the latest after `session_ttl_secs`.
+
+Removing the registration through `/v1/auth/credentials/remove` (api.md §3.9) ends its sessions, and a member leaving the ACL loses all their registrations (§4).
+
+### 10.5 Threat notes
+
+* **Relay-proof natively.** In TLS 1.3 the client signs the handshake transcript, which includes the server's key share and certificate, so a sign-in can't be relayed through a server that doesn't hold the real server's key. The session token itself is a bearer secret, like every session (§3).
+* **The proxy mode trusts the proxy.** Whoever can send requests from a trusted address, or misconfigure the proxy to pass a client's header through, can sign in as any member whose certificate they have, and certificates are public. Keep `mtls_trusted_proxies` to the proxies themselves, and the network between them and zen-serve private.
+* **Not post-quantum for authentication.** The client's signature is ECDSA or Ed25519 (natively; whatever the proxy accepts in mode 2). A large quantum computer that recovers a certificate's private key from its public key could sign in with it. The **key exchange** of native TLS is post-quantum hybrid (`X25519MLKEM768`, operations.md §8), which protects the session token and the traffic against later decryption, not the sign-in against forgery. Methods 1 and 6 sign with a hybrid including ML-DSA-65.
+* **No revocation** (§10.1): a stolen certificate key works until its registration is removed or the certificate expires (natively; in mode 2, as the proxy checks).
+* **Expiry** is checked at the TLS layer natively, and by the proxy in mode 2; zen-serve doesn't check it in mode 2.
+* **Linkability.** The credential id is a public function of the certificate, and it is the session's device id, which other members can see (for example as the `sender` of ephemeral messages, api.md §9). Someone holding the certificate can tell it signed in.
+* **The client CA is a gate, not an identity.** Natively, any certificate of the CA passes the handshake; only the registration decides who it signs in as. A CA that issues to people outside the deployment lets them complete handshakes, but not sign in.
+* **Nothing secret on the server.** The store holds the key fingerprint and metadata only.
 
 ## 11. Method 6: password-derived key (default)
 
@@ -389,18 +475,18 @@ Signing in never gives the server a key to the data. Which methods can also **un
 | 2 `passkey` | yes | yes, if the authenticator supports the WebAuthn PRF extension: a PRF keyslot (formats.md §6, type 4) opens with the passkey's PRF output (§7.7) |
 | 3 `opaque` | yes | not specified yet |
 | 4 `api_token` | yes | no |
-| 5 `mtls` | yes | no |
+| 5 `mtls` | yes | no: the certificate's private key stays in the TLS stack (the browser, the OS key store, a smart card, or the proxy), which can sign handshakes but derives no secret a keyslot could use |
 | 6 `password_key` | yes | yes: the client holds the password, so it can also open or create a passphrase keyslot (formats.md §6, type 1) |
 
 For method 6 the sign-in key and a passphrase keyslot are independent derivations, with separate salts and labels: neither reveals the other. Using the same password for both is the user's choice. The server already holds an offline-guessable verifier for each (§11.4).
 
 ## 13. Adding a method
 
-For implementers of the reserved methods (3, 5). A method:
+For implementers of the reserved method (3) and of later ones. A method:
 1. Adds itself to `auth::IMPLEMENTED` in zen-server once it works; its `AuthMethod` variant, id, wire name and `[auth]` flag already exist.
 2. Calls `AppState::require_method` first in each of its endpoints.
 3. Stores its credentials with `cred::put`, as a `CredRecord` with its method id and any new optional fields it needs, and finds them with `cred::get`, `cred::owner`, `cred::list` and, for a typed name, `cred::login` (§4.2). Credential removal, listing, the per-user limit and the clean-up when a member leaves the ACL then work unchanged.
-4. Ends a sign-in with `auth::issue_session(user, credential id, method, signed)`. A method that signs a challenge and an origin passes them as `Signed`, which spends the challenge and applies the origin policy (§5) in the session's transaction, pinning the first origin. A method that signs no origin passes `None`.
+4. Ends a sign-in with `auth::issue_session(user, credential id, method, signed)`. A method that signs a challenge and an origin passes them as `Signed`, which spends the challenge and applies the origin policy (§5) in the session's transaction, pinning the first origin. A method that signs no origin passes `None`, as TLS client certificates do (§10.4): the handshake binds them instead.
 5. Documents itself in its section here, in api.md §3 and in TECH_DEBT.md for what it defers.
 
 Sessions of a method other than device keys stay valid only while their credential exists in the store (§3, step 4), so every such session must name a stored credential.

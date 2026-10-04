@@ -154,3 +154,4 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * These keys are data, not server metadata: `export` copies them and `import` restores them. So a restored or migrated cluster keeps its credentials, its pin and its fake parameters.
 * All of them are new: a store from before them simply has none.
 * Passkeys (auth.md §7) add no keys: a passkey is a credential record with the method's optional fields, which older readers ignore. Registering a passkey spends its challenge in `pack("chal", challenge)` (§3.5), like a sign-in.
+* TLS client certificates (auth.md §10) add no keys either: a registration is a credential record whose `id` is the SHA-256 of the certificate's public key (auth.md §4.1), so `credx` finds the member from the certificate a connection presents.
