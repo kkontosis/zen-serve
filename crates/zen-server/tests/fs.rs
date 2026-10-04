@@ -1111,3 +1111,58 @@ async fn chunk_grace_restarts_on_reupload_and_release() {
         "collected after grace"
     );
 }
+
+/// While a purged node's tombstone is kept, operations naming it (as the
+/// node or as a parent) are refused with `stale_op` instead of resurrecting
+/// an empty node. Once the tombstone is dropped, the id is new again.
+#[tokio::test(flavor = "multi_thread")]
+async fn operations_on_purged_nodes_are_stale() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.crdt_horizon_secs = 2;
+        c.limits.crdt_max_skew_ms = 500;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let st = &h.server.state;
+    let t = zfs::hlc(now_ms(), 0);
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"dir")),
+            mv(id(2), id(1), t + 1, Some(b"file")),
+            mv(id(1), TRASH, t + 2, None),
+        ],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(get(&h, &a, &[id(1), id(2)]).await.is_empty(), "purged");
+    let fresh = || zfs::hlc(now_ms(), 0);
+    let stale = |r: Result<CommitResult, ApiErr>| {
+        let e = r.expect_err("refused");
+        assert_eq!((e.0, e.1.code.as_str()), (409, "stale_op"), "{e:?}");
+    };
+    stale(ops(&h, &a, vec![mv(id(2), ROOT, fresh(), None)]).await);
+    stale(ops(&h, &a, vec![mv(id(1), ROOT, fresh(), Some(b"x"))]).await);
+    stale(ops(&h, &a, vec![mv(id(9), id(2), fresh(), Some(b"new"))]).await);
+    stale(ops(&h, &a, vec![meta(id(2), fresh(), b"m")]).await);
+    stale(ops(&h, &a, vec![write(id(2), &[], &[], b"m")]).await);
+    assert!(
+        get(&h, &a, &[id(1), id(2), id(9)]).await.is_empty(),
+        "nothing resurrected"
+    );
+    // An unknown parent that was never purged is still a plain 400.
+    let e = ops(&h, &a, vec![mv(id(9), id(8), fresh(), None)])
+        .await
+        .expect_err("unknown parent");
+    assert_eq!(e.0, 400);
+    // Tombstones older than the horizon are dropped; the id is then new.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    ops(&h, &a, vec![mv(id(2), ROOT, fresh(), Some(b"again"))])
+        .await
+        .unwrap();
+    assert_eq!(parent_of(&get(&h, &a, &[id(2)]).await[&id(2)]), Some(ROOT));
+}

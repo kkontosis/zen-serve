@@ -94,6 +94,7 @@ meta {node, hlc, meta}
 * **Clock skew.** An `hlc` more than `limits.crdt_max_skew_ms` (default 60,000) ahead of the server's clock is refused with 409 `clock_skew`. Otherwise one member could win every conflict by writing from the future. The client fixes its clock or waits.
 * **Horizon.** An `hlc` older than `limits.crdt_horizon_secs` (default 7 days) is refused with 409 `stale_op`.
 * **Undo depth.** A move whose undo/redo would touch more than `limits.crdt_max_redo` logged moves (default 1,000) is also refused with 409 `stale_op`.
+* **Purged nodes.** An operation that names a purged node (§6) as its `node` or `parent`, while the node's tombstone is still kept, is refused with 409 `stale_op`. The server no longer has the state the operation refers to; applying it would resurrect an empty node (no meta, no content) in place of what the sequential merge would show. After the tombstone is dropped the id is unknown: a `move` of it is a creation, and a `move` under it fails with 400 (unknown parent).
 * **Rebase.** The client reissues a `stale_op` operation with a fresh `hlc`, and the operation then takes its arrival position. The client library does this automatically. The user-visible effect: very old offline moves are applied as if made at sync time.
 
 ## 4. Content
@@ -141,7 +142,9 @@ The sweeper (every node runs it) keeps the tree bounded:
   * its move into trash is older than the horizon, and
   * every node in its subtree has a move older than the horizon.
 
-  Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed.
+  Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed, plus a by-id entry (keyspace.md §3.6, `tp`) that refuses later operations on the node (§3.4) until the tombstone is dropped.
+
+  A purge can still contradict an operation that is inside the horizon but has not arrived yet: an offline device that moved a file out of a directory before the directory was trashed, and syncs after the purge. Its operation is refused with `stale_op` rather than applied to a node whose content is gone; the client shows the file as deleted.
 * **Chunks:** unreferenced chunks are deleted after the grace period (§4.1).
 * **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Logged moves of a purged node itself (a skipped move can name one) are passed over by undo and redo. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.
 

@@ -283,6 +283,16 @@ pub fn tombstones(fs: u32, tree: &[u8]) -> Key {
     Key::new().str("tx").int(fs.into()).bytes(tree)
 }
 
+/// A purged node's tombstone by id: `("tp", fs, tree, node)` → `cvs(12)`.
+pub fn purged(fs: u32, tree: &[u8], node: &[u8]) -> Vec<u8> {
+    Key::new()
+        .str("tp")
+        .int(fs.into())
+        .bytes(tree)
+        .bytes(node)
+        .finish()
+}
+
 /// `("tf", fs, tree, node)`: content versions of a node.
 pub fn versions(fs: u32, tree: &[u8], node: &[u8]) -> Key {
     Key::new().str("tf").int(fs.into()).bytes(tree).bytes(node)

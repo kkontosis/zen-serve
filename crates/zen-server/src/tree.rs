@@ -334,6 +334,25 @@ impl<'a> Engine<'a> {
         Ok(n == ROOT || n == TRASH || self.get_node(t, (fs, tree, n)).await?.is_some())
     }
 
+    /// 409 `stale_op` if `n` (which has no record) was purged and its
+    /// tombstone is still kept (fs.md §3.4): the operation refers to state
+    /// the server no longer has, and applying it would resurrect an empty
+    /// node. Otherwise `missing` (a 400).
+    async fn missing_node(
+        &mut self,
+        t: &mut Box<dyn Txn>,
+        fs: u32,
+        tree: Id,
+        n: Id,
+        missing: &'static str,
+    ) -> ApiError {
+        match t.get(&keys::purged(fs, &tree, &n)).await {
+            Ok(Some(_)) => stale_op("the node was purged; rebase"),
+            Ok(None) => bad_request(missing),
+            Err(e) => e.into(),
+        }
+    }
+
     /// Whether `anc` is `n` or one of its ancestors.
     async fn is_ancestor(
         &mut self,
@@ -482,7 +501,14 @@ impl<'a> Engine<'a> {
         }
         self.check_clock(hlc)?;
         if !self.exists(t, fs, tree, parent).await? {
-            return Err(bad_request("unknown parent"));
+            return Err(self
+                .missing_node(t, fs, tree, parent, "unknown parent")
+                .await);
+        }
+        if self.get_node(t, (fs, tree, node)).await?.is_none()
+            && t.get(&keys::purged(fs, &tree, &node)).await?.is_some()
+        {
+            return Err(stale_op("the node was purged; rebase"));
         }
         let ts = Ts {
             hlc,
@@ -545,10 +571,10 @@ impl<'a> Engine<'a> {
         meta: &[u8],
     ) -> ApiResult<()> {
         let k = (fs, tree, node);
-        let mut rec = self
-            .get_node(t, k)
-            .await?
-            .ok_or_else(|| bad_request("unknown node"))?;
+        let mut rec = match self.get_node(t, k).await? {
+            Some(r) => r,
+            None => return Err(self.missing_node(t, fs, tree, node, "unknown node").await),
+        };
         let ts = Ts {
             hlc,
             dev: self.device,
@@ -571,10 +597,10 @@ impl<'a> Engine<'a> {
         manifest: &[u8],
     ) -> ApiResult<()> {
         let (fs, tree, node) = k;
-        let mut rec = self
-            .get_node(t, k)
-            .await?
-            .ok_or_else(|| bad_request("unknown node"))?;
+        let mut rec = match self.get_node(t, k).await? {
+            Some(r) => r,
+            None => return Err(self.missing_node(t, fs, tree, node, "unknown node").await),
+        };
         let mut bytes = 0i64;
         for d in replaces {
             if d.len() != 12 {
@@ -1168,6 +1194,7 @@ async fn purge_trash(st: &Shared, fs: u32, tree: &Id, cutoff_ms: u64) -> ApiResu
                 .bytes(n)
                 .finish_incomplete();
             t.set_versionstamped_key(&p, &s, &[]);
+            t.set_versionstamped_value(&keys::purged(fs, tree, n), &[], &i.to_be_bytes());
             let vpfx = keys::versions(fs, tree, n).finish();
             for (_, v) in t
                 .get_range(&vpfx, &keys::end_of(&vpfx), 10_000, false)
@@ -1210,6 +1237,7 @@ async fn drop_tombstones(st: &Shared, fs: u32, tree: &Id, before: &[u8; 12]) -> 
                 return Err(internal("bad tombstone"));
             };
             t.clear(&keys::changes(fs, tree).vs(o).bytes(n).finish());
+            t.clear(&keys::purged(fs, tree, n));
             newest = newest.max(*o);
         }
         t.clear_range(&pfx, &key_after(last));

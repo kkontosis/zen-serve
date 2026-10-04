@@ -108,6 +108,7 @@ Leases are never deleted: the stored token is what keeps fencing tokens increasi
 | `pack("tm", fs, tree, hlc, dev)` | move log: `node ‖ parent ‖ u8 has_old ‖ [old_parent ‖ u64 old_hlc ‖ old_dev(32)]`: the parent and move timestamp the move replaced, restored on undo |
 | `pack("tv", fs, tree, cvs, node)` | change index: empty, or `0x01` for a purged node's tombstone |
 | `pack("tx", fs, tree, cvs, node)` | empty: tombstones only, so the sweeper can drop old ones without scanning the change index |
+| `pack("tp", fs, tree, node)` | `cvs(12)` of the node's tombstone: a purged node by id, so operations naming it are refused (fs.md §3.4); dropped with the tombstone |
 | `pack("tf", fs, tree, node, dot)` | content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest` |
 | `pack("ck", fs, chunk)` | sealed chunk |
 | `pack("cr", fs, chunk)` | `i64` little-endian, atomic add: number of versions referencing the chunk |
