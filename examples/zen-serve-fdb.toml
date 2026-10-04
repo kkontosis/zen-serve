@@ -6,6 +6,8 @@
 #
 # Build with: cargo build -p zen-server --release --features fdb
 
+# The API (clients, browsers). Separate from the database addresses in [fdb]
+# (spec/operations.md §3.3).
 listen = "0.0.0.0:8080"
 data_dir = "/var/lib/zen"
 public_origins = ["https://zen.example.org"]
@@ -20,7 +22,8 @@ backend = "fdb"
 
 [fdb]
 processes = 2              # fdbserver processes on this node
-listen_ip = "10.0.0.5"     # private network address of this node
+listen_ip = "10.8.0.1"     # FoundationDB only: this node's WireGuard/private address.
+                           # 127.0.0.1 for a single node; never 0.0.0.0 or public without TLS.
 port = 4500
 auto_redundancy = true     # single → double at 3 nodes → triple at 5
 # tls_cert = "/etc/zen/fdb.pem"

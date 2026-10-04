@@ -48,7 +48,7 @@ listen_ip = "10.0.0.5" # address the processes bind to
 public_ip = "10.0.0.5" # address other nodes use (default: listen_ip)
 port = 4500            # process i listens on port + i
 auto_redundancy = true
-# tls_cert = "/etc/zen/fdb.pem"   # all three, or none (§3.3)
+# tls_cert = "/etc/zen/fdb.pem"   # all three, or none (§3.4)
 # tls_key  = "/etc/zen/fdb.key"
 # tls_ca   = "/etc/zen/ca.pem"
 ```
@@ -78,16 +78,45 @@ With `auto_redundancy` on, the cluster status is checked every 30 s. One node ac
 * The mode is only ever raised (`configure double` / `configure triple`), then `coordinators auto` runs.
 * It is never lowered: a node that dies must not reduce redundancy. To shrink a cluster, exclude nodes and reconfigure with `fdbcli` yourself.
 
-### 3.3 Network trust (G18)
+### 3.3 Addresses: the API and the database are separate
+
+Two unrelated settings:
+
+| Setting | Who connects | Typical value |
+|---|---|---|
+| `listen` (top level) | clients and browsers: the zen-serve API | `0.0.0.0:8080`, or `127.0.0.1:8080` behind a reverse proxy |
+| `[fdb] listen_ip`, `public_ip`, `port` | only FoundationDB peers: other nodes' `fdbserver`s, zen-serve's own database client, `fdbcli`, backup agents | `127.0.0.1` (single node) or a private / WireGuard address |
+
+zen-serve never proxies FoundationDB traffic. Exposing the API does not expose the database.
+
+* **Single node.**
+  * Keep `listen_ip = "127.0.0.1"` (the default): nothing outside the machine can reach FoundationDB.
+  * Local processes still can: FoundationDB only speaks TCP (`IP:PORT`), with no Unix-socket transport.
+  * For no database port at all, use the embedded backend.
+* **Several nodes over WireGuard (or another private network).** Set `listen_ip` to the node's tunnel address on every node; `public_ip` defaults to it:
+
+  ```toml
+  listen = "0.0.0.0:8080"     # the API, public
+  [fdb]
+  listen_ip = "10.8.0.1"      # this node's WireGuard address
+  ```
+
+* **One address per process.**
+  * Each `fdbserver` binds exactly one `IP:PORT`, and the cluster file lists those addresses.
+  * So in a multi-node cluster the local zen-serve also reaches its own database through the tunnel address. That traffic stays on the machine.
+  * Binding `127.0.0.1` and the tunnel address at the same time is neither possible nor needed.
+* **Never** set `listen_ip` to `0.0.0.0` or a public address without TLS (§3.4).
+
+### 3.4 Network trust (G18)
 
 * **The join token is the cluster file**, base64url-encoded: the cluster's name and its coordinators' addresses. It is not a credential. Anyone who can reach the FoundationDB ports can read and write the whole database, which is ciphertext and metadata (the threat model: the server sees no plaintext).
-* So run the cluster on a **private network**, or turn on **TLS**. With `tls_cert`, `tls_key` and `tls_ca` set on every node:
+* So run the cluster on a **private network** (§3.3), or turn on **TLS**. With `tls_cert`, `tls_key` and `tls_ca` set on every node:
   * the processes listen with `:tls`
   * `fdbcli`, the backup tools and zen-serve's own client use the same files
   * the CA decides who may join
 * Automatic TLS between nodes comes later, with ACME.
 
-### 3.4 Versions and clocks (G20)
+### 3.5 Versions and clocks (G20)
 
 * Leases, claims and idempotency records expire by **commit version**, about 1,000,000 per second, never by wall-clock time. On an idle cluster versions advance in steps of up to about 2 s, so a lease can expire up to that much late, never early.
 * Sessions and challenges expire by wall-clock time (unix seconds). Keep node clocks in sync with NTP.
