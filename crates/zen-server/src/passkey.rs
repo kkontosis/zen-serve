@@ -5,7 +5,7 @@
 //!   the canonical origin (auth.md §5.5). Without either, passkeys can't be
 //!   registered or used yet.
 //! * The user handle is the user fingerprint.
-//! * A passkey's store id is `BLAKE3.derive_key("zen-serve 2026 passkey",
+//! * A passkey's store id is `BLAKE3.derive_key("zen/v1/passkey-id",
 //!   credential id)`; the credential's owner index (`credx`) finds the
 //!   user from the id the authenticator returns.
 //! * The clientDataJSON origin goes through the origin policy in

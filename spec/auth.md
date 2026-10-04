@@ -114,7 +114,7 @@ Fields a server doesn't know are ignored, so a method can add its own without br
 
 | Method | Id |
 |---|---|
-| `passkey` | `BLAKE3.derive_key("zen-serve 2026 passkey", WebAuthn credential id)` (§7.2): the owner index (keyspace.md §3.7) finds the user from the id an authenticator returns |
+| `passkey` | `BLAKE3.derive_key("zen/v1/passkey-id", WebAuthn credential id)` (§7.2): the owner index (keyspace.md §3.7) finds the user from the id an authenticator returns |
 | `password_key` | random, chosen at registration; a password change gets a new one |
 | `api_token` | `BLAKE3.derive_key("zen-serve 2026 api token", secret)` (§9) |
 
@@ -251,7 +251,7 @@ The server checks, and returns 400 (401 for the challenge and the origin) otherw
 * **No attestation verification.** `fmt` `"none"` must carry an empty statement. The statement of any other format (`packed`, `tpm`, `apple`, …) is ignored, not verified: the server keeps no attestation roots and treats every passkey as unattested. It can't tell a hardware key from a software one (`TD-AUTH-WEBAUTHN-ATTESTATION`).
 * The credential id isn't registered yet, by anyone (400). The user holds fewer than 100 credentials (429 `quota`).
 
-The passkey is stored in the credential store (§4) with id `BLAKE3.derive_key("zen-serve 2026 passkey", credential id)`, and the credential id, the COSE public key, its algorithm, the signature counter, the rp id, the label and the creation time. The last sign-in time is added on each use.
+The passkey is stored in the credential store (§4) with id `BLAKE3.derive_key("zen/v1/passkey-id", credential id)`, and the credential id, the COSE public key, its algorithm, the signature counter, the rp id, the label and the creation time. The last sign-in time is added on each use.
 
 ### 7.3 Sign-in
 

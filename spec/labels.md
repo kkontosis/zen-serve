@@ -33,6 +33,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/acl-chain` | `H(doc)` of a signed ACL, chaining ACL versions (formats.md §9.2) |
 | `zen/v1/range-hash` | hash of a KV range for `expect_ranges` (api.md §6) |
 | `zen/v1/tree-op-chain` | per-tree chain over filesystem operations (formats.md §11.5) |
+| `zen/v1/passkey-id` | a passkey's credential-store id from its WebAuthn credential id (auth.md §4.1, formats.md §6) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 

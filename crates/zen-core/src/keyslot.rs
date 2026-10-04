@@ -214,10 +214,10 @@ pub fn create_device(fs: &FsKeys, recipient: &DevicePublic, rng: &mut dyn Rng) -
 
 /// A passkey's credential id in the server's credential store
 /// (spec/auth.md §4.1), from its WebAuthn credential id (`rawId`):
-/// `BLAKE3.derive_key("zen-serve 2026 passkey", rawId)`. WebAuthn PRF
+/// `BLAKE3.derive_key("zen/v1/passkey-id", rawId)`. WebAuthn PRF
 /// keyslots name their passkey by it.
 pub fn passkey_credential_id(webauthn_id: &[u8]) -> [u8; 32] {
-    blake3::derive_key("zen-serve 2026 passkey", webauthn_id)
+    blake3::derive_key(crate::labels::PASSKEY_ID, webauthn_id)
 }
 
 /// Create a keyslot that opens with a passkey's WebAuthn PRF output

@@ -230,7 +230,7 @@ fn keyslots_reject_wrong_secrets() {
     // The store id of a passkey (auth.md §4.1).
     assert_eq!(
         keyslot::passkey_credential_id(b"raw id"),
-        *blake3::derive_key("zen-serve 2026 passkey", b"raw id").as_ref()
+        *blake3::derive_key("zen/v1/passkey-id", b"raw id").as_ref()
     );
 
     // WebAuthn PRF: the output for the slot's salt opens it; another

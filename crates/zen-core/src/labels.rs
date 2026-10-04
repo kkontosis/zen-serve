@@ -41,6 +41,8 @@ pub const ACL_CHAIN: &str = "zen/v1/acl-chain";
 pub const RANGE_HASH: &str = "zen/v1/range-hash";
 /// Hash: per-tree chain over filesystem operations.
 pub const TREE_OP_CHAIN: &str = "zen/v1/tree-op-chain";
+/// A passkey's credential-store id from its WebAuthn credential id.
+pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
 
 /// AAD domain: sealed KV value.
 pub const AAD_KV: &str = "zen/v1/aad/kv";
@@ -100,6 +102,7 @@ pub const ALL: &[&str] = &[
     ACL_CHAIN,
     RANGE_HASH,
     TREE_OP_CHAIN,
+    PASSKEY_ID,
     AAD_KV,
     AAD_EVENT,
     AAD_EPOCH_CHAIN,
