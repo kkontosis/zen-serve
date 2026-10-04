@@ -23,7 +23,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -294,7 +294,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `auth` | `token` | authenticate the stream |
 | `sub` | `id: u32, fs, topic?, prefix?, after?: bytes(12)` | Subscribe to one topic, or to every topic under a topic-id prefix (an empty prefix means the whole fs). Needs topic `read`. History after `after` is streamed from storage, then live events follow **with no gap and no reordering** (G9). With no `after`, only new events are sent. |
 | `unsub` | `id` | stop a subscription |
-| `epub` | `fs, topic, data: bytes` | ephemeral publish: not in the log; kept for at most about a minute (§9.1). Needs topic `append`. |
+| `epub` | `fs, topic, data: bytes` | ephemeral publish: not in the log; kept for at most about a minute (§9.1). Needs topic `append`. Rate-limited per device (§9.1): over the limit, the reply is `err` with code `quota`. |
 | `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe: messages published after the `ok`. Needs topic `read`. |
 
 **Server → client:**
@@ -313,6 +313,12 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 ### 9.1 Ephemeral messages across nodes
 
 Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5), so a subscriber on any node receives messages published on any other. Delivery is best effort: there is no history, and a subscriber that falls behind may miss messages. Entries are deleted after `limits.ephemeral_ttl_secs` (default 60 s), so they never reach the log, and appear in a backup only if it is taken within that window.
+
+**Rate limit.** Ephemeral messages bypass the fs quotas, so each device's publishes are limited by a token bucket:
+* `limits.ephemeral_bytes_per_sec` (default 65,536) sustained, with bursts of `limits.ephemeral_burst_bytes` (default 1,048,576). A message costs its `data` length plus 256 bytes. `ephemeral_bytes_per_sec = 0` turns the limit off.
+* `ephemeral_burst_bytes` must be at least `max_envelope_bytes` + 256, so a message of any allowed size can be sent.
+* A publish over the limit is refused with `quota` and not delivered. The client waits and retries, or drops the message.
+* The buckets are kept in each node's memory, per device. A device that publishes through several nodes of a cluster gets the limit on each, so the cluster-wide limit is the per-node limit times the number of nodes. A node restart refills them.
 
 ## 10. Static files
 

@@ -412,3 +412,54 @@ async fn oversized_frames_close_the_stream() {
     .expect("server closes the socket");
     assert!(closed);
 }
+
+/// Ephemeral publishes are rate-limited per device: over the bucket, the
+/// publish is refused with `quota` and nothing reaches subscribers.
+#[tokio::test(flavor = "multi_thread")]
+async fn ephemeral_publishes_are_rate_limited() {
+    let h = Harness::start_with(|c| {
+        c.limits.max_envelope_bytes = 1000;
+        c.limits.ephemeral_bytes_per_sec = 1;
+        c.limits.ephemeral_burst_bytes = 2000;
+    })
+    .await;
+    let admin = User::new(1);
+    let bob = User::new(2);
+    h.claim(&admin, &[&bob]).await;
+    let a_tok = h.sign_in(&admin).await.unwrap();
+    let b_tok = h.sign_in(&bob).await.unwrap();
+    let mut a = connect(&h, &a_tok).await;
+    let mut b = connect(&h, &b_tok).await;
+    send(
+        &mut b,
+        &Frame::Esub {
+            id: 1,
+            fs: 1,
+            topic: Some(topic(3)),
+            prefix: None,
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut b).await, Frame::Ok { id: Some(1) });
+    let epub = |n: u8| Frame::Epub {
+        fs: 1,
+        topic: topic(3),
+        data: vec![n; 700], // costs 700 + 256 bytes
+    };
+    // The burst holds two messages; the third is over the limit.
+    for n in 1..=3 {
+        send(&mut a, &epub(n)).await;
+    }
+    match recv(&mut a).await {
+        Frame::Err { code, .. } => assert_eq!(code, "quota"),
+        other => panic!("{other:?}"),
+    }
+    // Another device has its own bucket.
+    send(&mut b, &epub(4)).await;
+    for n in [1, 2, 4] {
+        match recv(&mut b).await {
+            Frame::Eph { data, .. } => assert_eq!(data[0], n),
+            other => panic!("{other:?}"),
+        }
+    }
+}

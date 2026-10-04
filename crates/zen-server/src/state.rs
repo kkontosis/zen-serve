@@ -59,7 +59,11 @@ impl AppState {
         challenge_key: [u8; 32],
     ) -> Self {
         AppState {
-            eph: EphHub::new(store.clone()),
+            eph: EphHub::new(
+                store.clone(),
+                cfg.limits.ephemeral_bytes_per_sec,
+                cfg.limits.ephemeral_burst_bytes,
+            ),
             cfg,
             store,
             acl: RwLock::new(Arc::new(acl)),

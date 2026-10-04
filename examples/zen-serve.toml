@@ -38,3 +38,6 @@ crdt_horizon_secs = 604800   # late operations and trash are kept 7 days
 crdt_max_redo = 1000
 crdt_max_depth = 1000
 chunk_grace_secs = 86400
+# Ephemeral pub/sub (api.md §9.1): per device, per node.
+ephemeral_bytes_per_sec = 65536   # a message costs its data + 256 bytes; 0 = no limit
+ephemeral_burst_bytes = 1048576

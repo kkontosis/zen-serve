@@ -135,6 +135,11 @@ pub struct FsConfig {
     pub id: u32,
 }
 
+/// What one ephemeral message costs against its device's rate limit on top
+/// of its data: the topic id (at most 256 bytes), the sender and the ring
+/// entry's key.
+pub const EPH_MSG_OVERHEAD: u64 = 256;
+
 /// Server limits.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -164,6 +169,11 @@ pub struct LimitsConfig {
     pub sweep_interval_secs: u64,
     /// How long ephemeral messages stay in the cross-node ring.
     pub ephemeral_ttl_secs: u64,
+    /// Ephemeral publishes per device and node: sustained bytes per second
+    /// (a message costs its data plus [`EPH_MSG_OVERHEAD`]); 0 = no limit.
+    pub ephemeral_bytes_per_sec: u64,
+    /// Ephemeral publishes per device and node: burst, in bytes.
+    pub ephemeral_burst_bytes: u64,
     /// How far a filesystem `hlc` may be ahead of the server clock.
     pub crdt_max_skew_ms: u64,
     /// How far back a late filesystem operation may reach (spec/fs.md §3.4).
@@ -193,6 +203,8 @@ impl Default for LimitsConfig {
             claim_ttl_ms: 30_000,
             sweep_interval_secs: 60,
             ephemeral_ttl_secs: 60,
+            ephemeral_bytes_per_sec: 65_536,
+            ephemeral_burst_bytes: 1_048_576,
             crdt_max_skew_ms: 60_000,
             crdt_horizon_secs: 7 * 86_400,
             crdt_max_redo: 1000,
@@ -287,6 +299,14 @@ impl Config {
         }
         if self.limits.crdt_max_depth == 0 || self.limits.max_range_items == 0 {
             return Err("limits.crdt_max_depth and max_range_items must be at least 1".into());
+        }
+        let l = &self.limits;
+        if l.ephemeral_bytes_per_sec > 0
+            && l.ephemeral_burst_bytes < l.max_envelope_bytes as u64 + EPH_MSG_OVERHEAD
+        {
+            return Err(format!(
+                "limits.ephemeral_burst_bytes must be at least max_envelope_bytes + {EPH_MSG_OVERHEAD}"
+            ));
         }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fs {
