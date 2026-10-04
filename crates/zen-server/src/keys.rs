@@ -242,6 +242,11 @@ pub fn meta(name: &str) -> Vec<u8> {
     Key::new().str("meta").str(name).finish()
 }
 
+/// `("meta")`: all server metadata, private to one store or cluster.
+pub fn meta_prefix() -> Vec<u8> {
+    Key::new().str("meta").finish()
+}
+
 // ---- filesystem trees (keyspace.md §3.6)
 
 /// `("tr", fs)`: tree headers of an fs.

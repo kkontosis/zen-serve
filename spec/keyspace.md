@@ -80,6 +80,8 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 | `pack("acl_head")` | `u64 version` of the current ACL |
 | `pack("meta", name)` | metadata: `"version"` (embedded backend's version clock), `"challenge_key"` (32 random bytes, the cluster-wide challenge MAC key, api.md §3.1) |
 
+Metadata belongs to one store (or one cluster): `export` skips every `meta` key, `import` ignores them in a file, and they don't count as data when `import` checks that the target is empty (operations.md §6). Each target keeps or creates its own.
+
 ### 3.5 Sessions, challenges, ephemeral ring
 
 Every node of a cluster shares these, so a request can go to any node.
