@@ -15,6 +15,11 @@ pub const MAX_ACL_ORIGINS: usize = 16;
 
 /// The ACL document.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
 pub struct AclDoc {
     /// Admin user fingerprints.
     pub admins: Vec<ByteBuf>,
@@ -27,64 +32,94 @@ pub struct AclDoc {
     /// Origins the admins vouch for as the server's own (spec/auth.md §5.3).
     /// Omitted when empty, so documents without it encode as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
     pub origins: Vec<String>,
     /// Version: 1, 2, 3, …
     pub version: u64,
     /// Hash of the previous doc (zeros for version 1).
     #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub prev_hash: Vec<u8>,
 }
 
 /// A member: a user identity and its device certificates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
 pub struct Member {
     /// Device certificates (formats.md §7.4).
     pub devices: Vec<ByteBuf>,
     /// Encoded public identity (formats.md §7.2).
     #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub identity: Vec<u8>,
 }
 
 /// A grant. Without `topic` it is an fs grant; with `topic` it covers every
 /// topic id with that prefix.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
 pub struct Grant {
     /// fs_id.
     pub fs: u32,
     /// Topic-id prefix.
     #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
     pub topic: Option<Vec<u8>>,
     /// Rights.
     pub rights: Vec<String>,
     /// User fingerprint.
     #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub subject: Vec<u8>,
 }
 
 /// Per-fs quota.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
 pub struct FsLimit {
     /// fs_id.
     pub fs: u32,
     /// Max KV keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
     pub max_keys: Option<u64>,
     /// Max bytes (KV keys + values + event envelopes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
     pub max_bytes: Option<u64>,
 }
 
 /// A signed ACL: `{doc, sig, signer}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
 pub struct SignedAcl {
     /// The encoded [`AclDoc`], verbatim.
     #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub doc: Vec<u8>,
     /// Hybrid signature, purpose `zen/v1/sig/acl`.
     #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub sig: Vec<u8>,
     /// Signer's user fingerprint.
     #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub signer: Vec<u8>,
 }
 

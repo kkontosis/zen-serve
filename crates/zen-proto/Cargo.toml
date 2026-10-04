@@ -10,3 +10,10 @@ repository.workspace = true
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+tsify = { version = "0.5", default-features = false, features = ["js"], optional = true }
+wasm-bindgen = { version = "=0.2.129", optional = true }
+
+[features]
+# TypeScript declarations of the wire types, for the WASM bindings
+# (crates/zen-wasm). Byte fields are `Uint8Array`, `ByteBuf` is an alias of it.
+ts = ["dep:tsify", "dep:wasm-bindgen"]

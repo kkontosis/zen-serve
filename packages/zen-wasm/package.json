@@ -1,0 +1,18 @@
+{
+  "name": "@zen/wasm",
+  "version": "0.1.0",
+  "description": "zen-serve crypto core and wire types, compiled to WASM (built by scripts/build-wasm.sh)",
+  "license": "MIT",
+  "type": "module",
+  "main": "pkg/zen_wasm.js",
+  "types": "pkg/zen_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/zen_wasm.d.ts",
+      "default": "./pkg/zen_wasm.js"
+    },
+    "./zen_wasm_bg.wasm": "./pkg/zen_wasm_bg.wasm"
+  },
+  "files": ["pkg"],
+  "sideEffects": false
+}
