@@ -136,7 +136,7 @@ write {node, replaces: [dot], chunks: [chunk_id], manifest}
 
 ## 6. Garbage collection
 
-The sweeper (every node runs it) keeps the tree bounded:
+The sweeper (every node runs it) keeps the tree bounded. It visits only trees with work left (keyspace.md §3.6, `ts`): a tree is listed by any commit with a `move` on it, and dropped once its move log, trash and tombstones are all gone, so its cost doesn't grow with the number of trees ever used.
 * **Move log:** entries older than the horizon are removed. No accepted operation can need them (§3.4).
 * **Margin.** "Older than the horizon" here means older than `crdt_horizon_secs` plus `crdt_max_skew_ms` by the sweeping node's clock. So a node whose clock is slightly behind never accepts an operation that needs a removed entry.
 * **Trash purge.** A child of `TRASH` is purged when:

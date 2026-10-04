@@ -284,6 +284,8 @@ pub struct Engine<'a> {
     /// Nodes whose content changed: re-stamped even if the record is not.
     touched: HashSet<NodeKey>,
     trees: BTreeMap<(u32, Id), Header>,
+    /// Trees with new moves: listed in the sweep index on flush.
+    moved: BTreeSet<(u32, Id)>,
     new_chunks: HashSet<(u32, Id)>,
     /// Writes so far (the next write's dot index).
     pub writes: u16,
@@ -303,6 +305,7 @@ impl<'a> Engine<'a> {
             dirty: BTreeSet::new(),
             touched: HashSet::new(),
             trees: BTreeMap::new(),
+            moved: BTreeSet::new(),
             new_chunks: HashSet::new(),
             writes: 0,
             delta: HashMap::new(),
@@ -545,6 +548,7 @@ impl<'a> Engine<'a> {
         }
         let old = self.do_move(t, fs, tree, ts, node, parent).await?;
         t.set(&key, &LogEntry { node, parent, old }.encode());
+        self.moved.insert((fs, tree));
         for (k, ts, e) in &redo {
             // A move of a purged node (not a creation) stays as logged.
             if e.old.is_some() && self.get_node(t, (fs, tree, e.node)).await?.is_none() {
@@ -741,6 +745,11 @@ impl<'a> Engine<'a> {
         for ((fs, tree), h) in &self.trees {
             t.set(&keys::tree_header(*fs, tree), &h.encode());
             t.set_versionstamped_value(&keys::tree_head(*fs, tree), &[], &[]);
+        }
+        // A move adds a move-log entry, and maybe a trash child: work for
+        // the sweeper (a blind write, so concurrent commits don't conflict).
+        for (fs, tree) in &self.moved {
+            t.set(&keys::sweep_needed(*fs, tree), &[]);
         }
         let mut idx: u16 = 0;
         for k @ (fs, tree, node) in &self.dirty {
@@ -1089,7 +1098,9 @@ pub async fn chunks_get(
 
 // ------------------------------------------------------------------ sweeper
 
-/// One sweeper pass over every configured fs (spec/fs.md §6).
+/// One sweeper pass over every configured fs (spec/fs.md §6). Only the
+/// trees in the sweep index are visited: those with moves, trash or
+/// tombstones left.
 pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
     let l = &st.cfg.limits;
     let now_ms = unix_ms();
@@ -1106,24 +1117,26 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
     );
     for f in &st.cfg.fs {
         let fs = f.id;
-        let pfx = keys::trees(fs).finish();
-        let trees: Vec<Id> = {
-            let mut t = st.store.begin(None).await?;
-            t.snapshot_get_range(&pfx, &keys::end_of(&pfx), 100_000, false)
-                .await?
-                .into_iter()
-                .filter_map(
-                    |(k, _)| match unpack_prefix(&k[pfx.len()..], 1).ok()?.0.as_slice() {
-                        [Elem::Bytes(t)] => t[..].try_into().ok(),
-                        _ => None,
-                    },
-                )
-                .collect()
-        };
-        for tree in trees {
-            trim_log(st, fs, &tree, cutoff_ms).await?;
-            purge_tree(st, fs, &tree, cutoff_ms, PURGE).await?;
-            drop_tombstones(st, fs, &tree, &horizon_cvs).await?;
+        backfill_sweep_index(st, fs).await?;
+        let ipfx = keys::sweep_index(fs).finish();
+        let mut begin = ipfx.clone();
+        loop {
+            let page = {
+                let mut t = st.store.begin(None).await?;
+                t.snapshot_get_range(&begin, &keys::end_of(&ipfx), 1000, false)
+                    .await?
+            };
+            for (k, _) in &page {
+                let tree = tail_id(k, ipfx.len())?;
+                trim_log(st, fs, &tree, cutoff_ms).await?;
+                purge_tree(st, fs, &tree, cutoff_ms, PURGE).await?;
+                drop_tombstones(st, fs, &tree, &horizon_cvs).await?;
+                settle(st, fs, &tree).await?;
+            }
+            match page.last() {
+                Some((k, _)) if page.len() == 1000 => begin = key_after(k),
+                _ => break,
+            }
         }
         for _ in 0..100 {
             if collect_chunks(st, fs, &grace_cvs).await? == 0 {
@@ -1131,6 +1144,78 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// List every existing tree of `fs` in the sweep index, once: data from
+/// before the index has trees with work but no entries. A tree without work
+/// leaves the index on its first sweep.
+async fn backfill_sweep_index(st: &Shared, fs: u32) -> ApiResult<()> {
+    let ready = keys::sweep_index_ready(fs);
+    if st
+        .store
+        .begin(None)
+        .await?
+        .snapshot_get(&ready)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let pfx = keys::trees(fs).finish();
+    let mut begin = pfx.clone();
+    loop {
+        let (next, _) = txn_loop!(st.store, None, |t| {
+            let page = t
+                .snapshot_get_range(&begin, &keys::end_of(&pfx), 1000, false)
+                .await?;
+            for (k, _) in &page {
+                t.set(&keys::sweep_needed(fs, &tail_id(k, pfx.len())?), &[]);
+            }
+            Ok(match page.last() {
+                Some((k, _)) if page.len() == 1000 => Some(key_after(k)),
+                _ => None,
+            })
+        })?;
+        match next {
+            Some(k) => begin = k,
+            None => break,
+        }
+    }
+    txn_loop!(st.store, None, |t| {
+        t.set(&ready, &[]);
+        Ok(())
+    })?;
+    tracing::info!(fs, "sweep index backfilled");
+    Ok(())
+}
+
+/// Drop a tree from the sweep index once it has no move log, trash or
+/// tombstones left. Reads the entry and the ranges with conflicts, so a
+/// commit that adds work meanwhile keeps it listed.
+async fn settle(st: &Shared, fs: u32, tree: &Id) -> ApiResult<()> {
+    let entry = keys::sweep_needed(fs, tree);
+    txn_loop!(st.store, None, |t| {
+        if t.get(&entry).await?.is_none() {
+            return Ok(());
+        }
+        for p in [
+            keys::move_log(fs, tree).finish(),
+            keys::children(fs, tree, &TRASH).finish(),
+            keys::tombstones(fs, tree).finish(),
+        ] {
+            if !t
+                .get_range(&p, &keys::end_of(&p), 1, false)
+                .await?
+                .is_empty()
+            {
+                return Ok(());
+            }
+        }
+        t.clear(&entry);
+        t.clear(&keys::trash_cursor(fs, tree));
+        Ok(())
+    })?;
     Ok(())
 }
 

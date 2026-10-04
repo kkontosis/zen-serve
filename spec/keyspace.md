@@ -111,7 +111,9 @@ Leases are never deleted: the stored token is what keeps fencing tokens increasi
 | `pack("tm", fs, tree, hlc, dev)` | move log: `node ‖ parent ‖ u8 has_old ‖ [old_parent ‖ u64 old_hlc ‖ old_dev(32)]`: the parent and move timestamp the move replaced, restored on undo |
 | `pack("tv", fs, tree, cvs, node)` | change index: empty, or `0x01` for a purged node's tombstone |
 | `pack("tx", fs, tree, cvs, node)` | empty: tombstones only, so the sweeper can drop old ones without scanning the change index |
-| `pack("tq", fs, tree)` | `node(16)`: the trash-purge cursor, the `TRASH` child the sweeper's next purge round starts at (fs.md §6); absent means the first |
+| `pack("ts", fs, tree)` | empty: the sweep index, a tree that may have work for the sweeper (fs.md §6). Every commit with a `move` on the tree sets it (a blind write); the sweeper clears it once the tree has no move log, no `TRASH` children and no tombstones |
+| `pack("tsi", fs)` | empty: the sweep index of the fs is complete. Absent on data from before the index: the sweeper then lists every tree with a header (`tr`) in `ts` once, and sets it |
+| `pack("tq", fs, tree)` | `node(16)`: the trash-purge cursor, the `TRASH` child the sweeper's next purge round starts at (fs.md §6); absent means the first. Cleared with the tree's `ts` entry |
 | `pack("tp", fs, tree, node)` | `cvs(12)` of the node's tombstone: a purged node by id, so operations naming it are refused (fs.md §3.4); dropped with the tombstone |
 | `pack("tf", fs, tree, node, dot)` | content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest` |
 | `pack("ck", fs, chunk)` | sealed chunk |
@@ -134,5 +136,6 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * The move log is in timestamp order. Undo and redo read the range after a move's key.
 * A node's old `tv` entry is cleared when it changes again, so the change index holds one entry per live node, plus tombstones.
 * `resync_before` in the tree header is the newest tombstone the sweeper has dropped. A `changes` cursor before it gets 409 `resync`.
+* The sweeper visits only the trees in `ts`. A move is the only operation that adds a move-log entry or a `TRASH` child, and tombstones only come from purging a tree that is listed, so a tree outside the index has nothing to sweep (chunk GC is per fs, through `cz`).
 * The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count`. Records written before milestone 3.5 have no `write_count`, which then reads as 0.
 

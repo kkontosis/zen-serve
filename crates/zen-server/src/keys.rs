@@ -293,6 +293,23 @@ pub fn changes(fs: u32, tree: &[u8]) -> Key {
     Key::new().str("tv").int(fs.into()).bytes(tree)
 }
 
+/// `("ts", fs)`: the trees of an fs that the sweeper visits.
+pub fn sweep_index(fs: u32) -> Key {
+    Key::new().str("ts").int(fs.into())
+}
+
+/// A tree that may have work for the sweeper: `("ts", fs, tree)` → ∅,
+/// written with every move, cleared by the sweeper once there is none.
+pub fn sweep_needed(fs: u32, tree: &[u8]) -> Vec<u8> {
+    sweep_index(fs).bytes(tree).finish()
+}
+
+/// `("tsi", fs)` → ∅: the sweep index lists every tree with work, including
+/// trees from before it existed (backfilled once from the tree headers).
+pub fn sweep_index_ready(fs: u32) -> Vec<u8> {
+    Key::new().str("tsi").int(fs.into()).finish()
+}
+
 /// The tree's trash-purge cursor: `("tq", fs, tree)` → the `TRASH` child
 /// the next purge round starts at.
 pub fn trash_cursor(fs: u32, tree: &[u8]) -> Vec<u8> {

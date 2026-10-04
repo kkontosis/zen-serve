@@ -1207,3 +1207,80 @@ async fn depth_is_bounded() {
     let info: Info = h.get("/v1/info").await;
     assert_eq!(info.limits.crdt_max_depth, 3);
 }
+
+/// The sweeper visits only the trees in its index: a move lists the tree,
+/// and the sweeper drops it once its move log, trash and tombstones are
+/// gone. Data from before the index is listed once by a backfill.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweeper_visits_only_indexed_trees() {
+    use zen_server::keys;
+    let (h, a, _) = two_devices(|c| {
+        c.limits.crdt_horizon_secs = 2;
+        c.limits.crdt_max_skew_ms = 500;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let st = &h.server.state;
+    let store = st.store.clone();
+    let has = |k: Vec<u8>| {
+        let store = store.clone();
+        async move {
+            let mut t = store.begin(None).await.unwrap();
+            t.get(&k).await.unwrap().is_some()
+        }
+    };
+    let clear = |k: Vec<u8>| {
+        let store = store.clone();
+        async move {
+            let mut t = store.begin(None).await.unwrap();
+            t.clear(&k);
+            t.commit().await.unwrap();
+        }
+    };
+    let (entry, ready) = (keys::sweep_needed(1, &TREE), keys::sweep_index_ready(1));
+    let t = zfs::hlc(now_ms(), 0);
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"x")),
+            mv(id(1), TRASH, t + 1, None),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(has(entry.clone()).await, "a move lists the tree");
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        has(ready.clone()).await,
+        "the first sweep completes the index"
+    );
+    assert!(has(entry.clone()).await, "work left: still listed");
+
+    // A tree missing from a complete index is not visited.
+    clear(entry.clone()).await;
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(!get(&h, &a, &[id(1)]).await.is_empty(), "not visited");
+
+    // Without the marker (data from before the index), a sweep lists every
+    // tree again; then the trash is purged and, once its tombstone is
+    // dropped (an age in versions, polled), the tree leaves the index.
+    clear(ready.clone()).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(has(ready.clone()).await);
+    assert!(get(&h, &a, &[id(1)]).await.is_empty(), "purged");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while has(entry.clone()).await {
+        assert!(Instant::now() < deadline, "the tree leaves the index");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        zen_server::sweep_once(st).await.unwrap();
+    }
+    assert!(!has(keys::trash_cursor(1, &TREE)).await);
+
+    // New work lists it again.
+    ops(&h, &a, vec![mv(id(2), ROOT, zfs::hlc(now_ms(), 0), None)])
+        .await
+        .unwrap();
+    assert!(has(entry.clone()).await);
+}
