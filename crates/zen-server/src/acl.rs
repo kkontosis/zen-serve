@@ -315,10 +315,8 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
         Ok(())
     })?;
     let version = new.version;
+    // Also spends the claim token at version 1.
     st.set_acl(new);
-    if version == 1 {
-        st.consume_claim_token();
-    }
     tracing::info!(version, "ACL updated");
     Ok(Cbor(AclVersion { version }))
 }
@@ -438,7 +436,8 @@ pub async fn header_put(
     }))
 }
 
-/// Keep the in-memory ACL in sync with storage (other nodes, M3).
+/// Keep the in-memory ACL in sync with storage (other nodes, M3). A new
+/// head also spends this node's claim token when another node was claimed.
 pub async fn follow(st: Shared) {
     loop {
         let w = match st.store.watch(&keys::acl_head()).await {

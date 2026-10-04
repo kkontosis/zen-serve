@@ -132,7 +132,7 @@ Any number of zen-serve nodes can serve one cluster: nodes set up with `join`, o
 
 Every node runs the sweeper. Each sweep is idempotent.
 
-An unclaimed cluster prints a claim token on every node. Use the token of the node you send `/v1/acl/put` to.
+An unclaimed cluster prints a claim token on every node. Use the token of the node you send `/v1/acl/put` to. Once the cluster is claimed, every node deletes its `claim-token` file (api.md §4.1).
 
 ## 5. Backup and point-in-time restore (FoundationDB)
 

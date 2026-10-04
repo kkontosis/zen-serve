@@ -99,7 +99,7 @@ A session is checked again on every request: it stops working as soon as an ACL 
 ```
 
 * The ACL is authenticated by its own signature, so this request needs no session.
-* **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. The token is deleted once version 1 commits.
+* **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. Once version 1 commits, every node of the cluster forgets its token and deletes its `claim-token` file: the node that accepted it at once, every other node as soon as it sees the new ACL, and a node that was down when it next starts.
 * Validation rules: formats.md §9.3.
 * The version CAS failing returns 409 `version_mismatch`.
 

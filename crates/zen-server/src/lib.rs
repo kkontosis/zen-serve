@@ -346,6 +346,8 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         eprintln!("zen-serve: unclaimed; claim token: {t}");
         Some(t)
     } else {
+        // Claimed, perhaps through another node while this one was down.
+        state::remove_claim_token(&cfg.data_dir);
         None
     };
     let listener = tokio::net::TcpListener::bind(cfg.listen)
