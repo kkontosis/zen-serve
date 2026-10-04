@@ -168,17 +168,72 @@ cert = body ‖ hybrid_signature("zen/v1/sig/device-cert", body)                
 
 The verifier checks the signature with the expected user identity, **and** that `user_fp` in the body is that identity's fingerprint.
 
-The membership log that distributes certificates (G1) is specified in a later milestone.
+The membership log that distributes certificates (G1) is the ACL chain (§9).
 
 ## 8. Not yet specified
 
 These later-milestone formats are out of scope here:
 * commit records and signed roots
 * event checkpoints
-* the ACL document
-* the membership log
 * the authenticated (Merkle) integrity tier
 * CRDT op encodings
 * zen-db catalog and row encodings
 
 They'll reuse §4 and §7 and the labels already registered.
+
+## 9. Signed ACL and membership log (G1)
+
+The server ACL is a plaintext document containing only opaque ids. The server parses it and enforces it. Every version is kept, and each one names the hash of the previous one, so **the ACL chain is the membership log**: it distributes public identities and device certificates.
+
+### 9.1 Document
+
+Deterministic CBOR (RFC 8949 §4.2.1: definite lengths, shortest integers, map keys sorted bytewise by their encoding). Field names in that sorted order:
+
+```
+AclDoc = {
+  admins:    [bytes(32)],          // user_fp of each admin; each must be a member
+  grants:    [Grant],
+  limits:    [{fs: u32, max_keys: u64?, max_bytes: u64?}],
+  members:   [{devices: [bytes], identity: bytes}],   // device certs (§7.4), public identity (§7.2)
+  version:   u64,                  // 1, 2, 3, …
+  prev_hash: bytes(32),            // H(previous doc bytes), 32 zero bytes for version 1
+}
+Grant = {fs: u32, topic: bytes?, rights: [text], subject: bytes(32)}
+```
+
+* **Grants.** A grant without `topic` is an **fs grant**, with rights in {`read`, `write`}. A grant with `topic` is a **topic grant** covering every topic id with that byte prefix, with rights in {`read`, `append`, `consume`}. An empty `topic` covers all topics of the fs.
+* **Admins.** Being an admin carries the `admin` right: it can change the ACL and fs headers. It grants no data access by itself.
+
+### 9.2 Signing and hashing
+
+```
+SignedAcl = {doc: bytes, sig: bytes, signer: bytes(32)}        (CBOR)
+sig       = hybrid signature, purpose "zen/v1/sig/acl", msg = doc
+H(doc)    = BLAKE3.derive_key("zen/v1/acl-chain", doc)
+```
+
+Verifiers hash and verify the **received bytes of `doc`**. They never re-encode it.
+
+### 9.3 Acceptance rules (server, and clients walking the chain)
+
+1. `version` is the head version + 1 (1 if there is no head), and `prev_hash` is H(head doc), or zeros for version 1.
+2. `signer` is an admin of the **head** doc. For version 1 it must be an admin of the new doc, and the claim token is required (api.md §4.1). The signer's identity is taken from that doc's `members`, and `sig` must verify.
+3. The new doc is well formed:
+   * at least one admin, and every admin is a member
+   * member identities are unique, and every device certificate verifies against its member's identity
+   * every grant subject is a member, and every right is valid for its grant kind
+   * grant topics are 16·n bytes with n ≤ 16
+   * every grant and limit `fs` is a configured, non-zero fs_id
+
+Clients pin the head they've verified, and refuse a chain that doesn't extend it.
+
+## 10. Session signature
+
+To sign in (api.md §3), a device signs with its device identity (§7.1):
+
+```
+purpose = "zen/v1/sig/session"
+msg     = lp(challenge) ‖ lp(origin)
+```
+
+`origin` is the UTF-8 `scheme://host[:port]` of the server, as the client sees it.

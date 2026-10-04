@@ -1,0 +1,288 @@
+# HTTP / WebSocket API (v1)
+
+The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where the two differ. The storage layout behind it is in [keyspace.md](keyspace.md).
+
+## 1. Conventions
+
+* **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
+* **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3). Three requests don't need it: `/v1/info`, `/v1/auth/*` and `/v1/acl/put`.
+* **Errors.** An error response is `{code: text, message: text}` with this status:
+
+  | Status | `code` | Retry? |
+  |---|---|---|
+  | 400 | `bad_request` | no |
+  | 401 | `unauthorized` (no or expired session) | after signing in again |
+  | 403 | `forbidden` (ACL) | no |
+  | 404 | `not_found` (unknown fs, group, …) | no |
+  | 409 | `conflict`, `too_old` (read version left the ~5 s window) | **yes**, the whole transaction |
+  | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
+  | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
+  | 413 | `too_large` | no |
+  | 429 | `quota` | later |
+  | 501 | `not_implemented` (`crdt_ops`) | no |
+
+* **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
+
+## 2. `GET /v1/info`
+
+No authentication. Returns:
+
+```
+{ server: text, api: 1,
+  suites: [1],                       // supported suite ids (spec/suites.md)
+  formats: [1],
+  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static"
+  cross_origin_isolation: bool,      // DESIGN-3 §4.2
+  claimed: bool,                     // an ACL exists
+  limits: { max_key_bytes, max_value_bytes, max_envelope_bytes, max_commit_bytes,
+            max_commit_ops, max_range_items, idempotency_ttl_secs, session_ttl_secs } }
+```
+
+## 3. Sessions
+
+### 3.1 `POST /v1/auth/challenge`
+
+`{}` → `{challenge: bytes(32)}`. Challenges are single-use and expire after 60 s.
+
+### 3.2 `POST /v1/auth/session`
+
+```
+{ challenge: bytes(32), origin: text,
+  user: bytes,          // user's public identity (formats.md §7.2)
+  cert: bytes,          // device certificate issued by `user` (formats.md §7.4)
+  sig: bytes }          // device signature, purpose zen/v1/sig/session (formats.md §10)
+→ { token: bytes(32), expires_unix: u64, user_fp: bytes(32), device_fp: bytes(32) }
+```
+
+The server checks all of these, or returns 401:
+* the challenge is live
+* `origin` is one the server accepts (§3.3)
+* `user` is a member of the current ACL
+* `cert` verifies against `user`, and the certified device is listed under that member
+* `sig` verifies with the certified device's signing key
+
+A session is checked again on every request: it stops working as soon as an ACL version removes its device.
+
+### 3.3 Origin binding
+
+`origin` is the server origin **as the client sees it**: `scheme://host[:port]`, with no trailing slash. Binding it stops a malicious server from relaying a challenge from the real one. The server accepts:
+* each `public_origins` entry in its config, or
+* if that list is empty, `http://<Host>` and `https://<Host>` from the request's `Host` header.
+
+## 4. ACL and fs headers
+
+### 4.1 `POST /v1/acl/put`
+
+```
+{ acl: bytes,            // signed ACL (formats.md §9)
+  claim?: text }         // the claim token; required exactly for version 1
+→ { version: u64 }
+```
+
+* The ACL is authenticated by its own signature, so this request needs no session.
+* **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. The token is deleted once version 1 commits.
+* Validation rules: formats.md §9.3.
+* The version CAS failing returns 409 `version_mismatch`.
+
+### 4.2 `POST /v1/acl/get`
+
+`{from?: u64}` → `{head: u64, entries: [bytes]}`. Returns the signed ACLs from version `from` (default: `head`) up to `head`, in order, so clients can verify the chain (G1). Needs a session.
+
+### 4.3 `POST /v1/fs/list`
+
+`{}` → `{fs: [{id: u32, rights: [text]}]}`: the configured filesystems on which the caller has at least one right (fs or topic).
+
+### 4.4 `POST /v1/fs/header/get` and `/v1/fs/header/put`
+
+```
+get: {fs}                                   → {header: bytes?, version: bytes(10)?}
+put: {fs, header: bytes, expect: bytes(10)?} → {version: bytes(10)}
+```
+
+* `get` needs fs `read`, or admin.
+* `put` needs admin. `expect` absent means "must not exist yet". A mismatch returns 409 `version_mismatch`.
+* The header (volume header + keyslots) is opaque to the server.
+
+## 5. KV
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `/v1/grv` | `{}` | `{read_version}` |
+| `/v1/kv/get` | `{fs, keys: [bytes], read_version?}` | `{read_version, items: [{key, value: bytes?, version: bytes(10)?}]}` |
+| `/v1/kv/range` | `{fs, begin: bytes, end: bytes?, limit?, reverse?, read_version?}` | `{read_version, items: [{key, value, version}], more: bool}` |
+
+* Everything needs fs `read`.
+* `keys` and range bounds are **stored keys** (formats.md §3.2). `value` is the sealed value, without the stored versionstamp; `version` is that versionstamp.
+* `/v1/kv/get` returns one item per requested key, in request order, with `value` and `version` null for a missing key.
+* `/v1/kv/range` reads `[begin, end)`, with `end` absent meaning the end of the fs.
+  * `limit` defaults to and is capped by `max_range_items`.
+  * `more` means the limit cut the range short. To continue, set `begin` to the last key ‖ `0x00` (or `end` to the last key, when `reverse`).
+* **Snapshots.** Reads at the same `read_version` see one consistent snapshot. If `read_version` is absent, the server takes a fresh one and returns it.
+  * A `read_version` must come from `/v1/grv` or an earlier read response.
+  * A read version older than about 5 s returns 409 `too_old`.
+
+## 6. Commit: the only write path
+
+```
+POST /v1/commit
+{ commit_id: bytes(16),
+  read_version?: u64,                                       // short mode
+  read_conflicts?: [{fs, begin: bytes, end: bytes?}],
+  expect?: [{fs, key: bytes, version: bytes(10)?}],         // long mode; version null = key must be absent
+  expect_ranges?: [{fs, begin: bytes, end: bytes?, hash: bytes(32)}],
+  writes?: [{fs, key: bytes, value: bytes?}],               // value null = delete
+  clear_ranges?: [{fs, begin: bytes, end: bytes?}],
+  append?: [{fs, topic: bytes, key_token: bytes(16)?, envelope: bytes}],
+  consume?: [{fs, group: bytes, partition?: u32, key_token: bytes(16)?,
+              from: bytes(12), to: bytes(12), token: u64}],
+  crdt_ops?: [any] }                                        // non-empty → 501
+→ { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)] }
+```
+
+The whole commit is **one storage transaction**: all of it applies, or none of it.
+
+1. **Idempotency.** If `commit_id` already committed, the stored result is returned and nothing is applied again. The record is kept for `idempotency_ttl_secs` (default 24 h, G13). A `commit_id` reused by a different device returns 409 `commit_id_reused`.
+2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`, and consumes need topic `consume`. Then sizes and quotas are checked.
+3. **Short mode.** With `read_version`, the transaction runs at that version, and every `read_conflicts` range conflicts with any write committed after it. That gives full serializability, including phantoms. Anything else the server reads (cursors, leases, idempotency) is checked the same way. A conflict returns 409 `conflict`.
+4. **Long mode.**
+   * Each `expect` key is re-read: its version must equal `version`, or the key must be absent when `version` is null.
+   * Each `expect_ranges` range is re-read, and its hash must equal `hash`, where
+     `hash = H("zen/v1/range-hash", concat over the range in key order of lp(stored_key) ‖ version(10))`, with `H(label, x) = BLAKE3.derive_key(label, x)`.
+   * A range with more than `max_range_items` items returns 413.
+   * Any mismatch returns 409 `conflict`.
+5. **Writes**, then **clears**. `writes` are applied in order, so the last write to a key wins.
+6. **Consumes** (§8.3) are processed before appends, in order.
+7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
+
+## 7. Log
+
+### 7.1 `POST /v1/log/append`
+
+`{commit_id, append: [...]}`: shorthand for a commit with only `append`. Same response as §6.
+
+### 7.2 `POST /v1/log/read`
+
+```
+{fs, topic: bytes, after?: bytes(12), key_token?: bytes(16), limit?}
+→ {events: [{offset: bytes(12), key_token: bytes(16)?, envelope: bytes}], more: bool}
+```
+
+* Returns events strictly after `after`, which defaults to the zero offset. With `key_token`, it returns only that key's events.
+* Needs topic `read`.
+
+## 8. Consumer groups
+
+### 8.1 `POST /v1/consume/groups`
+
+```
+{ fs, group: bytes(1..64), topic: bytes,
+  mode: "broadcast" | "sequential" | "partitioned" | "per_key" | "single_key",
+  partitions?: u32,        // partitioned: 1..=256
+  key_token?: bytes(16),   // single_key
+  max_inflight?: u32,      // events handed out per `next`; default 1
+  max_attempts?: u32,      // default 5; 0 = unlimited
+  on_poison?: "dlq" | "block",   // default "dlq" (G7)
+  start?: "earliest" | "latest" } // default "earliest"
+→ {created: bool}
+```
+
+* A group is **immutable** (G8). Creating it again with identical parameters returns `created: false`. Different parameters return 409 `group_exists`.
+* Needs topic `consume`.
+* `broadcast` stores only the definition. Its members read the log with their own cursors (§7.2, §9).
+* **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0.
+* A `per_key` group starting at `earliest` puts every key's first event on the ready list. A topic with more than 100,000 events returns 413; use `latest` instead.
+
+### 8.2 Leases (`sequential`, `partitioned`, `single_key`)
+
+```
+POST /v1/consume/lease    {fs, group, partition?: u32, token?: u64, ttl_ms?: u32}
+→ {token: u64, expires_version: u64, cursor: bytes(12)}
+POST /v1/consume/release  {fs, group, partition?, token}  → {}
+```
+
+* **Acquire or renew.** If the lease is empty, expired or released, the caller gets it with `token = previous token + 1`.
+  * If the caller passes the current `token` and holds the lease, it's renewed with the same token.
+  * Otherwise the response is 412 `not_leader`.
+* `ttl_ms` defaults to 10,000. Expiry is measured in versions (DESIGN-3 §3.1).
+
+### 8.3 Delivery and the consume step
+
+```
+POST /v1/consume/next
+{fs, group, partition?, token?, limit?, wait_ms?}
+→ {events: [{offset, key_token?, envelope, from: bytes(12), token: u64, attempts: u32}]}
+```
+
+* **Lease modes.** `token` must be the current lease token, or the response is 412 `not_leader`. The response holds the next `min(limit, max_inflight)` events of the partition after its cursor. `from` is the cursor that the event's consume step must present.
+  * For the first event, `from` is the cursor itself.
+  * For each later prefetched event, `from` is the previous event's offset.
+  * This is the **delivery gate**: an event is never handed out before the cursor reaches its predecessor, except as prefetch to the lease holder, and commits must still land in order.
+* **`per_key`.** No lease is needed. The server takes up to `limit` keys from the front of the ready list that have no live claim, oldest pending event first. For each key it creates a claim with a fresh `token`, valid for `claim_ttl` (30 s by default), and returns the key's next event, with `from` = the key's last committed offset.
+* **Long-polling.** With `wait_ms` (≤ 30,000) and nothing to deliver, the request waits for an append to the topic.
+* **Consume step.** A consume entry in a commit, `{group, partition | key_token, from, to, token}`, checks four things and advances atomically with the rest of the commit:
+  1. The token is current: the lease (412 `not_leader`) or the key's claim (412 `claim_lost`).
+  2. The cursor equals `from` (412 `cursor_moved`).
+  3. `to` is the next eligible event after `from` (412 `cursor_moved` otherwise).
+  4. Then the cursor is set to `to` and the attempt counter is cleared.
+  * For `per_key` it also moves the key's ready entry to the key's next event, if there is one, and releases the claim.
+  * A commit with only `consume` acknowledges an event without writes.
+
+### 8.4 Failure, poison events and the DLQ (G7)
+
+```
+POST /v1/consume/nack {fs, group, partition? | key_token?, offset: bytes(12), token} → {attempts: u32, dead_lettered: bool}
+```
+
+* **Nack** increments the event's attempt counter and, for `per_key`, releases the claim.
+* When `attempts` reaches `max_attempts` and `on_poison` is `dlq`, then in the same transaction:
+  * the event is copied to the group's dead-letter list
+  * the cursor or key advances past it, exactly like a consume step
+* With `on_poison = block`, the event is redelivered indefinitely.
+
+```
+POST /v1/consume/dlq/list  {fs, group, after?: bytes(12), limit?} → {items: [{id: bytes(12), offset, topic, key_token?, envelope}]}
+POST /v1/consume/dlq/retry {fs, group, id, commit_id} → commit result (re-appends the envelope to its topic)
+POST /v1/consume/dlq/drop  {fs, group, id} → {}
+```
+
+* `retry` re-appends the envelope unchanged, with a new offset. It still decrypts, because the AAD binds only the fs, topic and key token.
+
+### 8.5 `POST /v1/consume/cursor`
+
+`{fs, group, partition? | key_token?}` → `{cursor: bytes(12), low_watermark: bytes(12)?}`
+
+`low_watermark` is the offset of the oldest pending event in a `per_key` group's ready list.
+
+## 9. WebSocket `/v1/stream`
+
+* Binary frames, each holding one CBOR map with an `op` field.
+* The first frame must be `{op: "auth", token: bytes}`. Nothing else is accepted before it.
+
+**Client → server:**
+
+| `op` | Fields | Effect |
+|---|---|---|
+| `auth` | `token` | authenticate the stream |
+| `sub` | `id: u32, fs, topic?, prefix?, after?: bytes(12)` | Subscribe to one topic, or to every topic under a topic-id prefix (an empty prefix means the whole fs). Needs topic `read`. History after `after` is streamed from storage, then live events follow **with no gap and no reordering** (G9). With no `after`, only new events are sent. |
+| `unsub` | `id` | stop a subscription |
+| `epub` | `fs, topic, data: bytes` | ephemeral publish, never stored. Needs topic `append`. |
+| `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe. Needs topic `read`. |
+
+**Server → client:**
+
+| `op` | Fields |
+|---|---|
+| `ok` | `id?` |
+| `ev` | `id, topic, offset, key_token?, envelope` |
+| `eph` | `id, topic, data, sender: bytes(32)` (device fp) |
+| `err` | `id?, code, message` |
+
+* Watches only wake a subscription. The data always comes from a range read after the subscription's cursor, so reconnecting with the last received `offset` loses nothing.
+* Ephemeral data should be sealed by the client with the topic key plus a sequence number (G21). The server forwards it as opaque bytes.
+
+## 10. Static files
+
+* `GET /unencrypted/*`, the root aliases, and the SPA fallback for `GET` with `Accept: text/html` (DESIGN-3 §4.2).
+* Responses carry a default `Content-Security-Policy` with `require-trusted-types-for 'script'` (G15), plus `X-Content-Type-Options: nosniff`.
+* When `cross_origin_isolation = true`, **every** response, `/v1` included, also carries COOP `same-origin`, COEP `require-corp` and CORP `same-origin`.

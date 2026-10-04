@@ -23,11 +23,13 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/device-sig` | device secret | empty | device identity seed |
 | `zen/v1/device-kem` | device secret | empty | X-Wing decapsulation seed |
 
-## Hash label
+## Hash labels (`BLAKE3.derive_key(label, data)`)
 
 | Label | Use |
 |---|---|
 | `zen/v1/fingerprint` | `FP(public_bytes)` |
+| `zen/v1/acl-chain` | `H(doc)` of a signed ACL, chaining ACL versions (formats.md §9.2) |
+| `zen/v1/range-hash` | hash of a KV range for `expect_ranges` (api.md §6) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 
@@ -47,8 +49,9 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig/device-cert` | user identity | device certificate body (formats.md §7.4) |
 | `zen/v1/sig/commit` | device | commit record / signed root (later milestone) |
 | `zen/v1/sig/checkpoint` | device | per-device event checkpoint, every `sig_every` events (later milestone) |
-| `zen/v1/sig/acl` | admin identity | signed ACL document (later milestone) |
-| `zen/v1/sig/membership` | admin identity | membership-log entry (later milestone) |
+| `zen/v1/sig/acl` | admin identity | signed ACL document (formats.md §9) |
+| `zen/v1/sig/membership` | admin identity | reserved; the membership log is the ACL chain (formats.md §9) |
+| `zen/v1/sig/session` | device | sign-in challenge (formats.md §10) |
 | `zen/v1/sig/event` | device | a single event (later milestone) |
 
 Signing with a purpose not in this table is an error.
