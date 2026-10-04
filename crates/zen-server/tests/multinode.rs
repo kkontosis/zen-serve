@@ -287,3 +287,70 @@ async fn claiming_one_node_removes_every_claim_token_file() {
         "stale claim-token file deleted at start"
     );
 }
+
+/// The credential store, the login-name index, the fake parameters and the
+/// origin pin are shared by every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn credentials_and_pins_cross_nodes() {
+    use zen_core::pwkey::PasswordKey;
+    use zen_core::vectors::FIXTURE_ARGON2;
+    let Some((a, b, ta, _, _, _)) = two_nodes().await else {
+        return;
+    };
+    async fn params(h: &Harness, name: &str) -> PasswordParams {
+        let req = PasswordParamsRequest { name: name.into() };
+        h.call("/v1/auth/password/params", None, &req)
+            .await
+            .unwrap()
+    }
+    // Fakes agree across nodes.
+    assert_eq!(params(&a, "ghost").await, params(&b, "ghost").await);
+
+    // Register on A, sign in on B.
+    let (key, salt) =
+        PasswordKey::create(b"pw", FIXTURE_ARGON2, &mut zen_core::rng::OsRng).unwrap();
+    let set = PasswordSet {
+        name: "alice".into(),
+        salt: salt.to_vec(),
+        m_cost_kib: FIXTURE_ARGON2.m_cost_kib,
+        t_cost: FIXTURE_ARGON2.t_cost,
+        p_cost: FIXTURE_ARGON2.p_cost,
+        identity: key.public().encode(),
+    };
+    let id: CredentialId = a
+        .call("/v1/auth/password/set", Some(&ta), &set)
+        .await
+        .unwrap();
+    assert_eq!(params(&b, "alice").await.salt, salt.to_vec());
+    let c: Challenge = b.call("/v1/auth/challenge", None, &Empty {}).await.unwrap();
+    let origin = b.origin();
+    let req = PasswordSessionRequest {
+        name: "alice".into(),
+        sig: key.sign_session(&c.challenge, &origin).unwrap(),
+        challenge: c.challenge,
+        origin,
+    };
+    let s: Session = b
+        .call("/v1/auth/password/session", None, &req)
+        .await
+        .unwrap();
+    fs_list(&b, &s.token).await.unwrap();
+
+    // Removed on A: B stops accepting the session within its cache time.
+    let _: Empty = a
+        .call("/v1/auth/credentials/remove", Some(&ta), &id)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fs_list(&b, &s.token).await.is_ok() {
+        assert!(Instant::now() < deadline, "B kept the session");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Both nodes see the pin set through A's first sign-in.
+    let st: OriginState = b
+        .call("/v1/admin/origins/get", Some(&ta), &Empty {})
+        .await
+        .unwrap();
+    assert_eq!(st.pinned, vec![a.origin()]);
+}

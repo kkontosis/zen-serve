@@ -31,13 +31,18 @@ opaque        = false   # method 3
 api_tokens    = false   # method 4
 mtls          = true    # method 5
 password_keys = true    # method 6
+# Origin policy (§5): origin_pinning, origin_pinning_always, acl_origins.
+# Method 6 (§11): password_m_cost_kib, password_t_cost, password_p_cost,
+#                 password_max_failures, password_lockout_secs.
 ```
 
 `/v1/info` (api.md §2) carries:
 
 ```
-auth: { methods: [text],     // offered methods, in id order
-        default?: text }     // the method a client offers first
+auth: { methods: [text],               // offered methods, in id order
+        default?: text,                // the method a client offers first
+        origins?: {…},                 // the origin policy (§5.5)
+        password_params?: {…} }        // method 6 registration parameters (§11.2)
 ```
 
 `default` is the first offered method in the order `password_key`, `passkey`, `device_key`, `opaque`, `mtls`. API tokens are for services and never the default. Older servers send no `auth`; clients then assume `["device_key"]`.
@@ -71,7 +76,7 @@ The session response's `device_fp` carries the credential id, and `method` names
 3. The user is a member of the current ACL; for `device_key`, the device is still certified under that member.
 4. For the other methods, the credential still exists in the credential store (§4).
 
-Steps 1–3 apply immediately on every node. A removed credential, like a logout, stops working at once on the node that removed it and within 10 s on the others (their session cache).
+Steps 2 and 3 apply immediately on every node. A logout or a removed credential (steps 1 and 4) takes effect at once on the node that handled it and within 10 s on the others (their session cache).
 
 ## 4. Credential store
 
@@ -291,3 +296,14 @@ Signing in never gives the server a key to the data. Which methods can also **un
 | 6 `password_key` | yes | yes: the client holds the password, so it can also open or create a passphrase keyslot (formats.md §6, type 1) |
 
 For method 6 the sign-in key and a passphrase keyslot are independent derivations, with separate salts and labels: neither reveals the other. Using the same password for both is the user's choice. The server already holds an offline-guessable verifier for each (§11.4).
+
+## 13. Adding a method
+
+For implementers of the reserved methods (2, 3, 5). A method:
+1. Adds itself to `auth::IMPLEMENTED` in zen-server once it works; its `AuthMethod` variant, id, wire name and `[auth]` flag already exist.
+2. Calls `AppState::require_method` first in each of its endpoints.
+3. Stores its credentials with `cred::put`, as a `CredRecord` with its method id and any new optional fields it needs, and finds them with `cred::get`, `cred::owner`, `cred::list` and, for a typed name, `cred::login` (§4.2). Credential removal, listing, the per-user limit and the clean-up when a member leaves the ACL then work unchanged.
+4. Ends a sign-in with `auth::issue_session(user, credential id, method, signed)`. A method that signs a challenge and an origin passes them as `Signed`, which spends the challenge and applies the origin policy (§5) in the session's transaction, pinning the first origin. A method that signs no origin passes `None`.
+5. Documents itself in its section here, in api.md §3 and in TECH_DEBT.md for what it defers.
+
+Sessions of a method other than device keys stay valid only while their credential exists in the store (§3, step 4), so every such session must name a stored credential.
