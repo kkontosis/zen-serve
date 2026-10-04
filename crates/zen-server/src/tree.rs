@@ -1251,12 +1251,20 @@ struct PurgeSizes {
     batch: usize,
     /// Children read per node per round.
     page: usize,
+    /// Before a partial purge, at most this many recent move-log entries
+    /// are checked, and at most this many node records read for their
+    /// ancestors. Past either, partial purges wait (the subtree counts as
+    /// blocked).
+    recent_entries: usize,
+    recent_reads: usize,
 }
 
 const PURGE: PurgeSizes = PurgeSizes {
     tops: 100,
     batch: 500,
     page: 500,
+    recent_entries: 5_000,
+    recent_reads: 2_000,
 };
 
 /// Rounds per tree per sweeper pass.
@@ -1400,6 +1408,86 @@ async fn walk_top(
     Ok((Walk::Partial, out))
 }
 
+/// The `TRASH` children whose subtree holds a node that moved at or after
+/// the cutoff, found from the move log (which keeps every such move): each
+/// named node whose current move is recent, walked up to its `TRASH` child.
+/// `None` when there are too many to check within the caps. The log range is
+/// read with a conflict, so a move committed meanwhile retries the round.
+async fn recent_tops(
+    t: &mut Box<dyn Txn>,
+    fs: u32,
+    tree: &Id,
+    cutoff_ms: u64,
+    max_depth: u32,
+    z: PurgeSizes,
+) -> ApiResult<Option<HashSet<Id>>> {
+    let prefix = keys::move_log(fs, tree);
+    let pfx = prefix.clone().finish();
+    let begin = prefix.int(zfs::hlc(cutoff_ms, 0) as i64).finish();
+    let got = t
+        .get_range(&begin, &keys::end_of(&pfx), z.recent_entries + 1, false)
+        .await?;
+    if got.len() > z.recent_entries {
+        return Ok(None);
+    }
+    let named: BTreeSet<Id> = got
+        .iter()
+        .map(|(_, v)| LogEntry::decode(v).map(|e| e.node))
+        .collect::<ApiResult<_>>()?;
+    // Node → the `TRASH` child at or above it (`None`: not in the trash).
+    let mut top_of: HashMap<Id, Option<Id>> = HashMap::new();
+    let mut tops = HashSet::new();
+    let mut reads = 0usize;
+    for x in named {
+        reads += 1;
+        if reads > z.recent_reads {
+            return Ok(None);
+        }
+        let Some(rec) = t
+            .get(&keys::node(fs, tree, &x))
+            .await?
+            .map(|v| NodeRec::decode(&v))
+            .transpose()?
+        else {
+            continue; // purged since
+        };
+        if hlc_ms(rec.move_ts.hlc) < cutoff_ms {
+            continue; // a skipped or superseded move: the node's own is old
+        }
+        let mut path = Vec::new();
+        let (mut n, mut parent) = (x, rec.parent);
+        let top = loop {
+            if let Some(known) = top_of.get(&n) {
+                break *known;
+            }
+            path.push(n);
+            if path.len() > max_depth as usize + 2 {
+                return Ok(None); // not a tree: don't guess
+            }
+            match parent {
+                Some(p) if p == TRASH => break Some(n),
+                Some(p) if p != ROOT => {
+                    reads += 1;
+                    if reads > z.recent_reads {
+                        return Ok(None);
+                    }
+                    n = p;
+                    parent = match t.get(&keys::node(fs, tree, &p)).await? {
+                        Some(v) => NodeRec::decode(&v)?.parent,
+                        None => break None, // an orphan: not in the trash
+                    };
+                }
+                _ => break None,
+            }
+        };
+        for p in path {
+            top_of.insert(p, top);
+        }
+        tops.extend(top);
+    }
+    Ok(Some(tops))
+}
+
 /// One purge round (one transaction): examine up to `z.tops` `TRASH`
 /// children from the tree's purge cursor on, purge up to `z.batch` nodes of
 /// the subtrees whose every node moved before the cutoff, and move the
@@ -1430,21 +1518,42 @@ async fn purge_trash(
         // Where the next round starts; `None` is the beginning.
         let mut next = None;
         let mut all = true;
+        // Subtrees with a recent node, read once per round when needed.
+        let mut recent: Option<Option<HashSet<Id>>> = None;
         for (k, _) in &tops {
             let top = tail_id(k, tpfx.len())?;
             let room = z.batch - doomed.len();
-            let (walk, order) = walk_top(&mut t, fs, tree, top, cutoff_ms, z, room).await?;
+            let (mut walk, order) = walk_top(&mut t, fs, tree, top, cutoff_ms, z, room).await?;
             let progress = !order.is_empty();
-            doomed.extend(order);
+            if matches!(walk, Walk::Partial) && progress {
+                // The walk didn't see the whole subtree: a recent node may
+                // be in the part it didn't reach.
+                if recent.is_none() {
+                    let depth = st.cfg.limits.crdt_max_depth;
+                    recent = Some(recent_tops(&mut t, fs, tree, cutoff_ms, depth, z).await?);
+                }
+                if recent
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .is_none_or(|r| r.contains(&top))
+                {
+                    walk = Walk::Blocked;
+                }
+            }
             match walk {
+                Walk::Blocked => next = id_after(&top),
                 // More of it can go next round: resume there.
                 Walk::Partial if progress => {
+                    doomed.extend(order);
                     next = Some(top);
                     all = false;
                     break;
                 }
-                // Blocked for now, purged, or stuck: move on.
-                _ => next = id_after(&top),
+                // Purged, or stuck: move on.
+                _ => {
+                    doomed.extend(order);
+                    next = id_after(&top);
+                }
             }
             if doomed.len() >= z.batch {
                 all = false;
@@ -1695,16 +1804,19 @@ mod tests {
                 tops: 100,
                 batch: 100,
                 page: 2,
+                ..PURGE
             },
             PurgeSizes {
                 tops: 1,
                 batch: 3,
                 page: 2,
+                ..PURGE
             },
             PurgeSizes {
                 tops: 2,
                 batch: 1,
                 page: 5,
+                ..PURGE
             },
         ] {
             let (st, _dir) = state();
@@ -1763,6 +1875,7 @@ mod tests {
             tops: 2,
             batch: 100,
             page: 100,
+            ..PURGE
         };
         purge_tree(&st, FS, &TREE, cutoff, z).await.unwrap();
         let left: Vec<Id> = nodes(&st).await.into_keys().collect();
@@ -1771,5 +1884,79 @@ mod tests {
         // Once they are old too, the rest goes.
         purge_tree(&st, FS, &TREE, recent + 1, z).await.unwrap();
         assert!(nodes(&st).await.is_empty());
+    }
+
+    /// A subtree larger than one round, with a node deep inside that moved
+    /// recently: nothing of it is purged, even where the walk stops before
+    /// reaching that node, until the move is older than the cutoff.
+    #[tokio::test]
+    async fn partial_purge_waits_for_a_recent_node_anywhere_in_the_subtree() {
+        let old = unix_ms() - HOUR_MS;
+        let recent = unix_ms();
+        let cutoff = unix_ms() - 60_000;
+        let (st, _dir) = state();
+        // D(1) → {E(2) → F(3), 100..130}. The walk visits the highest ids
+        // first, so the leaves fill the round before it reaches E and F.
+        let mut ops = vec![(id(1), ROOT, old), (id(2), id(1), old), (id(3), id(2), old)];
+        ops.extend((100..130).map(|n| (id(n), id(1), old)));
+        ops.push((id(1), TRASH, old + 1));
+        ops.push((id(9), ROOT, old)); // live, with a recent move of its own
+        moves(&st, &ops).await;
+        moves(&st, &[(id(4), id(3), recent), (id(10), id(9), recent)]).await;
+        let z = PurgeSizes {
+            tops: 100,
+            batch: 5,
+            page: 100,
+            ..PURGE
+        };
+        let all = nodes(&st).await.len();
+        purge_tree(&st, FS, &TREE, cutoff, z).await.unwrap();
+        assert_eq!(nodes(&st).await.len(), all, "nothing purged");
+        // Once the move is older than the cutoff, the subtree goes, over
+        // several rounds.
+        purge_tree(&st, FS, &TREE, recent + 1, z).await.unwrap();
+        let left: Vec<Id> = nodes(&st).await.into_keys().collect();
+        assert_eq!(left, vec![id(9), id(10)]);
+        assert_no_orphans(&st).await;
+    }
+
+    /// When the recent moves are too many to check, a partial purge waits;
+    /// a subtree small enough for one round is still purged (its walk sees
+    /// every node).
+    #[tokio::test]
+    async fn partial_purge_waits_when_recent_moves_exceed_the_caps() {
+        let old = unix_ms() - HOUR_MS;
+        let recent = unix_ms();
+        let cutoff = unix_ms() - 60_000;
+        let (st, _dir) = state();
+        // Big D(1) → 100..110 and small S(2) → 120, both in the trash.
+        let mut ops = vec![(id(1), ROOT, old), (id(2), ROOT, old)];
+        ops.extend((100..110).map(|n| (id(n), id(1), old)));
+        ops.push((id(120), id(2), old));
+        ops.extend([(id(1), TRASH, old + 1), (id(2), TRASH, old + 1)]);
+        ops.push((id(9), ROOT, old));
+        moves(&st, &ops).await;
+        // Recent moves outside the trash only.
+        let live: Vec<_> = (10..14).map(|n| (id(n), id(9), recent)).collect();
+        moves(&st, &live).await;
+        let z = |entries, reads| PurgeSizes {
+            tops: 100,
+            batch: 5,
+            page: 100,
+            recent_entries: entries,
+            recent_reads: reads,
+        };
+        for capped in [z(3, 100), z(100, 3)] {
+            purge_tree(&st, FS, &TREE, cutoff, capped).await.unwrap();
+            let left = nodes(&st).await;
+            assert!(left.contains_key(&id(1)) && left.contains_key(&id(100)));
+            assert!(!left.contains_key(&id(2)), "small subtree purged");
+        }
+        // Within the caps, nothing recent is under D: it goes.
+        purge_tree(&st, FS, &TREE, cutoff, z(100, 100))
+            .await
+            .unwrap();
+        let left: Vec<Id> = nodes(&st).await.into_keys().collect();
+        assert_eq!(left, vec![id(9), id(10), id(11), id(12), id(13)]);
     }
 }
