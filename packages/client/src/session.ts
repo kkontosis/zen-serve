@@ -5,7 +5,7 @@ import { randomBytes, utf8 } from './bytes.js';
 import type { Client } from './client.js';
 import { Fs } from './fs.js';
 import { type Authenticator, passkeyCreate } from './passkey.js';
-import { Stream } from './stream.js';
+import { Stream, type StreamOptions } from './stream.js';
 import type { Dec, Enc } from './transport.js';
 import { zw } from './wasm.js';
 
@@ -72,8 +72,8 @@ export class Session {
   }
 
   /** Open the WebSocket stream (§9). */
-  stream(): Promise<Stream> {
-    return Stream.open(this);
+  stream(opts?: StreamOptions): Promise<Stream> {
+    return Stream.open(this, opts);
   }
 
   // ---------------------------------------------------------------- credentials

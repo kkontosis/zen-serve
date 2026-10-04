@@ -6,7 +6,7 @@ import { ZenError } from './errors.js';
 import { Kv, type Transaction, type TxnOptions, transaction } from './kv.js';
 import { Topic } from './log.js';
 import type { Argon2, Session } from './session.js';
-import { Tree } from './tree.js';
+import { Tree, type TreeOptions } from './tree.js';
 import { zw } from './wasm.js';
 
 /** Keyslot types (formats.md §6). */
@@ -239,8 +239,8 @@ export class UnlockedFs {
   }
 
   /** A filesystem tree by id (`tree.ts`). */
-  tree(id: Uint8Array): Tree {
-    return new Tree(this, id);
+  tree(id: Uint8Array, opts?: TreeOptions): Tree {
+    return new Tree(this, id, opts);
   }
 
   // ------------------------------------------------------------ keyslot admin

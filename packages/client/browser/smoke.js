@@ -1,7 +1,7 @@
 // Browser smoke test of @zen/client, driven by smoke.spec.ts: the page is
 // served by zen-serve itself (unencrypted_dir), so the client's origin is the
 // server's. The steps' results go to `window.smoke`.
-import { browserAuthenticator, bytes, connect, prfSlotSalts } from './client/index.js';
+import { browserAuthenticator, bytes, connect, prfSlotSalts, ROOT, Tree } from './client/index.js';
 
 const log = (m) => {
   document.getElementById('log').textContent += `${m}\n`;
@@ -42,7 +42,25 @@ async function run(cfg) {
   await fs.kv.set(['smoke', 'hello'], bytes.utf8('from the browser'));
   out.kv = bytes.fromUtf8(await fs.kv.get(['smoke', 'hello']));
 
-  if (cfg.extra) Object.assign(out, await cfg.extra(sp, fs));
+  // The CRDT filesystem: a file of two chunks, written and read back.
+  const tree = fs.tree(Tree.newId());
+  const node = await tree.create(ROOT, 'notes.txt');
+  const data = new Uint8Array(100_000).map((_, i) => i % 251);
+  await tree.writeFile(node, data);
+  out.file = bytes.equal(await tree.readFile(node), data);
+  out.listing = (await tree.list(ROOT)).map((n) => n.meta.name);
+
+  // The WebSocket stream: a subscription receives an append.
+  const topic = fs.topic('chat', 'room');
+  const stream = await sp.stream();
+  const sub = await stream.subscribe(topic);
+  await topic.append(bytes.utf8('hi from the browser'));
+  for await (const ev of sub) {
+    out.event = bytes.fromUtf8(ev.payload);
+    break;
+  }
+  stream.close();
+  log('tree and stream done');
   fs.close();
   return out;
 }

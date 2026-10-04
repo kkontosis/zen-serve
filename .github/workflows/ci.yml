@@ -119,6 +119,7 @@ jobs:
         run: |
           npx biome check
           npx tsc -p packages/client/tsconfig.test.json
+          npx tsc -p packages/fuse/tsconfig.json --noEmit
       - name: Test (Node)
         run: npx vitest run
       - name: Test (Chromium)

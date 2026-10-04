@@ -22,7 +22,21 @@ export {
   type TxnOptions,
   transaction,
 } from './kv.js';
-export { Topic } from './log.js';
+export {
+  type AppendOptions,
+  Consumer,
+  type Delivery,
+  Dlq,
+  type DlqEntry,
+  type GroupOptions,
+  Leader,
+  type LeaderOptions,
+  type LeaseOptions,
+  type NextOptions,
+  type ReadOptions,
+  Topic,
+  type TopicEvent,
+} from './log.js';
 export {
   type Authenticator,
   browserAuthenticator,
@@ -32,7 +46,40 @@ export {
   type GetResult,
 } from './passkey.js';
 export { type Argon2, Session, type UnlockMaterial } from './session.js';
-export { Stream } from './stream.js';
+export {
+  type EphemeralMessage,
+  Stream,
+  type StreamEvent,
+  type StreamOptions,
+  type StreamTarget,
+  type SubscribeOptions,
+  Subscription,
+} from './stream.js';
 export { Transport, type TransportOptions } from './transport.js';
-export { Tree } from './tree.js';
+export {
+  CHUNK_SIZE,
+  type ChangeBatch,
+  type ChunkCache,
+  type ChunkIndex,
+  type ClockStore,
+  type CreateOptions,
+  computeChain,
+  displayNames,
+  type FileVersion,
+  memoryClockStore,
+  type NodeStat,
+  type OpRecord,
+  opBytes,
+  type PendingOp,
+  ROOT,
+  TRASH,
+  Tree,
+  TreeBatch,
+  type TreeChange,
+  TreeClock,
+  type TreeNode,
+  type TreeOptions,
+  type WriteOptions,
+  type WrittenFile,
+} from './tree.js';
 export { initWasm, zw } from './wasm.js';

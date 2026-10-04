@@ -74,7 +74,7 @@ test.beforeAll(async () => {
 
 test.afterAll(() => server?.stop());
 
-test('sign in, passkey with PRF unlock, KV', async ({ page }) => {
+test('sign in, passkey with PRF unlock, KV, files, stream', async ({ page }) => {
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('WebAuthn.enable');
   await cdp.send('WebAuthn.addVirtualAuthenticator', {
@@ -104,4 +104,7 @@ test('sign in, passkey with PRF unlock, KV', async ({ page }) => {
   expect(r.prf).toBe(true);
   expect(r.passkeyMethod).toBe('passkey');
   expect(r.kv).toBe('from the browser');
+  expect(r.file).toBe(true);
+  expect(r.listing).toEqual(['notes.txt']);
+  expect(r.event).toBe('hi from the browser');
 });
