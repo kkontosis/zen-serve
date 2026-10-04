@@ -1,0 +1,35 @@
+[package]
+name = "zen-core"
+version = "0.1.0"
+description = "zen-serve client-side crypto core: formats, key hierarchy, AEAD, keyslots, signatures"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Deterministic RNG and the test-vector generator. Never enable in production builds.
+test-utils = ["dep:serde_json"]
+
+[dependencies]
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+blake3 = { version = "1.8", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "zeroize"] }
+getrandom = "0.4"
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "zeroize"] }
+x-wing = { version = "0.1", features = ["zeroize", "hazmat"] }
+zeroize = { version = "1.8", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = "1"
+zen-core = { path = ".", features = ["test-utils"] }
+
+[[example]]
+name = "gen_vectors"
+required-features = ["test-utils"]
