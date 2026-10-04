@@ -97,3 +97,49 @@ fn signature_vectors_verify_from_files() {
     );
     assert_eq!(created, 1_790_000_000);
 }
+
+#[test]
+fn fs_vectors_open_from_files() {
+    use zen_core::fs;
+    let fsk = fs_from_file();
+    let v = load("fs.json");
+    let tree: [u8; 16] = hx(&v["tree"]).try_into().unwrap();
+    let node: [u8; 16] = hx(&v["node"]).try_into().unwrap();
+    assert_eq!(fsk.fs_data_key().to_vec(), hx(&v["fs_data_key"]));
+    let meta = fs::open_meta(&fsk, &tree, &node, &hx(&v["meta"]["sealed"])).unwrap();
+    assert_eq!(meta, vectors::fixture_meta());
+    assert_eq!(meta.encode().unwrap(), hx(&v["meta"]["plaintext"]));
+    // Bound to its node: another node id fails.
+    assert!(fs::open_meta(&fsk, &tree, &[0x23; 16], &hx(&v["meta"]["sealed"])).is_err());
+    let m = fs::open_manifest(&fsk, &tree, &node, &hx(&v["manifest"]["sealed"])).unwrap();
+    assert_eq!(m.encode(), hx(&v["manifest"]["plaintext"]));
+    assert_eq!(m.size, 70_000);
+    let cid: [u8; 16] = hx(&v["chunk"]["id"]).try_into().unwrap();
+    assert_eq!(
+        fs::open_chunk(&fsk, &cid, &hx(&v["chunk"]["sealed"])).unwrap(),
+        hx(&v["chunk"]["plaintext"])
+    );
+    // Kinds are not interchangeable.
+    assert!(fs::open_manifest(&fsk, &tree, &node, &hx(&v["meta"]["sealed"])).is_err());
+    let device: [u8; 32] = hx(&v["device"]).try_into().unwrap();
+    let mut chain = [0u8; 32];
+    for step in v["op_chain"]["steps"].as_array().unwrap() {
+        chain = fs::chain_next(&chain, &hx(&step["op"]), &device);
+        assert_eq!(chain.to_vec(), hx(&step["chain"]));
+    }
+    let hlc = v["hlc"]["hlc"].as_u64().unwrap();
+    assert_eq!(fs::hlc_ms(hlc), v["hlc"]["unix_ms"].as_u64().unwrap());
+}
+
+#[test]
+fn hlc_clock_rules() {
+    use zen_core::fs::{Clock, hlc};
+    let mut c = Clock::default();
+    let a = c.tick(1000);
+    assert_eq!(a, hlc(1000, 0));
+    let b = c.tick(1000);
+    assert_eq!(b, hlc(1000, 1));
+    c.observe(hlc(5000, 3));
+    assert_eq!(c.tick(1001), hlc(5000, 4));
+    assert!(c.tick(6000) > hlc(5000, 4));
+}

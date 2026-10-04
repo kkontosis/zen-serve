@@ -11,6 +11,8 @@ pub const KV_NAME: &str = "zen/v1/kv-name";
 pub const TOPIC_NAME: &str = "zen/v1/topic-name";
 /// KDF: per-(fs, epoch) root of the topic data-key tree.
 pub const TOPIC_DATA: &str = "zen/v1/topic-data";
+/// KDF: per-(fs, epoch) AEAD key for filesystem meta, manifests and chunks.
+pub const FS_DATA: &str = "zen/v1/fs-data";
 /// KDF: step of a naming chain (KV elements and topic segments).
 pub const NAME_CHAIN: &str = "zen/v1/name-chain";
 /// KDF: step of the topic data-key chain.
@@ -35,6 +37,8 @@ pub const FINGERPRINT: &str = "zen/v1/fingerprint";
 pub const ACL_CHAIN: &str = "zen/v1/acl-chain";
 /// Hash: `expect_ranges` hash of a KV range.
 pub const RANGE_HASH: &str = "zen/v1/range-hash";
+/// Hash: per-tree chain over filesystem operations.
+pub const TREE_OP_CHAIN: &str = "zen/v1/tree-op-chain";
 
 /// AAD domain: sealed KV value.
 pub const AAD_KV: &str = "zen/v1/aad/kv";
@@ -44,6 +48,12 @@ pub const AAD_EVENT: &str = "zen/v1/aad/event";
 pub const AAD_EPOCH_CHAIN: &str = "zen/v1/aad/epoch-chain";
 /// AAD domain: keyslot.
 pub const AAD_KEYSLOT: &str = "zen/v1/aad/keyslot";
+/// AAD domain: filesystem node meta.
+pub const AAD_FS_META: &str = "zen/v1/aad/fs-meta";
+/// AAD domain: filesystem manifest.
+pub const AAD_FS_MANIFEST: &str = "zen/v1/aad/fs-manifest";
+/// AAD domain: filesystem chunk.
+pub const AAD_FS_CHUNK: &str = "zen/v1/aad/fs-chunk";
 
 /// Signature domain prefix, prepended to every signed message.
 pub const SIG_DOMAIN: &str = "zen/v1/sig";
@@ -61,6 +71,8 @@ pub const SIG_MEMBERSHIP: &str = "zen/v1/sig/membership";
 pub const SIG_EVENT: &str = "zen/v1/sig/event";
 /// Signature purpose: device sign-in challenge.
 pub const SIG_SESSION: &str = "zen/v1/sig/session";
+/// Signature purpose: filesystem tree checkpoint.
+pub const SIG_TREE_CHECKPOINT: &str = "zen/v1/sig/tree-checkpoint";
 
 /// Every label, for registry checks.
 pub const ALL: &[&str] = &[
@@ -69,6 +81,7 @@ pub const ALL: &[&str] = &[
     KV_NAME,
     TOPIC_NAME,
     TOPIC_DATA,
+    FS_DATA,
     NAME_CHAIN,
     TOPIC_DATA_CHAIN,
     EVENT_KEY,
@@ -81,10 +94,14 @@ pub const ALL: &[&str] = &[
     FINGERPRINT,
     ACL_CHAIN,
     RANGE_HASH,
+    TREE_OP_CHAIN,
     AAD_KV,
     AAD_EVENT,
     AAD_EPOCH_CHAIN,
     AAD_KEYSLOT,
+    AAD_FS_META,
+    AAD_FS_MANIFEST,
+    AAD_FS_CHUNK,
     SIG_DOMAIN,
     SIG_DEVICE_CERT,
     SIG_COMMIT,
@@ -93,6 +110,7 @@ pub const ALL: &[&str] = &[
     SIG_MEMBERSHIP,
     SIG_EVENT,
     SIG_SESSION,
+    SIG_TREE_CHECKPOINT,
 ];
 
 /// Signature purposes accepted by [`crate::sig`].
@@ -104,4 +122,5 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_MEMBERSHIP,
     SIG_EVENT,
     SIG_SESSION,
+    SIG_TREE_CHECKPOINT,
 ];

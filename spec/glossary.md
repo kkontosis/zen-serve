@@ -23,3 +23,13 @@
 | **commit** | One atomic, conditional request to `/v1/commit`: validate reads, write KV, append events, advance consumer cursors, apply CRDT ops. Identified by a random 128-bit **commit_id** for idempotency. |
 | **versionstamp** | FoundationDB's 10-byte, cluster-wide, strictly increasing commit version. Used as the event offset. |
 | **suite** | The algorithm set, recorded per object (spec/suites.md). |
+| **tree** | A filesystem tree in an fs, identified by a random 16-byte id (spec/fs.md). |
+| **node** | A file, directory or symlink in a tree, identified by a random 16-byte id. `ROOT` (all zeros) and `TRASH` (all `FF`) are reserved. |
+| **HLC** | Hybrid logical clock, `unix_ms << 16 \| counter` (formats.md §11.1). |
+| **ts** | An operation's timestamp `(hlc, device fingerprint)`, the total order of tree and meta operations. |
+| **move** | The tree operation: create, move, rename, delete (move to trash) and restore are all moves. |
+| **version** | One content value of a file node: chunk ids plus a sealed manifest. Concurrent writes leave several versions, called **siblings**. |
+| **dot** | A version's 12-byte id, `versionstamp ‖ u16(i)`, assigned by the server. |
+| **chunk** | An immutable sealed piece of file content (64 KiB of plaintext), with a random 16-byte id. |
+| **horizon** | How far back (default 7 days) a late operation may reach. Older ones are refused with `stale_op` and **rebased**: reissued with a fresh HLC. |
+

@@ -15,7 +15,8 @@ NK    (32 B, random, long-lived)          MK_e  (32 B, random per epoch)
  │                                          │
  ├─ KDF("zen/v1/kv-name",    NK, u32(fs))   ├─ KDF("zen/v1/kv-data",     MK_e, u32(fs)‖u32(e))  → KV AEAD key
  └─ KDF("zen/v1/topic-name", NK, u32(fs))   ├─ KDF("zen/v1/epoch-chain", MK_e, u32(fs)‖u32(e))  → chain key
-                                            └─ KDF("zen/v1/topic-data",  MK_e, u32(fs)‖u32(e))  → topic data root
+                                            ├─ KDF("zen/v1/topic-data",  MK_e, u32(fs)‖u32(e))  → topic data root
+                                            └─ KDF("zen/v1/fs-data",     MK_e, u32(fs)‖u32(e))  → filesystem AEAD key (§11)
 ```
 
 * **Naming keys are never rotated by a revocation.** So stored keys, topic ids, ACL prefixes, cursors and subscriptions survive epoch changes. `key_epoch` appears in sealed objects only, **never** inside a token.
@@ -57,13 +58,14 @@ D_i  = KDF("zen/v1/topic-data-chain", D_{i-1}, lp(s_i))                         
 * **Event AEAD key** = `KDF("zen/v1/event-aead", D_topic, "")`.
 * **Event key token** (DESIGN-4 §1.1) = `PRF16(KDF("zen/v1/event-key", N_topic, ""), lp(key))`. It's scoped per topic, so the same entity can't be linked across topics.
 
-## 4. Sealed objects (KV values, events, epoch-chain records)
+## 4. Sealed objects (KV values, events, epoch-chain records, filesystem objects)
 
 ```
 off  len  field
   0    1  format_version = 1
   1    1  suite          = 1
-  2    1  kind           1 = KV value, 2 = event, 3 = epoch-chain record
+  2    1  kind           1 = KV value, 2 = event, 3 = epoch-chain record,
+                         4 = fs node meta, 5 = fs manifest, 6 = fs chunk
   3    1  reserved       = 0
   4    4  key_epoch      u32
   8   24  nonce          random per seal
@@ -79,6 +81,9 @@ Total = 48 + plaintext length.
 | 1 KV value | `zen/v1/aad/kv` | `u32(fs) ‖ lp(stored_key)` | KV AEAD key of `key_epoch` |
 | 2 event | `zen/v1/aad/event` | `u32(fs) ‖ lp(topic_id) ‖ lp(event_key_token or empty)` | event AEAD key of `key_epoch` |
 | 3 epoch chain | `zen/v1/aad/epoch-chain` | `u32(fs)` | chain key of `key_epoch` |
+| 4 fs node meta | `zen/v1/aad/fs-meta` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
+| 5 fs manifest | `zen/v1/aad/fs-manifest` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
+| 6 fs chunk | `zen/v1/aad/fs-chunk` | `u32(fs) ‖ chunk_id(16)` | filesystem AEAD key of `key_epoch` |
 
 * A value moved to another key or fs, or an event moved to another topic or event key, fails authentication.
 * Clients read `key_epoch` from the header to pick the right epoch keys before decrypting.
@@ -174,9 +179,9 @@ The membership log that distributes certificates (G1) is the ACL chain (§9).
 
 These later-milestone formats are out of scope here:
 * commit records and signed roots
-* event checkpoints
+* event checkpoints and filesystem tree checkpoints
 * the authenticated (Merkle) integrity tier
-* CRDT op encodings
+* CRDT objects other than the filesystem (§11)
 * zen-db catalog and row encodings
 
 They'll reuse §4 and §7 and the labels already registered.
@@ -237,3 +242,63 @@ msg     = lp(challenge) ‖ lp(origin)
 ```
 
 `origin` is the UTF-8 `scheme://host[:port]` of the server, as the client sees it.
+
+## 11. Filesystem objects (spec/fs.md)
+
+Every integer is big-endian. `tree`, `node` and `chunk_id` are 16 bytes. `ROOT = 00…00` and `TRASH = FF…FF` (16 bytes each).
+
+### 11.1 Hybrid logical clock
+
+```
+hlc = u64( unix_ms << 16 | counter )      counter: u16
+```
+
+* A client generates `last = max(wall_ms << 16, last + 1)` per operation, and observes server timestamps with `last = max(last, seen)` (fs.md §2).
+* The server compares `hlc >> 16` with its clock for the skew and horizon checks.
+* `hlc` must be at most `2^63 − 1`.
+
+### 11.2 Node meta (plaintext of a kind-4 object)
+
+```
+u8 meta_version = 1 ‖ u8 type ‖ lp(name) ‖ u32 mode ‖ u64 mtime_ms ‖ lp(xattrs)
+```
+
+* `type`: 1 = directory, 2 = file, 3 = symlink. A symlink's target is its content.
+* `name`: UTF-8 without `/` or NUL, 1–255 bytes.
+* `mode`: POSIX permission bits.
+* `mtime_ms`: unix milliseconds.
+* `xattrs`: CBOR map (may be empty, length 0).
+
+### 11.3 Manifest (plaintext of a kind-5 object)
+
+```
+u8 manifest_version = 1 ‖ u64 size ‖ u32 chunk_size ‖ u32 n ‖ n × chunk_id(16)
+```
+
+* `size` is the exact file size in bytes. Every chunk holds `chunk_size` plaintext bytes except the last.
+* The chunk list must equal the `chunks` of the `write` that carries the manifest (fs.md §4).
+
+### 11.4 Chunk (kind 6)
+
+The plaintext is the chunk's bytes. A chunk is bound to its fs and id, so the server can't substitute one chunk for another.
+
+### 11.5 Operation encoding and op chain
+
+Each operation has a canonical byte form, used for the per-tree chain:
+
+```
+move   = 0x01 ‖ u32(fs) ‖ tree ‖ node ‖ parent ‖ u64(hlc) ‖ lp(meta or empty)
+meta   = 0x02 ‖ u32(fs) ‖ tree ‖ node ‖ u64(hlc) ‖ lp(meta)
+write  = 0x03 ‖ u32(fs) ‖ tree ‖ node ‖ dot(12) ‖ u32(r) ‖ r × dot(12)
+              ‖ u32(n) ‖ n × chunk_id ‖ lp(manifest)
+```
+
+* `meta` and `manifest` are the sealed objects, byte for byte.
+* In `write`, the first `dot` is the one the server assigned to the new version, and the `r` dots are `replaces`.
+
+The chain starts at 32 zero bytes. Each operation accepted by the server extends it, in arrival order:
+
+```
+chain_n = BLAKE3.derive_key("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op_bytes) ‖ device_fp(32))
+```
+

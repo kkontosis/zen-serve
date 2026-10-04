@@ -1,10 +1,12 @@
-//! Sealed objects: KV values, events and epoch-chain records (spec/formats.md §4).
+//! Sealed objects: KV values, events, epoch-chain records (spec/formats.md §4).
+//! Filesystem objects (kinds 4–6) are sealed in [`crate::fs`].
 //!
 //! ```text
 //! off  len  field
 //!   0    1  format_version (= 1)
 //!   1    1  suite          (= 1, modern)
-//!   2    1  kind           (1 = kv value, 2 = event, 3 = epoch-chain record)
+//!   2    1  kind           (1 = kv value, 2 = event, 3 = epoch-chain record,
+//!                           4–6 = filesystem meta, manifest, chunk)
 //!   3    1  reserved       (= 0)
 //!   4    4  key_epoch      (u32 BE)
 //!   8   24  nonce          (random per seal)
@@ -40,6 +42,12 @@ pub enum Kind {
     Event = 2,
     /// A backward epoch-chain record (MK_{e-1} sealed under epoch e).
     EpochChain = 3,
+    /// Filesystem node meta (spec/formats.md §11.2).
+    FsMeta = 4,
+    /// Filesystem manifest (§11.3).
+    FsManifest = 5,
+    /// Filesystem chunk (§11.4).
+    FsChunk = 6,
 }
 
 fn header(kind: Kind, epoch: u32, nonce: &[u8; 24]) -> [u8; HEADER_LEN] {
@@ -63,8 +71,8 @@ fn full_aad(label: &str, header: &[u8], ctx: &[u8]) -> Vec<u8> {
 
 /// Kind-specific AAD context: label plus bound fields.
 pub(crate) struct Aad {
-    label: &'static str,
-    ctx: Vec<u8>,
+    pub(crate) label: &'static str,
+    pub(crate) ctx: Vec<u8>,
 }
 
 pub(crate) fn aad_epoch_chain(fs_id: u32) -> Aad {
@@ -131,6 +139,9 @@ pub fn peek(sealed: &[u8]) -> Result<(Kind, u32)> {
         1 => Kind::KvValue,
         2 => Kind::Event,
         3 => Kind::EpochChain,
+        4 => Kind::FsMeta,
+        5 => Kind::FsManifest,
+        6 => Kind::FsChunk,
         _ => return Err(Error::Format),
     };
     Ok((
