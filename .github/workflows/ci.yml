@@ -26,6 +26,28 @@ jobs:
       - name: wasm32 check
         run: cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown
 
+  # The pure-Rust build: no ring, the TLS provider on RustCrypto
+  # (spec/operations.md §8). The jobs around it test the default build,
+  # with ring.
+  pure-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Test (no default features)
+        run: cargo test --all --no-default-features
+      # With blake3's portable code too, nothing calls a C compiler.
+      - name: Build without a C compiler
+        env:
+          CC: "false"
+          CXX: "false"
+        run: cargo check -p zen-server --no-default-features --features blake3/pure
+
   # The FoundationDB backend, the supervisor and every server test against
   # a real cluster that zen-serve itself starts.
   fdb:
