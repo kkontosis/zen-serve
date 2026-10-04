@@ -1,0 +1,30 @@
+{
+  "description": "KDF(label,key,info)=BLAKE3.derive_key(label,key||info); PRF16=BLAKE3.keyed_hash(key,data)[0..16]; FP=BLAKE3.derive_key(\"zen/v1/fingerprint\",data)",
+  "fingerprint": [
+    {
+      "data": "7a656e",
+      "out": "39c6b1d9c723c6a77845fcdf7326befafd5358c3bc97d2e8421b0e3388b8c81f"
+    }
+  ],
+  "kdf": [
+    {
+      "info": "",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "label": "zen/v1/kv-data",
+      "out": "a8f2ec11bf3efc0df6d385b9ca84985c4ef126d7291e252cbe2dd0df33da1b3a"
+    },
+    {
+      "info": "616263",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "label": "zen/v1/name-chain",
+      "out": "d61814b25987affea45c1ccee3aec140ef6a55928994fa43cd424c81a96796cb"
+    }
+  ],
+  "prf16": [
+    {
+      "data": "7a656e",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "out": "3f26468fae4b886b3f798497f51a3bd0"
+    }
+  ]
+}

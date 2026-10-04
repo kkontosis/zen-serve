@@ -1,0 +1,26 @@
+{
+  "description": "Fixture fs (fs_id 7, epoch 0) and its rotation to epoch 1. The chain record seals epoch 0's epoch_key under epoch 1.",
+  "epoch_chain_record": "0101030000000001b77bac14ff4aee822ae2521ced887d6882cc951eabf2c7606bc5460de6a512ada34bdbaa26584674fbdab232ab95b9756e2ff363727d4a1adc2c00953188812368debf8f3b321058",
+  "fs_epoch0": {
+    "bundle": "000000070000000003c78d2fc785136cc4e315171a17c6750279785c99e21c5482accf2452001fc464150c1d702513cdde738037ac603919c07fc0a8f9e5b33ed01b84e8859252fc",
+    "epoch": 0,
+    "epoch_key": "64150c1d702513cdde738037ac603919c07fc0a8f9e5b33ed01b84e8859252fc",
+    "fs_id": 7,
+    "kv_data_key": "3f57dbb756c3cd164fb5a5c56ac499b4387cda3c21cd88d0409c30e870cfdde3",
+    "kv_name_root": "3893008a4027b833cbcbb364c90ebdb08326e33e36ef538b773047fbb313f8f8",
+    "naming_key": "03c78d2fc785136cc4e315171a17c6750279785c99e21c5482accf2452001fc4",
+    "topic_data_root": "7ef0eba36f023cf57a933ff7dad4a97042604aff99697e2fd32ab0474a3ab1d8",
+    "topic_name_root": "90ecaf511b03e3e894e4a0ea669c54cd247a684109c9d731d3efc7cda86a98de"
+  },
+  "fs_epoch1": {
+    "bundle": "000000070000000103c78d2fc785136cc4e315171a17c6750279785c99e21c5482accf2452001fc44f4109bc17110267f1a52e525314cd5f7d67fc03693d3ae018418a7079149667",
+    "epoch": 1,
+    "epoch_key": "4f4109bc17110267f1a52e525314cd5f7d67fc03693d3ae018418a7079149667",
+    "fs_id": 7,
+    "kv_data_key": "f6fc842682c77cba772bcfb83375da49e7e7f6a9fed6868f498f17f49b7541d8",
+    "kv_name_root": "3893008a4027b833cbcbb364c90ebdb08326e33e36ef538b773047fbb313f8f8",
+    "naming_key": "03c78d2fc785136cc4e315171a17c6750279785c99e21c5482accf2452001fc4",
+    "topic_data_root": "7635c6aa3d91cf6037a09d7bba0985ba9f0776f979825ed90e4454f845f12d4d",
+    "topic_name_root": "90ecaf511b03e3e894e4a0ea669c54cd247a684109c9d731d3efc7cda86a98de"
+  }
+}

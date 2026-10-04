@@ -1,0 +1,16 @@
+{
+  "description": "Sealed objects for the fixture fs at epoch 0. Nonces come from DetRng(seed).",
+  "event": {
+    "body": "01abababababababababababababababababababababababababababababababab0001020304050607000000056576742d3168656c6c6f2066616d696c79",
+    "key_token": "2effdef752fc1ec4af9531c163f7f6cb",
+    "rng_seed": "event",
+    "sealed": "01010200000000004e1d1b6366223a073dadfd3319c6c2a94d41ac24c200bd35b41e1166ef103c7b7d5419cfcff8490fb17e8c4a0056674083514b6f143e8a41f7e58a8739e4533351183b8482f5224e6ad4b23b18db9851d241be1980e4ce260ece2d51095a1a7ebe62f4aae7da",
+    "topic_id": "189c1a2d3d92658a9528e782c577b60900f92ea9719139749d0962a61c2e426c"
+  },
+  "kv_value": {
+    "plaintext": "7b226e616d65223a22416461227d",
+    "rng_seed": "value",
+    "sealed": "0101010000000000cf0754acb1e3a7c6e7d7c65ccdadb291e63f8d7b38d0f2cac794437377b17a43023e45a2dac57c36030729aea104b40d652e591e8b0e",
+    "stored_key": "0201cfda749c30788b8c84ac614f367d9b66ef8b4b47dd66730b84078e541c914929b228cd5a5afd187a97186181b05f"
+  }
+}
