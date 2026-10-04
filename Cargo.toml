@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/zen-core"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kkontosis/zen-serve"
+
+# Crypto is unusably slow unoptimized (Argon2id at 64 MiB, ML-DSA), even in tests.
+[profile.dev.package."*"]
+opt-level = 3
