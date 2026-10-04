@@ -433,3 +433,137 @@ pub async fn recv(ws: &mut Ws) -> Frame {
         }
     }
 }
+
+// ---- OPAQUE client (auth.md §8)
+
+/// The Argon2id parameters of OPAQUE test servers: the registration floor,
+/// so that fake records for unknown names are as cheap as real ones.
+pub fn opaque_cfg(c: &mut Config) {
+    let p = zen_core::vectors::FIXTURE_ARGON2;
+    c.auth.opaque = true;
+    c.auth.password_m_cost_kib = p.m_cost_kib;
+    c.auth.password_t_cost = p.t_cost;
+    c.auth.password_p_cost = p.p_cost;
+}
+
+/// Register (or replace) the caller's OPAQUE password, with the
+/// parameters the server asks for. Returns the credential id and the
+/// client's result (export key, server key).
+pub async fn opaque_set(
+    h: &Harness,
+    tok: &[u8],
+    name: &str,
+    pw: &[u8],
+) -> Result<(CredentialId, zen_core::opaque::Finished), ApiErr> {
+    use zen_core::opaque::Registration;
+    let (reg, request) = Registration::start(pw, &mut zen_core::rng::OsRng).unwrap();
+    let r: OpaqueRegistration = h
+        .call(
+            "/v1/auth/opaque/register/start",
+            Some(tok),
+            &OpaqueRegisterStart {
+                name: name.into(),
+                request,
+            },
+        )
+        .await?;
+    let p = zen_core::keyslot::Argon2Params {
+        m_cost_kib: r.m_cost_kib,
+        t_cost: r.t_cost,
+        p_cost: r.p_cost,
+    };
+    let done = reg
+        .finish(pw, &r.response, p, &mut zen_core::rng::OsRng)
+        .unwrap();
+    let id = h
+        .call(
+            "/v1/auth/opaque/register/finish",
+            Some(tok),
+            &OpaqueRegisterFinish {
+                name: name.into(),
+                upload: done.message.clone(),
+                m_cost_kib: p.m_cost_kib,
+                t_cost: p.t_cost,
+                p_cost: p.p_cost,
+            },
+        )
+        .await?;
+    Ok((id, done))
+}
+
+/// The first sign-in round, with the origin the client puts in its start
+/// request.
+pub async fn opaque_start(
+    h: &Harness,
+    name: &str,
+    pw: &[u8],
+    origin: &str,
+) -> Result<(zen_core::opaque::Login, OpaqueLoginResponse), ApiErr> {
+    let (login, request) = zen_core::opaque::Login::start(pw, &mut zen_core::rng::OsRng).unwrap();
+    let r = h
+        .call(
+            "/v1/auth/opaque/login/start",
+            None,
+            &OpaqueLoginStart {
+                name: name.into(),
+                origin: origin.into(),
+                request,
+            },
+        )
+        .await?;
+    Ok((login, r))
+}
+
+/// The client's second step with the origin it sees: the finalization to
+/// send and the export key, or 64 zero bytes and no key when the client
+/// can't finish (a wrong password or an unknown name), so the server still
+/// answers.
+pub fn opaque_client_finish(
+    login: zen_core::opaque::Login,
+    pw: &[u8],
+    r: &OpaqueLoginResponse,
+    origin: &str,
+) -> (Vec<u8>, Option<zen_core::opaque::ExportKey>) {
+    let p = zen_core::keyslot::Argon2Params {
+        m_cost_kib: r.m_cost_kib,
+        t_cost: r.t_cost,
+        p_cost: r.p_cost,
+    };
+    match login.finish(pw, &r.response, p, origin, &mut zen_core::rng::OsRng) {
+        Ok(done) => (done.message, Some(done.export_key)),
+        Err(e) => {
+            assert_eq!(e, zen_core::Error::Decrypt);
+            (vec![0; 64], None)
+        }
+    }
+}
+
+/// The second sign-in round.
+pub async fn opaque_finish(
+    h: &Harness,
+    state: Vec<u8>,
+    finalization: Vec<u8>,
+) -> Result<Session, ApiErr> {
+    h.call(
+        "/v1/auth/opaque/login/finish",
+        None,
+        &OpaqueLoginFinish {
+            state,
+            finalization,
+        },
+    )
+    .await
+}
+
+/// A whole OPAQUE sign-in through this harness's origin.
+pub async fn opaque_sign_in(
+    h: &Harness,
+    name: &str,
+    pw: &[u8],
+) -> Result<(Session, zen_core::opaque::ExportKey), ApiErr> {
+    let origin = h.origin();
+    let (login, r) = opaque_start(h, name, pw, &origin).await?;
+    let (fin, key) = opaque_client_finish(login, pw, &r, &origin);
+    let s = opaque_finish(h, r.state, fin).await?;
+    Ok((s, key.expect("a session needs a finished client")))
+}

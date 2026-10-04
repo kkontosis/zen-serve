@@ -28,6 +28,7 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 pub const IMPLEMENTED: &[AuthMethod] = &[
     AuthMethod::DeviceKey,
     AuthMethod::Passkey,
+    AuthMethod::Opaque,
     AuthMethod::ApiToken,
     AuthMethod::Mtls,
     AuthMethod::PasswordKey,

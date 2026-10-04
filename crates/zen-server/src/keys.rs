@@ -282,6 +282,12 @@ pub fn params_key() -> Vec<u8> {
     Key::new().str("auth_key").str("params").finish()
 }
 
+/// The OPAQUE server setup (auth.md §8.1): the OPRF seed and the AKE key
+/// pair, exported with the data. Losing it invalidates every OPAQUE record.
+pub fn opaque_setup() -> Vec<u8> {
+    Key::new().str("auth_key").str("opaque").finish()
+}
+
 /// Server metadata.
 pub fn meta(name: &str) -> Vec<u8> {
     Key::new().str("meta").str(name).finish()

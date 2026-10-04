@@ -146,12 +146,16 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 |---|---|
 | `pack("cred", user_fp, id)` | credential record, CBOR (auth.md §4) |
 | `pack("credx", id)` | `user_fp(32)`: a credential's owner, by id. For a passkey, `id` is a hash of the WebAuthn credential id (auth.md §4.1), so this also finds the user from the id an authenticator returns |
-| `pack("login", H(name))` | `user_fp(32) ‖ cred_id(32)`: the login-name index, by the hash of the normalized name (auth.md §4.2) |
+| `pack("login", H(name))` | `user_fp(32) ‖ cred_id(32)`: the login-name index of method 6, by the hash of the normalized name (auth.md §4.2) |
+| `pack("login", H(name), method)` | the same, for the other methods with a login name: `method` is the integer 3 (OPAQUE). Method 6's entry has no method element, as it predates the others |
 | `pack("auth_key", "params")` | 32 random bytes: the key of the fake parameters for unknown login names (auth.md §4.2), created on first use once the cluster is claimed |
+| `pack("auth_key", "opaque")` | the OPAQUE server setup (auth.md §8.1): OPRF seed(64) ‖ AKE private key(32) ‖ fake-record public key(32), created on first use once the cluster is claimed. Losing it invalidates every OPAQUE credential |
 | `pack("origins")` | CBOR `[text]`: the pinned sign-in origins (auth.md §5.2); absent when nothing is pinned |
 
 * `user_fp` and `id` are 32-byte byte-string elements.
 * These keys are data, not server metadata: `export` copies them and `import` restores them. So a restored or migrated cluster keeps its credentials, its pin and its fake parameters.
 * All of them are new: a store from before them simply has none.
 * Passkeys (auth.md §7) add no keys: a passkey is a credential record with the method's optional fields, which older readers ignore. Registering a passkey spends its challenge in `pack("chal", challenge)` (§3.5), like a sign-in.
+* OPAQUE (auth.md §8) adds the setup key and a login-index entry per name; a credential is a record with `opaque_record` and `opaque_ksf`. The login state between the two sign-in rounds is not stored: the client carries it, sealed (auth.md §8.3). The single use of its challenge is recorded in `pack("chal", challenge)` (§3.5).
+* A name used by both password methods has two index entries, each pointing to its own credential. A name belongs to one user across methods (auth.md §4.2).
 * TLS client certificates (auth.md §10) add no keys either: a registration is a credential record whose `id` is the SHA-256 of the certificate's public key (auth.md §4.1), so `credx` finds the member from the certificate a connection presents.

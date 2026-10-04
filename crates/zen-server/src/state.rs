@@ -51,8 +51,13 @@ pub struct AppState {
     /// Cluster-wide key for the fake parameters of unknown login names,
     /// once read or created (`cred::params_key`).
     pub params_key: Mutex<Option<[u8; 32]>>,
-    /// Failed password sign-ins per login name, on this node.
+    /// Failed password sign-ins per login name, on this node (methods 6
+    /// and 3).
     pub pw_limiter: crate::password::Limiter,
+    /// The cluster's OPAQUE server setup, once read or created
+    /// (`opaque::setup`).
+    pub opaque_setup:
+        Mutex<Option<Arc<zen_core::opaque::opaque_ke::ServerSetup<zen_core::opaque::Suite>>>>,
 }
 
 /// Shared handle.
@@ -73,6 +78,7 @@ impl AppState {
                 std::time::Duration::from_secs(cfg.auth.password_lockout_secs),
             ),
             params_key: Mutex::new(None),
+            opaque_setup: Mutex::new(None),
             eph: EphHub::new(
                 store.clone(),
                 cfg.limits.ephemeral_bytes_per_sec,

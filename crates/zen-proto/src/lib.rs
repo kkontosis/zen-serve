@@ -180,11 +180,11 @@ pub enum AuthMethod {
     DeviceKey = 1,
     /// 2: WebAuthn passkeys.
     Passkey = 2,
-    /// 3: OPAQUE password authentication (reserved).
+    /// 3: OPAQUE password authentication.
     Opaque = 3,
     /// 4: admin-issued bearer tokens for services and bots.
     ApiToken = 4,
-    /// 5: TLS client certificates (reserved).
+    /// 5: TLS client certificates.
     Mtls = 5,
     /// 6: a hybrid key derived from a password on the client.
     PasswordKey = 6,
@@ -569,6 +569,90 @@ pub struct PasskeySession {
     pub user_handle: Option<Vec<u8>>,
 }
 
+/// `POST /v1/auth/opaque/register/start` request (spec/auth.md §8.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueRegisterStart {
+    /// The login name, as typed.
+    pub name: String,
+    /// The OPAQUE `RegistrationRequest` (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub request: Vec<u8>,
+}
+
+/// `POST /v1/auth/opaque/register/start` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueRegistration {
+    /// The OPAQUE `RegistrationResponse` (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub response: Vec<u8>,
+    /// The Argon2id memory to register with (KiB): the server's
+    /// configured parameters.
+    pub m_cost_kib: u32,
+    /// Argon2id passes, likewise.
+    pub t_cost: u32,
+    /// Argon2id lanes, likewise.
+    pub p_cost: u32,
+}
+
+/// `POST /v1/auth/opaque/register/finish` request: the record to store.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueRegisterFinish {
+    /// The login name, as typed: the same as in `start`.
+    pub name: String,
+    /// The OPAQUE `RegistrationUpload` (192 bytes).
+    #[serde(with = "serde_bytes")]
+    pub upload: Vec<u8>,
+    /// The Argon2id memory the client stretched the password with (KiB).
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+}
+
+/// `POST /v1/auth/opaque/login/start` request (spec/auth.md §8.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueLoginStart {
+    /// The login name, as typed.
+    pub name: String,
+    /// The server origin as the client sees it: bound into the OPAQUE
+    /// context (spec/auth.md §8.4).
+    pub origin: String,
+    /// The OPAQUE `CredentialRequest`, KE1 (96 bytes).
+    #[serde(with = "serde_bytes")]
+    pub request: Vec<u8>,
+}
+
+/// `POST /v1/auth/opaque/login/start` response. Unknown names get a fake
+/// response of the same shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueLoginResponse {
+    /// The OPAQUE `CredentialResponse`, KE2 (320 bytes).
+    #[serde(with = "serde_bytes")]
+    pub response: Vec<u8>,
+    /// The server's sealed login state, returned with `finish`: opaque to
+    /// the client.
+    #[serde(with = "serde_bytes")]
+    pub state: Vec<u8>,
+    /// The Argon2id memory of the credential (KiB).
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+}
+
+/// `POST /v1/auth/opaque/login/finish` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueLoginFinish {
+    /// The `state` of the `start` response, unchanged.
+    #[serde(with = "serde_bytes")]
+    pub state: Vec<u8>,
+    /// The OPAQUE `CredentialFinalization`, KE3 (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub finalization: Vec<u8>,
+}
+
 /// `POST /v1/auth/mtls/register` request (spec/auth.md §10.3): bind a TLS
 /// client certificate to a member.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -620,7 +704,7 @@ pub struct Credential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// The last sign-in with it, unix seconds, where the method records
-    /// it (passkeys).
+    /// it (passkeys, certificates, OPAQUE).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_unix: Option<u64>,
 }

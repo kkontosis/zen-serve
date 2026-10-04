@@ -6,7 +6,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
 * **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
-* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin`, `/v1/auth/passkey/session` and `/v1/auth/mtls/session`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin`, `/v1/auth/passkey/session`, `/v1/auth/mtls/session` and `/v1/auth/opaque/login/{start,finish}`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
   | Status | `code` | Retry? |
@@ -24,7 +24,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, credentials per user §3.7, §3.8, §3.11, §3.13) | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, §3.16, credentials per user §3.7, §3.8, §3.11, §3.13, §3.15) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -173,7 +173,7 @@ The credential store (auth.md §4). Need a session, not an API token (403).
 list:   { user?: bytes(32) }   // absent: the caller's own; another member's needs admin (403)
 → { credentials: [{ id: bytes(32), method: text, created_unix: u64,
                     expires_unix?: u64, label?: text,
-                    last_used_unix?: u64 }] }     // passkeys and certificates: the last sign-in
+                    last_used_unix?: u64 }] }     // passkeys, certificates, OPAQUE: the last sign-in
 remove: { id: bytes(32) } → {}
 ```
 
@@ -272,6 +272,46 @@ Method 5 (auth.md §10.4): sign in with the request connection's client certific
 * 401: the method is dormant (neither native client certificates nor a trusted proxy are set up, auth.md §10); no certificate on the connection; the proxy header from an untrusted address, or one that doesn't parse; an unregistered certificate; a user no longer a member.
 * Natively, a certificate that doesn't verify against `[tls] client_ca` (another CA, expired, not for client authentication, a key or signature outside auth.md §10.1, such as RSA below 2048 bits) fails the TLS handshake before any request.
 * The session's `device_fp` is the credential id, and `method` is `mtls`. The token works on any connection and any node, like every session.
+
+### 3.15 `POST /v1/auth/opaque/register/start` and `/v1/auth/opaque/register/finish`
+
+Method 3, OPAQUE (auth.md §8.2): register or replace the caller's OPAQUE password. Need a session of the user, not an API token (403). 403 `method_disabled` if `opaque` is off.
+
+```
+start:  { name: text,
+          request: bytes(32) }        // RegistrationRequest
+→ { response: bytes(64),              // RegistrationResponse
+    m_cost_kib: u32, t_cost: u32, p_cost: u32 }   // Argon2id parameters to register with: the configured ones
+finish: { name: text,                 // the same name as in start
+          upload: bytes(192),         // RegistrationUpload: the record
+          m_cost_kib: u32, t_cost: u32, p_cost: u32 }   // the parameters the client used
+→ { id: bytes(32) }                   // the new credential id
+```
+
+* 400: a name that doesn't normalize (auth.md §4.2), a `request` or `upload` of the wrong size or encoding, parameters outside the registration floor and ceilings (formats.md §6).
+* 409 `name_taken`: another user holds the name, for either password method. 429 `quota`: the user holds 100 credentials (`finish`).
+* `start` stores nothing. `finish` deletes the user's previous OPAQUE credential, if any, with its sessions (auth.md §8.2).
+* The credential is listed and removed through §3.9.
+
+### 3.16 `POST /v1/auth/opaque/login/start` and `/v1/auth/opaque/login/finish`
+
+Method 3 (auth.md §8.3): sign in. No session. 403 `method_disabled` if `opaque` is off.
+
+```
+start:  { name: text,
+          origin: text,               // the server origin as the client sees it (§3.3), in the OPAQUE context
+          request: bytes(96) }        // CredentialRequest (KE1)
+→ { response: bytes(320),             // CredentialResponse (KE2); a fake record's for an unknown name
+    state: bytes,                     // the sealed login state, opaque to the client
+    m_cost_kib: u32, t_cost: u32, p_cost: u32 }   // the credential's Argon2id parameters
+finish: { state: bytes,               // from start, unchanged
+          finalization: bytes(64) }   // CredentialFinalization (KE3)
+→ Session (§3.2)
+```
+
+* `start`: 400 for a name that doesn't normalize or a `request` of the wrong size or encoding; 401 for a malformed origin; 429 `quota` while the login name is locked (auth.md §8.5). Every `start` counts as a failed attempt until a `finish` succeeds. An unknown name gets a response of the same shape, and the configured parameters.
+* `finish` may go to any node of the cluster. 401 for a state that is expired (60 s), already used, altered or from another cluster; for an origin the policy refuses (§3.3), which may also pin the origin (auth.md §5.2); and, with one message, "unknown login name or wrong password", for every credential failure: an unknown name, a wrong finalization, a credential removed or replaced since `start`, a user no longer a member.
+* The session's `device_fp` is the OPAQUE credential's id, and `method` is `opaque`.
 
 ## 4. ACL and fs headers
 

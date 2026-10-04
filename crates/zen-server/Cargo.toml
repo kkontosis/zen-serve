@@ -39,7 +39,7 @@ p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"
 # Native TLS and client certificates (spec/auth.md §10): rustls with a
 # crypto provider of our own on RustCrypto (`tls::provider`), pure Rust.
 aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
-chacha20poly1305 = { version = "0.11", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 hmac = "0.13"
 ml-kem = { version = "0.3", default-features = false, features = ["zeroize"] }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
@@ -54,7 +54,8 @@ toml = "1"
 tower-http = { version = "0.7", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zen-core = { path = "../zen-core" }
+# `opaque`: the OPAQUE cipher suite of sign-in method 3 (spec/auth.md §8).
+zen-core = { path = "../zen-core", features = ["opaque"] }
 zen-proto = { path = "../zen-proto" }
 zen-store = { path = "../zen-store" }
 
@@ -67,5 +68,5 @@ rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tempfile = "3"
 tokio-tungstenite = "0.30"
-zen-core = { path = "../zen-core", features = ["test-utils"] }
+zen-core = { path = "../zen-core", features = ["test-utils", "opaque"] }
 zen-server = { path = ".", features = ["test-utils"] }

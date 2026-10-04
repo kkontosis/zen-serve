@@ -5,7 +5,7 @@
 //! The suite is RFC 9807's `ristretto255-SHA512` configuration with
 //! Argon2id as the key stretching function:
 //! * OPRF: ristretto255-SHA512 (RFC 9497);
-//! * AKE: 3DH over ristretto255 with SHA-512 (RFC 9807 §6.4);
+//! * AKE: 3DH over ristretto255 with SHA-512;
 //! * KSF: Argon2id v1.3 with a salt of 16 zero bytes and a 64-byte output,
 //!   with the parameters stored for the credential ([`Argon2Params`],
 //!   the floors and ceilings of formats.md §6).

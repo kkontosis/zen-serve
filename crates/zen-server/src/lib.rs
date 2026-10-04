@@ -20,6 +20,7 @@ pub mod keys;
 pub mod kv;
 pub mod log;
 pub mod mtls;
+pub mod opaque;
 pub mod origin;
 pub mod passkey;
 pub mod password;
@@ -197,6 +198,22 @@ pub fn router(st: Shared) -> Router {
         .route(
             "/v1/auth/passkey/session",
             post(passkey::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/register/start",
+            post(opaque::register_start).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/register/finish",
+            post(opaque::register_finish).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/login/start",
+            post(opaque::login_start).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/opaque/login/finish",
+            post(opaque::login_finish).layer(auth_limit),
         )
         .route(
             "/v1/auth/mtls/session",

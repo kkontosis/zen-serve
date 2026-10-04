@@ -203,13 +203,21 @@ pub async fn set(
     Ok(Cbor(CredentialId { id: id.to_vec() }))
 }
 
-/// Failed sign-ins per login name, in this node's memory (auth.md §11.3).
-/// After `max` failures, the name is locked for `lockout` from the last
-/// one; a success clears it.
+/// Failed sign-ins per login name, in this node's memory (auth.md §11.3),
+/// shared by the password methods 6 and 3 (auth.md §8.5). After `max`
+/// failures, the name is locked for `lockout` from the last one; a
+/// success clears it.
 pub struct Limiter {
     max: u32,
     lockout: Duration,
-    by_name: Mutex<HashMap<[u8; 32], (u32, Instant)>>,
+    by_name: Mutex<HashMap<[u8; 32], Failures>>,
+}
+
+/// The failures of one name: how many, and when the last one was.
+struct Failures {
+    n: u32,
+    last: Instant,
+    last_unix: u64,
 }
 
 /// Names tracked before stale entries are dropped.
@@ -229,12 +237,10 @@ impl Limiter {
     pub fn check(&self, name: &[u8; 32]) -> ApiResult<()> {
         let m = self.by_name.lock().expect("limiter lock");
         match m.get(name) {
-            Some((n, last)) if *n >= self.max && last.elapsed() < self.lockout => {
-                Err(quota(format!(
-                    "too many failed sign-ins for this login name; retry in {} s",
-                    (self.lockout - last.elapsed()).as_secs() + 1
-                )))
-            }
+            Some(f) if f.n >= self.max && f.last.elapsed() < self.lockout => Err(quota(format!(
+                "too many failed sign-ins for this login name; retry in {} s",
+                (self.lockout - f.last.elapsed()).as_secs() + 1
+            ))),
             _ => Ok(()),
         }
     }
@@ -244,18 +250,32 @@ impl Limiter {
         let mut m = self.by_name.lock().expect("limiter lock");
         if m.len() >= LIMITER_CAP {
             let lockout = self.lockout;
-            m.retain(|_, (_, last)| last.elapsed() < lockout);
+            m.retain(|_, f| f.last.elapsed() < lockout);
         }
-        let e = m.entry(*name).or_insert((0, Instant::now()));
-        if e.1.elapsed() >= self.lockout {
-            e.0 = 0;
+        let e = m.entry(*name).or_insert(Failures {
+            n: 0,
+            last: Instant::now(),
+            last_unix: 0,
+        });
+        if e.last.elapsed() >= self.lockout {
+            e.n = 0;
         }
-        e.0 += 1;
-        e.1 = Instant::now();
+        e.n += 1;
+        e.last = Instant::now();
+        e.last_unix = unix_now();
     }
 
     /// Clear a name after a success.
     pub fn succeed(&self, name: &[u8; 32]) {
         self.by_name.lock().expect("limiter lock").remove(name);
+    }
+
+    /// Clear a name whose last failure here is no newer than a success
+    /// another node recorded at `success_unix` (auth.md §8.5).
+    pub fn succeeded_at(&self, name: &[u8; 32], success_unix: u64) {
+        let mut m = self.by_name.lock().expect("limiter lock");
+        if m.get(name).is_some_and(|f| f.last_unix <= success_unix) {
+            m.remove(name);
+        }
     }
 }

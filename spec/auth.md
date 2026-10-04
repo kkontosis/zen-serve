@@ -12,12 +12,12 @@ The signed ACL stays the **source of truth for membership, grants and admins**. 
 |---|---|---|---|---|---|---|
 | 1 | `device_key` | Device keys: a random per-device hybrid key, certified in the signed ACL | `device_keys` | on | yes | §6 |
 | 2 | `passkey` | Passkeys (WebAuthn): a key pair held by an authenticator | `passkeys` | on | yes (WebAuthn) | §7 |
-| 3 | `opaque` | Password via OPAQUE (augmented PAKE) | `opaque` | off | — | §8 (reserved) |
+| 3 | `opaque` | Password via OPAQUE (augmented PAKE, RFC 9807) | `opaque` | off | no; bound to it by the OPAQUE context | §8 |
 | 4 | `api_token` | API tokens: admin-issued bearer secrets for services and bots | `api_tokens` | off | no | §9 |
 | 5 | `mtls` | TLS client certificates (native TLS or a trusted proxy) | `mtls` | on, dormant until configured | no (TLS) | §10 |
 | 6 | `password_key` | Password-derived signing key: the password never leaves the client | `password_keys` | on | yes | §11 |
 
-* The id is stored in session records and credentials; the name is used on the wire. Id 3 is reserved for a method not implemented yet.
+* The id is stored in session records and credentials; the name is used on the wire.
 * **Method 6 is the primary method**: `/v1/info` names it as `auth.default` whenever it is on.
 * A server **offers** a method when it implements it and its flag is on; method 5 also needs a way for client certificates to reach the server, and is **dormant** without one (§10). `/v1/info` lists exactly the offered methods (§2). A flag that is on for a method the server doesn't implement yet has no effect.
 
@@ -33,6 +33,7 @@ mtls          = true    # method 5
 password_keys = true    # method 6
 # Origin policy (§5): origin_pinning, origin_pinning_always, acl_origins.
 # Method 2 (§7): passkey_rp_id, passkey_require_uv.
+# Method 3 (§8): uses the password_* settings of method 6.
 # Method 5 (§10): mtls_trusted_proxies, mtls_proxy_header; native TLS is [tls].
 # Method 6 (§11): password_m_cost_kib, password_t_cost, password_p_cost,
 #                 password_max_failures, password_lockout_secs.
@@ -67,6 +68,7 @@ A session records the user, the **method** and a **32-byte credential id**:
 |---|---|
 | `device_key` | the device fingerprint (`device_fp`, formats.md §7.2) |
 | `passkey` | the passkey's id in the credential store (§4.1) |
+| `opaque` | the id of the user's OPAQUE credential (§8) |
 | `password_key` | the id of the user's password credential (§11) |
 | `api_token` | the token's id (§9) |
 | `mtls` | the SHA-256 of the certificate's public key (§10.3) |
@@ -91,7 +93,7 @@ Credentials of every method except device keys live in a **server-side credentia
 cred record (CBOR) = { method: u8, created_unix: u64,
                        expires_unix?: u64,          // API tokens
                        label?: text,
-                       name_hash?: bytes(32),       // methods with a login name (6; 3 later)
+                       name_hash?: bytes(32),       // methods with a login name (6 and 3)
                        salt?: bytes(32), params?: {m_cost_kib, t_cost, p_cost},
                        identity?: bytes,            // method 6: the public identity
                        issued_by?: bytes(32),       // API tokens: the issuing admin; method 5: the admin who bound it
@@ -100,7 +102,9 @@ cred record (CBOR) = { method: u8, created_unix: u64,
                        alg?: int,                   // method 2: its COSE algorithm
                        sign_count?: u32,            // method 2: the last signature counter
                        rp_id?: text,                // method 2: the relying-party id
-                       last_used_unix?: u64 }       // methods 2 and 5: the last sign-in
+                       last_used_unix?: u64,        // methods 2, 3 and 5: the last sign-in
+                       opaque_record?: bytes,       // method 3: the OPAQUE registration record
+                       opaque_ksf?: {m_cost_kib, t_cost, p_cost} }   // method 3: its Argon2id parameters
 ```
 
 Fields a server doesn't know are ignored, so a method can add its own without breaking older readers.
@@ -108,15 +112,16 @@ Fields a server doesn't know are ignored, so a method can add its own without br
 * **Membership comes first.** A credential works only while its user is a member of the head ACL. An ACL version that removes a member deletes all their credentials in the same transaction, which also frees their login name. A member added back starts with none.
 * **Removal.** Removing a credential ends its sessions (§3).
 * **Limits.** A user holds at most 100 stored credentials.
-* **Privacy.** The store never returns keys, salts or secret hashes, only metadata (api.md §3.9). In particular, the public identity of a password-derived key stays on the server: other members never see it, unlike the ACL's user identities. Each credential is readable only by its owner and by admins.
+* **Privacy.** The store never returns keys, salts, secret hashes or OPAQUE records, only metadata (api.md §3.9). In particular, the public identity of a password-derived key stays on the server: other members never see it, unlike the ACL's user identities. Each credential is readable only by its owner and by admins.
 
-**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§7.2, §10.3, §11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
+**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§7.2, §8.2, §10.3, §11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
 
 ### 4.1 Credential ids
 
 | Method | Id |
 |---|---|
 | `passkey` | `BLAKE3.derive_key("zen/v1/passkey-id", WebAuthn credential id)` (§7.2): the owner index (keyspace.md §3.7) finds the user from the id an authenticator returns |
+| `opaque` | random, chosen at registration; a password change gets a new one |
 | `password_key` | random, chosen at registration; a password change gets a new one |
 | `api_token` | `BLAKE3.derive_key("zen-serve 2026 api token", secret)` (§9) |
 | `mtls` | `SHA-256(SubjectPublicKeyInfo)` of the certificate, DER (§10.3): the owner index finds the user from the certificate a connection presents |
@@ -125,12 +130,13 @@ Device keys are not in the store: their id is the device fingerprint, and the AC
 
 ### 4.2 Login names
 
-Methods where the user types a name (6 now, 3 later) find the account through a **login-name index**.
+Methods where the user types a name, 6 and 3, find the account through a **login-name index**, with an entry per method (keyspace.md §3.7).
 
 * **Normalization.** Surrounding whitespace is trimmed and ASCII letters are lowercased. The result must be 1–128 bytes of `a-z`, `0-9` and `. _ - @ +`: an email address fits. Other names are refused with 400. Unicode names are deferred (`TD-AUTH-UNICODE-LOGIN`).
 * **Only a hash is stored**: `H(name) = BLAKE3.derive_key("zen-serve 2026 login name", normalized name)`. A dump holds no names; a guessed name can be checked against it, as with any unsalted index.
-* **Unique across users.** A user can hold one login name per method; claiming a name another user holds returns 409 `name_taken`. That answer tells an authenticated member that the name exists.
-* **Unknown names get fake parameters.** The parameter lookup (§11.2) answers an unknown name with the configured Argon2id parameters and a salt `BLAKE3.keyed_hash(K, "zen-serve fake password salt" ‖ 0x00 ‖ H(name))`. `K` is 32 random bytes, kept in the keyspace with the data, so every node, and a restored copy, gives the same answer. It is created on first use after the claim; before the claim no account exists, and each node uses a key of its own, so a server that was only started holds no data (operations.md §6). A name gets the same fake every time, so repeated lookups don't reveal which names exist.
+* **Unique across users, across methods.** A name belongs to at most one user, whichever method registered it: claiming a name another user holds for either method returns 409 `name_taken`. That answer tells an authenticated member that the name exists.
+* **One name per method.** A user holds at most one name per method, and may use the **same name for both** (the usual case: one name, two credentials, each method holding its own), or different ones. A sign-in picks the method by its endpoint, not by the name: the client knows which method it registered. A client that offers both tries the default first (§2), and every attempt counts towards the name's lock (§8.5).
+* **Unknown names get fakes.** Method 3 answers an unknown name with OPAQUE's own fake record (§8.3). Method 6's parameter lookup (§11.2) answers an unknown name with the configured Argon2id parameters and a salt `BLAKE3.keyed_hash(K, "zen-serve fake password salt" ‖ 0x00 ‖ H(name))`. `K` is 32 random bytes, kept in the keyspace with the data, so every node, and a restored copy, gives the same answer. It is created on first use after the claim; before the claim no account exists, and each node uses a key of its own, so a server that was only started holds no data (operations.md §6). A name gets the same fake every time, so repeated lookups don't reveal which names exist.
   * **Residual leak.** A registered account whose parameters differ from the configured ones is distinguishable. Clients should register with the parameters `/v1/info` advertises (§11.2). A name that was registered and then removed gets a fake salt that differs from its old real one.
 
 ## 5. Origin policy
@@ -313,9 +319,116 @@ Signing in gives server access only. A client can also unlock data keys with the
 * **Removal.** Removing the passkey from the credential store (§4) doesn't remove its keyslot, nor the reverse: the slot keeps opening with the authenticator until it is removed from the fs header. As with any keyslot, a key bundle already unwrapped stays known; revoking it takes a rotation (formats.md §2).
 * **Threats.** Whoever holds the authenticator, and passes its user verification, can open the slot; the server and a dump hold nothing that opens it. The PRF is a symmetric secret of the authenticator, so the slot doesn't depend on the classical signature algorithms (§7.6). Synced passkeys carry their PRF secret to the user's other devices, so the slot opens on all of them.
 
-## 8. Method 3: OPAQUE (reserved)
+## 8. Method 3: OPAQUE
 
-> **Placeholder.** Password sign-in with the OPAQUE augmented PAKE. It shares the login-name index of §4.2 with method 6. Not implemented.
+Password sign-in with **OPAQUE**, the augmented PAKE of RFC 9807, **off by default**. The client proves it knows the password without sending it, or anything from which the password can be guessed without the server's own keys. The server stores a **registration record** per credential and one cluster-wide **server setup**.
+
+```toml
+[auth]
+opaque = true
+# The Argon2id parameters, the failed-attempt limit and the lockout are
+# method 6's: password_m_cost_kib, password_t_cost, password_p_cost,
+# password_max_failures, password_lockout_secs (§11).
+```
+
+Next to method 6 (§11), which also signs in with a password:
+* **Nothing to guess with outside the server.** Method 6 hands out the salt to anyone who asks and puts a password-derived signature on the wire. OPAQUE's record is useless without the server setup, and its messages are blinded: neither an eavesdropper nor another member gets anything to test guesses against (§8.7).
+* **No precomputation.** Guessing needs the server's OPRF key, so it can't start before the server's data is stolen.
+* **Mutual authentication.** The client finishes only if the server holds the record and the setup's key.
+* **Not post-quantum**, unlike method 6's hybrid signature (§8.7).
+
+Method 6 stays the default: it needs no second round, and its key is post-quantum. A server can offer both.
+
+### 8.1 Cipher suite and server setup
+
+**Suite** (zen-core `opaque`, from the `opaque-ke` crate): RFC 9807's ristretto255-SHA512 configuration.
+* OPRF: ristretto255-SHA512 (RFC 9497).
+* AKE: 3DH over ristretto255 with SHA-512.
+* KSF: **Argon2id** v1.3 over the OPRF output, with a salt of 16 zero bytes, as RFC 9807 recommends for Argon2id (the OPRF already makes the input unique per user and server), a 64-byte output, and the parameters stored with the credential (§8.2). The floors and ceilings are those of formats.md §6.
+* Client and server identities: the RFC defaults, the two public keys. No names enter the record, so a login-name change needs a new registration anyway (§8.2), and the server's origin may change without breaking records.
+* **Credential identifier:** `H(name)`, the login-name hash of §4.2. The server derives each name's OPRF key from it and the setup's seed, for unknown names too, so a fake record evaluates the OPRF exactly as a real one would.
+* **Context:** `"zen/v1/opaque" ‖ 0x00 ‖ origin` (labels.md), the origin the client sees (§8.4).
+
+Ristretto255 with 3DH and SHA-512 is one of the RFC's configurations, the one `opaque-ke` uses by default and checks against the RFC's test vectors; it is pure Rust and builds for wasm32, so browser clients can use zen-core. Argon2id is what the rest of zen-serve already uses for passwords (formats.md §6, §7.5), with the same parameters and limits.
+
+**Server setup.** One per cluster: the 64-byte OPRF seed, the server's AKE key pair and a public key for fake records, 128 bytes in `opaque-ke`'s encoding. It is stored at `pack("auth_key", "opaque")` (keyspace.md §3.7) and created on first use once the cluster is claimed; before the claim, each process uses one of its own for fake answers, so a server that was only started holds no data (operations.md §6).
+* It is **data, not server metadata**: every node uses the same one, and backups and exports carry it.
+* **Losing or replacing it invalidates every OPAQUE record**, and with them every type-5 keyslot (§8.6): users can no longer sign in with method 3 and must register again from a session of another method. A server never replaces a setup it can't decode; it refuses method-3 requests with 500 until the stored one is restored. Rotating the setup is not supported (`TD-AUTH-OPAQUE-SETUP-ROTATION`).
+* A client may remember the server's public key from its registration and compare it at each sign-in (zen-core returns it).
+
+### 8.2 Registration and password change
+
+1. The client blinds the password (zen-core `opaque::Registration::start`) and calls `POST /v1/auth/opaque/register/start` (api.md §3.15) with a session of the user, the login name and the `RegistrationRequest`. The server checks the name (§4.2) and that no other user holds it, and returns the `RegistrationResponse` and the configured Argon2id parameters. This round stores nothing.
+2. The client finishes (`Registration::finish`) with Argon2id parameters at least the registration floor of formats.md §6, usually the ones returned, and gets the **export key** (§8.6).
+3. `POST /v1/auth/opaque/register/finish` with the **same login name**, the `RegistrationUpload` and the parameters. The server checks the name again, the upload's encoding and the parameters against the floors and ceilings, and stores a new credential with a fresh random id. Any earlier OPAQUE credential of the user is deleted in the same transaction.
+
+The record is bound to the name's OPRF key: an upload sent with another name than its `start` stores a record that never signs in.
+
+The same call is the **password change**, and also changes the login name. The old credential's sessions end, including the calling session if it signed in with the old password, as for method 6 (§11.2). A new registration gives a new export key even for the same password.
+
+Any interactive session of the user may register: device key, passkey, password key or OPAQUE (`TD-AUTH-INVITES` covers a first registration without one). The old password is not asked for. A user holds at most one OPAQUE credential, and may hold a method-6 credential under the same name (§4.2).
+
+### 8.3 Sign-in
+
+1. The client starts (`opaque::Login::start`) and calls `POST /v1/auth/opaque/login/start {name, origin, request}` (api.md §3.16), without a session. The server answers with the `CredentialResponse`, the Argon2id parameters of the credential and a sealed **login state**.
+2. The client finishes (`Login::finish`) with the password, the parameters (checked against the ceilings of formats.md §6 only) and the origin it sees. It gets the export key and the `CredentialFinalization`. With a wrong password, an unknown name or a server that used another origin, the client fails here and has nothing to send.
+3. `POST /v1/auth/opaque/login/finish {state, finalization}`. The server opens the state, checks the finalization (the client's MAC over the transcript), that the name still points to the same credential and that its user is a member, and issues the session with `issue_session`, the state's challenge and the origin (§13). The session's `device_fp` is the credential id and `method` is `opaque`.
+
+The server answers every credential failure at `finish` (unknown name, wrong MAC, a credential since removed or replaced, a user no longer a member) with the same 401, "unknown login name or wrong password". A state that is expired, used, tampered with or from another cluster also gets 401.
+
+**The login state is stateless**, so `finish` may reach any node:
+
+```
+state     = challenge(32) ‖ nonce(24) ‖ XChaCha20-Poly1305(K, plaintext, aad = challenge)
+K         = BLAKE3.derive_key("zen-serve 2026 opaque login state", challenge key)
+plaintext = H(name)(32) ‖ u8 known ‖ user_fp(32) ‖ cred_id(32) ‖ u16 len ‖ origin ‖ ServerLogin
+```
+
+* The **challenge** is an ordinary one (api.md §3.1), made by `start`: its MAC and its 60-second expiry are checked first, and `issue_session` spends it, so a state finishes at most once in the cluster.
+* `ServerLogin` is `opaque-ke`'s server state: the expected client MAC and the session key. They are secrets, which is why the state is encrypted, not only authenticated.
+* The challenge key is server metadata (keyspace.md §3.4), shared by the nodes of a cluster but not exported: after a restore or import, sign-ins in flight start again.
+* Nothing is written for a `start`, so unauthenticated callers can't use it to load storage.
+
+**Unknown names** get OPAQUE's **fake record**, RFC 9807's defence against client enumeration: the response is built from a record with a random masking key and the setup's fake public key, with the OPRF key derived from the name like a real one. Its size and structure are those of a real response, and the masked parts are fresh random-looking bytes on every call, for real and fake records alike. The parameters returned are the configured ones. The state records that the name is unknown, and `finish` does the same work and gives the same 401.
+* **Residual leak** (as §4.2): a credential registered with other parameters than the configured ones is distinguishable by them, so clients register with the parameters `register/start` returns. Timing differences of the record lookup are not hidden.
+
+### 8.4 Origin binding
+
+OPAQUE signs nothing, but its MACs cover a **context**: the client and the server both use `"zen/v1/opaque" ‖ 0x00 ‖ origin`, where the client takes the origin it sees and the server the one `start` named, sealed in the state.
+* A relay that **forwards its own origin** gets a session refused by the origin policy (§5): `finish` passes the origin to `issue_session` like a signed one (`Signed`), which checks it in the session's transaction and pins it if it is the first (§5.2).
+* A relay that **names the real origin** to the server while its victim sees the relay's: the server's KE2 MAC covers the real origin, so the victim's client refuses it and never sends a finalization.
+* `start` refuses a malformed origin with 401; the policy itself is applied once, at `finish`, with the `Host` header of the `finish` request for the fallback (§5.4).
+
+This is the protection of method 6 (§11.4): it keeps an honest client from being relayed, as far as the origin policy knows the server's origins. It doesn't stop a phishing page whose own code collects the typed password.
+
+### 8.5 Failed-attempt limiter
+
+Method 3 uses method 6's limiter (§11.3), keyed by the login-name hash, so the counts of a name are **shared by both methods**, and `password_max_failures` and `password_lockout_secs` apply to their sum.
+* **Every `start` counts as a failure**, for unknown names too: a credential response lets the client test one password guess offline, whether or not it finishes. A successful `finish` clears the name's count. A failed `finish` doesn't count again.
+* While the name is locked, `start` returns 429 `quota`, even for the right password.
+* **Across nodes.** `start` and `finish` may reach different nodes; the count is on the node of the `start`, the success on the node of the `finish`. A successful sign-in therefore records its time in the credential (`last_used_unix`), and a `start` first clears the node's count of a name whose last failure there is no newer than that time. Otherwise a load balancer that alternates nodes would lock users out after `password_max_failures` sign-ins.
+* The other caveats of §11.3 stay: the limit is per node, and a restart clears it (`TD-AUTH-LIMITER-CLUSTER`).
+
+### 8.6 Unlocking data keys: the export key
+
+A registration and every sign-in with the same credential give the client the same 64-byte **export key**, which the server never sees. It opens a keyslot of type 5 (formats.md §6), which stores the credential id.
+* **Creating a slot.** After `register/finish`, the client, holding the fs keys, wraps them with the export key of the registration and the credential id the call returned.
+* **Unlocking while signing in.** The session's `device_fp` is the credential id: the client finds the matching type-5 slot in the fs header and opens it with the export key of the same sign-in. No second prompt.
+* **A password change** registers a new credential with a new export key, so the old slot no longer opens. The client opens it before (it signs in with the old password, or holds the fs keys), then creates a slot for the new credential and removes the old one.
+* **Online only.** Computing the export key needs the server's OPRF evaluation and the record, so a stolen fs header alone allows no offline guessing against the slot, unlike a passphrase slot (type 1). Whoever holds the record and the server setup can guess, as for sign-in (§8.7).
+* **Losing the record or the setup** (removing the credential, a member leaving the ACL, a lost setup) makes the slot unopenable for good. As with passkey slots (§7.7), users keep another keyslot.
+
+### 8.7 Threat notes
+
+* **A stolen database.** The record and the server setup are both in the keyspace, so the server, a backup and an export hold everything needed to **guess offline**, at one Argon2id run per guess (the KSF, §8.1), as for method 6 (§11.4). OPAQUE adds nothing against that attacker beyond Argon2id: strong parameters and strong passwords are the defence. Whoever holds the records but not the setup can't guess.
+* **Eavesdroppers and other members** get nothing to guess with: the OPRF input is blinded, the masked response opens only with the password, and nothing about a credential is listed to anyone (§4). Method 6, in comparison, gives out the salt, and every sign-in carries a password-derived signature against which whoever sees it can test guesses.
+* **Online guessing** costs one `start` per guess, which the limiter caps (§8.5). A `start` costs the server one OPRF evaluation and one 3DH, and the client one Argon2id run.
+* **No precomputation.** Guesses can't be prepared before the server's data is stolen: the OPRF key enters every one.
+* **Not post-quantum.** Ristretto255 is a classical group. A large quantum computer would let whoever recorded a sign-in solve its discrete logarithms: recover the name's OPRF key, guess the password offline against the recorded response, and impersonate the server to the client. The session token itself is protected by TLS (operations.md §8). Methods 1 and 6 sign with a hybrid including ML-DSA-65.
+* **Lockout as denial of service**, and **phishing**: as method 6 (§11.4).
+* **Enumeration.** Responses look the same for known and unknown names (§8.3), up to the parameter leak and timing.
+* **Mutual authentication.** A client that finishes knows the server holds the record and the setup's private key; a relay without them can't complete the AKE with it.
+* **The server setup is a key.** Protect backups and exports accordingly (operations.md §5.1, §6). Losing it locks out every method-3 user and their type-5 slots (§8.1).
 
 ## 9. Method 4: API tokens
 
@@ -462,7 +575,7 @@ Any interactive session of the user may set the password: a device-key session (
 2. The client derives the key, with the sign-in ceilings of formats.md §7.5, gets a challenge (api.md §3.1) and signs the session message with purpose `zen/v1/sig/password-session` (formats.md §10).
 3. `POST /v1/auth/password/session {name, challenge, origin, sig}` (api.md §3.6). The server checks the challenge and the origin policy (§5), then the signature against the stored identity, then that the user is a member. It answers every credential failure (unknown name, wrong key, not a member) with the same 401, and issues an ordinary session otherwise.
 
-**Failed-attempt limiter.** Each node counts failed sign-ins per login-name hash in memory, for unknown names too. After `password_max_failures` failures, the name is locked: every attempt gets 429 `quota`, even with the right password, until `password_lockout_secs` after the last failure. A success clears the count. Challenge and origin failures don't count.
+**Failed-attempt limiter.** Each node counts failed sign-ins per login-name hash in memory, for unknown names too. Method 3 shares the counts (§8.5). After `password_max_failures` failures, the name is locked: every attempt gets 429 `quota`, even with the right password, until `password_lockout_secs` after the last failure. A success clears the count. Challenge and origin failures don't count.
 * The limit applies **per node**: a cluster of n nodes allows n times as many guesses.
 * A restart clears it (`TD-AUTH-LIMITER-CLUSTER`).
 
@@ -483,7 +596,7 @@ Signing in never gives the server a key to the data. Which methods can also **un
 |---|---|---|
 | 1 `device_key` | yes | yes: an X-Wing device keyslot (formats.md §6, type 3) opens with the device secret |
 | 2 `passkey` | yes | yes, if the authenticator supports the WebAuthn PRF extension: a PRF keyslot (formats.md §6, type 4) opens with the passkey's PRF output (§7.7) |
-| 3 `opaque` | yes | not specified yet |
+| 3 `opaque` | yes | yes: an OPAQUE export-key keyslot (formats.md §6, type 5) opens with the export key of a sign-in with the credential (§8.6) |
 | 4 `api_token` | yes | no |
 | 5 `mtls` | yes | no: the certificate's private key stays in the TLS stack (the browser, the OS key store, a smart card, or the proxy), which can sign handshakes but derives no secret a keyslot could use |
 | 6 `password_key` | yes | yes: the client holds the password, so it can also open or create a passphrase keyslot (formats.md §6, type 1) |
@@ -492,11 +605,11 @@ For method 6 the sign-in key and a passphrase keyslot are independent derivation
 
 ## 13. Adding a method
 
-For implementers of the reserved method (3) and of later ones. A method:
-1. Adds itself to `auth::IMPLEMENTED` in zen-server once it works; its `AuthMethod` variant, id, wire name and `[auth]` flag already exist.
+For implementers of later methods. A method:
+1. Adds itself to `auth::IMPLEMENTED` in zen-server once it works; it also adds its `AuthMethod` variant (a new id and wire name) in zen-proto and its `[auth]` flag.
 2. Calls `AppState::require_method` first in each of its endpoints.
 3. Stores its credentials with `cred::put`, as a `CredRecord` with its method id and any new optional fields it needs, and finds them with `cred::get`, `cred::owner`, `cred::list` and, for a typed name, `cred::login` (§4.2). Credential removal, listing, the per-user limit and the clean-up when a member leaves the ACL then work unchanged.
-4. Ends a sign-in with `auth::issue_session(user, credential id, method, signed)`. A method that signs a challenge and an origin passes them as `Signed`, which spends the challenge and applies the origin policy (§5) in the session's transaction, pinning the first origin. A method that signs no origin passes `None`, as TLS client certificates do (§10.4): the handshake binds them instead.
+4. Ends a sign-in with `auth::issue_session(user, credential id, method, signed)`. A method that signs or MACs a challenge and an origin passes them as `Signed`, which spends the challenge and applies the origin policy (§5) in the session's transaction, pinning the first origin. A method that signs no origin passes `None`, as TLS client certificates do (§10.4): the handshake binds them instead.
 5. Documents itself in its section here, in api.md §3 and in TECH_DEBT.md for what it defers.
 
 Sessions of a method other than device keys stay valid only while their credential exists in the store (§3, step 4), so every such session must name a stored credential.

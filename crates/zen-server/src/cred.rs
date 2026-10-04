@@ -41,7 +41,7 @@ pub struct CredRecord {
     /// A label chosen at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Hash of the normalized login name (`password_key`, later `opaque`).
+    /// Hash of the normalized login name (`password_key`, `opaque`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_hash: Option<ByteBuf>,
     /// Argon2id salt (`password_key`).
@@ -73,9 +73,19 @@ pub struct CredRecord {
     /// The relying-party id it was registered under (`passkey`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rp_id: Option<String>,
-    /// The last sign-in with it, unix seconds (`passkey`, `mtls`).
+    /// The last sign-in with it, unix seconds (`passkey`, `mtls`,
+    /// `opaque`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_unix: Option<u64>,
+    /// The OPAQUE registration record, RFC 9807's `RegistrationRecord`
+    /// (`opaque`): the client's public key, the masking key and the
+    /// envelope. Never sent to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_record: Option<ByteBuf>,
+    /// The Argon2id parameters the client stretched the password with
+    /// (`opaque`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_ksf: Option<zen_proto::Argon2Params>,
 }
 
 impl CredRecord {
