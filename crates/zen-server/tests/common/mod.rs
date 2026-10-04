@@ -157,10 +157,17 @@ impl Harness {
 
     /// Another node serving the same storage (FoundationDB only).
     pub async fn peer(&self) -> Self {
+        self.peer_with(|_| {}).await
+    }
+
+    /// A peer whose data directory `f` prepares before it starts.
+    pub async fn peer_with(&self, f: impl FnOnce(&std::path::Path)) -> Self {
         assert!(on_fdb(), "peers need a shared backend");
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = self.cfg.clone();
         cfg.data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        f(&cfg.data_dir);
         Self::launch(cfg, dir).await
     }
 

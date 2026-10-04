@@ -57,9 +57,14 @@ pub fn log_prefix(fs: u32, topic: &[u8]) -> Key {
     Key::new().str("log").int(fs.into()).bytes(topic)
 }
 
+/// `("lk", fs, topic)`: the per-key index of a topic, in key order.
+pub fn lk_topic(fs: u32, topic: &[u8]) -> Key {
+    Key::new().str("lk").int(fs.into()).bytes(topic)
+}
+
 /// `("lk", fs, topic, key)`.
 pub fn lk_prefix(fs: u32, topic: &[u8], key: &[u8]) -> Key {
-    Key::new().str("lk").int(fs.into()).bytes(topic).bytes(key)
+    lk_topic(fs, topic).bytes(key)
 }
 
 /// Topic head.
@@ -87,6 +92,16 @@ pub fn group(fs: u32, group: &[u8]) -> Vec<u8> {
 /// `("ct", fs, topic)`: groups on a topic.
 pub fn topic_groups(fs: u32, topic: &[u8]) -> Key {
     Key::new().str("ct").int(fs.into()).bytes(topic)
+}
+
+/// `("lp", fs, group, part)`: a partitioned group's index of its topic's
+/// events by partition, `… vs → ∅`, written on append (keyspace.md §3.3).
+pub fn partition_index(fs: u32, group: &[u8], part: u32) -> Key {
+    Key::new()
+        .str("lp")
+        .int(fs.into())
+        .bytes(group)
+        .int(part.into())
 }
 
 /// Committed cursor of a partition.
@@ -227,6 +242,11 @@ pub fn meta(name: &str) -> Vec<u8> {
     Key::new().str("meta").str(name).finish()
 }
 
+/// `("meta")`: all server metadata, private to one store or cluster.
+pub fn meta_prefix() -> Vec<u8> {
+    Key::new().str("meta").finish()
+}
+
 // ---- filesystem trees (keyspace.md §3.6)
 
 /// `("tr", fs)`: tree headers of an fs.
@@ -273,9 +293,42 @@ pub fn changes(fs: u32, tree: &[u8]) -> Key {
     Key::new().str("tv").int(fs.into()).bytes(tree)
 }
 
+/// `("ts", fs)`: the trees of an fs that the sweeper visits.
+pub fn sweep_index(fs: u32) -> Key {
+    Key::new().str("ts").int(fs.into())
+}
+
+/// A tree that may have work for the sweeper: `("ts", fs, tree)` → ∅,
+/// written with every move, cleared by the sweeper once there is none.
+pub fn sweep_needed(fs: u32, tree: &[u8]) -> Vec<u8> {
+    sweep_index(fs).bytes(tree).finish()
+}
+
+/// `("tsi", fs)` → ∅: the sweep index lists every tree with work, including
+/// trees from before it existed (backfilled once from the tree headers).
+pub fn sweep_index_ready(fs: u32) -> Vec<u8> {
+    Key::new().str("tsi").int(fs.into()).finish()
+}
+
+/// The tree's trash-purge cursor: `("tq", fs, tree)` → the `TRASH` child
+/// the next purge round starts at.
+pub fn trash_cursor(fs: u32, tree: &[u8]) -> Vec<u8> {
+    Key::new().str("tq").int(fs.into()).bytes(tree).finish()
+}
+
 /// `("tx", fs, tree)`: tombstones.
 pub fn tombstones(fs: u32, tree: &[u8]) -> Key {
     Key::new().str("tx").int(fs.into()).bytes(tree)
+}
+
+/// A purged node's tombstone by id: `("tp", fs, tree, node)` → `cvs(12)`.
+pub fn purged(fs: u32, tree: &[u8], node: &[u8]) -> Vec<u8> {
+    Key::new()
+        .str("tp")
+        .int(fs.into())
+        .bytes(tree)
+        .bytes(node)
+        .finish()
 }
 
 /// `("tf", fs, tree, node)`: content versions of a node.
@@ -296,4 +349,9 @@ pub fn chunk_refs(fs: u32, id: &[u8]) -> Vec<u8> {
 /// `("cz", fs)`: chunk GC candidates.
 pub fn chunk_gc(fs: u32) -> Key {
     Key::new().str("cz").int(fs.into())
+}
+
+/// A chunk's newest GC candidate: `("cp", fs, chunk)` → `cvs(12)`.
+pub fn chunk_gc_ptr(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("cp").int(fs.into()).bytes(id).finish()
 }

@@ -94,6 +94,9 @@ pub struct Limits {
     pub max_commit_ops: u32,
     /// Max items per range read (and per `expect_ranges` range).
     pub max_range_items: u32,
+    /// Max bytes per range read.
+    #[serde(default)]
+    pub max_range_bytes: u64,
     /// Idempotency record lifetime.
     pub idempotency_ttl_secs: u64,
     /// Session lifetime.
@@ -107,6 +110,28 @@ pub struct Limits {
     /// Max logged moves one late move may undo and redo.
     #[serde(default)]
     pub crdt_max_redo: u32,
+    /// Max depth of a move's new parent.
+    #[serde(default)]
+    pub crdt_max_depth: u32,
+    /// How long an unreferenced chunk is kept.
+    #[serde(default)]
+    pub chunk_grace_secs: u64,
+    /// `per_key` claim lifetime.
+    #[serde(default)]
+    pub claim_ttl_ms: u32,
+    /// How long ephemeral messages stay in the cross-node ring.
+    #[serde(default)]
+    pub ephemeral_ttl_secs: u64,
+    /// Max consumer groups per topic.
+    #[serde(default)]
+    pub max_groups_per_topic: u32,
+    /// Ephemeral publishes per device and node: sustained bytes per second
+    /// (a message costs its data plus 256 bytes); 0 = no limit.
+    #[serde(default)]
+    pub ephemeral_bytes_per_sec: u64,
+    /// Ephemeral publishes per device and node: burst, in bytes.
+    #[serde(default)]
+    pub ephemeral_burst_bytes: u64,
 }
 
 // ---------------------------------------------------------------- auth

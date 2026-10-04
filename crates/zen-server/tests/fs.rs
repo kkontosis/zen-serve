@@ -1021,3 +1021,266 @@ async fn changes_across_nodes() {
         .unwrap();
     assert_eq!(c.changes.len(), 1);
 }
+
+async fn chunk_exists(h: &Harness, d: &Dev, c: [u8; 16]) -> bool {
+    let r: Chunks = h
+        .call(
+            "/v1/fs/chunks/get",
+            Some(&d.tok),
+            &ChunksGet {
+                fs: 1,
+                ids: vec![ByteBuf::from(c.to_vec())],
+            },
+        )
+        .await
+        .unwrap();
+    r.chunks[0].data.is_some()
+}
+
+async fn put_chunk(h: &Harness, d: &Dev, c: [u8; 16]) {
+    let commit = Commit {
+        commit_id: rcid(),
+        chunks: vec![ChunkPut {
+            fs: 1,
+            id: c.to_vec(),
+            data: vec![c[0]; 40],
+        }],
+        ..Default::default()
+    };
+    let _: CommitResult = h.call("/v1/commit", Some(&d.tok), &commit).await.unwrap();
+}
+
+/// The grace period of an unreferenced chunk restarts on re-upload and on
+/// every release: the sweeper only acts on a chunk's newest GC candidate,
+/// so an older candidate past the grace period does not delete it.
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_grace_restarts_on_reupload_and_release() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 3;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let st = &h.server.state;
+    // Re-upload.
+    put_chunk(&h, &a, id(0xA1)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    put_chunk(&h, &a, id(0xA1)).await; // restarts the grace period
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // The first candidate is older than the grace period, the second is not.
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        chunk_exists(&h, &a, id(0xA1)).await,
+        "re-upload restarted grace"
+    );
+    // Release, re-reference, release.
+    let t = zfs::hlc(now_ms(), 0);
+    let r = ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"f")),
+            write(id(1), &[], &[id(0xA1)], b"m1"),
+        ],
+    )
+    .await
+    .unwrap();
+    let d1 = r.dots[0].to_vec();
+    let r = ops(&h, &a, vec![write(id(1), &[d1], &[], b"m2")])
+        .await
+        .unwrap(); // released
+    let d2 = r.dots[0].to_vec();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let r = ops(&h, &a, vec![write(id(1), &[d2], &[id(0xA1)], b"m3")])
+        .await
+        .unwrap();
+    let d3 = r.dots[0].to_vec();
+    let _ = ops(&h, &a, vec![write(id(1), &[d3], &[], b"m4")])
+        .await
+        .unwrap(); // released again
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        chunk_exists(&h, &a, id(0xA1)).await,
+        "release restarted grace"
+    );
+    // Once the newest candidate is past the grace period, the chunk goes.
+    // The grace is measured in commit versions, which on an idle
+    // FoundationDB cluster can trail the wall clock by a couple of seconds.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        zen_server::sweep_once(st).await.unwrap();
+        if !chunk_exists(&h, &a, id(0xA1)).await {
+            break;
+        }
+        assert!(Instant::now() < deadline, "collected after grace");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// While a purged node's tombstone is kept, operations naming it (as the
+/// node or as a parent) are refused with `stale_op` instead of resurrecting
+/// an empty node. Once the tombstone is dropped, the id is new again.
+#[tokio::test(flavor = "multi_thread")]
+async fn operations_on_purged_nodes_are_stale() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.crdt_horizon_secs = 2;
+        c.limits.crdt_max_skew_ms = 500;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let st = &h.server.state;
+    let t = zfs::hlc(now_ms(), 0);
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"dir")),
+            mv(id(2), id(1), t + 1, Some(b"file")),
+            mv(id(1), TRASH, t + 2, None),
+        ],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(get(&h, &a, &[id(1), id(2)]).await.is_empty(), "purged");
+    let fresh = || zfs::hlc(now_ms(), 0);
+    let stale = |r: Result<CommitResult, ApiErr>| {
+        let e = r.expect_err("refused");
+        assert_eq!((e.0, e.1.code.as_str()), (409, "stale_op"), "{e:?}");
+    };
+    stale(ops(&h, &a, vec![mv(id(2), ROOT, fresh(), None)]).await);
+    stale(ops(&h, &a, vec![mv(id(1), ROOT, fresh(), Some(b"x"))]).await);
+    stale(ops(&h, &a, vec![mv(id(9), id(2), fresh(), Some(b"new"))]).await);
+    stale(ops(&h, &a, vec![meta(id(2), fresh(), b"m")]).await);
+    stale(ops(&h, &a, vec![write(id(2), &[], &[], b"m")]).await);
+    assert!(
+        get(&h, &a, &[id(1), id(2), id(9)]).await.is_empty(),
+        "nothing resurrected"
+    );
+    // An unknown parent that was never purged is still a plain 400.
+    let e = ops(&h, &a, vec![mv(id(9), id(8), fresh(), None)])
+        .await
+        .expect_err("unknown parent");
+    assert_eq!(e.0, 400);
+    // Tombstones older than the horizon are dropped; the id is then new.
+    // Tombstone age is measured in commit versions, which on an idle
+    // FoundationDB cluster can trail the wall clock by a couple of seconds.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        zen_server::sweep_once(st).await.unwrap();
+        match ops(&h, &a, vec![mv(id(2), ROOT, fresh(), Some(b"again"))]).await {
+            Ok(_) => break,
+            Err(e) => assert_eq!(e.1.code, "stale_op", "{e:?}"),
+        }
+        assert!(Instant::now() < deadline, "tombstone dropped");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(parent_of(&get(&h, &a, &[id(2)]).await[&id(2)]), Some(ROOT));
+}
+
+/// A move whose parent has more than `crdt_max_depth` ancestors is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn depth_is_bounded() {
+    let (h, a, _) = two_devices(|c| c.limits.crdt_max_depth = 3).await;
+    let t = zfs::hlc(now_ms(), 0);
+    // ROOT → 1 → 2 → 3 → 4: node 4's parent has three ancestors below ROOT.
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, None),
+            mv(id(2), id(1), t + 1, None),
+            mv(id(3), id(2), t + 2, None),
+            mv(id(4), id(3), t + 3, None),
+        ],
+    )
+    .await
+    .unwrap();
+    let e = ops(&h, &a, vec![mv(id(5), id(4), t + 4, None)])
+        .await
+        .expect_err("too deep");
+    assert_eq!(e.0, 400);
+    assert!(get(&h, &a, &[id(5)]).await.is_empty());
+    let info: Info = h.get("/v1/info").await;
+    assert_eq!(info.limits.crdt_max_depth, 3);
+}
+
+/// The sweeper visits only the trees in its index: a move lists the tree,
+/// and the sweeper drops it once its move log, trash and tombstones are
+/// gone. Data from before the index is listed once by a backfill.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweeper_visits_only_indexed_trees() {
+    use zen_server::keys;
+    let (h, a, _) = two_devices(|c| {
+        c.limits.crdt_horizon_secs = 2;
+        c.limits.crdt_max_skew_ms = 500;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let st = &h.server.state;
+    let store = st.store.clone();
+    let has = |k: Vec<u8>| {
+        let store = store.clone();
+        async move {
+            let mut t = store.begin(None).await.unwrap();
+            t.get(&k).await.unwrap().is_some()
+        }
+    };
+    let clear = |k: Vec<u8>| {
+        let store = store.clone();
+        async move {
+            let mut t = store.begin(None).await.unwrap();
+            t.clear(&k);
+            t.commit().await.unwrap();
+        }
+    };
+    let (entry, ready) = (keys::sweep_needed(1, &TREE), keys::sweep_index_ready(1));
+    let t = zfs::hlc(now_ms(), 0);
+    ops(
+        &h,
+        &a,
+        vec![
+            mv(id(1), ROOT, t, Some(b"x")),
+            mv(id(1), TRASH, t + 1, None),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(has(entry.clone()).await, "a move lists the tree");
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(
+        has(ready.clone()).await,
+        "the first sweep completes the index"
+    );
+    assert!(has(entry.clone()).await, "work left: still listed");
+
+    // A tree missing from a complete index is not visited.
+    clear(entry.clone()).await;
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(!get(&h, &a, &[id(1)]).await.is_empty(), "not visited");
+
+    // Without the marker (data from before the index), a sweep lists every
+    // tree again; then the trash is purged and, once its tombstone is
+    // dropped (an age in versions, polled), the tree leaves the index.
+    clear(ready.clone()).await;
+    zen_server::sweep_once(st).await.unwrap();
+    assert!(has(ready.clone()).await);
+    assert!(get(&h, &a, &[id(1)]).await.is_empty(), "purged");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while has(entry.clone()).await {
+        assert!(Instant::now() < deadline, "the tree leaves the index");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        zen_server::sweep_once(st).await.unwrap();
+    }
+    assert!(!has(keys::trash_cursor(1, &TREE)).await);
+
+    // New work lists it again.
+    ops(&h, &a, vec![mv(id(2), ROOT, zfs::hlc(now_ms(), 0), None)])
+        .await
+        .unwrap();
+    assert!(has(entry.clone()).await);
+}

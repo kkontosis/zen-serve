@@ -35,3 +35,5 @@ agents = true              # run backup_agent for `zen-serve backup`
 
 [limits]
 ephemeral_ttl_secs = 60
+ephemeral_bytes_per_sec = 65536   # a message costs its data + 256 bytes; 0 = no limit
+ephemeral_burst_bytes = 1048576

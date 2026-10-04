@@ -59,7 +59,11 @@ impl AppState {
         challenge_key: [u8; 32],
     ) -> Self {
         AppState {
-            eph: EphHub::new(store.clone()),
+            eph: EphHub::new(
+                store.clone(),
+                cfg.limits.ephemeral_bytes_per_sec,
+                cfg.limits.ephemeral_burst_bytes,
+            ),
             cfg,
             store,
             acl: RwLock::new(Arc::new(acl)),
@@ -74,18 +78,25 @@ impl AppState {
         self.acl.read().expect("acl lock").clone()
     }
 
-    /// Replace the ACL (only moves forward).
+    /// Replace the ACL (only moves forward). Once any version exists, this
+    /// node's claim token is spent, whichever node accepted version 1.
     pub fn set_acl(&self, a: AclState) {
-        let mut cur = self.acl.write().expect("acl lock");
-        if a.version > cur.version {
-            *cur = Arc::new(a);
+        let claimed = {
+            let mut cur = self.acl.write().expect("acl lock");
+            if a.version > cur.version {
+                *cur = Arc::new(a);
+            }
+            cur.version >= 1
+        };
+        if claimed && self.claim.lock().expect("claim lock").is_some() {
+            self.consume_claim_token();
         }
     }
 
     /// Forget the claim token once version 1 exists.
     pub fn consume_claim_token(&self) {
         *self.claim.lock().expect("claim lock") = None;
-        let _ = std::fs::remove_file(self.cfg.data_dir.join("claim-token"));
+        remove_claim_token(&self.cfg.data_dir);
     }
 
     /// 404 unless `fs` is configured.
@@ -95,5 +106,14 @@ impl AppState {
         } else {
             Err(not_found(format!("unknown fs {fs}")))
         }
+    }
+}
+
+/// Delete `<data_dir>/claim-token` (api.md §4.1), if it exists.
+pub fn remove_claim_token(data_dir: &std::path::Path) {
+    match std::fs::remove_file(data_dir.join("claim-token")) {
+        Ok(()) => tracing::info!("claimed: deleted the claim-token file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(error = %e, "could not delete the claim-token file"),
     }
 }

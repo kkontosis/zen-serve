@@ -54,9 +54,13 @@ fn io(e: std::io::Error) -> String {
     format!("I/O: {e}")
 }
 
-/// Backend-private keys are never exported.
+/// Server metadata (`meta/…`, keyspace.md §3.4) belongs to one store or
+/// cluster: the embedded backend's version clock and the cluster's
+/// challenge key. It is never exported or imported, and doesn't make a
+/// target count as holding data, so a server that was only ever started can
+/// be imported into without `--force`.
 fn private(k: &[u8]) -> bool {
-    k == keys::meta("version")
+    k.starts_with(&keys::meta_prefix())
 }
 
 /// Stream every pair in key order to `f`, reading in chunks. One
@@ -137,11 +141,21 @@ pub async fn export(store: &dyn Storage, backend: &str, w: impl Write) -> Result
 /// Whether `store` holds any (non-private) key.
 pub async fn is_empty(store: &dyn Storage) -> Result<bool, String> {
     let mut t = store.begin(None).await.map_err(|e| e.to_string())?;
-    let got = t
-        .snapshot_get_range(&[], &[0xFF], 2, false)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(got.iter().all(|(k, _)| private(k)))
+    let meta = keys::meta_prefix();
+    // Everything before and after the private `meta` range.
+    for (b, e) in [
+        (&[][..], &meta[..]),
+        (&keys::end_of(&meta)[..], &[0xFF][..]),
+    ] {
+        let got = t
+            .snapshot_get_range(b, e, 1, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !got.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Writes pairs in bounded transactions.

@@ -256,3 +256,34 @@ async fn leases_are_fenced_across_nodes() {
         .unwrap();
     assert_eq!(renewed.token, lease.token);
 }
+
+/// Claiming one node spends every node's claim token: a node that is up
+/// deletes its `claim-token` file when it sees the new ACL, and a node that
+/// starts later deletes a stale one.
+#[tokio::test(flavor = "multi_thread")]
+async fn claiming_one_node_removes_every_claim_token_file() {
+    if !on_fdb() {
+        return;
+    }
+    let a = Harness::start().await;
+    let b = a.peer().await;
+    let file = |h: &Harness| h.cfg.data_dir.join("claim-token");
+    assert!(file(&a).exists() && file(&b).exists());
+    assert!(b.server.claim_token.is_some());
+    a.claim(&User::new(1), &[]).await;
+    assert!(!file(&a).exists(), "the claimed node deletes its file");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while file(&b).exists() || b.server.state.claim.lock().unwrap().is_some() {
+        assert!(Instant::now() < deadline, "the other node spends its token");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A node that was down during the claim drops its stale file at start.
+    let c = a
+        .peer_with(|d| std::fs::write(d.join("claim-token"), "stale").unwrap())
+        .await;
+    assert!(c.server.claim_token.is_none());
+    assert!(
+        !file(&c).exists(),
+        "stale claim-token file deleted at start"
+    );
+}

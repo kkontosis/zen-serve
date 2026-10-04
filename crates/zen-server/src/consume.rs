@@ -23,6 +23,12 @@ use zen_store::{Txn, VERSIONS_PER_SEC};
 const DEFAULT_LEASE_MS: u32 = 10_000;
 const MAX_WAIT_MS: u32 = 30_000;
 const MAX_BACKFILL: usize = 100_000;
+/// Ready-list page size and the most entries one `next` walks past.
+const READY_PAGE: usize = 256;
+const READY_SCAN_MAX: usize = 10_000;
+/// A `per_key` long-poll re-checks the ready list this often: a sibling's
+/// commit frees a key without touching the watched topic head.
+const PER_KEY_RECHECK: Duration = Duration::from_millis(1000);
 
 /// A stored group: the normalized definition and its start offset.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,11 +37,22 @@ pub struct StoredGroup {
     pub def: GroupDef,
     /// Cursor of a partition or key that never committed.
     pub start: ByteBuf,
+    /// `partitioned`: events after this offset are in the group's
+    /// partition index (`lp`); older ones are found by scanning the log.
+    /// Absent for groups created before the index existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_from: Option<ByteBuf>,
 }
 
 impl StoredGroup {
     fn start(&self) -> Offset {
         self.start.as_slice().try_into().unwrap_or(ZERO_OFFSET)
+    }
+
+    fn indexed_from(&self) -> Option<Offset> {
+        self.indexed_from
+            .as_ref()
+            .and_then(|o| o.as_slice().try_into().ok())
     }
 
     fn max_attempts(&self) -> u32 {
@@ -236,35 +253,61 @@ pub async fn next_eligible(
         }
         (Mode::Partitioned, Sub::Part(p)) => {
             let n = g.def.partitions.unwrap_or(1);
+            let ix = g.indexed_from();
             let mut from = *after;
-            loop {
-                let (b, e) = keys::after_offset(keys::log_prefix(fs, topic), &from);
-                let got = range(t, &b, &e, 256, track).await?;
-                let done = got.len() < 256;
-                for (k, v) in got {
-                    let o = tail_offset(&k)?;
-                    let (key, _) = decode_entry(&v);
-                    if partition_of(key.as_deref(), n) == *p {
-                        return Ok(Some((o, v)));
+            // Events up to `indexed_from` predate the group's partition
+            // index: scan them (bounded by the topic's size at creation).
+            if ix.is_none_or(|ix| from < ix) {
+                loop {
+                    let (b, e) = keys::after_offset(keys::log_prefix(fs, topic), &from);
+                    let got = range(t, &b, &e, 256, track).await?;
+                    let done = got.len() < 256;
+                    for (k, v) in got {
+                        let o = tail_offset(&k)?;
+                        if ix.is_some_and(|ix| o > ix) {
+                            break;
+                        }
+                        let (key, _) = decode_entry(&v);
+                        if partition_of(key.as_deref(), n) == *p {
+                            return Ok(Some((o, v)));
+                        }
+                        from = o;
                     }
-                    from = o;
+                    if done || ix.is_some_and(|ix| from >= ix) {
+                        break;
+                    }
                 }
-                if done {
+                let Some(ix) = ix else {
                     return Ok(None);
-                }
+                };
+                from = from.max(ix);
             }
+            let (b, e) = keys::after_offset(keys::partition_index(fs, &g.def.group, *p), &from);
+            let Some((k, _)) = range(t, &b, &e, 1, track).await?.into_iter().next() else {
+                return Ok(None);
+            };
+            let o = tail_offset(&k)?;
+            let entry = t
+                .snapshot_get(&keys::log_prefix(fs, topic).vs(&o).finish())
+                .await?
+                .ok_or_else(|| internal("partition index points at a missing event"))?;
+            Ok(Some((o, entry)))
         }
         _ => Err(bad_request("invalid partition or key for this group")),
     }
 }
 
 /// Check the fencing token: the lease (lease modes) or the claim (`per_key`).
+/// The token must be current and held by `device`: tokens are small
+/// counters, so another member must not be able to guess one and act on a
+/// holder's behalf.
 async fn check_token(
     t: &mut Box<dyn Txn>,
     fs: u32,
     g: &StoredGroup,
     sub: &Sub,
     token: u64,
+    device: &[u8; 32],
 ) -> ApiResult<()> {
     match sub {
         Sub::Part(p) => match t
@@ -273,7 +316,7 @@ async fn check_token(
             .as_deref()
             .and_then(decode_lease)
         {
-            Some(l) if l.token == token => Ok(()),
+            Some(l) if l.token == token && l.holder == *device => Ok(()),
             _ => Err(not_leader("lease token is not current")),
         },
         Sub::Key(k) => match t
@@ -282,7 +325,7 @@ async fn check_token(
             .as_deref()
             .and_then(decode_lease)
         {
-            Some(c) if c.token == token => Ok(()),
+            Some(c) if c.token == token && c.holder == *device => Ok(()),
             _ => Err(claim_lost("claim token is not current")),
         },
     }
@@ -334,7 +377,7 @@ pub async fn consume_step(t: &mut Box<dyn Txn>, caller: &Caller, c: &Consume) ->
     let sub = sub_for(&g, c.partition, c.key_token.as_deref())?;
     let from = parse_offset(Some(&c.from))?;
     let to = parse_offset(Some(&c.to))?;
-    check_token(t, c.fs, &g, &sub, c.token).await?;
+    check_token(t, c.fs, &g, &sub, c.token, &caller.device).await?;
     if cursor_of(t, c.fs, &g, &sub).await? != from {
         return Err(cursor_moved("cursor is not at `from`"));
     }
@@ -365,48 +408,74 @@ pub async fn create_group(
                 Err(group_exists("a different group with this name exists"))
             };
         }
+        // Every append pays for the groups on its topic (ready lists,
+        // partition indexes), so their number is capped.
+        let ct = keys::topic_groups(fs, &def.topic).finish();
+        let max_groups = st.cfg.limits.max_groups_per_topic as usize;
+        let n = t
+            .get_range(&ct, &keys::end_of(&ct), max_groups + 1, false)
+            .await?
+            .len();
+        if n >= max_groups {
+            return Err(quota("too many consumer groups on this topic"));
+        }
         let log = keys::log_prefix(fs, &def.topic).finish();
         let log_end = keys::end_of(&log);
+        // The newest event; a conflict-tracked read, so a concurrent append
+        // either lands before it (and is scanned) or after (and is indexed).
+        let last = match t.get_range(&log, &log_end, 1, true).await?.pop() {
+            Some((k, _)) => tail_offset(&k)?,
+            None => ZERO_OFFSET,
+        };
         let start = match def.start {
-            Some(Start::Latest) => match t.get_range(&log, &log_end, 1, true).await?.pop() {
-                Some((k, _)) => tail_offset(&k)?,
-                None => ZERO_OFFSET,
-            },
+            Some(Start::Latest) => last,
             _ => ZERO_OFFSET,
         };
         if def.mode == Mode::PerKey && start == ZERO_OFFSET {
-            // Backfill: each key's first event goes on the ready list.
-            let all = t.get_range(&log, &log_end, MAX_BACKFILL + 1, false).await?;
+            // Backfill: each key's first event goes on the ready list. The
+            // per-key index is in (key, offset) order and holds no
+            // envelopes, so this reads keys only, not the topic's bodies.
+            let lk = keys::lk_topic(fs, &def.topic).finish();
+            let all = t
+                .get_range(&lk, &keys::end_of(&lk), MAX_BACKFILL + 1, false)
+                .await?;
             if all.len() > MAX_BACKFILL {
                 return Err(too_large("topic too long to backfill; use start = latest"));
             }
-            let mut seen = std::collections::HashSet::new();
-            for (k, v) in all {
-                if let (Some(key), _) = decode_entry(&v)
-                    && seen.insert(key.clone())
-                {
-                    let o = tail_offset(&k)?;
-                    t.set(
-                        &keys::ready_prefix(fs, &def.group)
-                            .vs(&o)
-                            .bytes(&key)
-                            .finish(),
-                        &[],
-                    );
-                    t.set(&keys::ready_ptr(fs, &def.group, &key), &o);
+            let mut last: Option<Vec<u8>> = None;
+            for (k, _) in all {
+                let (elems, _) = unpack_prefix(&k[lk.len()..], 2)
+                    .map_err(|_| internal("bad per-key index key"))?;
+                let [Elem::Bytes(key), Elem::Vs(o)] = elems.as_slice() else {
+                    return Err(internal("bad per-key index key"));
+                };
+                if last.as_deref() == Some(key.as_slice()) {
+                    continue;
                 }
+                last = Some(key.clone());
+                t.set(
+                    &keys::ready_prefix(fs, &def.group).vs(o).bytes(key).finish(),
+                    &[],
+                );
+                t.set(&keys::ready_ptr(fs, &def.group, key), o);
             }
         }
+        let partitioned = def.mode == Mode::Partitioned;
         let stored = StoredGroup {
             def: def.clone(),
             start: ByteBuf::from(start.to_vec()),
+            indexed_from: partitioned.then(|| ByteBuf::from(last.to_vec())),
         };
         t.set(&key, &to_cbor(&stored));
+        let mut ct = vec![def.mode.byte()];
+        if partitioned {
+            ct.extend_from_slice(&def.partitions.unwrap_or(1).to_be_bytes());
+        }
         t.set(
             &keys::topic_groups(fs, &def.topic)
                 .bytes(&def.group)
                 .finish(),
-            &[def.mode.byte()],
+            &ct,
         );
         Ok(true)
     })?;
@@ -503,12 +572,13 @@ async fn deliver(
     st: &Shared,
     caller: &Caller,
     req: &NextRequest,
-) -> ApiResult<(Vec<Delivery>, Vec<u8>)> {
+) -> ApiResult<(Vec<Delivery>, Vec<u8>, Mode)> {
     let (out, _) = txn_loop!(st.store, None, |t| {
         let fs = req.fs;
         let g = load_group(&mut t, fs, &req.group).await?;
         caller.require_topic(fs, &g.def.topic, R_CONSUME)?;
         let head = keys::topic_head(fs, &g.def.topic);
+        let mode = g.def.mode;
         let limit = req.limit.unwrap_or(1).clamp(1, 1000);
         let now = t.read_version();
         let mut out = Vec::new();
@@ -519,48 +589,60 @@ async fn deliver(
             let ttl = ms_to_versions(st.cfg.limits.claim_ttl_ms);
             let prefix = keys::ready_prefix(fs, &g.def.group).finish();
             let end = keys::end_of(&prefix);
-            let ready = t
-                .snapshot_get_range(&prefix, &end, (limit as usize) * 4 + 16, false)
-                .await?;
-            for (k, _) in ready {
-                let (elems, _) =
-                    unpack_prefix(&k[prefix.len()..], 2).map_err(|_| internal("bad ready key"))?;
-                let [Elem::Vs(o), Elem::Bytes(key)] = elems.as_slice() else {
-                    return Err(internal("bad ready key"));
-                };
-                let claim_key = keys::claim(fs, &g.def.group, key);
-                let claim = t.get(&claim_key).await?;
-                if claim
-                    .as_deref()
-                    .and_then(decode_lease)
-                    .is_some_and(|c| c.expires > now)
-                {
-                    continue;
+            // Walk the ready list in pages past the claimed keys, so many
+            // keys in flight never hide the ready ones behind them.
+            let mut from_key = prefix.clone();
+            let mut scanned = 0usize;
+            'scan: while scanned < READY_SCAN_MAX {
+                let ready = t
+                    .snapshot_get_range(&from_key, &end, READY_PAGE, false)
+                    .await?;
+                let page = ready.len();
+                for (k, _) in ready {
+                    from_key = zen_store::key_after(&k);
+                    scanned += 1;
+                    let (elems, _) = unpack_prefix(&k[prefix.len()..], 2)
+                        .map_err(|_| internal("bad ready key"))?;
+                    let [Elem::Vs(o), Elem::Bytes(key)] = elems.as_slice() else {
+                        return Err(internal("bad ready key"));
+                    };
+                    let claim_key = keys::claim(fs, &g.def.group, key);
+                    let claim = t.get(&claim_key).await?;
+                    if claim
+                        .as_deref()
+                        .and_then(decode_lease)
+                        .is_some_and(|c| c.expires > now)
+                    {
+                        continue;
+                    }
+                    let (from, last_token) = key_cursor(&mut t, fs, &g, key).await?;
+                    let token = last_token + 1;
+                    let mut kc = from.to_vec();
+                    kc.extend_from_slice(&token.to_be_bytes());
+                    t.set(&keys::key_cursor(fs, &g.def.group, key), &kc);
+                    t.set(
+                        &claim_key,
+                        &encode_lease(&caller.device, token, now + ttl, Some(o)),
+                    );
+                    let entry = t
+                        .snapshot_get(&keys::log_prefix(fs, &g.def.topic).vs(o).finish())
+                        .await?
+                        .ok_or_else(|| internal("ready list points at a missing event"))?;
+                    let (key_token, envelope) = decode_entry(&entry);
+                    let sub = Sub::Key(key.clone());
+                    out.push(Delivery {
+                        offset: o.to_vec(),
+                        key_token,
+                        envelope,
+                        from: from.to_vec(),
+                        token,
+                        attempts: attempts_of(&mut t, fs, &g.def.group, &sub, o).await?,
+                    });
+                    if out.len() as u32 >= limit {
+                        break 'scan;
+                    }
                 }
-                let (from, last_token) = key_cursor(&mut t, fs, &g, key).await?;
-                let token = last_token + 1;
-                let mut kc = from.to_vec();
-                kc.extend_from_slice(&token.to_be_bytes());
-                t.set(&keys::key_cursor(fs, &g.def.group, key), &kc);
-                t.set(
-                    &claim_key,
-                    &encode_lease(&caller.device, token, now + ttl, Some(o)),
-                );
-                let entry = t
-                    .snapshot_get(&keys::log_prefix(fs, &g.def.topic).vs(o).finish())
-                    .await?
-                    .ok_or_else(|| internal("ready list points at a missing event"))?;
-                let (key_token, envelope) = decode_entry(&entry);
-                let sub = Sub::Key(key.clone());
-                out.push(Delivery {
-                    offset: o.to_vec(),
-                    key_token,
-                    envelope,
-                    from: from.to_vec(),
-                    token,
-                    attempts: attempts_of(&mut t, fs, &g.def.group, &sub, o).await?,
-                });
-                if out.len() as u32 >= limit {
+                if page < READY_PAGE {
                     break;
                 }
             }
@@ -600,7 +682,7 @@ async fn deliver(
                 from = o;
             }
         }
-        Ok((out, head))
+        Ok((out, head, mode))
     })?;
     Ok(out)
 }
@@ -621,14 +703,18 @@ pub async fn next(
             Some(k) => Some(st.store.watch(k).await?),
             None => None,
         };
-        let (events, head) = deliver(&st, &caller, &req).await?;
+        let (events, head, mode) = deliver(&st, &caller, &req).await?;
         let now = Instant::now();
         if !events.is_empty() || now >= deadline {
             return Ok(Cbor(Deliveries { events }));
         }
         match w {
             Some(w) => {
-                let _ = tokio::time::timeout(deadline - now, w).await;
+                let mut slice = deadline - now;
+                if mode == Mode::PerKey {
+                    slice = slice.min(PER_KEY_RECHECK);
+                }
+                let _ = tokio::time::timeout(slice, w).await;
             }
             None => watch_key = Some(head),
         }
@@ -649,7 +735,7 @@ pub async fn nack(
         let g = load_group(&mut t, fs, &req.group).await?;
         caller.require_topic(fs, &g.def.topic, R_CONSUME)?;
         let sub = sub_for(&g, req.partition, req.key_token.as_deref())?;
-        check_token(&mut t, fs, &g, &sub, req.token).await?;
+        check_token(&mut t, fs, &g, &sub, req.token, &caller.device).await?;
         let cur = cursor_of(&mut t, fs, &g, &sub).await?;
         let Some((o, entry)) = next_eligible(&mut t, fs, &g, &sub, &cur, false).await? else {
             return Err(cursor_moved("no pending event"));
@@ -766,9 +852,10 @@ pub async fn dlq_list(
         .clamp(1, st.cfg.limits.max_range_items) as usize;
     let (b, e) = keys::after_offset(keys::dlq_prefix(req.fs, &req.group), &after);
     let mut t = st.store.begin(None).await?;
-    let items = t
-        .snapshot_get_range(&b, &e, limit, false)
+    let max_bytes = st.cfg.limits.max_range_bytes as usize;
+    let items = crate::kv::read_capped(&mut t, &b, &e, limit, false, max_bytes, false)
         .await?
+        .0
         .into_iter()
         .map(|(k, v)| decode_dlq(tail_offset(&k)?, &v))
         .collect::<ApiResult<_>>()?;

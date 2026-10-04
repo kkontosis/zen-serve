@@ -132,7 +132,7 @@ Any number of zen-serve nodes can serve one cluster: nodes set up with `join`, o
 
 Every node runs the sweeper. Each sweep is idempotent.
 
-An unclaimed cluster prints a claim token on every node. Use the token of the node you send `/v1/acl/put` to.
+An unclaimed cluster prints a claim token on every node. Use the token of the node you send `/v1/acl/put` to. Once the cluster is claimed, every node deletes its `claim-token` file (api.md §4.1).
 
 ## 5. Backup and point-in-time restore (FoundationDB)
 
@@ -163,10 +163,11 @@ zen-serve backup stop     -c zen.toml
 ```sh
 zen-serve restore -c zen.toml --source file:///srv/zen-backups/backup-… \
     [--timestamp 2026/10/04.12:00:00+0000 | --version V] [--add-prefix P]
+    [--orig-cluster-file /etc/zen/old-fdb.cluster]
 ```
 
 * Without `--add-prefix`, the target cluster must be empty: restore into a new cluster.
-* `--timestamp` picks the newest restorable version at or before that time.
+* `--timestamp` picks the newest restorable version at or before that time. The time is translated into a version with the metadata of the database the backup was taken from, so when the target is a different cluster, pass that database's cluster file as `--orig-cluster-file` (default: the target's). Restoring a clone into the same cluster needs nothing extra.
 * The backup agents must be running while the restore runs.
 
 ### 5.3 Clone at time T
@@ -188,10 +189,11 @@ zen-serve migrate -c zen-fdb.toml --from-data-dir /var/lib/zen   # embedded → 
 ```
 
 * **Format.** A header, then every key-value pair in key order, then a trailer with the count, a source version and a BLAKE3 digest. The digest is checked on import.
+* **Server metadata is not copied** (keyspace.md §3.4): the embedded backend's version clock and the cluster's challenge key. The target keeps its own challenge key, or creates one when it first starts. A challenge lives 60 s, so nothing depends on the key surviving the copy; sessions are copied and keep working.
 * **Consistency.**
   * On the embedded backend an export is one consistent snapshot.
   * On FoundationDB a large export spans several transactions, so it is consistent only while the servers are stopped. It warns otherwise. Use native backup for consistent copies of a live cluster.
-* **Import** refuses a target that already holds data, unless `--force`. It writes in transactions of at most about 4 MB.
+* **Import** refuses a target that already holds data, unless `--force`. A server that was only started (never claimed or written to) holds only metadata, so it counts as empty. Import writes in transactions of at most about 4 MB.
 * **Versions.** Imported keys and values keep their versionstamps byte for byte. Afterwards the target's version clock is advanced past the source's newest version, so new versionstamps sort after the imported ones. On FoundationDB this is `\xff/minRequiredCommitVersion` (what `fdbcli advanceversion` does), and it causes one quick recovery.
 * **`migrate`** is export plus import without the file. Stop the embedded server first. Old sessions keep working on the new backend.
 

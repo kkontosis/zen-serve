@@ -40,11 +40,9 @@ async fn try_everything(s: &dyn Storage) -> zen_store::Result<Vec<KeyValue>> {
             break;
         }
     }
-    let private = zen_store::tuple::Key::new()
-        .str("meta")
-        .str("version")
-        .finish();
-    out.retain(|(k, _)| *k != private);
+    // Server metadata is private to each store (keyspace.md §3.4).
+    let private = zen_server::keys::meta_prefix();
+    out.retain(|(k, _)| !k.starts_with(&private));
     Ok(out)
 }
 
@@ -180,4 +178,52 @@ async fn migrate_copies_into_another_store() {
         }
     };
     assert!(stamp[..] > first.versionstamp[..]);
+}
+
+/// A server that was only ever started holds no data: its metadata (the
+/// challenge key, the embedded version clock) is private to it. So an
+/// import needs no `--force`, and the target keeps its own challenge key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_started_server_counts_as_empty() {
+    let (h, _, _) = populated().await;
+    let file = h.dir.path().join("dump.zen");
+    dump::export(
+        h.server.state.store.as_ref(),
+        "test",
+        std::fs::File::create(&file).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let target = Harness::start().await;
+    let store = target.server.state.store.clone();
+    let key = zen_server::keys::meta("challenge_key");
+    let mine = target.server.state.challenge_key;
+    {
+        let mut t = store.begin(None).await.unwrap();
+        assert_eq!(t.get(&key).await.unwrap().as_deref(), Some(&mine[..]));
+    }
+    assert!(dump::is_empty(store.as_ref()).await.unwrap());
+    dump::import(store.as_ref(), std::fs::File::open(&file).unwrap(), false)
+        .await
+        .unwrap();
+    assert!(!dump::is_empty(store.as_ref()).await.unwrap());
+    assert_eq!(
+        everything(store.as_ref()).await,
+        everything(h.server.state.store.as_ref()).await
+    );
+    for _ in 0..50 {
+        let mut t = store.begin(None).await.unwrap();
+        match t.get(&key).await {
+            Ok(v) => {
+                assert_eq!(v.as_deref(), Some(&mine[..]), "own challenge key kept");
+                return;
+            }
+            Err(zen_store::Error::TooOld) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("storage kept failing");
 }

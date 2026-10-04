@@ -56,8 +56,9 @@ Quota counters are read with snapshot reads, so concurrent commits don't conflic
 
 | Key | Value |
 |---|---|
-| `pack("cg", fs, group)` | `{def, start}` CBOR: the normalized definition (api.md §8.1) and the start offset, which is the cursor of any partition or key that has not committed yet |
-| `pack("ct", fs, topic, group)` | `u8 mode`: index of the groups on a topic, read on append |
+| `pack("cg", fs, group)` | `{def, start, indexed_from?}` CBOR: the normalized definition (api.md §8.1), the start offset (the cursor of any partition or key that has not committed yet), and for `partitioned` the newest offset at creation: events after it are in the group's partition index, older ones are scanned |
+| `pack("ct", fs, topic, group)` | `u8 mode ‖ [u32 partitions]`: index of the groups on a topic, read on append; the partition count is present for `partitioned` groups |
+| `pack("lp", fs, group, part, vs)` | empty: a `partitioned` group's index of its topic's events by partition, written on append for every event after `indexed_from` |
 | `pack("cc", fs, group, part)` | `offset`: committed cursor (`sequential` uses part 0; `single_key` uses part 0) |
 | `pack("cl", fs, group, part)` | lease: `holder_fp(32) ‖ u64 token ‖ u64 expires_version` |
 | `pack("kc", fs, group, key)` | `offset ‖ u64 last_claim_token`: last committed offset for one key (`per_key`) |
@@ -78,6 +79,8 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 | `pack("acl", version)` | signed ACL (formats.md §9), every version kept (the membership log) |
 | `pack("acl_head")` | `u64 version` of the current ACL |
 | `pack("meta", name)` | metadata: `"version"` (embedded backend's version clock), `"challenge_key"` (32 random bytes, the cluster-wide challenge MAC key, api.md §3.1) |
+
+Metadata belongs to one store (or one cluster): `export` skips every `meta` key, `import` ignores them in a file, and they don't count as data when `import` checks that the target is empty (operations.md §6). Each target keeps or creates its own.
 
 ### 3.5 Sessions, challenges, ephemeral ring
 
@@ -108,10 +111,15 @@ Leases are never deleted: the stored token is what keeps fencing tokens increasi
 | `pack("tm", fs, tree, hlc, dev)` | move log: `node ‖ parent ‖ u8 has_old ‖ [old_parent ‖ u64 old_hlc ‖ old_dev(32)]`: the parent and move timestamp the move replaced, restored on undo |
 | `pack("tv", fs, tree, cvs, node)` | change index: empty, or `0x01` for a purged node's tombstone |
 | `pack("tx", fs, tree, cvs, node)` | empty: tombstones only, so the sweeper can drop old ones without scanning the change index |
+| `pack("ts", fs, tree)` | empty: the sweep index, a tree that may have work for the sweeper (fs.md §6). Every commit with a `move` on the tree sets it (a blind write); the sweeper clears it once the tree has no move log, no `TRASH` children and no tombstones |
+| `pack("tsi", fs)` | empty: the sweep index of the fs is complete. Absent on data from before the index: the sweeper then lists every tree with a header (`tr`) in `ts` once, and sets it |
+| `pack("tq", fs, tree)` | `node(16)`: the trash-purge cursor, the `TRASH` child the sweeper's next purge round starts at (fs.md §6); absent means the first. Cleared with the tree's `ts` entry |
+| `pack("tp", fs, tree, node)` | `cvs(12)` of the node's tombstone: a purged node by id, so operations naming it are refused (fs.md §3.4); dropped with the tombstone |
 | `pack("tf", fs, tree, node, dot)` | content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest` |
 | `pack("ck", fs, chunk)` | sealed chunk |
 | `pack("cr", fs, chunk)` | `i64` little-endian, atomic add: number of versions referencing the chunk |
 | `pack("cz", fs, cvs, chunk)` | empty: chunk GC candidate, from upload or the release of a reference |
+| `pack("cp", fs, chunk)` | `cvs(12)` of the chunk's newest GC candidate: only that candidate can delete the chunk, so each upload or release restarts the grace period |
 
 **Node record:**
 
@@ -128,5 +136,6 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * The move log is in timestamp order. Undo and redo read the range after a move's key.
 * A node's old `tv` entry is cleared when it changes again, so the change index holds one entry per live node, plus tombstones.
 * `resync_before` in the tree header is the newest tombstone the sweeper has dropped. A `changes` cursor before it gets 409 `resync`.
+* The sweeper visits only the trees in `ts`. A move is the only operation that adds a move-log entry or a `TRASH` child, and tombstones only come from purging a tree that is listed, so a tree outside the index has nothing to sweep (chunk GC is per fs, through `cz`).
 * The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count`. Records written before milestone 3.5 have no `write_count`, which then reads as 0.
 

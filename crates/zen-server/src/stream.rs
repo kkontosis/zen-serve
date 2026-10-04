@@ -24,7 +24,14 @@ const MAX_SUBS: usize = 256;
 
 /// `GET /v1/stream`.
 pub async fn ws(State(st): State<Shared>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |sock| run(st, sock))
+    // A client frame carries at most one ephemeral message (an envelope's
+    // worth of data plus a topic id); the socket is unauthenticated until
+    // its first frame, so the buffer is bounded accordingly.
+    let max = st.cfg.limits.max_envelope_bytes as usize + 4096;
+    upgrade
+        .max_message_size(max)
+        .max_frame_size(max)
+        .on_upgrade(move |sock| run(st, sock))
 }
 
 fn err_frame(id: Option<u32>, e: &ApiError) -> Frame {
@@ -299,8 +306,9 @@ async fn subscription(
             let w = st.store.watch(&head_key).await?;
             let more = match &target {
                 Target::Topic(t) => {
+                    let max = st.cfg.limits.max_range_bytes as usize;
                     let (events, more) =
-                        read_topic(st.store.as_ref(), fs, t, None, &cursor, BATCH).await?;
+                        read_topic(st.store.as_ref(), fs, t, None, &cursor, BATCH, max).await?;
                     for (o, e) in events {
                         cursor = o;
                         let f = Frame::Ev {
@@ -317,8 +325,9 @@ async fn subscription(
                     more
                 }
                 Target::Prefix(p) => {
+                    let max = st.cfg.limits.max_range_bytes as usize;
                     let (events, last, more) =
-                        read_prefix(st.store.as_ref(), fs, p, &cursor, BATCH).await?;
+                        read_prefix(st.store.as_ref(), fs, p, &cursor, BATCH, max).await?;
                     let caller = resolve(&st, &token).await?;
                     for (topic, e) in events {
                         if caller.require_topic(fs, &topic, R_READ).is_err() {

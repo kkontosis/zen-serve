@@ -8,6 +8,55 @@ use crate::keys;
 use crate::state::Shared;
 use axum::extract::State;
 use zen_proto::{Empty, KvGet, KvItem, KvItems, KvRange, ReadVersion};
+use zen_store::{KeyValue, Txn, key_after};
+
+/// Items per storage round trip of a capped read.
+const PAGE: usize = 256;
+
+/// Read `[begin, end)` in pages: at most `limit` pairs, stopping once the
+/// pairs read hold `max_bytes` or more (keys and values). Returns the pairs
+/// and whether the byte cap stopped the read before `limit`. A snapshot
+/// read, unless `track`.
+pub async fn read_capped(
+    t: &mut Box<dyn Txn>,
+    begin: &[u8],
+    end: &[u8],
+    limit: usize,
+    reverse: bool,
+    max_bytes: usize,
+    track: bool,
+) -> ApiResult<(Vec<KeyValue>, bool)> {
+    let (mut b, mut e) = (begin.to_vec(), end.to_vec());
+    let mut out: Vec<KeyValue> = Vec::new();
+    let mut bytes = 0usize;
+    while out.len() < limit {
+        let n = (limit - out.len()).min(PAGE);
+        let got = if track {
+            t.get_range(&b, &e, n, reverse).await?
+        } else {
+            t.snapshot_get_range(&b, &e, n, reverse).await?
+        };
+        let done = got.len() < n;
+        for kv in got {
+            bytes += kv.0.len() + kv.1.len();
+            out.push(kv);
+            if bytes >= max_bytes {
+                let capped = out.len() < limit;
+                return Ok((out, capped));
+            }
+        }
+        if done {
+            break;
+        }
+        let last = &out.last().expect("non-empty page").0;
+        if reverse {
+            e = last.clone();
+        } else {
+            b = key_after(last);
+        }
+    }
+    Ok((out, false))
+}
 
 /// Split a stored value into `(sealed value, version)`.
 pub fn split_value(v: Vec<u8>) -> ApiResult<(Vec<u8>, Vec<u8>)> {
@@ -82,10 +131,17 @@ pub async fn range(
     let limit = req.limit.unwrap_or(max).clamp(1, max) as usize;
     let (b, e) = keys::kv_range(req.fs, &req.begin, req.end.as_deref());
     let mut t = st.store.begin(req.read_version).await?;
-    let mut got = t
-        .snapshot_get_range(&b, &e, limit + 1, req.reverse.unwrap_or(false))
-        .await?;
-    let more = got.len() > limit;
+    let (mut got, capped) = read_capped(
+        &mut t,
+        &b,
+        &e,
+        limit + 1,
+        req.reverse.unwrap_or(false),
+        st.cfg.limits.max_range_bytes as usize,
+        false,
+    )
+    .await?;
+    let more = capped || got.len() > limit;
     got.truncate(limit);
     let prefix_len = keys::kv_prefix(req.fs).len();
     let items = got

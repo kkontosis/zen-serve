@@ -57,6 +57,10 @@ fn replay(rec: &[u8], device: &[u8; 32]) -> ApiResult<CommitResult> {
 /// Stateless checks: sizes, ids, permissions.
 fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     let l = &st.cfg.limits;
+    // Besides its payload, every operation costs keys, index entries,
+    // versionstamp operands and conflict ranges in the storage transaction;
+    // this keeps a full commit under FoundationDB's 10 MB.
+    const OP_OVERHEAD: usize = 512;
     if req.commit_id.len() != COMMIT_ID_LEN {
         return Err(bad_request("commit_id must be 16 bytes"));
     }
@@ -72,7 +76,7 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     if ops > l.max_commit_ops as usize {
         return Err(too_large("too many operations"));
     }
-    let mut bytes = 0usize;
+    let mut bytes = ops * OP_OVERHEAD;
     let key_ok = |k: &[u8]| -> ApiResult<()> {
         if k.len() > l.max_key_bytes as usize {
             Err(too_large("key too long"))
@@ -184,31 +188,45 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     Ok(())
 }
 
-/// Per-key groups on a topic, read once per commit (conflict-tracked, so a
-/// concurrent group creation and append serialize).
-async fn per_key_groups(
+/// A group on a topic that indexes appends: `per_key` (ready list), or
+/// `partitioned` with its partition count (partition index).
+#[derive(Clone)]
+enum Indexing {
+    PerKey(Vec<u8>),
+    Partitioned(Vec<u8>, u32),
+}
+
+/// Indexing groups on a topic, read once per commit (conflict-tracked, so
+/// a concurrent group creation and append serialize).
+async fn topic_groups(
     t: &mut Box<dyn Txn>,
-    cache: &mut HashMap<(u32, Vec<u8>), Vec<Vec<u8>>>,
+    cache: &mut HashMap<(u32, Vec<u8>), Vec<Indexing>>,
     fs: u32,
     topic: &[u8],
-) -> ApiResult<Vec<Vec<u8>>> {
+) -> ApiResult<Vec<Indexing>> {
     if let Some(g) = cache.get(&(fs, topic.to_vec())) {
         return Ok(g.clone());
     }
     let prefix = keys::topic_groups(fs, topic).finish();
-    let groups: Vec<Vec<u8>> = t
-        .get_range(&prefix, &keys::end_of(&prefix), 10_000, false)
-        .await?
-        .into_iter()
-        .filter(|(_, v)| v.first() == Some(&Mode::PerKey.byte()))
-        .filter_map(|(k, _)| {
-            let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 1).ok()?;
-            match elems.into_iter().next() {
-                Some(zen_store::tuple::Elem::Bytes(g)) => Some(g),
-                _ => None,
-            }
-        })
-        .collect();
+    let groups: Vec<Indexing> =
+        t.get_range(&prefix, &keys::end_of(&prefix), 10_000, false)
+            .await?
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 1).ok()?;
+                let Some(zen_store::tuple::Elem::Bytes(g)) = elems.into_iter().next() else {
+                    return None;
+                };
+                match (v.first().copied(), v.get(1..5)) {
+                    (Some(m), _) if m == Mode::PerKey.byte() => Some(Indexing::PerKey(g)),
+                    // A `ct` entry without a partition count predates the index.
+                    (Some(m), Some(n)) if m == Mode::Partitioned.byte() => Some(
+                        Indexing::Partitioned(g, u32::from_be_bytes(n.try_into().ok()?)),
+                    ),
+                    _ => None,
+                }
+            })
+            .collect();
     cache.insert((fs, topic.to_vec()), groups.clone());
     Ok(groups)
 }
@@ -225,6 +243,7 @@ pub async fn execute(
     let cid_key = keys::commit_record(&req.commit_id);
     let limits = caller.acl.limits.clone();
     let max_range = st.cfg.limits.max_range_items as usize;
+    let max_bytes = st.cfg.limits.max_range_bytes as usize;
     // Last write per key wins; clears apply first (api.md §6).
     let mut writes: BTreeMap<(u32, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
     for w in &req.writes {
@@ -253,8 +272,10 @@ pub async fn execute(
         }
         for e in &req.expect_ranges {
             let (b, end) = keys::kv_range(e.fs, &e.begin, e.end.as_deref());
-            let got = t.get_range(&b, &end, max_range + 1, false).await?;
-            if got.len() > max_range {
+            let (got, capped) =
+                crate::kv::read_capped(&mut t, &b, &end, max_range + 1, false, max_bytes, true)
+                    .await?;
+            if capped || got.len() > max_range {
                 return Err(too_large("expect_ranges range too long"));
             }
             let prefix_len = keys::kv_prefix(e.fs).len();
@@ -271,8 +292,10 @@ pub async fn execute(
         let mut delta: HashMap<u32, (i64, i64)> = HashMap::new();
         for c in &req.clear_ranges {
             let (b, e) = keys::kv_range(c.fs, &c.begin, c.end.as_deref());
-            let got = t.snapshot_get_range(&b, &e, max_range + 1, false).await?;
-            if got.len() > max_range {
+            let (got, capped) =
+                crate::kv::read_capped(&mut t, &b, &e, max_range + 1, false, max_bytes, false)
+                    .await?;
+            if capped || got.len() > max_range {
                 return Err(too_large("clear range too long; clear in parts"));
             }
             let prefix_len = keys::kv_prefix(c.fs).len();
@@ -324,19 +347,29 @@ pub async fn execute(
             t.set_versionstamped_value(&keys::topic_head(fs, topic), &[], &ix);
             t.set_versionstamped_value(&keys::fs_head(fs), &[], &ix);
             delta.entry(fs).or_default().0 += (a.envelope.len() + topic.len()) as i64;
-            if let Some(k) = key {
-                for g in per_key_groups(&mut t, &mut groups, fs, topic).await? {
-                    if !readied.insert((fs, g.clone(), k.to_vec())) {
-                        continue;
+            for g in topic_groups(&mut t, &mut groups, fs, topic).await? {
+                match (g, key) {
+                    (Indexing::PerKey(g), Some(k)) => {
+                        if !readied.insert((fs, g.clone(), k.to_vec())) {
+                            continue;
+                        }
+                        let ptr = keys::ready_ptr(fs, &g, k);
+                        if t.get(&ptr).await?.is_none() {
+                            let (p, s) = keys::ready_prefix(fs, &g)
+                                .vs_incomplete(i)
+                                .bytes(k)
+                                .finish_incomplete();
+                            t.set_versionstamped_key(&p, &s, &[]);
+                            t.set_versionstamped_value(&ptr, &[], &ix);
+                        }
                     }
-                    let ptr = keys::ready_ptr(fs, &g, k);
-                    if t.get(&ptr).await?.is_none() {
-                        let (p, s) = keys::ready_prefix(fs, &g)
+                    (Indexing::PerKey(_), None) => {}
+                    (Indexing::Partitioned(g, n), key) => {
+                        let part = crate::consume::partition_of(key, n);
+                        let (p, s) = keys::partition_index(fs, &g, part)
                             .vs_incomplete(i)
-                            .bytes(k)
                             .finish_incomplete();
                         t.set_versionstamped_key(&p, &s, &[]);
-                        t.set_versionstamped_value(&ptr, &[], &ix);
                     }
                 }
             }
@@ -442,17 +475,26 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<usize> {
     let end = keys::commit_index()
         .vs(&crate::ids::offset(&stamp_of(cutoff), 0))
         .finish();
-    let (n, _) = txn_loop!(st.store, None, |t| {
-        let old = t.snapshot_get_range(&prefix, &end, 1000, false).await?;
-        for (k, _) in &old {
-            let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 2)
-                .map_err(|_| internal("bad commit index key"))?;
-            if let Some(zen_store::tuple::Elem::Bytes(cid)) = elems.get(1) {
-                t.clear(&keys::commit_record(cid));
+    let mut removed = 0;
+    // Pages of 1,000, up to 100 per pass: a busy server expires records
+    // faster than one page a minute.
+    for _ in 0..100 {
+        let (n, _) = txn_loop!(st.store, None, |t| {
+            let old = t.snapshot_get_range(&prefix, &end, 1000, false).await?;
+            for (k, _) in &old {
+                let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 2)
+                    .map_err(|_| internal("bad commit index key"))?;
+                if let Some(zen_store::tuple::Elem::Bytes(cid)) = elems.get(1) {
+                    t.clear(&keys::commit_record(cid));
+                }
+                t.clear(k);
             }
-            t.clear(k);
+            Ok(old.len())
+        })?;
+        removed += n;
+        if n < 1000 {
+            break;
         }
-        Ok(old.len())
-    })?;
-    Ok(n)
+    }
+    Ok(removed)
 }

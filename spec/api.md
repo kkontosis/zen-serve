@@ -18,12 +18,12 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
   | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
   | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
-  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, fs.md §3.4) | with a fresh `hlc` (rebase) |
+  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4) | with a fresh `hlc` (rebase); not for a purged node |
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -40,9 +40,17 @@ No authentication. Returns:
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
   limits: { max_key_bytes, max_value_bytes, max_envelope_bytes, max_commit_bytes,
-            max_commit_ops, max_range_items, idempotency_ttl_secs, session_ttl_secs,
-            crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo } }
+            max_commit_ops, max_range_items, max_range_bytes,
+            idempotency_ttl_secs, session_ttl_secs, claim_ttl_ms, ephemeral_ttl_secs,
+            ephemeral_bytes_per_sec, ephemeral_burst_bytes,
+            max_groups_per_topic,
+            crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
+            chunk_grace_secs } }
 ```
+
+Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
+
+* **Range reads** (`/v1/kv/range`, `/v1/log/read`, `tree/children`, `tree/changes`, `dlq/list`, stream subscriptions) return at most `max_range_items` items **and** stop once the items returned hold about `max_range_bytes` of keys and values; either cut sets `more`. A range the server must read whole (`expect_ranges`, `clear_ranges`, a file's versions) returns 413 `too_large` past either cap.
 
 ## 3. Sessions
 
@@ -79,6 +87,8 @@ A session is checked again on every request: it stops working as soon as an ACL 
 * each `public_origins` entry in its config, or
 * if that list is empty, `http://<Host>` and `https://<Host>` from the request's `Host` header.
 
+  The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. It is for development; a production server sets `public_origins`, and warns at start-up when it is empty.
+
 ## 4. ACL and fs headers
 
 ### 4.1 `POST /v1/acl/put`
@@ -90,7 +100,7 @@ A session is checked again on every request: it stops working as soon as an ACL 
 ```
 
 * The ACL is authenticated by its own signature, so this request needs no session.
-* **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. The token is deleted once version 1 commits.
+* **Bootstrap.** While no ACL exists, the server keeps a random **claim token**. It prints the token at start-up and stores it in `<data_dir>/claim-token` (mode 0600). Version 1 is accepted only together with that token. Once version 1 commits, every node of the cluster forgets its token and deletes its `claim-token` file: the node that accepted it at once, every other node as soon as it sees the new ACL, and a node that was down when it next starts.
 * Validation rules: formats.md §9.3.
 * The version CAS failing returns 409 `version_mismatch`.
 
@@ -125,8 +135,8 @@ put: {fs, header: bytes, expect: bytes(10)?} → {version: bytes(10)}
 * `keys` and range bounds are **stored keys** (formats.md §3.2). `value` is the sealed value, without the stored versionstamp; `version` is that versionstamp.
 * `/v1/kv/get` returns one item per requested key, in request order, with `value` and `version` null for a missing key.
 * `/v1/kv/range` reads `[begin, end)`, with `end` absent meaning the end of the fs.
-  * `limit` defaults to and is capped by `max_range_items`.
-  * `more` means the limit cut the range short. To continue, set `begin` to the last key ‖ `0x00` (or `end` to the last key, when `reverse`).
+  * `limit` defaults to and is capped by `max_range_items`; `max_range_bytes` caps the response as well (§2).
+  * `more` means a limit cut the range short. To continue, set `begin` to the last key ‖ `0x00` (or `end` to the last key, when `reverse`).
 * **Snapshots.** Reads at the same `read_version` see one consistent snapshot. If `read_version` is absent, the server takes a fresh one and returns it.
   * A `read_version` must come from `/v1/grv` or an earlier read response.
   * A read version older than about 5 s returns 409 `too_old`.
@@ -158,19 +168,19 @@ CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), 
 The whole commit is **one storage transaction**: all of it applies, or none of it.
 
 1. **Idempotency.** If `commit_id` already committed, the stored result is returned and nothing is applied again. The record is kept for `idempotency_ttl_secs` (default 24 h, G13). A `commit_id` reused by a different device returns 409 `commit_id_reused`.
-2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`, and consumes need topic `consume`. Then sizes and quotas are checked.
+2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`, and consumes need topic `consume`. Then sizes and quotas are checked: at most `max_commit_ops` operations, and at most `max_commit_bytes` counting every payload plus 512 bytes per operation for its keys and index entries.
 3. **Short mode.** With `read_version`, the transaction runs at that version, and every `read_conflicts` range conflicts with any write committed after it. That gives full serializability, including phantoms. Anything else the server reads (cursors, leases, idempotency) is checked the same way. A conflict returns 409 `conflict`.
 4. **Long mode.**
    * Each `expect` key is re-read: its version must equal `version`, or the key must be absent when `version` is null.
    * Each `expect_ranges` range is re-read, and its hash must equal `hash`, where
      `hash = H("zen/v1/range-hash", concat over the range in key order of lp(stored_key) ‖ version(10))`, with `H(label, x) = BLAKE3.derive_key(label, x)`.
-   * A range with more than `max_range_items` items returns 413.
+   * A range with more than `max_range_items` items, or more than `max_range_bytes` of keys and values, returns 413.
    * Any mismatch returns 409 `conflict`.
-5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys, else 413), then `writes`, where the last write to a key wins.
+5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys and `max_range_bytes`, else 413), then `writes`, where the last write to a key wins.
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
-9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` and `manifest` are at most `max_value_bytes`. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`.
+9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` (the stored version holds both, keyspace.md §3.6), which bounds a file at about `max_value_bytes / 32` chunks. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`.
 
 ## 7. Log
 
@@ -205,9 +215,10 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 ```
 
 * A group is **immutable** (G8). Creating it again with identical parameters returns `created: false`. Different parameters return 409 `group_exists`.
+* A topic holds at most `max_groups_per_topic` groups (every append pays for each one); the next creation returns 429 `quota`.
 * Needs topic `consume`.
 * `broadcast` stores only the definition. Its members read the log with their own cursors (§7.2, §9).
-* **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0.
+* **Partitions.** `partitioned` assigns an event to partition `u128_be(key_token) mod partitions`. Events with no key go to partition 0. Appends after the group's creation are indexed by partition (keyspace.md §3.3), so finding a partition's next event costs one read; events from before the creation are scanned once.
 * A `per_key` group starting at `earliest` puts every key's first event on the ready list. A topic with more than 100,000 events returns 413; use `latest` instead.
 * `per_key` and `single_key` groups only see events that have a `key_token`.
 
@@ -284,7 +295,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `auth` | `token` | authenticate the stream |
 | `sub` | `id: u32, fs, topic?, prefix?, after?: bytes(12)` | Subscribe to one topic, or to every topic under a topic-id prefix (an empty prefix means the whole fs). Needs topic `read`. History after `after` is streamed from storage, then live events follow **with no gap and no reordering** (G9). With no `after`, only new events are sent. |
 | `unsub` | `id` | stop a subscription |
-| `epub` | `fs, topic, data: bytes` | ephemeral publish: not in the log; kept for at most about a minute (§9.1). Needs topic `append`. |
+| `epub` | `fs, topic, data: bytes` | ephemeral publish: not in the log; kept for at most about a minute (§9.1). Needs topic `append`. Rate-limited per device (§9.1): over the limit, the reply is `err` with code `quota`. |
 | `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe: messages published after the `ok`. Needs topic `read`. |
 
 **Server → client:**
@@ -303,6 +314,13 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 ### 9.1 Ephemeral messages across nodes
 
 Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5), so a subscriber on any node receives messages published on any other. Delivery is best effort: there is no history, and a subscriber that falls behind may miss messages. Entries are deleted after `limits.ephemeral_ttl_secs` (default 60 s), so they never reach the log, and appear in a backup only if it is taken within that window.
+
+**Rate limit.** Ephemeral messages bypass the fs quotas, so each device's publishes are limited by a token bucket:
+* `limits.ephemeral_bytes_per_sec` (default 65,536) sustained, with bursts of `limits.ephemeral_burst_bytes` (default 1,048,576). A message costs its `data` length plus 256 bytes. `ephemeral_bytes_per_sec = 0` turns the limit off.
+* `ephemeral_burst_bytes` must be at least `max_envelope_bytes` + 256, so a message of any allowed size can be sent.
+* Both values are advertised in `/v1/info` `limits` (§2), so a client can pace itself.
+* A publish over the limit is refused with `quota` and not delivered. The client waits and retries, or drops the message.
+* The buckets are kept in each node's memory, per device. A device that publishes through several nodes of a cluster gets the limit on each, so the cluster-wide limit is the per-node limit times the number of nodes. A node restart refills them.
 
 ## 10. Static files
 
@@ -349,6 +367,6 @@ NodeState = { node: bytes(16),
   * `cursor` is the offset of the last change returned. Pass it as `after` next time; it is absent when nothing was returned and no `after` was given.
   * With `wait_ms` (at most 30,000), an empty result waits for the next change of the tree.
   * 409 `resync`: start again without `after`.
-* **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`. `nodes` and `ids` take at most 1,000 and 64 entries.
+* **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`; `max_range_bytes` of node records also sets `more` (§2). `nodes` and `ids` take at most 1,000 and 64 entries. `file/get` returns 413 when a node's versions exceed either cap.
 * **`read_version`** works as in KV reads (§5): several reads at one version see one snapshot.
 

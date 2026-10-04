@@ -34,6 +34,10 @@ zen-core = { path = "../zen-core" }
 zen-proto = { path = "../zen-proto" }
 zen-store = { path = "../zen-store" }
 
+[target.'cfg(unix)'.dependencies]
+# SIGTERM for the supervised FoundationDB processes (a safe `kill` wrapper).
+nix = { version = "0.30", default-features = false, features = ["signal"] }
+
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false }
 tempfile = "3"

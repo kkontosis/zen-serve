@@ -759,6 +759,19 @@ async fn sequential_gate_and_fencing() {
     let d: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
     assert_eq!(d.events.len(), 1, "delivery gate: max_inflight 1");
     assert_eq!(d.events[0].envelope, vec![0]);
+    // Bob knows the (guessable) token but does not hold the lease.
+    let forged = Commit {
+        commit_id: cid(49),
+        consume: vec![consume(b"audit", &d.events[0], None, None)],
+        ..Default::default()
+    };
+    assert_eq!(
+        code(
+            h.call::<_, CommitResult>("/v1/commit", Some(&bob_tok), &forged)
+                .await
+        ),
+        (412, "not_leader".into())
+    );
     // Skipping ahead is refused.
     let d2: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
     assert_eq!(
@@ -1271,4 +1284,344 @@ async fn sweeper_expires_idempotency_records() {
     // The record is gone, so the same commit_id is a new commit.
     let r2: CommitResult = h.call("/v1/log/append", Some(&tok), &c).await.unwrap();
     assert_ne!(r1.versionstamp, r2.versionstamp);
+}
+
+/// `per_key` delivery walks past claimed keys: with many keys in flight the
+/// ready ones behind them are still handed out, and a long-poll notices a
+/// key freed by another worker's commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_key_many_claims_do_not_hide_ready_keys() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let _: GroupCreated = h
+        .call(
+            "/v1/consume/groups",
+            Some(&tok),
+            &group(b"billing", Mode::PerKey),
+        )
+        .await
+        .unwrap();
+    // 40 keys, one event each (key tokens must be distinct 16-byte values).
+    let keys: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 16]).collect();
+    for (i, k) in keys.iter().enumerate() {
+        let ap = LogAppend {
+            commit_id: cid(i as u8),
+            append: vec![append(&topic(1), Some(k), &[i as u8])],
+        };
+        let _: CommitResult = h.call("/v1/log/append", Some(&tok), &ap).await.unwrap();
+    }
+    // Two events for the last key, so it has pending work after a commit.
+    let ap = LogAppend {
+        commit_id: cid(200),
+        append: vec![append(&topic(1), Some(&keys[39]), &[99])],
+    };
+    let _: CommitResult = h.call("/v1/log/append", Some(&tok), &ap).await.unwrap();
+    let next = NextRequest {
+        fs: 1,
+        group: b"billing".to_vec(),
+        partition: None,
+        token: None,
+        limit: Some(1),
+        wait_ms: None,
+    };
+    let mut got = Vec::new();
+    for _ in 0..40 {
+        let mut d: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
+        assert_eq!(d.events.len(), 1, "every key is handed out once");
+        got.push(d.events.remove(0));
+    }
+    let mut seen: Vec<u8> = got.iter().map(|e| e.envelope[0]).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (0..40).collect::<Vec<u8>>());
+    let none: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
+    assert!(none.events.is_empty(), "everything is claimed");
+    // A long-poll waits while every key is claimed, and wakes when a
+    // sibling's consume step frees a key that has a pending event.
+    let waiter = {
+        let next = NextRequest {
+            wait_ms: Some(10_000),
+            ..next.clone()
+        };
+        let http = h.http.clone();
+        let url = format!("{}/v1/consume/next", h.base);
+        let auth = format!(
+            "Bearer {}",
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &tok)
+        );
+        tokio::spawn(async move {
+            let resp = http
+                .post(url)
+                .header("authorization", auth)
+                .body(to_cbor(&next))
+                .send()
+                .await
+                .unwrap();
+            from_cbor::<Deliveries>(&resp.bytes().await.unwrap()).unwrap()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let last = got.iter().find(|e| e.envelope[0] == 39).unwrap();
+    let ack = Commit {
+        commit_id: cid(201),
+        consume: vec![consume(b"billing", last, None, Some(keys[39].clone()))],
+        ..Default::default()
+    };
+    let _: CommitResult = h.call("/v1/commit", Some(&tok), &ack).await.unwrap();
+    let woke = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the long-poll wakes without a new append")
+        .unwrap();
+    assert_eq!(
+        woke.events
+            .iter()
+            .map(|e| e.envelope[0])
+            .collect::<Vec<_>>(),
+        vec![99]
+    );
+}
+
+/// A partitioned group finds a sparse partition's next event through its
+/// partition index: events from before the group existed are scanned once,
+/// later ones cost one read however long the topic grows.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_sparse_partition_in_a_long_topic() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    // Key tokens of all-even bytes land in partition 0 of 2; `[1; 16]` in 1.
+    let even = |j: usize| vec![((j % 100) as u8) * 2; 16];
+    let bulk = |n: u8, c: u8| LogAppend {
+        commit_id: cid(c),
+        append: (0..300)
+            .map(|j| append(&topic(1), Some(&even(j)), &[n]))
+            .collect(),
+    };
+    let one = |n: u8, c: u8| LogAppend {
+        commit_id: cid(c),
+        append: vec![append(&topic(1), Some(&[1u8; 16]), &[n])],
+    };
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &bulk(0, 1))
+        .await
+        .unwrap();
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &one(7, 2))
+        .await
+        .unwrap();
+    let mut g = group(b"parts", Mode::Partitioned);
+    g.partitions = Some(2);
+    let _: GroupCreated = h.call("/v1/consume/groups", Some(&tok), &g).await.unwrap();
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &bulk(1, 3))
+        .await
+        .unwrap();
+    let _: CommitResult = h
+        .call("/v1/log/append", Some(&tok), &one(8, 4))
+        .await
+        .unwrap();
+    // Only appends after the creation are indexed, by partition.
+    let store = h.server.state.store.clone();
+    let count = |part: u32| {
+        let store = store.clone();
+        async move {
+            let pfx = zen_server::keys::partition_index(1, b"parts", part).finish();
+            let mut t = store.begin(None).await.unwrap();
+            t.snapshot_get_range(&pfx, &zen_server::keys::end_of(&pfx), 10_000, false)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!((count(0).await, count(1).await), (300, 1));
+    // Partition 1 gets its two events in order, across the scan/index seam.
+    let lease: Lease = h
+        .call(
+            "/v1/consume/lease",
+            Some(&tok),
+            &LeaseRequest {
+                fs: 1,
+                group: b"parts".to_vec(),
+                partition: Some(1),
+                token: None,
+                ttl_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+    let next = NextRequest {
+        fs: 1,
+        group: b"parts".to_vec(),
+        partition: Some(1),
+        token: Some(lease.token),
+        limit: Some(5),
+        wait_ms: None,
+    };
+    let mut got = Vec::new();
+    for c in 10..13u8 {
+        let d: Deliveries = h.call("/v1/consume/next", Some(&tok), &next).await.unwrap();
+        let Some(ev) = d.events.first() else {
+            break;
+        };
+        got.push(ev.envelope[0]);
+        let ack = Commit {
+            commit_id: cid(c),
+            consume: vec![consume(b"parts", ev, Some(1), None)],
+            ..Default::default()
+        };
+        let _: CommitResult = h.call("/v1/commit", Some(&tok), &ack).await.unwrap();
+    }
+    assert_eq!(got, vec![7, 8]);
+}
+
+/// `max_range_bytes` cuts range reads short with `more` (and refuses ranges
+/// the server must read whole), `max_groups_per_topic` caps groups, and
+/// the unauthenticated endpoints take only small bodies.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_bytes_group_cap_and_body_limits() {
+    let h = Harness::start_with(|c| {
+        c.limits.max_range_bytes = 300;
+        c.limits.max_groups_per_topic = 2;
+    })
+    .await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let info: Info = h.get("/v1/info").await;
+    assert_eq!(info.limits.max_range_bytes, 300);
+    assert_eq!(info.limits.max_groups_per_topic, 2);
+    assert_eq!(info.limits.claim_ttl_ms, 30_000);
+    // Five 200-byte values: a range read returns two at a time.
+    let c = Commit {
+        commit_id: cid(1),
+        writes: (0..5u8)
+            .map(|i| Write {
+                fs: 1,
+                key: vec![b'k', i],
+                value: Some(vec![i; 200]),
+            })
+            .collect(),
+        append: (0..5u8)
+            .map(|i| append(&topic(1), None, &[i; 200]))
+            .collect(),
+        ..Default::default()
+    };
+    let _: CommitResult = h.call("/v1/commit", Some(&tok), &c).await.unwrap();
+    let mut begin = b"k".to_vec();
+    let mut keys = Vec::new();
+    let mut pages = 0;
+    loop {
+        let r: KvItems = h
+            .call(
+                "/v1/kv/range",
+                Some(&tok),
+                &KvRange {
+                    fs: 1,
+                    begin: begin.clone(),
+                    end: Some(b"l".to_vec()),
+                    limit: Some(10),
+                    reverse: None,
+                    read_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        assert!(r.items.len() <= 2, "{} items", r.items.len());
+        keys.extend(r.items.iter().map(|i| i.key.clone()));
+        if !r.more {
+            break;
+        }
+        begin = r.items.last().unwrap().key.clone();
+        begin.push(0);
+    }
+    assert_eq!(keys.len(), 5);
+    assert_eq!(pages, 3);
+    let whole = |c: Commit| {
+        let (h, tok) = (&h, &tok);
+        async move { h.call::<_, CommitResult>("/v1/commit", Some(tok), &c).await }
+    };
+    let range = FsRange {
+        fs: 1,
+        begin: b"k".to_vec(),
+        end: Some(b"l".to_vec()),
+    };
+    let r = whole(Commit {
+        commit_id: cid(2),
+        expect_ranges: vec![ExpectRange {
+            fs: 1,
+            begin: range.begin.clone(),
+            end: range.end.clone(),
+            hash: vec![0; 32],
+        }],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(code(r), (413, "too_large".into()));
+    let r = whole(Commit {
+        commit_id: cid(3),
+        clear_ranges: vec![range],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(code(r), (413, "too_large".into()));
+    let ev: LogEvents = h
+        .call(
+            "/v1/log/read",
+            Some(&tok),
+            &LogRead {
+                fs: 1,
+                topic: topic(1),
+                after: None,
+                key_token: None,
+                limit: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ev.more && ev.events.len() < 5, "{} events", ev.events.len());
+    // Two groups fit; the third is over the cap.
+    for name in [&b"g1"[..], b"g2"] {
+        let _: GroupCreated = h
+            .call(
+                "/v1/consume/groups",
+                Some(&tok),
+                &group(name, Mode::Sequential),
+            )
+            .await
+            .unwrap();
+    }
+    let r: R<GroupCreated> = h
+        .call(
+            "/v1/consume/groups",
+            Some(&tok),
+            &group(b"g3", Mode::Sequential),
+        )
+        .await;
+    assert_eq!(code(r), (429, "quota".into()));
+    // Body limits on the unauthenticated endpoints. The server answers as
+    // soon as the limit is passed and may close before the rest of the body
+    // is written, so a write error is retried a few times.
+    for (path, size) in [
+        ("/v1/acl/put", (1 << 20) + 2048),
+        ("/v1/auth/session", 18 << 10),
+    ] {
+        let mut status = None;
+        for _ in 0..5 {
+            let r = h
+                .http
+                .post(format!("{}{}", h.base, path))
+                .header("content-type", CBOR)
+                .body(vec![0u8; size])
+                .send()
+                .await;
+            if let Ok(resp) = r {
+                status = Some(resp.status().as_u16());
+                break;
+            }
+        }
+        assert_eq!(status, Some(413), "{path}");
+    }
 }

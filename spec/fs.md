@@ -94,6 +94,8 @@ meta {node, hlc, meta}
 * **Clock skew.** An `hlc` more than `limits.crdt_max_skew_ms` (default 60,000) ahead of the server's clock is refused with 409 `clock_skew`. Otherwise one member could win every conflict by writing from the future. The client fixes its clock or waits.
 * **Horizon.** An `hlc` older than `limits.crdt_horizon_secs` (default 7 days) is refused with 409 `stale_op`.
 * **Undo depth.** A move whose undo/redo would touch more than `limits.crdt_max_redo` logged moves (default 1,000) is also refused with 409 `stale_op`.
+* **Depth.** A `move` whose `parent` has more than `limits.crdt_max_depth` ancestors (default 1,000) is refused with 400: the cycle check walks them, one read each.
+* **Purged nodes.** An operation that names a purged node (§6) as its `node` or `parent`, while the node's tombstone is still kept, is refused with 409 `stale_op`. The server no longer has the state the operation refers to; applying it would resurrect an empty node (no meta, no content) in place of what the sequential merge would show. After the tombstone is dropped the id is unknown: a `move` of it is a creation, and a `move` under it fails with 400 (unknown parent).
 * **Rebase.** The client reissues a `stale_op` operation with a fresh `hlc`, and the operation then takes its arrival position. The client library does this automatically. The user-visible effect: very old offline moves are applied as if made at sync time.
 
 ## 4. Content
@@ -119,7 +121,7 @@ write {node, replaces: [dot], chunks: [chunk_id], manifest}
 * Chunk ids are random 16-byte ids chosen by the client. They belong to the fs, not to a tree.
 * Chunks are uploaded through the commit field `chunks` (api.md §6). Large files are uploaded over several commits, then referenced by one `write`.
 * Re-uploading an identical chunk stores nothing new but restarts its grace period (below). Uploading different bytes under an existing id is refused (400).
-* The server counts references to every chunk. A chunk that no version references, and hasn't been referenced for `limits.chunk_grace_secs` (default 24 h), is deleted (§6). The grace period covers chunks uploaded in one commit and referenced by a later one.
+* The server counts references to every chunk. A chunk that no version references, and hasn't been uploaded or referenced for `limits.chunk_grace_secs` (default 24 h), is deleted (§6). The grace period covers chunks uploaded in one commit and referenced by a later one. It is measured from the chunk's **newest** upload or release (keyspace.md §3.6, `cp`), so an earlier one that has aged past the grace period doesn't delete a chunk that was uploaded or released again since.
 
 ## 5. Change feed and sync
 
@@ -134,14 +136,20 @@ write {node, replaces: [dot], chunks: [chunk_id], manifest}
 
 ## 6. Garbage collection
 
-The sweeper (every node runs it) keeps the tree bounded:
+The sweeper (every node runs it) keeps the tree bounded. It visits only trees with work left (keyspace.md §3.6, `ts`): a tree is listed by any commit with a `move` on it, and dropped once its move log, trash and tombstones are all gone, so its cost doesn't grow with the number of trees ever used.
 * **Move log:** entries older than the horizon are removed. No accepted operation can need them (§3.4).
 * **Margin.** "Older than the horizon" here means older than `crdt_horizon_secs` plus `crdt_max_skew_ms` by the sweeping node's clock. So a node whose clock is slightly behind never accepts an operation that needs a removed entry.
 * **Trash purge.** A child of `TRASH` is purged when:
   * its move into trash is older than the horizon, and
   * every node in its subtree has a move older than the horizon.
 
-  Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed.
+  Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed, plus a by-id entry (keyspace.md §3.6, `tp`) that refuses later operations on the node (§3.4) until the tombstone is dropped.
+
+  The sweeper works through the trash in bounded rounds, each resuming where the last one stopped (keyspace.md §3.6, `tq`) and starting over after the last child of `TRASH`. So a subtree that can't be purged yet doesn't hold up the others. A subtree too large for one round is removed over several, leaves first: a node is removed only in a round that also removes all of its children, so an interrupted purge never leaves an orphan.
+
+  The rule above holds for the whole subtree, including the part a round doesn't reach. Before removing part of a subtree, the round reads the tree's move log from the horizon on (it keeps every recent move), and walks up from each node whose current move is that recent. If one is inside the subtree, nothing of the subtree is removed. This check is bounded at 5,000 log entries and 2,000 node reads per round. While a tree has more recent moves than that, subtrees too large for one round wait. Smaller ones are still purged, because their round sees every node.
+
+  A purge can still contradict an operation that is inside the horizon but has not arrived yet: an offline device that moved a file out of a directory before the directory was trashed, and syncs after the purge. Its operation is refused with `stale_op` rather than applied to a node whose content is gone; the client shows the file as deleted.
 * **Chunks:** unreferenced chunks are deleted after the grace period (§4.1).
 * **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Logged moves of a purged node itself (a skipped move can name one) are passed over by undo and redo. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.
 
