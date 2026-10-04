@@ -43,6 +43,8 @@ pub const RANGE_HASH: &str = "zen/v1/range-hash";
 pub const TREE_OP_CHAIN: &str = "zen/v1/tree-op-chain";
 /// A passkey's credential-store id from its WebAuthn credential id.
 pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
+/// Hash: the secret of an OPAQUE export-key keyslot from the export key.
+pub const OPAQUE_KEYSLOT: &str = "zen/v1/opaque-keyslot";
 
 /// AAD domain: sealed KV value.
 pub const AAD_KV: &str = "zen/v1/aad/kv";
@@ -103,6 +105,7 @@ pub const ALL: &[&str] = &[
     RANGE_HASH,
     TREE_OP_CHAIN,
     PASSKEY_ID,
+    OPAQUE_KEYSLOT,
     AAD_KV,
     AAD_EVENT,
     AAD_EPOCH_CHAIN,

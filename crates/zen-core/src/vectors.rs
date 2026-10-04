@@ -35,6 +35,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("fs.json", fs_vectors()?),
         ("pwkey.json", pwkey_vectors()?),
         ("prf_keyslot.json", prf_keyslot_vectors()?),
+        ("opaque_keyslot.json", opaque_keyslot_vectors()?),
     ])
 }
 
@@ -197,6 +198,33 @@ fn prf_keyslot_vectors() -> Result<Value> {
         "description": "A WebAuthn PRF keyslot (type 4) wrapping the fixture fs bundle (keys.json fs_epoch0.bundle). prf_output stands in for the authenticator's PRF result for prf_salt.",
         "webauthn_prf": {"rng_seed": "slot-prf", "credential_id": h(&cred), "prf_salt": h(&salt),
                          "prf_output": h(&out), "slot": h(&slot)},
+    }))
+}
+
+/// The credential id and export key of the OPAQUE keyslot vector. The
+/// key stands in for an OPAQUE client's export key.
+pub fn fixture_opaque_export() -> ([u8; 32], [u8; keyslot::OPAQUE_EXPORT_KEY_LEN]) {
+    (
+        [0xE3; 32],
+        core::array::from_fn(|i| (i as u8).wrapping_mul(7)),
+    )
+}
+
+fn opaque_keyslot_vectors() -> Result<Value> {
+    let fs = fixture_fs();
+    let (cred, export_key) = fixture_opaque_export();
+    let slot =
+        keyslot::create_opaque_export(&fs, &cred, &export_key, &mut DetRng::new("slot-opaque"))?;
+    assert_eq!(
+        *keyslot::open(&slot, Unlock::OpaqueExport(&export_key))?.to_bundle(),
+        *fs.to_bundle()
+    );
+    assert_eq!(keyslot::opaque_export_credential(&slot)?, cred);
+    let secret = blake3::derive_key(labels::OPAQUE_KEYSLOT, &export_key);
+    Ok(json!({
+        "description": "An OPAQUE export-key keyslot (type 5) wrapping the fixture fs bundle (keys.json fs_epoch0.bundle). export_key stands in for an OPAQUE client's 64-byte export key; secret = BLAKE3.derive_key(\"zen/v1/opaque-keyslot\", export_key).",
+        "opaque_export": {"rng_seed": "slot-opaque", "credential_id": h(&cred), "export_key": h(&export_key),
+                          "secret": h(&secret), "slot": h(&slot)},
     }))
 }
 

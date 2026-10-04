@@ -34,6 +34,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/range-hash` | hash of a KV range for `expect_ranges` (api.md §6) |
 | `zen/v1/tree-op-chain` | per-tree chain over filesystem operations (formats.md §11.5) |
 | `zen/v1/passkey-id` | a passkey's credential-store id from its WebAuthn credential id (auth.md §4.1, formats.md §6) |
+| `zen/v1/opaque-keyslot` | the secret of an OPAQUE export-key keyslot from the 64-byte export key (formats.md §6, type 5) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 

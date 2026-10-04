@@ -95,6 +95,25 @@ fn prf_keyslot_vector_opens_from_file() {
 }
 
 #[test]
+fn opaque_keyslot_vector_opens_from_file() {
+    let v = &load("opaque_keyslot.json")["opaque_export"];
+    let bundle = hx(&load("keys.json")["fs_epoch0"]["bundle"]);
+    let slot = hx(&v["slot"]);
+    assert_eq!(
+        keyslot::opaque_export_credential(&slot).unwrap().to_vec(),
+        hx(&v["credential_id"])
+    );
+    let key: [u8; 64] = hx(&v["export_key"]).try_into().unwrap();
+    assert_eq!(
+        blake3::derive_key(labels::OPAQUE_KEYSLOT, &key).to_vec(),
+        hx(&v["secret"])
+    );
+    let fs = keyslot::open(&slot, Unlock::OpaqueExport(&key)).unwrap();
+    assert_eq!(*fs.to_bundle(), bundle);
+    assert_eq!(slot.len(), 164);
+}
+
+#[test]
 fn signature_vectors_verify_from_files() {
     let s = load("signatures.json");
     let user = PublicIdentity::decode(&hx(&s["user"]["public"])).unwrap();

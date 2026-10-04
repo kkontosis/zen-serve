@@ -267,6 +267,38 @@ fn keyslots_reject_wrong_secrets() {
         Some(Error::Param)
     );
     assert!(keyslot::open(&pslot[..pslot.len() - 1], Unlock::WebAuthnPrf(&out)).is_err());
+
+    // OPAQUE export key: the key opens it; another key, an altered
+    // credential id, or another method doesn't.
+    let (ocred, key) = vectors::fixture_opaque_export();
+    let oslot = keyslot::create_opaque_export(&fs, &ocred, &key, &mut DetRng::new("o")).unwrap();
+    assert_eq!(keyslot::opaque_export_credential(&oslot).unwrap(), ocred);
+    assert!(keyslot::open(&oslot, Unlock::OpaqueExport(&key)).is_ok());
+    let mut wrong = key;
+    wrong[63] ^= 1;
+    assert_eq!(
+        keyslot::open(&oslot, Unlock::OpaqueExport(&wrong)).err(),
+        Some(Error::Decrypt)
+    );
+    let mut bad = oslot.clone();
+    bad[20] ^= 1; // the credential id
+    assert_eq!(
+        keyslot::open(&bad, Unlock::OpaqueExport(&key)).err(),
+        Some(Error::Decrypt)
+    );
+    assert_eq!(
+        keyslot::open(&oslot, Unlock::WebAuthnPrf(&out)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::open(&pslot, Unlock::OpaqueExport(&key)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::opaque_export_credential(&pslot).err(),
+        Some(Error::Param)
+    );
+    assert!(keyslot::open(&oslot[..oslot.len() - 1], Unlock::OpaqueExport(&key)).is_err());
 }
 
 #[test]
