@@ -114,7 +114,10 @@ jobs:
         run: |
           cargo build -p zen-server
           scripts/build-wasm.sh
-      - run: npm ci
+      - name: Install and build the packages
+        run: |
+          npm ci
+          npm run build -w @zen/client
       - name: Lint and typecheck
         run: |
           npx biome check
@@ -124,6 +127,5 @@ jobs:
         run: npx vitest run
       - name: Test (Chromium)
         run: |
-          npm run build -w @zen/client
           npx playwright install --with-deps chromium
           npx playwright test
