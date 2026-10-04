@@ -132,3 +132,24 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** zen-serve's OPAQUE suite (auth.md §8.1) is RFC 9807's ristretto255-SHA512 configuration, but with an Argon2id KSF at the credential's parameters and a context of its own (`"zen/v1/opaque" ‖ 0x00 ‖ origin`). `opaque-ke` checks itself against the RFC's vectors, which use the identity KSF. There are no vectors for the zen-specific combination, so a client written without zen-core (for example in JavaScript) can only be checked against a running server. The export-key keyslot (formats.md §6, type 5) has vectors.
 * **Why deferred:** Deterministic transcripts depend on how the library draws its random scalars and nonces from the RNG, so vectors generated through zen-core would partly describe `opaque-ke`'s internals rather than the protocol. Interoperability tests against a second implementation are the useful check.
 * **What it would take:** Vectors in the RFC's format (fixed blinds, nonces, ephemeral keys and server setup, injected through the library's test hooks or a second implementation), with the Argon2id KSF at the formats.md §6 floor and a fixed origin, covering registration, a sign-in, the export key and a type-5 slot made from it; and a check of an independent client implementation against them.
+
+## TD-LOG-RETENTION
+
+* **Status:** open
+* **Context:** Event-log appends (`log`, `lk`, `gl`, `lp` keys) are never deleted. A busy topic grows without bound; nothing in zen-serve frees it (docs/STATS.md §2–3).
+* **Why deferred:** Retention interacts with consumer cursors (a group behind the retention point must not lose events silently), per-key ready lists, DLQs and the partition index, so it needs its own design.
+* **What it would take:** Per-topic retention (age or size) in the group-aware sense: trimming only below the slowest group's cursor unless forced, a `retained_from` offset per topic that readers below it get a clear error for, the sweeper trimming `log`/`lk`/`gl`/`lp` and quota counters together, an admin trim command, and tests with lagging consumers.
+
+## TD-FS-LARGE-FILES
+
+* **Status:** open
+* **Context:** A file version's manifest and chunk list must fit one value: 32 B per chunk within `max_value_bytes` (90,000 by default), so a version holds at most ~2,800 chunks of 64 KiB, about **175 MiB** (docs/STATS.md §1.3). Raising `max_value_bytes` helps only up to FoundationDB's 100 KB value limit (~195 MiB).
+* **Why deferred:** The server-side CRDT filesystem (milestone 3.5) targets family-scale files; large media and disk images need a different version layout.
+* **What it would take:** Chunk lists split over several keys (e.g. `pack("tf", fs, tree, node, dot, i)` pages, or a tree of manifests), the write op carrying a list reference instead of the whole list, refcounting and GC over the pages, a matching formats.md change for the sealed manifest, and tests with multi-GiB synthetic files.
+
+## TD-STORE-COMPACTION
+
+* **Status:** open
+* **Context:** The embedded backend's `zen.redb` file never shrinks: redb reuses freed pages but zen-serve never calls its compaction, so the file stays at its peak size after large deletions.
+* **Why deferred:** Compaction needs exclusive access to the database file (no open read transactions), which conflicts with the MVCC read window the embedded backend keeps open while serving.
+* **What it would take:** An offline `zen-serve compact` command (servers stopped) calling redb's compaction, or an online path that briefly drains read transactions; a note in operations.md; a test that deletes data and checks the file shrinks.
