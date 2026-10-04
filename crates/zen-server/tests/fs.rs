@@ -1104,12 +1104,18 @@ async fn chunk_grace_restarts_on_reupload_and_release() {
         "release restarted grace"
     );
     // Once the newest candidate is past the grace period, the chunk goes.
+    // The grace is measured in commit versions, which on an idle
+    // FoundationDB cluster can trail the wall clock by a couple of seconds.
     tokio::time::sleep(Duration::from_millis(2300)).await;
-    zen_server::sweep_once(st).await.unwrap();
-    assert!(
-        !chunk_exists(&h, &a, id(0xA1)).await,
-        "collected after grace"
-    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        zen_server::sweep_once(st).await.unwrap();
+        if !chunk_exists(&h, &a, id(0xA1)).await {
+            break;
+        }
+        assert!(Instant::now() < deadline, "collected after grace");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// While a purged node's tombstone is kept, operations naming it (as the
@@ -1159,11 +1165,19 @@ async fn operations_on_purged_nodes_are_stale() {
         .expect_err("unknown parent");
     assert_eq!(e.0, 400);
     // Tombstones older than the horizon are dropped; the id is then new.
-    tokio::time::sleep(Duration::from_millis(3000)).await;
-    zen_server::sweep_once(st).await.unwrap();
-    ops(&h, &a, vec![mv(id(2), ROOT, fresh(), Some(b"again"))])
-        .await
-        .unwrap();
+    // Tombstone age is measured in commit versions, which on an idle
+    // FoundationDB cluster can trail the wall clock by a couple of seconds.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        zen_server::sweep_once(st).await.unwrap();
+        match ops(&h, &a, vec![mv(id(2), ROOT, fresh(), Some(b"again"))]).await {
+            Ok(_) => break,
+            Err(e) => assert_eq!(e.1.code, "stale_op", "{e:?}"),
+        }
+        assert!(Instant::now() < deadline, "tombstone dropped");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert_eq!(parent_of(&get(&h, &a, &[id(2)]).await[&id(2)]), Some(ROOT));
 }
 
