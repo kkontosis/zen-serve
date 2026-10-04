@@ -105,7 +105,7 @@ u8 body_version = 1 ‖ sender_fp[32] ‖ u64(hlc) ‖ lp(causation_id) ‖ payl
 off  len   field
   0    1   format_version = 1
   1    1   suite          = 1
-  2    1   slot_type      1 = passphrase, 2 = recovery key, 3 = X-Wing device
+  2    1   slot_type      1 = passphrase, 2 = recovery key, 3 = X-Wing device, 4 = WebAuthn PRF
   3    1   reserved       = 0
   4   16   slot_id        random
  20    …   type params
@@ -120,11 +120,15 @@ off  len   field
 | 1 passphrase | `u32 m_cost_kib ‖ u32 t_cost ‖ u32 p_cost ‖ salt[32]` | `Argon2id(passphrase, salt, m, t, p, out=32)` | 176 B |
 | 2 recovery | (none) | the 32-byte recovery key | 132 B |
 | 3 device | `recipient_fp[32] ‖ xwing_ct[1120]` | X-Wing shared secret | 1284 B |
+| 4 WebAuthn PRF | `credential_id[32] ‖ prf_salt[32]` | the passkey's 32-byte PRF output for `prf_salt` | 196 B |
 
 * **Argon2id parameters** are authenticated in the AAD and feed the KEK, so altering them breaks the slot.
 * **Creation** requires m ≥ 65536 KiB (64 MiB), t ≥ 1 and 1 ≤ p ≤ 4. Recommended: native 1 GiB/t=4, browser 256 MiB/t=3, p=1. **Opening** enforces a ceiling of m ≤ 4194304 KiB (4 GiB), 1 ≤ t ≤ 16 and 1 ≤ p ≤ 4, because the stored parameters come from the untrusted server and would otherwise let it make unlocking hang or run out of memory. Within the ceiling, any stored parameters are accepted (lower ones only weaken the user's own slot, and they're authenticated).
 * **Device slots** wrap only to a device key verified by certificate and out-of-band fingerprint (G1). `recipient_fp` lets a device find its own slot.
+* **WebAuthn PRF slots** open with a passkey (auth.md §7.7). `credential_id` is the passkey's id in the server's credential store, `BLAKE3.derive_key("zen-serve 2026 passkey", WebAuthn credential id)` (auth.md §4.1), which is also the `device_fp` of its sessions; it lets a client find the slot of a passkey. `prf_salt` is 32 random bytes chosen for the slot, passed to the authenticator as the PRF input (`extensions.prf.eval.first`, or per credential in `evalByCredential`); the secret is the 32-byte result (`prf.results.first`). WebAuthn already domain-separates the PRF input (the browser hashes it with the context `"WebAuthn PRF"`), and the result is specific to the credential and the salt, so the slot needs no label of its own. The server never sees the PRF result: it is a client extension output, not part of the signed authenticator data. A passkey whose authenticator doesn't support PRF can't have a slot; its user keeps another one.
 * The **recovery key** is 32 random bytes. Its human-readable encoding (word list or grouped base32) is defined by the client UI spec in a later milestone.
+
+Vectors: `test-vectors/keyslots.json` (types 1–3), `test-vectors/prf_keyslot.json` (type 4).
 
 ## 7. Identities and signatures
 

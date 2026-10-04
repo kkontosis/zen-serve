@@ -79,6 +79,22 @@ fn keyslot_vectors_open_from_files() {
 }
 
 #[test]
+fn prf_keyslot_vector_opens_from_file() {
+    let v = &load("prf_keyslot.json")["webauthn_prf"];
+    let bundle = hx(&load("keys.json")["fs_epoch0"]["bundle"]);
+    let slot = hx(&v["slot"]);
+    let (cred, salt) = keyslot::webauthn_prf_params(&slot).unwrap();
+    assert_eq!(
+        (cred.to_vec(), salt.to_vec()),
+        (hx(&v["credential_id"]), hx(&v["prf_salt"]))
+    );
+    let out: [u8; 32] = hx(&v["prf_output"]).try_into().unwrap();
+    let fs = keyslot::open(&slot, Unlock::WebAuthnPrf(&out)).unwrap();
+    assert_eq!(*fs.to_bundle(), bundle);
+    assert_eq!(slot.len(), 196);
+}
+
+#[test]
 fn signature_vectors_verify_from_files() {
     let s = load("signatures.json");
     let user = PublicIdentity::decode(&hx(&s["user"]["public"])).unwrap();

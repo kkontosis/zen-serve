@@ -1,0 +1,10 @@
+{
+  "description": "A WebAuthn PRF keyslot (type 4) wrapping the fixture fs bundle (keys.json fs_epoch0.bundle). prf_output stands in for the authenticator's PRF result for prf_salt.",
+  "webauthn_prf": {
+    "credential_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "prf_output": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "prf_salt": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "rng_seed": "slot-prf",
+    "slot": "01010400738fbf12751e344a3ee6c51036c9851bcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fa8771f162810b0be7e0141c803cd732ae42986c019da66f455ee81609eee7644a9729c382e8fd69fe4665a42d1c8fc13dd2f9bce8779cda762036a562c924d1460bd318264be06e9f0b2534fd6f502f9c7b90eb13fbcc8576a3e5c2fbce7ec0b80b0ddac54420eb3b2d12bea359c724d"
+  }
+}

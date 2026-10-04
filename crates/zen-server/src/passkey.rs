@@ -33,9 +33,10 @@ const METHOD: AuthMethod = AuthMethod::Passkey;
 /// Max label length.
 const MAX_LABEL: usize = 128;
 
-/// The store id of a WebAuthn credential id.
+/// The store id of a WebAuthn credential id (auth.md §4.1), which PRF
+/// keyslots also name their passkey by (formats.md §6).
 pub fn credential_id(webauthn_id: &[u8]) -> Fp {
-    blake3::derive_key("zen-serve 2026 passkey", webauthn_id)
+    zen_core::keyslot::passkey_credential_id(webauthn_id)
 }
 
 /// The relying-party id, given the server's own origins.

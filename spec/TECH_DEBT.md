@@ -13,10 +13,10 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-AUTH-WEBAUTHN-PRF-KEYSLOT
 
-* **Status:** open (method 2, passkeys, may resolve it)
+* **Status:** resolved, by the commit "spec: WebAuthn PRF keyslot (formats.md §6, type 4)": keyslot type 4 in formats.md §6 and zen-core (`keyslot::create_webauthn_prf`), the flows in auth.md §7.7, vectors in `spec/test-vectors/prf_keyslot.json`.
 * **Context:** Passkeys (auth.md §7) only give server access. The WebAuthn PRF extension can return a per-credential secret on the client, which could unlock data keys the way a passphrase does.
 * **Why deferred:** It needs a new keyslot type (formats.md §6) and passkeys are not implemented yet.
-* **What it would take:** A keyslot type 4 whose secret is the PRF output for a fixed, per-slot salt; the slot stores the credential id and the PRF salt; new labels; vectors; and a fallback when the authenticator has no PRF support.
+* **What it would take:** A keyslot type 4 whose secret is the PRF output for a fixed, per-slot salt; the slot stores the credential id and the PRF salt; new labels; vectors; and a fallback when the authenticator has no PRF support. (Done without new labels: WebAuthn already domain-separates the PRF input. The fallback is the user's other keyslots.)
 
 ## TD-AUTH-WEBAUTHN-RS256
 

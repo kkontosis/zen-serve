@@ -34,6 +34,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("signatures.json", signature_vectors()?),
         ("fs.json", fs_vectors()?),
         ("pwkey.json", pwkey_vectors()?),
+        ("prf_keyslot.json", prf_keyslot_vectors()?),
     ])
 }
 
@@ -174,6 +175,28 @@ fn keyslot_vectors() -> Result<Value> {
         "recovery": {"rng_seed": "slot-recovery", "recovery_key": h(rkey.as_ref()), "slot": h(&rec)},
         "device": {"rng_seed": "slot-device", "device_rng_seed": "device",
                    "device_public": h(&dev.public().encode()), "slot": h(&devslot)},
+    }))
+}
+
+/// The credential id, PRF salt and PRF output of the WebAuthn PRF keyslot
+/// vector. The output stands in for an authenticator's.
+pub fn fixture_prf() -> ([u8; 32], [u8; 32], [u8; 32]) {
+    ([0xCD; 32], core::array::from_fn(|i| i as u8), [0x5A; 32])
+}
+
+fn prf_keyslot_vectors() -> Result<Value> {
+    let fs = fixture_fs();
+    let (cred, salt, out) = fixture_prf();
+    let slot = keyslot::create_webauthn_prf(&fs, &cred, &salt, &out, &mut DetRng::new("slot-prf"))?;
+    assert_eq!(
+        *keyslot::open(&slot, Unlock::WebAuthnPrf(&out))?.to_bundle(),
+        *fs.to_bundle()
+    );
+    assert_eq!(keyslot::webauthn_prf_params(&slot)?, (cred, salt));
+    Ok(json!({
+        "description": "A WebAuthn PRF keyslot (type 4) wrapping the fixture fs bundle (keys.json fs_epoch0.bundle). prf_output stands in for the authenticator's PRF result for prf_salt.",
+        "webauthn_prf": {"rng_seed": "slot-prf", "credential_id": h(&cred), "prf_salt": h(&salt),
+                         "prf_output": h(&out), "slot": h(&slot)},
     }))
 }
 

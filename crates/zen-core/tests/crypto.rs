@@ -226,6 +226,47 @@ fn keyslots_reject_wrong_secrets() {
         Some(Error::Decrypt)
     );
     assert!(keyslot::open(&dslot, Unlock::Device(&dev)).is_ok());
+
+    // The store id of a passkey (auth.md §4.1).
+    assert_eq!(
+        keyslot::passkey_credential_id(b"raw id"),
+        *blake3::derive_key("zen-serve 2026 passkey", b"raw id").as_ref()
+    );
+
+    // WebAuthn PRF: the output for the slot's salt opens it; another
+    // output, an altered credential id or salt, or another method doesn't.
+    let (cred, salt, out) = vectors::fixture_prf();
+    let pslot =
+        keyslot::create_webauthn_prf(&fs, &cred, &salt, &out, &mut DetRng::new("w")).unwrap();
+    assert_eq!(keyslot::webauthn_prf_params(&pslot).unwrap(), (cred, salt));
+    assert!(keyslot::open(&pslot, Unlock::WebAuthnPrf(&out)).is_ok());
+    let mut wrong = out;
+    wrong[31] ^= 1;
+    assert_eq!(
+        keyslot::open(&pslot, Unlock::WebAuthnPrf(&wrong)).err(),
+        Some(Error::Decrypt)
+    );
+    for i in [20, 52] {
+        let mut bad = pslot.clone();
+        bad[i] ^= 1; // the credential id, the salt
+        assert_eq!(
+            keyslot::open(&bad, Unlock::WebAuthnPrf(&out)).err(),
+            Some(Error::Decrypt)
+        );
+    }
+    assert_eq!(
+        keyslot::open(&pslot, Unlock::Recovery(&out)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::open(&rslot, Unlock::WebAuthnPrf(&out)).err(),
+        Some(Error::Param)
+    );
+    assert_eq!(
+        keyslot::webauthn_prf_params(&rslot).err(),
+        Some(Error::Param)
+    );
+    assert!(keyslot::open(&pslot[..pslot.len() - 1], Unlock::WebAuthnPrf(&out)).is_err());
 }
 
 #[test]

@@ -294,9 +294,15 @@ Set it to false to accept security keys that only test presence. The options the
 * **Native apps.** App origins (`android:apk-key-hash:…`, `ios:…`) are not web origins; the origin policy refuses them.
 * **A passkey session is a full interactive session.** It can register further passkeys, set a password (§11.2) and manage the user's credentials, like the other interactive methods.
 
-### 7.7 Unlocking data keys
+### 7.7 Unlocking data keys: the PRF keyslot
 
-Signing in with a passkey gives server access only. Separately, a client can unlock data keys with the same passkey through the WebAuthn PRF extension: see `TD-AUTH-WEBAUTHN-PRF-KEYSLOT`.
+Signing in gives server access only. A client can also unlock data keys with the same passkey, through the WebAuthn **PRF extension** and a keyslot of type 4 (formats.md §6). The server is not involved: the slot sits in the fs header, which is opaque to it, and the PRF result never leaves the client.
+
+* **Creating a slot.** The client, holding the fs keys, picks a random 32-byte salt, asks the authenticator for its PRF result (`extensions: {prf: {eval: {first: salt}}}` in a `navigator.credentials.get` limited to that passkey), and wraps the fs keys with the result. The slot stores the passkey's credential id (§4.1) and the salt. Whether an authenticator supports PRF shows at registration (`prf: {}` in the `create` extensions returns `prf.enabled`) or in the first `get`.
+* **Unlocking while signing in.** With `session/begin {user}` (§7.3) the client gets the user's credential ids. It hashes them to store ids (§4.1), matches them to the fs header's type-4 slots, and passes each matching slot's salt in `prf.evalByCredential`. One touch then both signs in and returns the PRF result. A discoverable sign-in can't do this, because `evalByCredential` needs `allowCredentials`: the client then runs a second `get` for the passkey that signed in, whose store id is the session's `device_fp`.
+* **Fallback.** Authenticators without PRF support, and browsers without the extension, can't unlock. Users keep another keyslot (passphrase, recovery key, device).
+* **Removal.** Removing the passkey from the credential store (§4) doesn't remove its keyslot, nor the reverse: the slot keeps opening with the authenticator until it is removed from the fs header. As with any keyslot, a key bundle already unwrapped stays known; revoking it takes a rotation (formats.md §2).
+* **Threats.** Whoever holds the authenticator, and passes its user verification, can open the slot; the server and a dump hold nothing that opens it. The PRF is a symmetric secret of the authenticator, so the slot doesn't depend on the classical signature algorithms (§7.6). Synced passkeys carry their PRF secret to the user's other devices, so the slot opens on all of them.
 
 ## 8. Method 3: OPAQUE (reserved)
 
@@ -380,7 +386,7 @@ Signing in never gives the server a key to the data. Which methods can also **un
 | Method | Server access | Can also unlock data keys |
 |---|---|---|
 | 1 `device_key` | yes | yes: an X-Wing device keyslot (formats.md §6, type 3) opens with the device secret |
-| 2 `passkey` | yes | no (see `TD-AUTH-WEBAUTHN-PRF-KEYSLOT` in [TECH_DEBT.md](TECH_DEBT.md)) |
+| 2 `passkey` | yes | yes, if the authenticator supports the WebAuthn PRF extension: a PRF keyslot (formats.md §6, type 4) opens with the passkey's PRF output (§7.7) |
 | 3 `opaque` | yes | not specified yet |
 | 4 `api_token` | yes | no |
 | 5 `mtls` | yes | no |
