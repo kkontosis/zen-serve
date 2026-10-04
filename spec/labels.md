@@ -48,6 +48,12 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/fs-manifest` | filesystem manifest (kind 5) |
 | `zen/v1/aad/fs-chunk` | filesystem chunk (kind 6) |
 
+## OPAQUE (auth.md §8)
+
+| Label | Use |
+|---|---|
+| `zen/v1/opaque` | prefix of the AKE context of an OPAQUE sign-in: `"zen/v1/opaque" ‖ 0x00 ‖ origin` |
+
 ## Signatures
 
 `zen/v1/sig` is the domain prefix of every signed message: `SM = "zen/v1/sig" ‖ 0x00 ‖ lp(purpose) ‖ msg`. Purposes:

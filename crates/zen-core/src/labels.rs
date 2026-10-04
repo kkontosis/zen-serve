@@ -46,6 +46,10 @@ pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
 /// Hash: the secret of an OPAQUE export-key keyslot from the export key.
 pub const OPAQUE_KEYSLOT: &str = "zen/v1/opaque-keyslot";
 
+/// OPAQUE: prefix of the AKE context, `label ‖ 0x00 ‖ origin` (sign-in
+/// method 3).
+pub const OPAQUE_CONTEXT: &str = "zen/v1/opaque";
+
 /// AAD domain: sealed KV value.
 pub const AAD_KV: &str = "zen/v1/aad/kv";
 /// AAD domain: sealed event.
@@ -106,6 +110,7 @@ pub const ALL: &[&str] = &[
     TREE_OP_CHAIN,
     PASSKEY_ID,
     OPAQUE_KEYSLOT,
+    OPAQUE_CONTEXT,
     AAD_KV,
     AAD_EVENT,
     AAD_EPOCH_CHAIN,
