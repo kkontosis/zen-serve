@@ -171,7 +171,7 @@ pub async fn execute(
     for w in &req.writes {
         writes.insert((w.fs, w.key.clone()), w.value.clone());
     }
-    let res = txn_loop!(st.store, req.read_version, |t| {
+    let res = txn_loop!(st.store, req.read_version, idempotent, |t| {
         if let Some(rec) = t.get(&cid_key).await? {
             return Ok(Outcome::Replay(rec));
         }
@@ -318,8 +318,8 @@ pub async fn execute(
     });
     match res {
         Ok((Outcome::Replay(rec), _)) => replay(&rec, &caller.device),
-        Ok((Outcome::Applied(n), version)) => Ok(result(&stamp_of(version), n)),
-        Err(e) if e.code == "conflict" || e.code == "too_old" => {
+        Ok((Outcome::Applied(n), stamp)) => Ok(result(&stamp, n)),
+        Err(e) if matches!(e.code, "conflict" | "too_old" | "commit_unknown") => {
             // The commit may have landed under an earlier attempt (resend
             // after an unknown result): answer from the record if so.
             match lookup(st, &cid_key).await? {

@@ -782,22 +782,32 @@ async fn sequential_gate_and_fencing() {
     assert_eq!(d.events[0].envelope, vec![1]);
 
     // The lease expires; Bob takes over with a higher token, and the stale
-    // leader's commit is fenced off.
+    // leader's commit is fenced off. Expiry follows the version clock, which
+    // on an idle FoundationDB cluster advances in steps of up to ~2 s.
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let bob_lease: Lease = h
-        .call(
-            "/v1/consume/lease",
-            Some(&bob_tok),
-            &LeaseRequest {
-                fs: 1,
-                group: b"audit".to_vec(),
-                partition: None,
-                token: None,
-                ttl_ms: None,
-            },
-        )
-        .await
-        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let bob_lease: Lease = loop {
+        let r = h
+            .call(
+                "/v1/consume/lease",
+                Some(&bob_tok),
+                &LeaseRequest {
+                    fs: 1,
+                    group: b"audit".to_vec(),
+                    partition: None,
+                    token: None,
+                    ttl_ms: None,
+                },
+            )
+            .await;
+        match r {
+            Ok(l) => break l,
+            Err(e) if e.1.code == "not_leader" && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
     assert_eq!(bob_lease.token, lease.token + 1);
     assert_eq!(bob_lease.cursor, d.events[0].from);
     let late = Commit {

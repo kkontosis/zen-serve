@@ -432,7 +432,7 @@ pub async fn lease(
             return Err(bad_request("lease needs a partition"));
         };
         let key = keys::lease(req.fs, &g.def.group, p);
-        let now = st.store.now_version();
+        let now = t.read_version();
         let cur = t.get(&key).await?.as_deref().and_then(decode_lease);
         let token = match (&cur, req.token) {
             (Some(l), Some(tok))
@@ -510,7 +510,7 @@ async fn deliver(
         caller.require_topic(fs, &g.def.topic, R_CONSUME)?;
         let head = keys::topic_head(fs, &g.def.topic);
         let limit = req.limit.unwrap_or(1).clamp(1, 1000);
-        let now = st.store.now_version();
+        let now = t.read_version();
         let mut out = Vec::new();
         if g.def.mode == Mode::PerKey {
             if req.partition.is_some() {
@@ -617,7 +617,10 @@ pub async fn next(
     let mut watch_key: Option<Vec<u8>> = None;
     loop {
         // Register the watch before reading, so no append is missed.
-        let w = watch_key.as_deref().map(|k| st.store.watch(k));
+        let w = match watch_key.as_deref() {
+            Some(k) => Some(st.store.watch(k).await?),
+            None => None,
+        };
         let (events, head) = deliver(&st, &caller, &req).await?;
         let now = Instant::now();
         if !events.is_empty() || now >= deadline {

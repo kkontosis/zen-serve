@@ -1,22 +1,28 @@
 //! zen-store: the storage layer of zen-serve.
 //!
 //! [`Storage`] and [`Txn`] mirror FoundationDB's transaction model, so the
-//! FoundationDB backend (milestone 3) is a thin adapter:
+//! FoundationDB backend ([`fdb`], feature `fdb`) is a thin adapter:
 //! * strictly serializable optimistic transactions with read versions
 //! * read conflict ranges, snapshot reads, read-your-writes
 //! * versionstamped keys and values
 //! * atomic add
 //! * watches
 //!
-//! [`embedded::Embedded`] is the single-node backend on `redb`.
-#![forbid(unsafe_code)]
+//! [`embedded::Embedded`] is the single-node backend on `redb`;
+//! [`prefixed::Prefixed`] places any backend under a key prefix.
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "testing")]
+pub mod conformance;
 pub mod embedded;
+#[cfg(feature = "fdb")]
+pub mod fdb;
+pub mod prefixed;
 pub mod tuple;
 
 /// A commit version: about 1,000,000 per second, strictly increasing.
@@ -54,6 +60,9 @@ pub enum Error {
     /// The key has a pending versionstamped or atomic mutation in this
     /// transaction and cannot be read back.
     Unreadable,
+    /// The commit may or may not have been applied (FoundationDB
+    /// `commit_unknown_result`). Retry only if the transaction is idempotent.
+    CommitUnknown,
     /// Backend I/O or corruption.
     Io(String),
 }
@@ -64,6 +73,7 @@ impl std::fmt::Display for Error {
             Error::Conflict => write!(f, "transaction conflict"),
             Error::TooOld => write!(f, "read version too old"),
             Error::Unreadable => write!(f, "key has an unreadable pending mutation"),
+            Error::CommitUnknown => write!(f, "commit result unknown"),
             Error::Io(e) => write!(f, "storage I/O: {e}"),
         }
     }
@@ -104,11 +114,18 @@ pub trait Storage: Send + Sync + 'static {
     /// window, or the result is [`Error::TooOld`].
     async fn begin(&self, read_version: Option<Version>) -> Result<Box<dyn Txn>>;
 
-    /// Watch `key`. The watch is registered before this returns.
-    fn watch(&self, key: &[u8]) -> Watch;
+    /// Watch `key`. The watch is armed before this returns: any write to
+    /// `key` committed after a read version obtained later fires it.
+    async fn watch(&self, key: &[u8]) -> Result<Watch>;
 
-    /// The current reading of the version clock (for expiry decisions).
-    fn now_version(&self) -> Version;
+    /// The current reading of the version clock (for expiry decisions). It
+    /// may lag the newest read version slightly.
+    async fn now_version(&self) -> Result<Version>;
+
+    /// Make every later commit version greater than `at_least` (after
+    /// importing data written by another store, whose versionstamps must
+    /// stay older than new ones). Never moves the clock back.
+    async fn advance_version(&self, at_least: Version) -> Result<()>;
 }
 
 /// One optimistic transaction.
@@ -165,9 +182,10 @@ pub trait Txn: Send {
     /// a read conflict.
     fn atomic_add(&mut self, key: &[u8], delta: i64);
 
-    /// Commit. Returns the commit version, or the read version for a
-    /// transaction without mutations.
-    async fn commit(self: Box<Self>) -> Result<Version>;
+    /// Commit. Returns the commit's versionstamp (the one versionstamped
+    /// mutations received), or `stamp_of(read_version)` for a transaction
+    /// without mutations.
+    async fn commit(self: Box<Self>) -> Result<Stamp>;
 }
 
 /// `[key, key ‖ 0x00)`: the range holding exactly `key`.

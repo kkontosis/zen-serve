@@ -15,7 +15,8 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 401 | `unauthorized` (no or expired session) | after signing in again |
   | 403 | `forbidden` (ACL) | no |
   | 404 | `not_found` (unknown fs, group, …) | no |
-  | 409 | `conflict`, `too_old` (read version left the ~5 s window) | **yes**, the whole transaction |
+  | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
+  | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
@@ -43,7 +44,7 @@ No authentication. Returns:
 
 ### 3.1 `POST /v1/auth/challenge`
 
-`{}` → `{challenge: bytes(32)}`. Challenges are single-use and expire after 60 s.
+`{}` → `{challenge: bytes(32)}`. Challenges are single-use and expire after 60 s. Any node of a cluster accepts a challenge issued by another: a challenge is `nonce(12) ‖ u32 expires_unix ‖ MAC(16)` under a cluster-wide key, and its use is recorded when the session is created. Clients treat it as opaque.
 
 ### 3.2 `POST /v1/auth/session`
 
@@ -62,7 +63,11 @@ The server checks all of these, or returns 401:
 * `cert` verifies against `user`, and the certified device is listed under that member
 * `sig` verifies with the certified device's signing key
 
-A session is checked again on every request: it stops working as soon as an ACL version removes its device.
+A session is checked again on every request: it stops working as soon as an ACL version removes its device. Sessions are stored (hashed) in the keyspace, so every node of a cluster accepts them. Each node caches a session for up to 10 s.
+
+### 3.4 `POST /v1/auth/logout`
+
+`{}` → `{}`, authenticated. Ends the caller's session. The node that serves the request stops accepting it at once; other nodes stop within 10 s (their session cache).
 
 ### 3.3 Origin binding
 
@@ -205,7 +210,7 @@ POST /v1/consume/release  {fs, group, partition?, token}  → {}
 * **Acquire or renew.** If the lease is empty, expired or released, the caller gets it with `token = previous token + 1`.
   * If the caller passes the current `token` and holds the lease, it's renewed with the same token.
   * Otherwise the response is 412 `not_leader`.
-* `ttl_ms` defaults to 10,000. Expiry is measured in versions (DESIGN-3 §3.1).
+* `ttl_ms` defaults to 10,000. Expiry is measured in versions (DESIGN-3 §3.1). Expiry is never early. It can be late by a second or two: on an idle FoundationDB cluster the version clock advances in steps.
 
 ### 8.3 Delivery and the consume step
 
@@ -267,8 +272,8 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `auth` | `token` | authenticate the stream |
 | `sub` | `id: u32, fs, topic?, prefix?, after?: bytes(12)` | Subscribe to one topic, or to every topic under a topic-id prefix (an empty prefix means the whole fs). Needs topic `read`. History after `after` is streamed from storage, then live events follow **with no gap and no reordering** (G9). With no `after`, only new events are sent. |
 | `unsub` | `id` | stop a subscription |
-| `epub` | `fs, topic, data: bytes` | ephemeral publish, never stored. Needs topic `append`. |
-| `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe. Needs topic `read`. |
+| `epub` | `fs, topic, data: bytes` | ephemeral publish: not in the log; kept for at most about a minute (§9.1). Needs topic `append`. |
+| `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe: messages published after the `ok`. Needs topic `read`. |
 
 **Server → client:**
 
@@ -283,8 +288,22 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 * Watches only wake a subscription. The data always comes from a range read after the subscription's cursor, so reconnecting with the last received `offset` loses nothing.
 * Ephemeral data should be sealed by the client with the topic key plus a sequence number (G21). The server forwards it as opaque bytes.
 
+### 9.1 Ephemeral messages across nodes
+
+Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5), so a subscriber on any node receives messages published on any other. Delivery is best effort: there is no history, and a subscriber that falls behind may miss messages. Entries are deleted after `limits.ephemeral_ttl_secs` (default 60 s), so they never reach the log, and appear in a backup only if it is taken within that window.
+
 ## 10. Static files
 
 * `GET /unencrypted/*`, the root aliases, and the SPA fallback for `GET` with `Accept: text/html` (DESIGN-3 §4.2).
 * Responses carry a default `Content-Security-Policy` with `require-trusted-types-for 'script'` (G15), plus `X-Content-Type-Options: nosniff`.
 * When `cross_origin_isolation = true`, **every** response, `/v1` included, also carries COOP `same-origin`, COEP `require-corp` and CORP `same-origin`.
+
+## 11. `POST /v1/admin/status`
+
+`{}` → storage health, admins only (operations.md §3.1):
+
+```
+{ backend: "embedded" | "fdb", available: bool, healthy: bool,
+  redundancy?: text,           // FoundationDB: "single", "double", "triple"
+  machines: u32, processes: u32, coordinators: u32, messages: [text] }
+```

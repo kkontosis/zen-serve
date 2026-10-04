@@ -3,44 +3,8 @@
 mod common;
 
 use common::*;
-use futures::{SinkExt, StreamExt};
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::Message;
 use zen_proto::*;
-
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn connect(h: &Harness, token: &[u8]) -> Ws {
-    let url = format!("ws://{}/v1/stream", h.server.addr);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    send(
-        &mut ws,
-        &Frame::Auth {
-            token: token.to_vec(),
-        },
-    )
-    .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: None });
-    ws
-}
-
-async fn send(ws: &mut Ws, f: &Frame) {
-    ws.send(Message::Binary(to_cbor(f).into())).await.unwrap();
-}
-
-async fn recv(ws: &mut Ws) -> Frame {
-    loop {
-        let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("frame within 5 s")
-            .unwrap()
-            .unwrap();
-        if let Message::Binary(b) = m {
-            return from_cbor(&b).unwrap();
-        }
-    }
-}
 
 async fn publish(h: &Harness, tok: &[u8], n: u8, t: &[u8]) -> Vec<u8> {
     let ap = LogAppend {

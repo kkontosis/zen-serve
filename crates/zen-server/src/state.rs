@@ -2,11 +2,11 @@
 
 use crate::acl::{AclState, Fp};
 use crate::config::Config;
+use crate::eph::EphHub;
 use crate::error::{ApiResult, not_found};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
-use tokio::sync::broadcast;
 use zen_store::Storage;
 
 /// A signed-in device.
@@ -16,21 +16,17 @@ pub struct SessionInfo {
     pub user: Fp,
     /// Device fingerprint.
     pub device: Fp,
-    /// Expiry.
-    pub expires: Instant,
+    /// Expiry, unix seconds.
+    pub expires_unix: u64,
 }
 
-/// An ephemeral message (never stored).
-#[derive(Debug)]
-pub struct EphMsg {
-    /// fs_id.
-    pub fs: u32,
-    /// Topic id.
-    pub topic: Vec<u8>,
-    /// Opaque data.
-    pub data: Vec<u8>,
-    /// Sending device.
-    pub sender: Fp,
+/// A session as cached by this node.
+#[derive(Clone, Debug)]
+pub struct CachedSession {
+    /// The session.
+    pub info: SessionInfo,
+    /// When it was read from storage.
+    pub at: Instant,
 }
 
 /// Server state.
@@ -40,14 +36,14 @@ pub struct AppState {
     /// Storage backend.
     pub store: Arc<dyn Storage>,
     acl: RwLock<Arc<AclState>>,
-    /// Sessions by token.
-    pub sessions: Mutex<HashMap<[u8; 32], SessionInfo>>,
-    /// Outstanding challenges and their expiry.
-    pub challenges: Mutex<HashMap<[u8; 32], Instant>>,
+    /// Session cache by token hash (the sessions live in storage).
+    pub sessions: Mutex<HashMap<[u8; 32], CachedSession>>,
+    /// Cluster-wide key for stateless challenges.
+    pub challenge_key: [u8; 32],
     /// Claim token while unclaimed.
     pub claim: Mutex<Option<String>>,
-    /// Ephemeral pub/sub fan-out.
-    pub eph: broadcast::Sender<Arc<EphMsg>>,
+    /// Ephemeral pub/sub: this node's ring tailers.
+    pub eph: EphHub,
 }
 
 /// Shared handle.
@@ -55,15 +51,21 @@ pub type Shared = Arc<AppState>;
 
 impl AppState {
     /// Build the state.
-    pub fn new(cfg: Config, store: Arc<dyn Storage>, acl: AclState, claim: Option<String>) -> Self {
+    pub fn new(
+        cfg: Config,
+        store: Arc<dyn Storage>,
+        acl: AclState,
+        claim: Option<String>,
+        challenge_key: [u8; 32],
+    ) -> Self {
         AppState {
+            eph: EphHub::new(store.clone()),
             cfg,
             store,
             acl: RwLock::new(Arc::new(acl)),
             sessions: Mutex::new(HashMap::new()),
-            challenges: Mutex::new(HashMap::new()),
+            challenge_key,
             claim: Mutex::new(claim),
-            eph: broadcast::channel(1024).0,
         }
     }
 

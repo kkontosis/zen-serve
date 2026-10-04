@@ -4,8 +4,11 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message;
 use zen_core::kdf::acl_hash;
 use zen_core::labels;
 use zen_core::sig::{DeviceSecret, SigningIdentity, issue_device_cert};
@@ -93,6 +96,30 @@ pub struct Harness {
     pub dir: tempfile::TempDir,
     pub http: reqwest::Client,
     pub base: String,
+    pub cfg: Config,
+}
+
+/// Whether the tests run on FoundationDB (`ZEN_TEST_BACKEND=fdb`, with
+/// `ZEN_TEST_CLUSTER_FILE`). Each server then gets a random key prefix, so
+/// tests run in parallel on one cluster.
+pub fn on_fdb() -> bool {
+    std::env::var("ZEN_TEST_BACKEND").as_deref() == Ok("fdb")
+}
+
+fn use_test_backend(cfg: &mut Config) {
+    if !on_fdb() {
+        return;
+    }
+    cfg.storage.backend = Some(zen_server::config::Backend::Fdb);
+    cfg.storage.cluster_file = Some(
+        std::env::var("ZEN_TEST_CLUSTER_FILE")
+            .expect("ZEN_TEST_CLUSTER_FILE")
+            .into(),
+    );
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).unwrap();
+    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+    cfg.storage.key_prefix = format!("test/{hex}/");
 }
 
 impl Drop for Harness {
@@ -110,8 +137,13 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::with_data_dir(dir.path().join("data"));
         cfg.listen = "127.0.0.1:0".parse().unwrap();
+        use_test_backend(&mut cfg);
         f(&mut cfg);
-        let server = zen_server::start(cfg).await.unwrap();
+        Self::launch(cfg, dir).await
+    }
+
+    async fn launch(cfg: Config, dir: tempfile::TempDir) -> Self {
+        let server = zen_server::start(cfg.clone()).await.unwrap();
         let base = format!("http://{}", server.addr);
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         Harness {
@@ -119,7 +151,17 @@ impl Harness {
             dir,
             http,
             base,
+            cfg,
         }
+    }
+
+    /// Another node serving the same storage (FoundationDB only).
+    pub async fn peer(&self) -> Self {
+        assert!(on_fdb(), "peers need a shared backend");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = self.cfg.clone();
+        cfg.data_dir = dir.path().join("data");
+        Self::launch(cfg, dir).await
     }
 
     pub fn origin(&self) -> String {
@@ -245,5 +287,41 @@ pub fn append(t: &[u8], k: Option<&[u8]>, body: &[u8]) -> Append {
         topic: t.to_vec(),
         key_token: k.map(<[u8]>::to_vec),
         envelope: body.to_vec(),
+    }
+}
+
+// ---- WebSocket client
+
+pub type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+pub async fn connect(h: &Harness, token: &[u8]) -> Ws {
+    let url = format!("ws://{}/v1/stream", h.server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    send(
+        &mut ws,
+        &Frame::Auth {
+            token: token.to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut ws).await, Frame::Ok { id: None });
+    ws
+}
+
+pub async fn send(ws: &mut Ws, f: &Frame) {
+    ws.send(Message::Binary(to_cbor(f).into())).await.unwrap();
+}
+
+pub async fn recv(ws: &mut Ws) -> Frame {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("frame within 5 s")
+            .unwrap()
+            .unwrap();
+        if let Message::Binary(b) = m {
+            return from_cbor(&b).unwrap();
+        }
     }
 }

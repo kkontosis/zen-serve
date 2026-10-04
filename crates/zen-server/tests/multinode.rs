@@ -1,0 +1,258 @@
+//! Several zen-serve nodes on one FoundationDB cluster: shared sessions and
+//! challenges, cross-node ephemeral pub/sub and subscriptions, fencing across
+//! nodes. The multi-node cases run with `ZEN_TEST_BACKEND=fdb` only; logout
+//! and challenge reuse run on every backend.
+
+mod common;
+
+use common::*;
+use std::time::{Duration, Instant};
+use zen_proto::*;
+
+fn group_def(name: &[u8]) -> GroupDef {
+    GroupDef {
+        fs: 1,
+        group: name.to_vec(),
+        topic: topic(1),
+        mode: Mode::Sequential,
+        partitions: None,
+        key_token: None,
+        max_inflight: None,
+        max_attempts: None,
+        on_poison: None,
+        start: None,
+    }
+}
+
+async fn fs_list(h: &Harness, tok: &[u8]) -> Result<FsList, ApiErr> {
+    h.call("/v1/fs/list", Some(tok), &Empty {}).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_ends_the_session() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    fs_list(&h, &tok).await.unwrap();
+    let _: Empty = h
+        .call("/v1/auth/logout", Some(&tok), &Empty {})
+        .await
+        .unwrap();
+    let e = fs_list(&h, &tok).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (401, "unauthorized"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_challenge_is_single_use() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let c: Challenge = h.call("/v1/auth/challenge", None, &Empty {}).await.unwrap();
+    let origin = h.origin();
+    let req = SessionRequest {
+        challenge: c.challenge.clone(),
+        origin: origin.clone(),
+        user: admin.id.public().encode(),
+        cert: admin.cert.clone(),
+        sig: admin
+            .device
+            .signing()
+            .sign(
+                zen_core::labels::SIG_SESSION,
+                &session_message(&c.challenge, &origin),
+            )
+            .unwrap(),
+    };
+    let _: Session = h.call("/v1/auth/session", None, &req).await.unwrap();
+    let e = h
+        .call::<_, Session>("/v1/auth/session", None, &req)
+        .await
+        .unwrap_err();
+    assert_eq!(e.1.code, "unauthorized");
+    // A forged challenge is refused.
+    let mut forged = req.clone();
+    forged.challenge[20] ^= 1;
+    let e = h
+        .call::<_, Session>("/v1/auth/session", None, &forged)
+        .await
+        .unwrap_err();
+    assert_eq!(e.1.code, "unauthorized");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_and_acl_are_shared() {
+    if !on_fdb() {
+        return;
+    }
+    let a = Harness::start().await;
+    let b = a.peer().await;
+    let admin = User::new(1);
+    a.claim(&admin, &[]).await;
+    // B learns the ACL by watching it; sign-in on A works on B.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tok = loop {
+        match a.sign_in(&admin).await {
+            Ok(t) if fs_list(&b, &t).await.is_ok() => break t,
+            _ if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
+            other => panic!("{other:?}"),
+        }
+    };
+    // A challenge from B, used on A.
+    let c: Challenge = b.call("/v1/auth/challenge", None, &Empty {}).await.unwrap();
+    let origin = a.origin();
+    let s: Session = a
+        .call(
+            "/v1/auth/session",
+            None,
+            &SessionRequest {
+                challenge: c.challenge.clone(),
+                origin: origin.clone(),
+                user: admin.id.public().encode(),
+                cert: admin.cert.clone(),
+                sig: admin
+                    .device
+                    .signing()
+                    .sign(
+                        zen_core::labels::SIG_SESSION,
+                        &session_message(&c.challenge, &origin),
+                    )
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    fs_list(&b, &s.token).await.unwrap();
+    // Logout on A reaches B within the session cache time.
+    let _: Empty = a
+        .call("/v1/auth/logout", Some(&tok), &Empty {})
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fs_list(&b, &tok).await.is_ok() {
+        assert!(Instant::now() < deadline, "logout reached node B");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn two_nodes() -> Option<(Harness, Harness, Vec<u8>, Vec<u8>, User, User)> {
+    if !on_fdb() {
+        return None;
+    }
+    let a = Harness::start().await;
+    let b = a.peer().await;
+    let (alice, bob) = (User::new(1), User::new(2));
+    a.claim(&alice, &[&bob]).await;
+    let ta = a.sign_in(&alice).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tb = loop {
+        match b.sign_in(&bob).await {
+            Ok(t) => break t,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    Some((a, b, ta, tb, alice, bob))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ephemeral_and_subscriptions_cross_nodes() {
+    let Some((a, b, ta, tb, alice, _)) = two_nodes().await else {
+        return;
+    };
+    let mut wb = connect(&b, &tb).await;
+    send(
+        &mut wb,
+        &Frame::Esub {
+            id: 1,
+            fs: 1,
+            topic: Some(topic(3)),
+            prefix: None,
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut wb).await, Frame::Ok { id: Some(1) });
+    send(
+        &mut wb,
+        &Frame::Sub {
+            id: 2,
+            fs: 1,
+            topic: Some(topic(1)),
+            prefix: None,
+            after: None,
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut wb).await, Frame::Ok { id: Some(2) });
+
+    let mut wa = connect(&a, &ta).await;
+    send(
+        &mut wa,
+        &Frame::Epub {
+            fs: 1,
+            topic: topic(3),
+            data: b"typing".to_vec(),
+        },
+    )
+    .await;
+    match recv(&mut wb).await {
+        Frame::Eph {
+            id, data, sender, ..
+        } => {
+            assert_eq!((id, data), (1, b"typing".to_vec()));
+            assert_eq!(sender, alice.device.public().fingerprint().to_vec());
+        }
+        other => panic!("{other:?}"),
+    }
+    let ap = LogAppend {
+        commit_id: cid(1),
+        append: vec![append(&topic(1), None, b"e")],
+    };
+    let r: CommitResult = a.call("/v1/log/append", Some(&ta), &ap).await.unwrap();
+    match recv(&mut wb).await {
+        Frame::Ev { id, offset, .. } => {
+            assert_eq!(id, 2);
+            assert_eq!(offset, r.appended[0].to_vec());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leases_are_fenced_across_nodes() {
+    let Some((a, b, ta, tb, ..)) = two_nodes().await else {
+        return;
+    };
+    let _: GroupCreated = a
+        .call("/v1/consume/groups", Some(&ta), &group_def(b"g"))
+        .await
+        .unwrap();
+    let req = LeaseRequest {
+        fs: 1,
+        group: b"g".to_vec(),
+        partition: None,
+        token: None,
+        ttl_ms: Some(60_000),
+    };
+    let lease: Lease = a.call("/v1/consume/lease", Some(&ta), &req).await.unwrap();
+    let e = b
+        .call::<_, Lease>("/v1/consume/lease", Some(&tb), &req)
+        .await
+        .unwrap_err();
+    assert_eq!(e.1.code, "not_leader");
+    // The holder renews through the other node: the lease is in storage.
+    let renewed: Lease = b
+        .call(
+            "/v1/consume/lease",
+            Some(&ta),
+            &LeaseRequest {
+                token: Some(lease.token),
+                ..req.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renewed.token, lease.token);
+}

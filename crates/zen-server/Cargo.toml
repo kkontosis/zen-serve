@@ -10,16 +10,22 @@ repository.workspace = true
 name = "zen-serve"
 path = "src/main.rs"
 
+[features]
+# FoundationDB backend and supervisor commands (needs libfdb_c).
+fdb = ["zen-store/fdb"]
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+blake3 = "1.8"
+serde_json = "1"
 getrandom = "0.4"
 include_dir = "0.7"
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "process", "io-util"] }
 toml = "1"
 tower-http = { version = "0.7", features = ["cors"] }
 tracing = "0.1"

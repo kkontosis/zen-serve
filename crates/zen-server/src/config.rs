@@ -41,6 +41,90 @@ pub struct Config {
     /// Limits.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Storage backend.
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// FoundationDB processes run by the supervisor (`zen-serve init/join`).
+    #[serde(default)]
+    pub fdb: FdbConfig,
+    /// FoundationDB native backup.
+    #[serde(default)]
+    pub backup: BackupConfig,
+}
+
+/// Storage backend kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// redb file `data_dir/zen.redb` (single node).
+    #[default]
+    Embedded,
+    /// FoundationDB (needs the `fdb` build feature).
+    Fdb,
+}
+
+/// `[storage]`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Backend. Absent: `fdb` on a node set up by `zen-serve init/join`
+    /// (`data_dir/fdb.cluster` exists), else `embedded`.
+    pub backend: Option<Backend>,
+    /// FoundationDB cluster file. Absent: `data_dir/fdb.cluster` if it
+    /// exists (written by `zen-serve init/join`), else the platform default.
+    pub cluster_file: Option<PathBuf>,
+    /// Serve the keyspace under this key prefix (UTF-8 bytes), e.g. a clone
+    /// restored with `zen-serve restore --add-prefix` (operations.md).
+    pub key_prefix: String,
+}
+
+/// `[fdb]`: the supervised `fdbserver` processes (operations.md).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FdbConfig {
+    /// Directory with `fdbserver`, `fdbcli`, `fdbbackup`, `fdbrestore` and
+    /// `backup_agent`. Absent: search the standard install locations.
+    pub bin_dir: Option<PathBuf>,
+    /// `fdbserver` processes on this node (1 per core is a good start).
+    pub processes: u16,
+    /// IP the processes listen on.
+    pub listen_ip: String,
+    /// IP other nodes reach this node at. Absent: `listen_ip`.
+    pub public_ip: Option<String>,
+    /// First process port; process `i` uses `port + i`.
+    pub port: u16,
+    /// TLS for FoundationDB traffic (all three, or none).
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key.
+    pub tls_key: Option<PathBuf>,
+    /// TLS CA bundle.
+    pub tls_ca: Option<PathBuf>,
+    /// Manage redundancy mode and coordinators automatically.
+    pub auto_redundancy: bool,
+}
+
+impl Default for FdbConfig {
+    fn default() -> Self {
+        FdbConfig {
+            bin_dir: None,
+            processes: 1,
+            listen_ip: "127.0.0.1".into(),
+            public_ip: None,
+            port: 4500,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            auto_redundancy: true,
+        }
+    }
+}
+
+/// `[backup]`: FoundationDB native continuous backup (operations.md).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupConfig {
+    /// Run `backup_agent` processes under the supervisor.
+    pub agents: bool,
 }
 
 /// One filesystem.
@@ -75,6 +159,8 @@ pub struct LimitsConfig {
     pub claim_ttl_ms: u32,
     /// Sweeper period.
     pub sweep_interval_secs: u64,
+    /// How long ephemeral messages stay in the cross-node ring.
+    pub ephemeral_ttl_secs: u64,
 }
 
 impl Default for LimitsConfig {
@@ -90,6 +176,7 @@ impl Default for LimitsConfig {
             session_ttl_secs: 86_400,
             claim_ttl_ms: 30_000,
             sweep_interval_secs: 60,
+            ephemeral_ttl_secs: 60,
         }
     }
 }
@@ -137,11 +224,40 @@ impl Config {
             cross_origin_isolation: false,
             cors_origins: Vec::new(),
             limits: LimitsConfig::default(),
+            storage: StorageConfig::default(),
+            fdb: FdbConfig::default(),
+            backup: BackupConfig::default(),
         }
+    }
+
+    /// The backend in effect.
+    pub fn backend(&self) -> Backend {
+        self.storage.backend.unwrap_or_else(|| {
+            if self.data_dir.join("fdb.cluster").exists() {
+                Backend::Fdb
+            } else {
+                Backend::Embedded
+            }
+        })
+    }
+
+    /// The cluster file to connect with, if any.
+    pub fn cluster_file(&self) -> Option<PathBuf> {
+        self.storage.cluster_file.clone().or_else(|| {
+            let p = self.data_dir.join("fdb.cluster");
+            p.exists().then_some(p)
+        })
     }
 
     /// Check invariants.
     pub fn validate(&self) -> Result<(), String> {
+        let tls = [&self.fdb.tls_cert, &self.fdb.tls_key, &self.fdb.tls_ca];
+        if tls.iter().any(|t| t.is_some()) && !tls.iter().all(|t| t.is_some()) {
+            return Err("fdb.tls_cert, tls_key and tls_ca go together".into());
+        }
+        if self.fdb.processes == 0 {
+            return Err("fdb.processes must be at least 1".into());
+        }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fs {
             if f.id == 0 {

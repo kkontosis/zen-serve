@@ -4,7 +4,9 @@ use crate::acl::{AclState, Fp, R_READ};
 use crate::cbor::Cbor;
 use crate::error::*;
 use crate::ids::{random32, unix_now};
-use crate::state::{SessionInfo, Shared};
+use crate::keys;
+use crate::state::{CachedSession, SessionInfo, Shared};
+use crate::txn::txn_loop;
 use axum::extract::{FromRequestParts, State};
 use axum::http::{HeaderMap, header, request::Parts};
 use base64::Engine;
@@ -23,6 +25,8 @@ pub struct Caller {
     pub user: Fp,
     /// Device fingerprint.
     pub device: Fp,
+    /// Hash of the session token.
+    pub session: [u8; 32],
     /// The ACL the request was authorized against.
     pub acl: Arc<AclState>,
 }
@@ -57,17 +61,76 @@ impl Caller {
     }
 }
 
+/// How long a node trusts its cached copy of a session. A logout or expiry
+/// reaches other nodes within this time; ACL changes apply immediately.
+pub const SESSION_CACHE: Duration = Duration::from_secs(10);
+
+/// The keyspace id of a bearer token: a hash, so a dump holds no tokens.
+pub fn token_hash(token: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("zen-serve 2025 session token", token)
+}
+
+fn encode_session(s: &SessionInfo) -> Vec<u8> {
+    let mut v = Vec::with_capacity(72);
+    v.extend_from_slice(&s.user);
+    v.extend_from_slice(&s.device);
+    v.extend_from_slice(&s.expires_unix.to_be_bytes());
+    v
+}
+
+fn decode_session(v: &[u8]) -> Option<SessionInfo> {
+    (v.len() == 72).then(|| SessionInfo {
+        user: v[..32].try_into().expect("32"),
+        device: v[32..64].try_into().expect("32"),
+        expires_unix: u64::from_be_bytes(v[64..].try_into().expect("8")),
+    })
+}
+
+async fn lookup_session(st: &Shared, hash: &[u8; 32]) -> ApiResult<Option<SessionInfo>> {
+    let cached = {
+        let sessions = st.sessions.lock().expect("session lock");
+        sessions
+            .get(hash)
+            .filter(|c| c.at.elapsed() < SESSION_CACHE)
+            .map(|c| c.info.clone())
+    };
+    if let Some(s) = cached {
+        return Ok(Some(s));
+    }
+    let mut t = st.store.begin(None).await?;
+    let s = t
+        .snapshot_get(&keys::session(hash))
+        .await?
+        .as_deref()
+        .and_then(decode_session);
+    let mut sessions = st.sessions.lock().expect("session lock");
+    match &s {
+        Some(info) => {
+            sessions.insert(
+                *hash,
+                CachedSession {
+                    info: info.clone(),
+                    at: Instant::now(),
+                },
+            );
+        }
+        None => {
+            sessions.remove(hash);
+        }
+    }
+    Ok(s)
+}
+
 /// Resolve a session token against the current ACL.
-pub fn resolve(st: &Shared, token: &[u8]) -> ApiResult<Caller> {
+pub async fn resolve(st: &Shared, token: &[u8]) -> ApiResult<Caller> {
     let token: [u8; 32] = token
         .try_into()
         .map_err(|_| unauthorized("bad session token"))?;
-    let s = {
-        let sessions = st.sessions.lock().expect("session lock");
-        sessions.get(&token).cloned()
-    }
-    .ok_or_else(|| unauthorized("unknown session"))?;
-    if s.expires <= Instant::now() {
+    let hash = token_hash(&token);
+    let s = lookup_session(st, &hash)
+        .await?
+        .ok_or_else(|| unauthorized("unknown session"))?;
+    if s.expires_unix <= unix_now() {
         return Err(unauthorized("session expired"));
     }
     let acl = st.acl();
@@ -77,6 +140,7 @@ pub fn resolve(st: &Shared, token: &[u8]) -> ApiResult<Caller> {
     Ok(Caller {
         user: s.user,
         device: s.device,
+        session: hash,
         acl,
     })
 }
@@ -94,22 +158,56 @@ impl FromRequestParts<Shared> for Caller {
         let token = URL_SAFE_NO_PAD
             .decode(h.trim())
             .map_err(|_| unauthorized("bad bearer token"))?;
-        resolve(st, &token)
+        resolve(st, &token).await
     }
 }
 
-/// `POST /v1/auth/challenge`.
+/// `POST /v1/auth/challenge`. Challenges are stateless, so any node can
+/// check them: `nonce(12) ‖ u32 expires_unix ‖ MAC(16)` under the cluster's
+/// challenge key. Single use is enforced when a session is created.
 pub async fn challenge(State(st): State<Shared>, Cbor(_): Cbor<Empty>) -> Cbor<Challenge> {
-    let c = random32();
-    let mut ch = st.challenges.lock().expect("challenge lock");
-    let now = Instant::now();
-    ch.retain(|_, exp| *exp > now);
-    if ch.len() < 100_000 {
-        ch.insert(c, now + CHALLENGE_TTL);
-    }
+    let mut c = [0u8; 32];
+    c[..12].copy_from_slice(&random32()[..12]);
+    let exp = (unix_now() + CHALLENGE_TTL.as_secs()) as u32;
+    c[12..16].copy_from_slice(&exp.to_be_bytes());
+    let mac = challenge_mac(&st.challenge_key, &c[..16]);
+    c[16..].copy_from_slice(&mac);
     Cbor(Challenge {
         challenge: c.to_vec(),
     })
+}
+
+fn challenge_mac(key: &[u8; 32], body: &[u8]) -> [u8; 16] {
+    blake3::keyed_hash(key, body).as_bytes()[..16]
+        .try_into()
+        .expect("16")
+}
+
+/// Whether `c` is a live challenge this cluster issued.
+fn challenge_ok(st: &Shared, c: &[u8; 32]) -> bool {
+    let mac = challenge_mac(&st.challenge_key, &c[..16]);
+    let fresh = u32::from_be_bytes(c[12..16].try_into().expect("4")) as u64 > unix_now();
+    let mut diff = 0u8;
+    for (a, b) in mac.iter().zip(&c[16..]) {
+        diff |= a ^ b;
+    }
+    diff == 0 && fresh
+}
+
+/// Load or create the cluster-wide challenge key.
+pub async fn challenge_key(store: &dyn zen_store::Storage) -> ApiResult<[u8; 32]> {
+    let key = keys::meta("challenge_key");
+    let (k, _) = txn_loop!(store, None, |t| {
+        Ok(match t.get(&key).await? {
+            Some(v) if v.len() == 32 => v.try_into().expect("32"),
+            _ => {
+                let k = random32();
+                t.set(&key, &k);
+                k
+            }
+        })
+    })?;
+    Ok(k)
 }
 
 fn origin_ok(st: &Shared, headers: &HeaderMap, origin: &str) -> bool {
@@ -133,13 +231,7 @@ pub async fn session(
         .as_slice()
         .try_into()
         .map_err(|_| unauthorized("bad challenge"))?;
-    let live = st
-        .challenges
-        .lock()
-        .expect("challenge lock")
-        .remove(&challenge)
-        .is_some_and(|exp| exp > Instant::now());
-    if !live {
+    if !challenge_ok(&st, &challenge) {
         return Err(unauthorized("unknown or expired challenge"));
     }
     if !origin_ok(&st, &headers, &req.origin) {
@@ -168,18 +260,95 @@ pub async fn session(
         .map_err(|_| unauthorized("bad session signature"))?;
     let token = random32();
     let ttl = st.cfg.limits.session_ttl_secs;
+    let info = SessionInfo {
+        user: user_fp,
+        device: device_fp,
+        expires_unix: unix_now() + ttl,
+    };
+    let hash = token_hash(&token);
+    let used = keys::challenge(&challenge);
+    let chal_exp = u32::from_be_bytes(challenge[12..16].try_into().expect("4")) as u64;
+    // Idempotent: a retry after an unknown result finds its own session.
+    let sess_key = keys::session(&hash);
+    txn_loop!(st.store, None, idempotent, |t| {
+        if t.get(&sess_key).await?.is_some() {
+            return Ok(());
+        }
+        if t.get(&used).await?.is_some() {
+            return Err(unauthorized("challenge already used"));
+        }
+        t.set(&used, &chal_exp.to_be_bytes());
+        t.set(&sess_key, &encode_session(&info));
+        Ok(())
+    })?;
     st.sessions.lock().expect("session lock").insert(
-        token,
-        SessionInfo {
-            user: user_fp,
-            device: device_fp,
-            expires: Instant::now() + Duration::from_secs(ttl),
+        hash,
+        CachedSession {
+            info: info.clone(),
+            at: Instant::now(),
         },
     );
     Ok(Cbor(Session {
         token: token.to_vec(),
-        expires_unix: unix_now() + ttl,
+        expires_unix: info.expires_unix,
         user_fp: user_fp.to_vec(),
         device_fp: device_fp.to_vec(),
     }))
+}
+
+/// `POST /v1/auth/logout`: end the caller's session on every node.
+pub async fn logout(
+    State(st): State<Shared>,
+    caller: Caller,
+    Cbor(_): Cbor<Empty>,
+) -> ApiResult<Cbor<Empty>> {
+    let key = keys::session(&caller.session);
+    txn_loop!(st.store, None, |t| {
+        t.clear(&key);
+        Ok(())
+    })?;
+    st.sessions
+        .lock()
+        .expect("session lock")
+        .remove(&caller.session);
+    Ok(Cbor(Empty {}))
+}
+
+/// Remove expired sessions and consumed challenges (sweeper). Returns the
+/// number removed.
+pub async fn sweep(st: &Shared) -> ApiResult<usize> {
+    let now = unix_now();
+    let mut removed = 0;
+    for (prefix, exp_at) in [(keys::session_prefix(), 64), (keys::challenge_prefix(), 0)] {
+        let end = keys::end_of(&prefix);
+        let mut from = prefix.clone();
+        loop {
+            let ((n, next), _) = txn_loop!(st.store, None, |t| {
+                let got = t.snapshot_get_range(&from, &end, 1000, false).await?;
+                let mut n = 0;
+                for (k, v) in &got {
+                    let exp = v
+                        .get(exp_at..exp_at + 8)
+                        .map(|b| u64::from_be_bytes(b.try_into().expect("8")))
+                        .unwrap_or(0);
+                    if exp <= now {
+                        t.clear(k);
+                        n += 1;
+                    }
+                }
+                let next = (got.len() == 1000).then(|| zen_store::key_after(&got[999].0));
+                Ok((n, next))
+            })?;
+            removed += n;
+            match next {
+                Some(k) => from = k,
+                None => break,
+            }
+        }
+    }
+    st.sessions
+        .lock()
+        .expect("session lock")
+        .retain(|_, c| c.at.elapsed() < SESSION_CACHE);
+    Ok(removed)
 }
