@@ -72,7 +72,7 @@ async fn fake_params(st: &Shared, name_hash: &[u8; 32]) -> ApiResult<PasswordPar
 /// The user and password credential behind a login name, if any.
 async fn lookup(st: &Shared, name_hash: &[u8; 32]) -> ApiResult<Option<(Fp, Fp, CredRecord)>> {
     let (found, _) = txn_loop!(st.store, None, |t| {
-        Ok(match cred::login(&mut t, name_hash).await? {
+        Ok(match cred::login(&mut t, METHOD, name_hash).await? {
             Some((user, id)) => cred::get(&mut t, &user, &id)
                 .await?
                 .filter(|r| r.method() == Some(METHOD))
@@ -175,7 +175,7 @@ pub async fn set(
         ..Default::default()
     };
     let (old, _) = txn_loop!(st.store, None, |t| {
-        if let Some((holder, _)) = cred::login(&mut t, &h).await?
+        if let Some(holder) = cred::name_holder(&mut t, &h).await?
             && holder != user
         {
             return Err(name_taken("that login name is taken"));

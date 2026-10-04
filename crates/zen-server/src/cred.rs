@@ -135,16 +135,36 @@ pub async fn owner(t: &mut Box<dyn Txn>, id: &Fp) -> ApiResult<Option<Fp>> {
         .and_then(|v| v.try_into().ok()))
 }
 
-/// Who holds a login name: `(user, credential id)`.
-pub async fn login(t: &mut Box<dyn Txn>, name_hash: &[u8; 32]) -> ApiResult<Option<(Fp, Fp)>> {
-    Ok(t.get(&keys::login(name_hash)).await?.and_then(|v| {
-        (v.len() == 64).then(|| {
-            (
-                v[..32].try_into().expect("32"),
-                v[32..].try_into().expect("32"),
-            )
-        })
-    }))
+/// The methods whose credentials have a login name (auth.md §4.2).
+pub const LOGIN_METHODS: [AuthMethod; 2] = [AuthMethod::PasswordKey, AuthMethod::Opaque];
+
+/// Who holds a login name for `method`: `(user, credential id)`.
+pub async fn login(
+    t: &mut Box<dyn Txn>,
+    method: AuthMethod,
+    name_hash: &[u8; 32],
+) -> ApiResult<Option<(Fp, Fp)>> {
+    Ok(t.get(&keys::login(method.id(), name_hash))
+        .await?
+        .and_then(|v| {
+            (v.len() == 64).then(|| {
+                (
+                    v[..32].try_into().expect("32"),
+                    v[32..].try_into().expect("32"),
+                )
+            })
+        }))
+}
+
+/// The user who holds a login name, for any method: a name belongs to
+/// one user across methods (auth.md §4.2).
+pub async fn name_holder(t: &mut Box<dyn Txn>, name_hash: &[u8; 32]) -> ApiResult<Option<Fp>> {
+    for m in LOGIN_METHODS {
+        if let Some((user, _)) = login(t, m, name_hash).await? {
+            return Ok(Some(user));
+        }
+    }
+    Ok(None)
 }
 
 /// Every credential of `user`, by id.
@@ -177,7 +197,7 @@ pub fn put(t: &mut Box<dyn Txn>, user: &Fp, id: &Fp, rec: &CredRecord) {
     if let Some(h) = rec.name_hash() {
         let mut v = user.to_vec();
         v.extend_from_slice(id);
-        t.set(&keys::login(&h), &v);
+        t.set(&keys::login(rec.method, &h), &v);
     }
 }
 
@@ -185,10 +205,10 @@ pub fn put(t: &mut Box<dyn Txn>, user: &Fp, id: &Fp, rec: &CredRecord) {
 pub async fn delete(t: &mut Box<dyn Txn>, user: &Fp, id: &Fp, rec: &CredRecord) -> ApiResult<()> {
     t.clear(&keys::cred(user, id));
     t.clear(&keys::cred_owner(id));
-    if let Some(h) = rec.name_hash() {
+    if let (Some(h), Some(m)) = (rec.name_hash(), rec.method()) {
         // The name may already point at a newer credential.
-        if login(t, &h).await? == Some((*user, *id)) {
-            t.clear(&keys::login(&h));
+        if login(t, m, &h).await? == Some((*user, *id)) {
+            t.clear(&keys::login(rec.method, &h));
         }
     }
     Ok(())

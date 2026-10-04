@@ -263,9 +263,17 @@ pub fn cred_owner(id: &[u8; 32]) -> Vec<u8> {
     Key::new().str("credx").bytes(id).finish()
 }
 
-/// The login-name index: `("login", H(name))` → `user_fp(32) ‖ cred_id(32)`.
-pub fn login(name_hash: &[u8; 32]) -> Vec<u8> {
-    Key::new().str("login").bytes(name_hash).finish()
+/// The login-name index of a method with a login name (auth.md §4.2):
+/// `("login", H(name))` for method 6, which predates the method element,
+/// and `("login", H(name), method)` for the others (method 3)
+/// → `user_fp(32) ‖ cred_id(32)`.
+pub fn login(method: u8, name_hash: &[u8; 32]) -> Vec<u8> {
+    let k = Key::new().str("login").bytes(name_hash);
+    if method == 6 {
+        k.finish()
+    } else {
+        k.int(method.into()).finish()
+    }
 }
 
 /// The key the fake sign-in parameters for unknown login names are
