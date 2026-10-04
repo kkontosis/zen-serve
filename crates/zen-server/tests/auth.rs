@@ -303,6 +303,29 @@ async fn pinning_always_adds_the_first_contact() {
     );
 }
 
+/// With `origin_pinning_always`, the first sign-in pins its origin even
+/// when that origin is already in `public_origins` (auth.md §5.2): the
+/// `Host` origin is then no longer accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinning_always_pins_a_listed_first_origin() {
+    let h = Harness::start_with(|c| {
+        c.public_origins = vec!["https://app.example".into()];
+        c.auth.origin_pinning_always = true;
+    })
+    .await;
+    let (admin, bob) = (User::new(1), User::new(2));
+    claim_with_origin(&h, &admin, &bob, None).await.unwrap();
+    let tok = h
+        .sign_in_at(&admin, "https://app.example", &h.host_header())
+        .await
+        .unwrap();
+    let s = origin_state(&h, &tok).await;
+    assert_eq!(s.pinned, vec!["https://app.example".to_string()]);
+    assert_eq!(s.accepted, vec!["https://app.example".to_string()]);
+    assert!(!s.host_fallback);
+    assert_eq!(code(h.sign_in(&bob).await).0, 401);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn acl_origins_are_accepted_when_turned_on() {
     let acl_origin = "https://acl.example";
