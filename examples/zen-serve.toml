@@ -1,0 +1,30 @@
+# zen-serve configuration (see spec/api.md and docs/DESIGN-3.md §4).
+
+listen = "127.0.0.1:8080"
+data_dir = "./zen-data"
+
+# Origins clients sign into (scheme://host[:port]). Empty: derived from the
+# Host header, which is fine behind a reverse proxy that preserves it.
+public_origins = []
+
+# Plaintext static files. Without this, the bundled defaults are served.
+# unencrypted_dir = "/srv/zen/unencrypted"
+aliases = ["favicon.ico", "robots.txt", "manifest.webmanifest"]
+spa_fallback = true
+
+# COOP/COEP/CORP on every response, for SharedArrayBuffer (DESIGN-3 §4.2).
+cross_origin_isolation = false
+
+# Extra origins allowed to call the API (G17). Empty: same-origin only.
+cors_origins = []
+
+[[fs]]
+id = 1   # "/"
+
+[[fs]]
+id = 2   # "/home/user"
+
+[limits]
+max_value_bytes = 90000
+idempotency_ttl_secs = 86400
+session_ttl_secs = 86400

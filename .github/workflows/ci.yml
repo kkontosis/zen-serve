@@ -24,4 +24,4 @@ jobs:
       - name: Test
         run: cargo test --all
       - name: wasm32 check
-        run: cargo check -p zen-core --target wasm32-unknown-unknown
+        run: cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown

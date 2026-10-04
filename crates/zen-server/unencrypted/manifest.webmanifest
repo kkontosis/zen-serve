@@ -1,0 +1,6 @@
+{
+  "name": "zen-serve",
+  "short_name": "zen",
+  "start_url": "/",
+  "display": "standalone"
+}

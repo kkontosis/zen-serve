@@ -31,6 +31,10 @@ pub const DEVICE_SIG: &str = "zen/v1/device-sig";
 pub const DEVICE_KEM: &str = "zen/v1/device-kem";
 /// Hash: fingerprint of public key material.
 pub const FINGERPRINT: &str = "zen/v1/fingerprint";
+/// Hash: chain hash of a signed ACL document.
+pub const ACL_CHAIN: &str = "zen/v1/acl-chain";
+/// Hash: `expect_ranges` hash of a KV range.
+pub const RANGE_HASH: &str = "zen/v1/range-hash";
 
 /// AAD domain: sealed KV value.
 pub const AAD_KV: &str = "zen/v1/aad/kv";
@@ -55,6 +59,8 @@ pub const SIG_ACL: &str = "zen/v1/sig/acl";
 pub const SIG_MEMBERSHIP: &str = "zen/v1/sig/membership";
 /// Signature purpose: individual event (when `sig_every = 1` uses Ed25519 only).
 pub const SIG_EVENT: &str = "zen/v1/sig/event";
+/// Signature purpose: device sign-in challenge.
+pub const SIG_SESSION: &str = "zen/v1/sig/session";
 
 /// Every label, for registry checks.
 pub const ALL: &[&str] = &[
@@ -73,6 +79,8 @@ pub const ALL: &[&str] = &[
     DEVICE_SIG,
     DEVICE_KEM,
     FINGERPRINT,
+    ACL_CHAIN,
+    RANGE_HASH,
     AAD_KV,
     AAD_EVENT,
     AAD_EPOCH_CHAIN,
@@ -84,6 +92,7 @@ pub const ALL: &[&str] = &[
     SIG_ACL,
     SIG_MEMBERSHIP,
     SIG_EVENT,
+    SIG_SESSION,
 ];
 
 /// Signature purposes accepted by [`crate::sig`].
@@ -94,4 +103,5 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_ACL,
     SIG_MEMBERSHIP,
     SIG_EVENT,
+    SIG_SESSION,
 ];
