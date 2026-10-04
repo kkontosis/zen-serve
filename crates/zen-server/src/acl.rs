@@ -314,6 +314,12 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
     }
     let is_fs = |fs| st.cfg.has_fs(fs);
     let new = validate_successor(&req.acl, &head, &is_fs)?;
+    let removed: Vec<Fp> = head
+        .members
+        .keys()
+        .filter(|u| !new.members.contains_key(*u))
+        .copied()
+        .collect();
     // The claim may name the origin to pin (auth.md §5.2).
     let pin = match &req.origin {
         Some(o) if new.version == 1 => {
@@ -340,6 +346,11 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
         t.set(&keys::acl_head(), &new.version.to_be_bytes());
         if let Some(o) = &pin {
             crate::origin::pin_at_claim(&st.cfg, &mut t, o).await?;
+        }
+        // A member who leaves takes their stored credentials along
+        // (auth.md §4).
+        for user in &removed {
+            crate::cred::delete_user(&mut t, user).await?;
         }
         Ok(())
     })?;

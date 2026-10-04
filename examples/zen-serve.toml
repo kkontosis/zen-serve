@@ -32,6 +32,13 @@ password_keys = true   # 6: password-derived keys, the default method
 origin_pinning = true            # 7b: pin the first origin while public_origins is empty
 origin_pinning_always = false    # keep 7b alongside public_origins (risky)
 acl_origins = false              # 7c: also accept the origins listed in the signed ACL
+# Method 6 (spec/auth.md §11): Argon2id parameters advertised for registration
+# (and returned for unknown login names), and the failed sign-in limiter.
+password_m_cost_kib = 262144
+password_t_cost = 3
+password_p_cost = 1
+password_max_failures = 10
+password_lockout_secs = 300
 
 [[fs]]
 id = 1   # "/"

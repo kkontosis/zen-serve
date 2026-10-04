@@ -159,6 +159,18 @@ pub struct AuthConfig {
     pub origin_pinning_always: bool,
     /// 7c: also accept the `origins` listed in the head ACL.
     pub acl_origins: bool,
+    /// Method 6: Argon2id memory (KiB) that `/v1/info` recommends for new
+    /// registrations, and that unknown login names are answered with.
+    pub password_m_cost_kib: u32,
+    /// Method 6: Argon2id passes, likewise.
+    pub password_t_cost: u32,
+    /// Method 6: Argon2id lanes, likewise.
+    pub password_p_cost: u32,
+    /// Method 6: failed sign-ins per login name before it is locked.
+    pub password_max_failures: u32,
+    /// Method 6: how long a locked login name stays locked after its last
+    /// failure.
+    pub password_lockout_secs: u64,
 }
 
 impl Default for AuthConfig {
@@ -173,11 +185,27 @@ impl Default for AuthConfig {
             origin_pinning: true,
             origin_pinning_always: false,
             acl_origins: false,
+            // The browser recommendation of formats.md §6: the slowest
+            // client must be able to sign in.
+            password_m_cost_kib: 256 * 1024,
+            password_t_cost: 3,
+            password_p_cost: 1,
+            password_max_failures: 10,
+            password_lockout_secs: 300,
         }
     }
 }
 
 impl AuthConfig {
+    /// The configured Argon2id parameters of method 6.
+    pub fn password_params(&self) -> zen_proto::Argon2Params {
+        zen_proto::Argon2Params {
+            m_cost_kib: self.password_m_cost_kib,
+            t_cost: self.password_t_cost,
+            p_cost: self.password_p_cost,
+        }
+    }
+
     /// Whether `m` is turned on (implemented or not).
     pub fn enabled(&self, m: AuthMethod) -> bool {
         match m {
@@ -380,6 +408,11 @@ impl Config {
                      no trailing slash)"
                 ));
             }
+        }
+        crate::password::check_params(self.auth.password_params())
+            .map_err(|e| format!("auth.password_*: {e}"))?;
+        if self.auth.password_max_failures == 0 {
+            return Err("auth.password_max_failures must be at least 1".into());
         }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fs {

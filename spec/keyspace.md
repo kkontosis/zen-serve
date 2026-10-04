@@ -144,6 +144,12 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 
 | Key | Value |
 |---|---|
+| `pack("cred", user_fp, id)` | credential record, CBOR (auth.md §4) |
+| `pack("credx", id)` | `user_fp(32)`: a credential's owner, by id |
+| `pack("login", H(name))` | `user_fp(32) ‖ cred_id(32)`: the login-name index, by the hash of the normalized name (auth.md §4.2) |
+| `pack("auth_key", "params")` | 32 random bytes: the key of the fake parameters for unknown login names (auth.md §4.2), created on first use once the cluster is claimed |
 | `pack("origins")` | CBOR `[text]`: the pinned sign-in origins (auth.md §5.2); absent when nothing is pinned |
 
-These keys are data, not server metadata: `export` copies them and `import` restores them, so a restored or migrated cluster keeps its pin.
+* `user_fp` and `id` are 32-byte byte-string elements.
+* These keys are data, not server metadata: `export` copies them and `import` restores them. So a restored or migrated cluster keeps its credentials, its pin and its fake parameters.
+* All of them are new: a store from before them simply has none.

@@ -73,6 +73,48 @@ The session response's `device_fp` carries the credential id, and `method` names
 
 Steps 1–3 apply immediately on every node. A removed credential, like a logout, stops working at once on the node that removed it and within 10 s on the others (their session cache).
 
+## 4. Credential store
+
+Credentials of every method except device keys live in a **server-side credential store** in the keyspace (keyspace.md §3.7), not in the signed ACL. Each credential belongs to one user, the member who owns it, and has a random or derived **32-byte id**.
+
+```
+cred record (CBOR) = { method: u8, created_unix: u64,
+                       expires_unix?: u64,          // API tokens
+                       label?: text,
+                       name_hash?: bytes(32),       // methods with a login name (6; 3 later)
+                       salt?: bytes(32), params?: {m_cost_kib, t_cost, p_cost},
+                       identity?: bytes,            // method 6: the public identity
+                       issued_by?: bytes(32) }      // API tokens: the issuing admin
+```
+
+Fields a server doesn't know are ignored, so a method can add its own without breaking older readers.
+
+* **Membership comes first.** A credential works only while its user is a member of the head ACL. An ACL version that removes a member deletes all their credentials in the same transaction, which also frees their login name. A member added back starts with none.
+* **Removal.** Removing a credential ends its sessions (§3).
+* **Limits.** A user holds at most 100 stored credentials.
+* **Privacy.** The store never returns keys, salts or secret hashes, only metadata (api.md §3.9). In particular, the public identity of a password-derived key stays on the server: other members never see it, unlike the ACL's user identities. Each credential is readable only by its owner and by admins.
+
+**Endpoints** (api.md §3.9). A user's own session can list and remove their own credentials, and add them through each method's registration endpoint (§11.2). Admins can list and remove any member's. Sessions from API tokens can do none of this (§9).
+
+### 4.1 Credential ids
+
+| Method | Id |
+|---|---|
+| `password_key` | random, chosen at registration; a password change gets a new one |
+| `api_token` | `BLAKE3.derive_key("zen-serve 2026 api token", secret)` (§9) |
+
+Device keys are not in the store: their id is the device fingerprint, and the ACL holds them.
+
+### 4.2 Login names
+
+Methods where the user types a name (6 now, 3 later) find the account through a **login-name index**.
+
+* **Normalization.** Surrounding whitespace is trimmed and ASCII letters are lowercased. The result must be 1–128 bytes of `a-z`, `0-9` and `. _ - @ +`: an email address fits. Other names are refused with 400. Unicode names are deferred (`TD-AUTH-UNICODE-LOGIN`).
+* **Only a hash is stored**: `H(name) = BLAKE3.derive_key("zen-serve 2026 login name", normalized name)`. A dump holds no names; a guessed name can be checked against it, as with any unsalted index.
+* **Unique across users.** A user can hold one login name per method; claiming a name another user holds returns 409 `name_taken`. That answer tells an authenticated member that the name exists.
+* **Unknown names get fake parameters.** The parameter lookup (§11.2) answers an unknown name with the configured Argon2id parameters and a salt `BLAKE3.keyed_hash(K, "zen-serve fake password salt" ‖ 0x00 ‖ H(name))`. `K` is 32 random bytes, kept in the keyspace with the data, so every node, and a restored copy, gives the same answer. It is created on first use after the claim; before the claim no account exists, and each node uses a key of its own, so a server that was only started holds no data (operations.md §6). A name gets the same fake every time, so repeated lookups don't reveal which names exist.
+  * **Residual leak.** A registered account whose parameters differ from the configured ones is distinguishable. Clients should register with the parameters `/v1/info` advertises (§11.2). A name that was registered and then removed gets a fake salt that differs from its old real one.
+
 ## 5. Origin policy
 
 Methods 1 and 6 sign the **origin** the client sees, `scheme://host[:port]` (formats.md §10), together with a challenge. That stops a malicious server from relaying a sign-in to the real one: the relay's origin differs, so the server refuses the signature. It works only if the server knows its own origins. Three sources tell it, numbered 7a–7c after the decision that introduced them.
@@ -167,6 +209,55 @@ To sign in, the device signs the challenge and the origin (formats.md §10) and 
 ## 10. Method 5: TLS client certificates (reserved)
 
 > **Placeholder.** Sign-in with a TLS client certificate, either terminated by zen-serve itself (native TLS) or by a trusted reverse proxy that forwards the verified certificate. Not implemented; `mtls = true` has no effect yet.
+
+## 11. Method 6: password-derived key (default)
+
+The **primary method**. The client turns a password into a hybrid Ed25519 + ML-DSA-65 key pair (formats.md §7.5) and signs `challenge ‖ origin` with it. **The password never leaves the client**, and the server stores only a public key.
+
+```toml
+[auth]
+password_keys = true
+password_m_cost_kib = 262144    # Argon2id parameters advertised for registration (256 MiB, …
+password_t_cost = 3             # … 3 passes, 1 lane: the browser recommendation of formats.md §6),
+password_p_cost = 1             # and returned for unknown login names
+password_max_failures = 10      # failed sign-ins per login name before a lockout
+password_lockout_secs = 300
+```
+
+The configured parameters must meet the registration floor of formats.md §7.5.
+
+### 11.1 Login names
+
+Each user has at most one password credential, under one login name (§4.2). The name only finds the account; it is not an input of the key.
+
+### 11.2 Registration and password change
+
+1. The client reads `auth.password_params` from `/v1/info`, picks a random 32-byte salt and derives the key (formats.md §7.5).
+2. It calls `POST /v1/auth/password/set` (api.md §3.7) with a session of the user: the login name, the salt, the parameters and the **public identity**.
+3. The server checks the name (§4.2), the salt length, the parameters against the registration floor and ceilings, and that the identity decodes. It then stores a new credential with a fresh random id. Any earlier password credential of the user is deleted in the same transaction.
+
+The same call is the **password change**, and also changes the login name. The old credential's sessions end, including the calling session if it signed in with the old password. The new credential has a new id, so to the rest of the server it is a new device (§3).
+
+Any interactive session of the user may set the password: a device-key session (the usual way to add a password to a new member, see `TD-AUTH-INVITES`), a password session, or later a passkey session. The old password is not asked for; a stolen session can already act as the user.
+
+### 11.3 Sign-in
+
+1. `POST /v1/auth/password/params {name}` returns the salt and parameters, or stable fakes for an unknown name (§4.2). No session needed.
+2. The client derives the key, with the sign-in ceilings of formats.md §7.5, gets a challenge (api.md §3.1) and signs the session message with purpose `zen/v1/sig/password-session` (formats.md §10).
+3. `POST /v1/auth/password/session {name, challenge, origin, sig}` (api.md §3.6). The server checks the challenge and the origin policy (§5), then the signature against the stored identity, then that the user is a member. It answers every credential failure (unknown name, wrong key, not a member) with the same 401, and issues an ordinary session otherwise.
+
+**Failed-attempt limiter.** Each node counts failed sign-ins per login-name hash in memory, for unknown names too. After `password_max_failures` failures, the name is locked: every attempt gets 429 `quota`, even with the right password, until `password_lockout_secs` after the last failure. A success clears the count. Challenge and origin failures don't count.
+* The limit applies **per node**: a cluster of n nodes allows n times as many guesses.
+* A restart clears it (`TD-AUTH-LIMITER-CLUSTER`).
+
+### 11.4 Threat notes
+
+* **Offline guessing.** The stored public identity, salt and parameters form a verifier: whoever holds them (the server, a backup, a dump) can test password guesses offline, at one Argon2id run per guess. That is the same exposure as a passphrase keyslot (formats.md §6), which the server also stores. Strong parameters and strong passwords are the defence.
+* **Online guessing** costs the attacker one Argon2id run per guess and is capped by the limiter.
+* **Lockout as denial of service.** Anyone who knows a login name can keep it locked. The account can still sign in by other methods, and an admin can raise `password_max_failures` or change the name.
+* **Relay.** The signature binds the origin (§5), like a device signature.
+* **Enumeration.** Parameter lookups and failed sign-ins look the same for known and unknown names (§4.2), up to the residual leak noted there and timing.
+* **Phishing.** A look-alike site can collect the typed password. The origin binding stops it from signing in **through** the real server with a relayed challenge, but not from deriving the key itself once it has the password. Passkeys (§7) resist phishing; passwords don't.
 
 ## 12. Server access and data keys
 

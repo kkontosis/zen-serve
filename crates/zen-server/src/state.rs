@@ -48,6 +48,11 @@ pub struct AppState {
     pub claim: Mutex<Option<String>>,
     /// Ephemeral pub/sub: this node's ring tailers.
     pub eph: EphHub,
+    /// Cluster-wide key for the fake parameters of unknown login names,
+    /// once read or created (`cred::params_key`).
+    pub params_key: Mutex<Option<[u8; 32]>>,
+    /// Failed password sign-ins per login name, on this node.
+    pub pw_limiter: crate::password::Limiter,
 }
 
 /// Shared handle.
@@ -63,6 +68,11 @@ impl AppState {
         challenge_key: [u8; 32],
     ) -> Self {
         AppState {
+            pw_limiter: crate::password::Limiter::new(
+                cfg.auth.password_max_failures,
+                std::time::Duration::from_secs(cfg.auth.password_lockout_secs),
+            ),
+            params_key: Mutex::new(None),
             eph: EphHub::new(
                 store.clone(),
                 cfg.limits.ephemeral_bytes_per_sec,

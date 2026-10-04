@@ -6,7 +6,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
 * **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
-* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3). Three requests don't need it: `/v1/info`, `/v1/auth/*` and `/v1/acl/put`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session` and `/v1/auth/password/{params,session}`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
   | Status | `code` | Retry? |
@@ -21,10 +21,10 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
   | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4) | with a fresh `hlc` (rebase); not for a purged node |
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
-  | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused` | no |
+  | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 413 | `too_large` | no |
-  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1) | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, credentials per user §3.7) | later |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -48,7 +48,8 @@ No authentication. Returns:
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
             chunk_grace_secs },
   auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2)
-           origins?: { origins: [text], pinning: bool, host_fallback: bool } } }   // auth.md §5.5
+           origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
+           password_params?: { m_cost_kib: u32, t_cost: u32, p_cost: u32 } } }   // auth.md §11.2
 ```
 
 Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
@@ -102,6 +103,60 @@ A session is checked again on every request (auth.md §3): it stops working as s
 An origin outside that union is accepted only by the **`Host` fallback**, as `http://<Host>` or `https://<Host>` of the request: while pinning is in force and nothing is pinned yet (the origin is then pinned), or when pinning is off and the union is empty.
 
   The fallback trusts the `Host` header, which a relaying server chooses when it forwards the request, so it does **not** stop the relay attack above. Pinning narrows that to the first contact after the claim; a claim that carries `origin` (§4.1) closes it. It is for development and first set-up: a production server sets `public_origins`, and prints a multi-line warning at start-up while it is empty. `/v1/info` `auth.origins.host_fallback` says whether the fallback is open right now.
+
+### 3.5 `POST /v1/auth/password/params`
+
+Method 6, the password-derived key (auth.md §11). No session.
+
+```
+{ name: text } → { salt: bytes(32), m_cost_kib: u32, t_cost: u32, p_cost: u32 }
+```
+
+* `name` is normalized (auth.md §4.2); a name that doesn't normalize returns 400.
+* A registered name returns its salt and parameters. An unknown name returns the configured parameters and a fake salt that is the same on every call (auth.md §4.2).
+* 403 `method_disabled` if password keys are off.
+
+### 3.6 `POST /v1/auth/password/session`
+
+```
+{ name: text, challenge: bytes(32), origin: text,
+  sig: bytes }            // password-derived key, purpose zen/v1/sig/password-session (formats.md §7.5, §10)
+→ Session (§3.2)
+```
+
+* 403 `method_disabled` if password keys are off. 400 for a name that doesn't normalize.
+* 429 `quota` while the login name is locked after too many failures (auth.md §11.3).
+* 401 for a dead or spent challenge, or an origin the policy refuses (§3.3).
+* 401 `unauthorized` with one message, "unknown login name or wrong password", for every credential failure: unknown name, bad signature, user no longer a member. Each one counts towards the lock.
+* The session's `device_fp` is the password credential's id, and `method` is `password_key`.
+
+### 3.7 `POST /v1/auth/password/set`
+
+Register or replace the caller's password-derived key. Needs a session of the user, not an API token (403).
+
+```
+{ name: text, salt: bytes(32), m_cost_kib: u32, t_cost: u32, p_cost: u32,
+  identity: bytes }       // the key's public identity (formats.md §7.2)
+→ { id: bytes(32) }       // the new credential id
+```
+
+* 400: a name that doesn't normalize, a salt that isn't 32 bytes, parameters outside the registration floor and ceilings (formats.md §7.5), or an identity that doesn't decode.
+* 409 `name_taken`: another user holds the name. 429 `quota`: the user holds 100 credentials.
+* The user's previous password credential, if any, is deleted with its sessions (auth.md §11.2).
+
+### 3.9 `POST /v1/auth/credentials/list` and `/v1/auth/credentials/remove`
+
+The credential store (auth.md §4). Need a session, not an API token (403).
+
+```
+list:   { user?: bytes(32) }   // absent: the caller's own; another member's needs admin (403)
+→ { credentials: [{ id: bytes(32), method: text, created_unix: u64,
+                    expires_unix?: u64, label?: text }] }
+remove: { id: bytes(32) } → {}
+```
+
+* `list` returns metadata only, never keys, salts or secret hashes. Device keys are not in the store; they are listed in the ACL.
+* `remove` deletes a credential of the caller, or as an admin of any member, and ends its sessions (auth.md §3). An id that doesn't exist, or belongs to another member when the caller isn't an admin, returns 404 `not_found`.
 
 ### 3.10 `POST /v1/admin/origins/get` and `/v1/admin/origins/set`
 

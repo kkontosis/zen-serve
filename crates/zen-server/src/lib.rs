@@ -11,6 +11,7 @@ pub mod cbor;
 pub mod commit;
 pub mod config;
 pub mod consume;
+pub mod cred;
 pub mod dump;
 pub mod eph;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod keys;
 pub mod kv;
 pub mod log;
 pub mod origin;
+pub mod password;
 pub mod state;
 pub mod statics;
 pub mod stream;
@@ -162,6 +164,26 @@ pub fn router(st: Shared) -> Router {
         )
         .route("/v1/auth/session", post(auth::session).layer(auth_limit))
         .route("/v1/auth/logout", post(auth::logout).layer(auth_limit))
+        .route(
+            "/v1/auth/password/params",
+            post(password::params).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/password/session",
+            post(password::session).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/password/set",
+            post(password::set).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/credentials/list",
+            post(cred::list_endpoint).layer(auth_limit),
+        )
+        .route(
+            "/v1/auth/credentials/remove",
+            post(cred::remove_endpoint).layer(auth_limit),
+        )
         .route("/v1/acl/put", post(acl::put).layer(acl_limit))
         .route("/v1/acl/get", post(acl::get))
         .route("/v1/fs/list", post(acl::fs_list))
@@ -344,6 +366,7 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
     let challenge_key = auth::challenge_key(store.as_ref())
         .await
         .map_err(|e| format!("challenge key: {}", e.message))?;
+
     let is_fs = |fs| cfg.has_fs(fs);
     let acl = acl::load(store.as_ref(), &is_fs)
         .await

@@ -95,6 +95,21 @@ pub struct AuthInfo {
     /// The origin policy (spec/auth.md §5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origins: Option<OriginInfo>,
+    /// The Argon2id parameters to register a password-derived key with,
+    /// when that method is on (spec/auth.md §11.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_params: Option<Argon2Params>,
+}
+
+/// Argon2id parameters of a password-derived key (spec/formats.md §7.5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Argon2Params {
+    /// Memory, KiB.
+    pub m_cost_kib: u32,
+    /// Passes.
+    pub t_cost: u32,
+    /// Lanes.
+    pub p_cost: u32,
 }
 
 /// `/v1/info` `auth.origins` (spec/auth.md §5.5).
@@ -300,6 +315,18 @@ pub struct Session {
     pub method: Option<String>,
 }
 
+/// Max length of a normalized login name.
+pub const MAX_LOGIN_LEN: usize = 128;
+
+/// Normalize a login name (spec/auth.md §11.1): trim surrounding
+/// whitespace and lowercase ASCII letters. The result must be 1–128 bytes
+/// of `a-z`, `0-9` and `. _ - @ +`; anything else is `None`.
+pub fn normalize_login(name: &str) -> Option<String> {
+    let n = name.trim().to_ascii_lowercase();
+    let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-@+".contains(&b);
+    (!n.is_empty() && n.len() <= MAX_LOGIN_LEN && n.bytes().all(ok)).then_some(n)
+}
+
 /// Max length of an origin.
 pub const MAX_ORIGIN_LEN: usize = 255;
 
@@ -370,6 +397,118 @@ pub fn session_message(challenge: &[u8], origin: &str) -> Vec<u8> {
     m.extend_from_slice(&(origin.len() as u32).to_be_bytes());
     m.extend_from_slice(origin.as_bytes());
     m
+}
+
+/// `POST /v1/auth/password/params` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordParamsRequest {
+    /// The login name, as typed.
+    pub name: String,
+}
+
+/// `POST /v1/auth/password/params` response: what the client needs to
+/// derive the key (spec/formats.md §7.5). Unknown names get plausible,
+/// stable fakes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordParams {
+    /// 32-byte salt.
+    #[serde(with = "serde_bytes")]
+    pub salt: Vec<u8>,
+    /// Argon2id memory, KiB.
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+}
+
+impl PasswordParams {
+    /// The Argon2id parameters.
+    pub fn params(&self) -> Argon2Params {
+        Argon2Params {
+            m_cost_kib: self.m_cost_kib,
+            t_cost: self.t_cost,
+            p_cost: self.p_cost,
+        }
+    }
+}
+
+/// `POST /v1/auth/password/session` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordSessionRequest {
+    /// The login name, as typed.
+    pub name: String,
+    /// The challenge.
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    /// The server origin as the client sees it.
+    pub origin: String,
+    /// Signature by the password-derived key, purpose
+    /// `zen/v1/sig/password-session`.
+    #[serde(with = "serde_bytes")]
+    pub sig: Vec<u8>,
+}
+
+/// `POST /v1/auth/password/set` request: register or replace the caller's
+/// password-derived key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PasswordSet {
+    /// The login name, as typed.
+    pub name: String,
+    /// 32-byte salt the client derived the key with.
+    #[serde(with = "serde_bytes")]
+    pub salt: Vec<u8>,
+    /// Argon2id memory, KiB.
+    pub m_cost_kib: u32,
+    /// Argon2id passes.
+    pub t_cost: u32,
+    /// Argon2id lanes.
+    pub p_cost: u32,
+    /// The key's public identity (spec/formats.md §7.2).
+    #[serde(with = "serde_bytes")]
+    pub identity: Vec<u8>,
+}
+
+/// A credential id, as returned when one is created.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CredentialId {
+    /// 32 bytes.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+}
+
+/// `POST /v1/auth/credentials/list` request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CredentialsList {
+    /// Whose credentials (a user fingerprint); absent: the caller's own.
+    /// Another member's needs admin.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    pub user: Option<Vec<u8>>,
+}
+
+/// One stored credential: metadata only, never secrets or keys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Credential {
+    /// Credential id.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+    /// The sign-in method ([`AuthMethod::name`]).
+    pub method: String,
+    /// Creation time, unix seconds.
+    pub created_unix: u64,
+    /// Expiry, unix seconds, if it expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+    /// A label chosen at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `POST /v1/auth/credentials/list` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Credentials {
+    /// The user's stored credentials, by id.
+    pub credentials: Vec<Credential>,
 }
 
 // ---------------------------------------------------------------- ACL, fs
@@ -1511,6 +1650,20 @@ mod tests {
         }
         assert_eq!(AuthMethod::from_id(0), None);
         assert_eq!(AuthMethod::from_id(7), None);
+    }
+
+    #[test]
+    fn login_names_are_normalized() {
+        assert_eq!(
+            normalize_login("  Ada@Example.org ").as_deref(),
+            Some("ada@example.org")
+        );
+        assert_eq!(normalize_login("bob_1+x-y").as_deref(), Some("bob_1+x-y"));
+        for bad in ["", "   ", "a b", "ada/1", "ádá", "a\u{0}b"] {
+            assert_eq!(normalize_login(bad), None, "{bad:?}");
+        }
+        assert!(normalize_login(&"a".repeat(MAX_LOGIN_LEN)).is_some());
+        assert!(normalize_login(&"a".repeat(MAX_LOGIN_LEN + 1)).is_none());
     }
 
     #[test]

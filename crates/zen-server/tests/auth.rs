@@ -4,6 +4,9 @@
 mod common;
 
 use common::*;
+use zen_core::pwkey::PasswordKey;
+use zen_core::rng::OsRng;
+use zen_core::vectors::FIXTURE_ARGON2;
 use zen_proto::*;
 use zen_server::state::SessionInfo;
 
@@ -379,4 +382,403 @@ async fn empty_public_origins_warn_at_start_up() {
     assert!(w.contains("NO protection"), "{w}");
     cfg.public_origins = vec!["https://zen.example.org".into()];
     assert_eq!(zen_server::origin::startup_warning(&cfg), None);
+}
+
+// ---- method 6: password-derived keys (auth.md §11)
+
+/// Register (or replace) the caller's password key, at the Argon2id floor.
+async fn set_password(h: &Harness, tok: &[u8], name: &str, pw: &[u8]) -> R<CredentialId> {
+    let (key, salt) = PasswordKey::create(pw, FIXTURE_ARGON2, &mut OsRng).unwrap();
+    let req = PasswordSet {
+        name: name.into(),
+        salt: salt.to_vec(),
+        m_cost_kib: FIXTURE_ARGON2.m_cost_kib,
+        t_cost: FIXTURE_ARGON2.t_cost,
+        p_cost: FIXTURE_ARGON2.p_cost,
+        identity: key.public().encode(),
+    };
+    h.call("/v1/auth/password/set", Some(tok), &req).await
+}
+
+async fn pw_params(h: &Harness, name: &str) -> R<PasswordParams> {
+    h.call(
+        "/v1/auth/password/params",
+        None,
+        &PasswordParamsRequest { name: name.into() },
+    )
+    .await
+}
+
+/// The whole client side: params, derive, challenge, sign, session.
+async fn password_sign_in(h: &Harness, name: &str, pw: &[u8]) -> R<Session> {
+    let p = pw_params(h, name).await?;
+    let core = zen_core::keyslot::Argon2Params {
+        m_cost_kib: p.m_cost_kib,
+        t_cost: p.t_cost,
+        p_cost: p.p_cost,
+    };
+    // Unknown names get the configured (expensive) fakes: don't run them.
+    let key = if core == FIXTURE_ARGON2 {
+        PasswordKey::derive(pw, &p.salt.clone().try_into().unwrap(), core).unwrap()
+    } else {
+        PasswordKey::create(pw, FIXTURE_ARGON2, &mut OsRng)
+            .unwrap()
+            .0
+    };
+    let c: Challenge = h.call("/v1/auth/challenge", None, &Empty {}).await?;
+    let origin = h.origin();
+    let sig = key.sign_session(&c.challenge, &origin).unwrap();
+    h.call(
+        "/v1/auth/password/session",
+        None,
+        &PasswordSessionRequest {
+            name: name.into(),
+            challenge: c.challenge,
+            origin,
+            sig,
+        },
+    )
+    .await
+}
+
+async fn grv(h: &Harness, tok: &[u8]) -> R<ReadVersion> {
+    h.call("/v1/grv", Some(tok), &Empty {}).await
+}
+
+async fn creds(h: &Harness, tok: &[u8], user: Option<&User>) -> R<Credentials> {
+    let req = CredentialsList {
+        user: user.map(|u| u.fp()),
+    };
+    h.call("/v1/auth/credentials/list", Some(tok), &req).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_sign_in_and_credentials() {
+    let h = Harness::start().await;
+    let (admin, bob) = (User::new(1), User::new(2));
+    let doc1 = h.claim(&admin, &[&bob]).await;
+    let info: Info = h.get("/v1/info").await;
+    let auth = info.auth.unwrap();
+    assert_eq!(auth.default.as_deref(), Some("password_key"));
+    assert!(auth.methods.contains(&"password_key".to_string()));
+    assert_eq!(auth.password_params.unwrap().m_cost_kib, 256 * 1024);
+
+    let bob_dev = h.sign_in(&bob).await.unwrap();
+    assert_eq!(
+        code(password_sign_in(&h, "bob@example.org", b"pw one").await),
+        (401, "unauthorized".into())
+    );
+    let id1 = set_password(&h, &bob_dev, "Bob@Example.org", b"pw one")
+        .await
+        .unwrap();
+    // The login name is normalized, the password is not.
+    let s = password_sign_in(&h, " bob@EXAMPLE.org", b"pw one")
+        .await
+        .unwrap();
+    assert_eq!(s.method.as_deref(), Some("password_key"));
+    assert_eq!(s.device_fp, id1.id, "the credential id is the device");
+    assert_eq!(s.user_fp, bob.fp());
+    let pw_tok = s.token;
+    grv(&h, &pw_tok).await.unwrap();
+    let wrong = password_sign_in(&h, "bob@example.org", b"pw two").await;
+    let unknown = password_sign_in(&h, "nobody@example.org", b"pw one").await;
+    let (w, u) = (wrong.unwrap_err(), unknown.unwrap_err());
+    assert_eq!((w.0, &w.1.code), (401, &"unauthorized".to_string()));
+    assert_eq!(w.1.message, u.1.message, "no hint which part was wrong");
+
+    // Names are unique across users.
+    let admin_dev = h.sign_in(&admin).await.unwrap();
+    assert_eq!(
+        code(set_password(&h, &admin_dev, "bob@example.org", b"x").await),
+        (409, "name_taken".into())
+    );
+    assert_eq!(
+        code(set_password(&h, &admin_dev, "bad name", b"x").await).0,
+        400
+    );
+
+    // Listing: own, or any member's as an admin; metadata only.
+    let own = creds(&h, &pw_tok, None).await.unwrap().credentials;
+    assert_eq!(own.len(), 1);
+    assert_eq!(
+        (own[0].id.clone(), own[0].method.as_str()),
+        (id1.id.clone(), "password_key")
+    );
+    assert_eq!(
+        creds(&h, &admin_dev, Some(&bob)).await.unwrap().credentials,
+        own
+    );
+    assert_eq!(code(creds(&h, &bob_dev, Some(&admin)).await).0, 403);
+
+    // A password change replaces the credential and ends its sessions.
+    let id2 = set_password(&h, &pw_tok, "bob@example.org", b"pw two")
+        .await
+        .unwrap();
+    assert_ne!(id1.id, id2.id);
+    assert_eq!(code(grv(&h, &pw_tok).await).0, 401);
+    assert_eq!(
+        code(password_sign_in(&h, "bob@example.org", b"pw one").await).0,
+        401
+    );
+    let pw_tok = password_sign_in(&h, "bob@example.org", b"pw two")
+        .await
+        .unwrap()
+        .token;
+
+    // Removing it: only the owner or an admin; others see "not found".
+    let rm = |id: &[u8]| CredentialId { id: id.to_vec() };
+    let carol = User::new(3);
+    let (v2, doc2) = signed_acl(
+        &admin,
+        2,
+        Some(&doc1),
+        &[&admin],
+        &[&admin, &bob, &carol],
+        vec![],
+        vec![],
+    );
+    h.put_acl(v2, None).await.unwrap();
+    let carol_tok = h.sign_in(&carol).await.unwrap();
+    let r: R<Empty> = h
+        .call(
+            "/v1/auth/credentials/remove",
+            Some(&carol_tok),
+            &rm(&id2.id),
+        )
+        .await;
+    assert_eq!(code(r), (404, "not_found".into()));
+    let r: R<Empty> = h
+        .call("/v1/auth/credentials/remove", Some(&bob_dev), &rm(&id2.id))
+        .await;
+    r.unwrap();
+    assert_eq!(code(grv(&h, &pw_tok).await).0, 401);
+    assert_eq!(
+        code(password_sign_in(&h, "bob@example.org", b"pw two").await).0,
+        401
+    );
+    assert!(
+        creds(&h, &bob_dev, None)
+            .await
+            .unwrap()
+            .credentials
+            .is_empty()
+    );
+    // An admin removes another member's.
+    let id3 = set_password(&h, &bob_dev, "bob@example.org", b"pw three")
+        .await
+        .unwrap();
+    let r: R<Empty> = h
+        .call(
+            "/v1/auth/credentials/remove",
+            Some(&admin_dev),
+            &rm(&id3.id),
+        )
+        .await;
+    r.unwrap();
+
+    // Leaving the ACL ends the sessions and deletes the credentials, which
+    // frees the login name.
+    set_password(&h, &bob_dev, "bob@example.org", b"pw four")
+        .await
+        .unwrap();
+    let pw_tok = password_sign_in(&h, "bob@example.org", b"pw four")
+        .await
+        .unwrap()
+        .token;
+    let (v3, _) = signed_acl(
+        &admin,
+        3,
+        Some(&doc2),
+        &[&admin],
+        &[&admin, &carol],
+        vec![],
+        vec![],
+    );
+    h.put_acl(v3, None).await.unwrap();
+    assert_eq!(code(grv(&h, &pw_tok).await).0, 401);
+    assert!(
+        creds(&h, &admin_dev, Some(&bob))
+            .await
+            .unwrap()
+            .credentials
+            .is_empty()
+    );
+    set_password(&h, &carol_tok, "bob@example.org", b"carol's now")
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_sign_in_checks_challenge_origin_and_purpose() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let dev = h.sign_in(&admin).await.unwrap();
+    let (key, salt) = PasswordKey::create(b"pw", FIXTURE_ARGON2, &mut OsRng).unwrap();
+    let set = PasswordSet {
+        name: "ada".into(),
+        salt: salt.to_vec(),
+        m_cost_kib: FIXTURE_ARGON2.m_cost_kib,
+        t_cost: FIXTURE_ARGON2.t_cost,
+        p_cost: FIXTURE_ARGON2.p_cost,
+        identity: key.public().encode(),
+    };
+    let r: R<CredentialId> = h.call("/v1/auth/password/set", Some(&dev), &set).await;
+    r.unwrap();
+    // Registration enforces the Argon2id floor and a 32-byte salt.
+    let weak = PasswordSet {
+        m_cost_kib: 1024,
+        ..set.clone()
+    };
+    let r: R<CredentialId> = h.call("/v1/auth/password/set", Some(&dev), &weak).await;
+    assert_eq!(code(r).0, 400);
+    let short = PasswordSet {
+        salt: vec![1; 16],
+        ..set.clone()
+    };
+    let r: R<CredentialId> = h.call("/v1/auth/password/set", Some(&dev), &short).await;
+    assert_eq!(code(r).0, 400);
+    // No session, no registration.
+    let r: R<CredentialId> = h.call("/v1/auth/password/set", None, &set).await;
+    assert_eq!(code(r).0, 401);
+
+    // Sign in as "ada" with `sig_for(challenge, origin)`.
+    async fn attempt(
+        h: &Harness,
+        origin: &str,
+        challenge: Option<Vec<u8>>,
+        sig_for: impl Fn(&[u8], &str) -> Vec<u8>,
+    ) -> R<Vec<u8>> {
+        let c = match challenge {
+            Some(c) => c,
+            None => {
+                let c: Challenge = h.call("/v1/auth/challenge", None, &Empty {}).await?;
+                c.challenge
+            }
+        };
+        let req = PasswordSessionRequest {
+            name: "ADA".into(),
+            challenge: c.clone(),
+            origin: origin.into(),
+            sig: sig_for(&c, origin),
+        };
+        let _: Session = h.call("/v1/auth/password/session", None, &req).await?;
+        Ok(c)
+    }
+    let good = |c: &[u8], o: &str| key.sign_session(c, o).unwrap();
+    let used = attempt(&h, &h.origin(), None, good).await.unwrap();
+    // A challenge is spent once.
+    assert_eq!(
+        code(attempt(&h, &h.origin(), Some(used), good).await).0,
+        401
+    );
+    // The origin is bound and checked against the policy (pinned above).
+    assert_eq!(
+        code(attempt(&h, "https://evil.example", None, good).await).0,
+        401
+    );
+    // A device's session signature is not a password signature.
+    let device = |c: &[u8], o: &str| {
+        admin
+            .device
+            .signing()
+            .sign(zen_core::labels::SIG_SESSION, &session_message(c, o))
+            .unwrap()
+    };
+    assert_eq!(code(attempt(&h, &h.origin(), None, device).await).0, 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_login_names_get_stable_fake_params() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let a = pw_params(&h, "nobody@example.org").await.unwrap();
+    // Stable across calls and spellings of the same name…
+    assert_eq!(pw_params(&h, " NOBODY@example.org").await.unwrap(), a);
+    // …different per name, and shaped like a real answer.
+    let b = pw_params(&h, "somebody@example.org").await.unwrap();
+    assert_ne!(a.salt, b.salt);
+    assert_eq!(a.salt.len(), 32);
+    let cfg = h.cfg.auth.password_params();
+    assert_eq!(
+        (a.m_cost_kib, a.t_cost, a.p_cost),
+        (cfg.m_cost_kib, cfg.t_cost, cfg.p_cost)
+    );
+    // A registered name answers with its own salt and parameters.
+    let fake = pw_params(&h, "ada").await.unwrap();
+    let tok = h.sign_in(&admin).await.unwrap();
+    set_password(&h, &tok, "ada", b"pw").await.unwrap();
+    let real = pw_params(&h, "ada").await.unwrap();
+    assert_eq!(real.m_cost_kib, FIXTURE_ARGON2.m_cost_kib);
+    assert_ne!(real.salt, fake.salt);
+    // The fakes come from a key stored with the data (not server
+    // metadata), so every node, and a restored copy, answers the same.
+    let mut t = h.server.state.store.begin(None).await.unwrap();
+    let stored = t.get(&zen_server::keys::params_key()).await.unwrap();
+    let key = zen_server::cred::params_key(&h.server.state).await.unwrap();
+    assert_eq!(stored.as_deref(), Some(&key[..]));
+    assert!(!zen_server::keys::params_key().starts_with(&zen_server::keys::meta_prefix()));
+    assert_eq!(code(pw_params(&h, "no spaces allowed").await).0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_password_sign_ins_lock_the_name() {
+    let h = Harness::start_with(|c| {
+        c.auth.password_max_failures = 3;
+        c.auth.password_lockout_secs = 2;
+    })
+    .await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    set_password(&h, &tok, "ada", b"right").await.unwrap();
+    for _ in 0..3 {
+        assert_eq!(code(password_sign_in(&h, "ada", b"wrong").await).0, 401);
+    }
+    // Locked, even for the right password.
+    assert_eq!(
+        code(password_sign_in(&h, "ada", b"right").await),
+        (429, "quota".into())
+    );
+    // Unknown names lock the same way, so locking reveals nothing.
+    for _ in 0..3 {
+        assert_eq!(code(password_sign_in(&h, "ghost", b"x").await).0, 401);
+    }
+    assert_eq!(code(password_sign_in(&h, "ghost", b"x").await).0, 429);
+    // Other names are unaffected; the lock lifts after the lockout.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    password_sign_in(&h, "ada", b"right").await.unwrap();
+    // A success clears the count.
+    for _ in 0..2 {
+        assert_eq!(code(password_sign_in(&h, "ada", b"wrong").await).0, 401);
+    }
+    password_sign_in(&h, "ada", b"right").await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(code(password_sign_in(&h, "ada", b"wrong").await).0, 401);
+    }
+    password_sign_in(&h, "ada", b"right").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_keys_can_be_turned_off() {
+    let h = Harness::start_with(|c| c.auth.password_keys = false).await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let off = (403, "method_disabled".to_string());
+    assert_eq!(code(pw_params(&h, "ada").await), off);
+    assert_eq!(code(set_password(&h, &tok, "ada", b"pw").await), off);
+    let req = PasswordSessionRequest {
+        name: "ada".into(),
+        challenge: vec![0; 32],
+        origin: h.origin(),
+        sig: vec![],
+    };
+    let r: R<Session> = h.call("/v1/auth/password/session", None, &req).await;
+    assert_eq!(code(r), off);
+    let auth = h.get::<Info>("/v1/info").await.auth.unwrap();
+    assert!(!auth.methods.contains(&"password_key".to_string()));
+    assert_eq!(auth.default.as_deref(), Some("device_key"));
+    assert_eq!(auth.password_params, None);
 }

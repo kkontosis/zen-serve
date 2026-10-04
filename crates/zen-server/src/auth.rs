@@ -25,7 +25,7 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
 /// The sign-in methods this server implements. A method also needs its
 /// `[auth]` flag ([`crate::state::AppState::method_on`]).
-pub const IMPLEMENTED: &[AuthMethod] = &[AuthMethod::DeviceKey];
+pub const IMPLEMENTED: &[AuthMethod] = &[AuthMethod::DeviceKey, AuthMethod::PasswordKey];
 
 /// The order in which a client offers sign-in methods: the first one that
 /// is on is `/v1/info`'s `auth.default`. API tokens are for services, never
@@ -62,6 +62,9 @@ pub async fn info(st: &Shared) -> AuthInfo {
             .iter()
             .find(|m| st.method_on(**m))
             .map(|m| m.name().to_string()),
+        password_params: st
+            .method_on(AuthMethod::PasswordKey)
+            .then(|| st.cfg.auth.password_params()),
     }
 }
 
@@ -89,8 +92,19 @@ impl Caller {
         self.acl.admins.contains(&self.user)
     }
 
-    /// 403 unless the caller is an admin.
+    /// 403 unless the caller signed in interactively: API tokens can't
+    /// manage credentials or the origin policy (auth.md §9).
+    pub fn require_interactive(&self) -> ApiResult<()> {
+        if self.method == AuthMethod::ApiToken {
+            Err(forbidden("API tokens cannot manage sign-in"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 403 unless the caller is an admin, signed in interactively.
     pub fn require_admin(&self) -> ApiResult<()> {
+        self.require_interactive()?;
         if self.is_admin() {
             Ok(())
         } else {
@@ -175,6 +189,18 @@ async fn lookup_session(st: &Shared, hash: &[u8; 32]) -> ApiResult<Option<Sessio
         .await?
         .as_deref()
         .and_then(decode_session);
+    // Outside the ACL, a session lives only as long as its credential.
+    // (A session whose method is off fails in `resolve` instead.)
+    if let Some(info) = &s
+        && info.method != AuthMethod::DeviceKey
+        && st.method_on(info.method)
+        && t.snapshot_get(&keys::cred(&info.user, &info.cred))
+            .await?
+            .is_none()
+    {
+        st.sessions.lock().expect("session lock").remove(hash);
+        return Err(unauthorized("the session's credential was removed"));
+    }
     let mut sessions = st.sessions.lock().expect("session lock");
     match &s {
         Some(info) => {
