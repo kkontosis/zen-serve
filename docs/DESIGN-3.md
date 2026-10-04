@@ -242,6 +242,7 @@ The server never sees names (namespaces, tables, columns, topics, paths), keys, 
 3. FoundationDB backend + `fdbserver` supervisor (`init`/`join`), backup and PITR (DESIGN-2 §6).
 3.5. **Server-merged CRDT filesystem** (DESIGN-4 §2.3): spec and server side ([`docs/MILESTONE-3.5.md`](MILESTONE-3.5.md), [`spec/fs.md`](../spec/fs.md)). Moved forward from 7, because the client library and zen-fs build on its wire format. It replaces the filesystem over KV.
 4. `@zen/client` (TS + WASM): KV, transactions, Log, leader consumer, keyslot admin, filesystem operations, and the `zen-mount` FUSE CLI ([`docs/MILESTONE-4.md`](MILESTONE-4.md)).
-5. zen-db (tables, private and fast indexes, query builder), zen-fs client (local replica, POSIX-ish API over the CRDT filesystem), Loro adapter.
+4.5. **zen-db and the embedded broker, specs only** ([`docs/MILESTONE-4.5.md`](MILESTONE-4.5.md)): one client class that is a database and a broker (publish/subscribe, work queues, request/reply, delayed messages, sagas, change events), with db writes and messages in one transaction, on the existing server primitives; plus the proof-of-concept apps M5 builds.
+5. zen-db and the broker as specified in 4.5 (tables, private and fast indexes, query builder, messaging patterns, the proof-of-concept apps), zen-fs client (local replica, POSIX-ish API over the CRDT filesystem), Loro adapter.
 6. Authenticated-namespace Merkle tree, `zen-ublk`. (Ephemeral pub/sub shipped in milestone 2–3.)
 7. Later: `fips` suite, ORAM, more server CRDT types (`lww_map`, `or_set`, `counter`).
