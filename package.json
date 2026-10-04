@@ -1,0 +1,27 @@
+{
+  "name": "zen-serve-packages",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/zen-wasm",
+    "packages/client",
+    "packages/fuse"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:wasm": "scripts/build-wasm.sh",
+    "build": "npm run build --workspaces --if-present",
+    "check": "biome check packages && tsc -p packages/client --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@playwright/test": "1.56",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "undici": "^7.30.0",
+    "vitest": "^3.2.7"
+  }
+}

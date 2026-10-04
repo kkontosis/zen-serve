@@ -82,3 +82,47 @@ jobs:
       - name: Supervisor log
         if: failure()
         run: cat /tmp/zen-ci/init.log
+
+  # @zen/client and zen-mount (docs/MILESTONE-4.md): the WASM core, then the
+  # TypeScript packages tested against a spawned embedded zen-serve, in Node
+  # and in Chromium, and FUSE mounts.
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: wasm-bindgen-cli at the Cargo.lock version
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+          echo "WASM_BINDGEN_VERSION=$v" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: FUSE (zen-mount)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fuse3 libfuse-dev pkg-config
+          sudo chmod 666 /dev/fuse
+      - name: Build zen-serve and the WASM module
+        run: |
+          cargo build -p zen-server
+          scripts/build-wasm.sh
+      - run: npm ci
+      - name: Lint and typecheck
+        run: |
+          npx biome check
+          npx tsc -p packages/client/tsconfig.test.json
+      - name: Test (Node)
+        run: npx vitest run
+      - name: Test (Chromium)
+        run: |
+          npm run build -w @zen/client
+          npx playwright install --with-deps chromium
+          npx playwright test
