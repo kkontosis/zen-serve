@@ -9,6 +9,7 @@
 mod encoding;
 pub mod error;
 pub mod fs;
+pub mod header;
 pub mod kdf;
 pub mod keys;
 pub mod keyslot;

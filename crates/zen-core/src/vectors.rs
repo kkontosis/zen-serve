@@ -36,6 +36,8 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("pwkey.json", pwkey_vectors()?),
         ("prf_keyslot.json", prf_keyslot_vectors()?),
         ("opaque_keyslot.json", opaque_keyslot_vectors()?),
+        ("header.json", header_vectors()?),
+        ("acl.json", acl_vectors()?),
     ])
 }
 
@@ -338,5 +340,88 @@ fn pwkey_vectors() -> Result<Value> {
         "public": h(&public.encode()), "fingerprint": h(&public.fingerprint()),
         "session": {"purpose": labels::SIG_PASSWORD_SESSION, "challenge": h(&FIXTURE_CHALLENGE),
                     "origin": FIXTURE_ORIGIN, "message": h(&msg), "signature": h(&signature)},
+    }))
+}
+
+fn header_vectors() -> Result<Value> {
+    use crate::header::FsHeader;
+    let fs = fixture_fs();
+    let mut header = FsHeader::new(&fs)?;
+    let recovery = keyslot::create_recovery(&fs, &mut DetRng::new("header-recovery"))?;
+    header.add_slot(recovery.0)?;
+    let epoch0 = header.encode()?;
+    let next = header.rotate(&fs, &mut DetRng::new("header-rotate"))?;
+    let pass = keyslot::create_passphrase(
+        &next,
+        FIXTURE_PASSPHRASE,
+        FIXTURE_ARGON2,
+        &mut DetRng::new("header-pass"),
+    )?;
+    header.add_slot(pass)?;
+    let epoch1 = header.encode()?;
+    // Sanity: decode round trip, the new slot opens to epoch 1, the chain
+    // walks back to epoch 0.
+    let back = FsHeader::decode(&epoch1)?;
+    assert_eq!(back, header);
+    let opened = keyslot::open(&back.slots[1], Unlock::Passphrase(FIXTURE_PASSPHRASE))?;
+    assert_eq!(*opened.to_bundle(), *next.to_bundle());
+    assert_eq!(*back.keys_at(&opened, 0)?.to_bundle(), *fs.to_bundle());
+    Ok(json!({
+        "description": "fs headers of the fixture fs (formats.md §12). epoch0: one recovery slot. epoch1: after a rotation (chain[0] opens epoch 0 from epoch 1) and a new passphrase slot on epoch 1; the recovery slot still wraps epoch 0.",
+        "epoch0": {"recovery_rng_seed": "header-recovery", "recovery_key": h(recovery.1.as_ref()), "header": h(&epoch0)},
+        "epoch1": {"rotate_rng_seed": "header-rotate", "pass_rng_seed": "header-pass",
+                   "passphrase": String::from_utf8_lossy(FIXTURE_PASSPHRASE),
+                   "fs_epoch1_bundle": h(&next.to_bundle()), "header": h(&epoch1)},
+    }))
+}
+
+fn acl_vectors() -> Result<Value> {
+    use zen_proto::ByteBuf;
+    use zen_proto::acl::{AclDoc, FsLimit, Grant, Member, SignedAcl};
+    let (user, _) = SigningIdentity::generate(&mut DetRng::new("user"))?;
+    let dev = fixture_device();
+    let cert = sig::issue_device_cert(&user, &dev.public(), 1_790_000_000)?;
+    let fp = user.public().fingerprint().to_vec();
+    let doc = AclDoc {
+        admins: vec![ByteBuf::from(fp.clone())],
+        grants: vec![
+            Grant {
+                fs: 7,
+                topic: None,
+                rights: vec!["read".into(), "write".into()],
+                subject: fp.clone(),
+            },
+            Grant {
+                fs: 7,
+                topic: Some(Vec::new()),
+                rights: vec!["read".into(), "append".into(), "consume".into()],
+                subject: fp.clone(),
+            },
+        ],
+        limits: vec![FsLimit {
+            fs: 7,
+            max_keys: Some(1_000_000),
+            max_bytes: None,
+        }],
+        members: vec![Member {
+            devices: vec![ByteBuf::from(cert)],
+            identity: user.public().encode(),
+        }],
+        origins: vec!["https://zen.example.org".into()],
+        version: 1,
+        prev_hash: vec![0; 32],
+    };
+    let doc_bytes = zen_proto::to_cbor(&doc);
+    let signature = user.sign(labels::SIG_ACL, &doc_bytes)?;
+    let signed = zen_proto::to_cbor(&SignedAcl {
+        doc: doc_bytes.clone(),
+        sig: signature,
+        signer: fp,
+    });
+    Ok(json!({
+        "description": "A version-1 signed ACL (formats.md §9) by the user of signatures.json, with the device certificate of signatures.json: deterministic CBOR doc, H(doc) = BLAKE3.derive_key(\"zen/v1/acl-chain\", doc), and the CBOR SignedAcl.",
+        "doc": h(&doc_bytes),
+        "hash": h(&crate::kdf::acl_hash(&doc_bytes)),
+        "signed": h(&signed),
     }))
 }

@@ -347,7 +347,7 @@ put: {fs, header: bytes, expect: bytes(10)?} → {version: bytes(10)}
 
 * `get` needs fs `read`, or admin.
 * `put` needs admin. `expect` absent means "must not exist yet". A mismatch returns 409 `version_mismatch`.
-* The header (volume header + keyslots) is opaque to the server.
+* The header (keyslots and epoch chain, formats.md §12) is opaque to the server.
 
 ## 5. KV
 

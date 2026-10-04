@@ -311,6 +311,49 @@ pub fn opaque_export_credential(slot: &[u8]) -> Result<[u8; 32]> {
     r.array()
 }
 
+/// Slot type: passphrase.
+pub const SLOT_PASSPHRASE: u8 = TYPE_PASSPHRASE;
+/// Slot type: recovery key.
+pub const SLOT_RECOVERY: u8 = TYPE_RECOVERY;
+/// Slot type: X-Wing device.
+pub const SLOT_DEVICE: u8 = TYPE_DEVICE;
+/// Slot type: WebAuthn PRF.
+pub const SLOT_WEBAUTHN_PRF: u8 = TYPE_WEBAUTHN_PRF;
+/// Slot type: OPAQUE export key.
+pub const SLOT_OPAQUE_EXPORT: u8 = TYPE_OPAQUE_EXPORT;
+
+/// The public part of a keyslot's prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotInfo {
+    /// `slot_type` (any value: unknown types are reported, not refused).
+    pub slot_type: u8,
+    /// `slot_id`.
+    pub slot_id: [u8; 16],
+}
+
+/// Read a keyslot's type and id. Unknown slot types are accepted, so a
+/// header can carry slots that a newer client wrote.
+pub fn slot_info(slot: &[u8]) -> Result<SlotInfo> {
+    check_prefix(slot)?;
+    let mut r = Reader::new(&slot[2..]);
+    let slot_type = r.u8()?;
+    if r.u8()? != 0 {
+        return Err(Error::Format);
+    }
+    Ok(SlotInfo {
+        slot_type,
+        slot_id: r.array()?,
+    })
+}
+
+/// The recipient fingerprint of a device keyslot: lets a device find its slot.
+pub fn device_recipient(slot: &[u8]) -> Result<[u8; 32]> {
+    if slot_info(slot)?.slot_type != TYPE_DEVICE {
+        return Err(Error::Param);
+    }
+    Reader::new(&slot[20..]).array()
+}
+
 /// Unlock a keyslot and return the fs keys it wraps.
 pub fn open(slot: &[u8], unlock: Unlock<'_>) -> Result<FsKeys> {
     check_prefix(slot)?;

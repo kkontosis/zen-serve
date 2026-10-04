@@ -24,7 +24,9 @@ jobs:
       - name: Test
         run: cargo test --all
       - name: wasm32 check
-        run: cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown
+        run: |
+          cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown
+          cargo check -p zen-core --features opaque --target wasm32-unknown-unknown
 
   # The pure-Rust build: no ring, the TLS provider on RustCrypto
   # (spec/operations.md §8). The jobs around it test the default build,

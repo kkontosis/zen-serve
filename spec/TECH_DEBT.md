@@ -153,3 +153,10 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** The embedded backend's `zen.redb` file never shrinks: redb reuses freed pages but zen-serve never calls its compaction, so the file stays at its peak size after large deletions.
 * **Why deferred:** Compaction needs exclusive access to the database file (no open read transactions), which conflicts with the MVCC read window the embedded backend keeps open while serving.
 * **What it would take:** An offline `zen-serve compact` command (servers stopped) calling redb's compaction, or an online path that briefly drains read transactions; a note in operations.md; a test that deletes data and checks the file shrinks.
+
+## TD-FS-HEADER-SELF-SLOT
+
+* **Status:** open
+* **Context:** Only an admin may write the fs header (api.md §4.4), so a member can't add a keyslot for their own new passkey or password, nor re-wrap their OPAQUE slot after a password change. The client prepares the slot and an admin adds it (formats.md §12).
+* **Why deferred:** Letting members write the header needs a rule the server can enforce on opaque bytes: for example, a member may append or replace slots whose credential id is one of their own credentials, and nothing else. Milestone 4 (the client library) did not need it.
+* **What it would take:** Either a structured header endpoint (`fs/slots/put {fs, slot}`, `fs/slots/remove`) where the server checks that the slot's credential id or recipient fingerprint belongs to the caller, or a per-member header section; spec in api.md and formats.md §12; tests for a member adding, replacing and failing to remove another member's slot.
