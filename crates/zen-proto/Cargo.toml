@@ -1,0 +1,12 @@
+[package]
+name = "zen-proto"
+version = "0.1.0"
+description = "zen-serve wire types (spec/api.md): CBOR request/response bodies, stream frames, the signed ACL document"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
