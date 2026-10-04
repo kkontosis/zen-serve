@@ -28,6 +28,7 @@ pub mod supervisor;
 pub mod token;
 pub mod tree;
 mod txn;
+pub mod webauthn;
 
 use crate::cbor::Cbor;
 use crate::config::Config;
