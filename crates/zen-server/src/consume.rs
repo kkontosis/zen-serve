@@ -385,26 +385,32 @@ pub async fn create_group(
             _ => ZERO_OFFSET,
         };
         if def.mode == Mode::PerKey && start == ZERO_OFFSET {
-            // Backfill: each key's first event goes on the ready list.
-            let all = t.get_range(&log, &log_end, MAX_BACKFILL + 1, false).await?;
+            // Backfill: each key's first event goes on the ready list. The
+            // per-key index is in (key, offset) order and holds no
+            // envelopes, so this reads keys only, not the topic's bodies.
+            let lk = keys::lk_topic(fs, &def.topic).finish();
+            let all = t
+                .get_range(&lk, &keys::end_of(&lk), MAX_BACKFILL + 1, false)
+                .await?;
             if all.len() > MAX_BACKFILL {
                 return Err(too_large("topic too long to backfill; use start = latest"));
             }
-            let mut seen = std::collections::HashSet::new();
-            for (k, v) in all {
-                if let (Some(key), _) = decode_entry(&v)
-                    && seen.insert(key.clone())
-                {
-                    let o = tail_offset(&k)?;
-                    t.set(
-                        &keys::ready_prefix(fs, &def.group)
-                            .vs(&o)
-                            .bytes(&key)
-                            .finish(),
-                        &[],
-                    );
-                    t.set(&keys::ready_ptr(fs, &def.group, &key), &o);
+            let mut last: Option<Vec<u8>> = None;
+            for (k, _) in all {
+                let (elems, _) = unpack_prefix(&k[lk.len()..], 2)
+                    .map_err(|_| internal("bad per-key index key"))?;
+                let [Elem::Bytes(key), Elem::Vs(o)] = elems.as_slice() else {
+                    return Err(internal("bad per-key index key"));
+                };
+                if last.as_deref() == Some(key.as_slice()) {
+                    continue;
                 }
+                last = Some(key.clone());
+                t.set(
+                    &keys::ready_prefix(fs, &def.group).vs(o).bytes(key).finish(),
+                    &[],
+                );
+                t.set(&keys::ready_ptr(fs, &def.group, key), o);
             }
         }
         let stored = StoredGroup {

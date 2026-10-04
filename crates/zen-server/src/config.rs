@@ -270,6 +270,11 @@ impl Config {
         if self.fdb.processes == 0 {
             return Err("fdb.processes must be at least 1".into());
         }
+        // Event offsets and dots index a commit's appends and writes with a
+        // u16 (keyspace.md §2).
+        if self.limits.max_commit_ops > u16::MAX as u32 {
+            return Err("limits.max_commit_ops must be at most 65535".into());
+        }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fs {
             if f.id == 0 {

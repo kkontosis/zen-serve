@@ -442,17 +442,26 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<usize> {
     let end = keys::commit_index()
         .vs(&crate::ids::offset(&stamp_of(cutoff), 0))
         .finish();
-    let (n, _) = txn_loop!(st.store, None, |t| {
-        let old = t.snapshot_get_range(&prefix, &end, 1000, false).await?;
-        for (k, _) in &old {
-            let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 2)
-                .map_err(|_| internal("bad commit index key"))?;
-            if let Some(zen_store::tuple::Elem::Bytes(cid)) = elems.get(1) {
-                t.clear(&keys::commit_record(cid));
+    let mut removed = 0;
+    // Pages of 1,000, up to 100 per pass: a busy server expires records
+    // faster than one page a minute.
+    for _ in 0..100 {
+        let (n, _) = txn_loop!(st.store, None, |t| {
+            let old = t.snapshot_get_range(&prefix, &end, 1000, false).await?;
+            for (k, _) in &old {
+                let (elems, _) = zen_store::tuple::unpack_prefix(&k[prefix.len()..], 2)
+                    .map_err(|_| internal("bad commit index key"))?;
+                if let Some(zen_store::tuple::Elem::Bytes(cid)) = elems.get(1) {
+                    t.clear(&keys::commit_record(cid));
+                }
+                t.clear(k);
             }
-            t.clear(k);
+            Ok(old.len())
+        })?;
+        removed += n;
+        if n < 1000 {
+            break;
         }
-        Ok(old.len())
-    })?;
-    Ok(n)
+    }
+    Ok(removed)
 }

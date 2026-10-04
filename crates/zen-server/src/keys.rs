@@ -57,9 +57,14 @@ pub fn log_prefix(fs: u32, topic: &[u8]) -> Key {
     Key::new().str("log").int(fs.into()).bytes(topic)
 }
 
+/// `("lk", fs, topic)`: the per-key index of a topic, in key order.
+pub fn lk_topic(fs: u32, topic: &[u8]) -> Key {
+    Key::new().str("lk").int(fs.into()).bytes(topic)
+}
+
 /// `("lk", fs, topic, key)`.
 pub fn lk_prefix(fs: u32, topic: &[u8], key: &[u8]) -> Key {
-    Key::new().str("lk").int(fs.into()).bytes(topic).bytes(key)
+    lk_topic(fs, topic).bytes(key)
 }
 
 /// Topic head.
