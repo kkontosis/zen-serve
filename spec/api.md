@@ -6,7 +6,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
 * **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
-* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session` and `/v1/auth/password/{params,session}`.
+* **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session` and `/v1/auth/password/{params,session}`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
   | Status | `code` | Retry? |
@@ -143,6 +143,24 @@ Register or replace the caller's password-derived key. Needs a session of the us
 * 400: a name that doesn't normalize, a salt that isn't 32 bytes, parameters outside the registration floor and ceilings (formats.md §7.5), or an identity that doesn't decode.
 * 409 `name_taken`: another user holds the name. 429 `quota`: the user holds 100 credentials.
 * The user's previous password credential, if any, is deleted with its sessions (auth.md §11.2).
+
+### 3.8 `POST /v1/auth/tokens/create`
+
+Method 4, API tokens (auth.md §9). Admins only, signed in interactively (403 otherwise). 403 `method_disabled` if API tokens are off.
+
+```
+{ user: bytes(32),          // the member the token acts as
+  label?: text,             // at most 128 bytes
+  expires_unix?: u64 }      // absent: never
+→ { token: text,            // "zen_at_" ‖ base64url(32-byte secret): shown only here
+    id: bytes(32),          // the credential id
+    expires_unix?: u64 }
+```
+
+* 400: `user` is not a member of the head ACL, `expires_unix` is not in the future, or the label is too long. 429 `quota`: the member holds 100 credentials.
+* **Use.** The token is sent as is, `Authorization: Bearer zen_at_…`, on every request, with no session. On the stream (§9), the `auth` frame's `token` is the UTF-8 bytes of the same text.
+* A request with a token that is unknown, revoked, expired, or whose member left the ACL returns 401, as does any token while the method is off.
+* Tokens are listed and revoked through §3.9. `/v1/auth/logout` with a token returns 400.
 
 ### 3.9 `POST /v1/auth/credentials/list` and `/v1/auth/credentials/remove`
 
@@ -375,7 +393,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 ## 9. WebSocket `/v1/stream`
 
 * Binary frames, each holding one CBOR map with an `op` field.
-* The first frame must be `{op: "auth", token: bytes}`. Nothing else is accepted before it.
+* The first frame must be `{op: "auth", token: bytes}`: a session token, or the UTF-8 bytes of an API token (§3.8). Nothing else is accepted before it.
 
 **Client → server:**
 

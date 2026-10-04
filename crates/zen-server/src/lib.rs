@@ -25,6 +25,7 @@ pub mod state;
 pub mod statics;
 pub mod stream;
 pub mod supervisor;
+pub mod token;
 pub mod tree;
 mod txn;
 
@@ -177,6 +178,10 @@ pub fn router(st: Shared) -> Router {
             post(password::set).layer(auth_limit),
         )
         .route(
+            "/v1/auth/tokens/create",
+            post(token::create).layer(auth_limit),
+        )
+        .route(
             "/v1/auth/credentials/list",
             post(cred::list_endpoint).layer(auth_limit),
         )
@@ -261,7 +266,7 @@ fn claim_token(cfg: &Config) -> std::io::Result<String> {
 }
 
 /// Background housekeeping (G13): expired idempotency records, sessions,
-/// consumed challenges and the ephemeral ring. Every node runs it; each
+/// consumed challenges, API tokens and the ephemeral ring. Every node runs it; each
 /// sweep is an idempotent transaction.
 async fn sweeper(st: Shared) {
     let period = Duration::from_secs(st.cfg.limits.sweep_interval_secs.max(1));
@@ -283,6 +288,10 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
     let n = auth::sweep(st).await?;
     if n > 0 {
         tracing::debug!(removed = n, "expired sessions and challenges");
+    }
+    let n = token::sweep(st).await?;
+    if n > 0 {
+        tracing::debug!(removed = n, "expired API tokens");
     }
     tree::sweep(st, now).await?;
     let cutoff = now.saturating_sub(st.cfg.limits.ephemeral_ttl_secs * zen_store::VERSIONS_PER_SEC);

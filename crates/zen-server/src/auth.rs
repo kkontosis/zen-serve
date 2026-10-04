@@ -25,7 +25,11 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
 /// The sign-in methods this server implements. A method also needs its
 /// `[auth]` flag ([`crate::state::AppState::method_on`]).
-pub const IMPLEMENTED: &[AuthMethod] = &[AuthMethod::DeviceKey, AuthMethod::PasswordKey];
+pub const IMPLEMENTED: &[AuthMethod] = &[
+    AuthMethod::DeviceKey,
+    AuthMethod::ApiToken,
+    AuthMethod::PasswordKey,
+];
 
 /// The order in which a client offers sign-in methods: the first one that
 /// is on is `/v1/info`'s `auth.default`. API tokens are for services, never
@@ -219,8 +223,12 @@ async fn lookup_session(st: &Shared, hash: &[u8; 32]) -> ApiResult<Option<Sessio
     Ok(s)
 }
 
-/// Resolve a session token against the current ACL.
+/// Resolve a bearer token, a session token or an API token (auth.md §9),
+/// against the current ACL.
 pub async fn resolve(st: &Shared, token: &[u8]) -> ApiResult<Caller> {
+    if crate::token::is_api_token(token) {
+        return crate::token::resolve(st, token).await;
+    }
     let token: [u8; 32] = token
         .try_into()
         .map_err(|_| unauthorized("bad session token"))?;
@@ -270,9 +278,13 @@ impl FromRequestParts<Shared> for Caller {
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| unauthorized("missing bearer token"))?;
+            .ok_or_else(|| unauthorized("missing bearer token"))?
+            .trim();
+        if crate::token::is_api_token(h.as_bytes()) {
+            return resolve(st, h.as_bytes()).await;
+        }
         let token = URL_SAFE_NO_PAD
-            .decode(h.trim())
+            .decode(h)
             .map_err(|_| unauthorized("bad bearer token"))?;
         resolve(st, &token).await
     }
@@ -446,6 +458,11 @@ pub async fn logout(
     caller: Caller,
     Cbor(_): Cbor<Empty>,
 ) -> ApiResult<Cbor<Empty>> {
+    if caller.method == AuthMethod::ApiToken {
+        return Err(bad_request(
+            "an API token is not a session: an admin revokes it (/v1/auth/credentials/remove)",
+        ));
+    }
     let key = keys::session(&caller.session);
     txn_loop!(st.store, None, |t| {
         t.clear(&key);

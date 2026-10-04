@@ -782,3 +782,219 @@ async fn password_keys_can_be_turned_off() {
     assert_eq!(auth.default.as_deref(), Some("device_key"));
     assert_eq!(auth.password_params, None);
 }
+
+// ---- method 4: API tokens (auth.md §9)
+
+/// A request with a raw `Authorization: Bearer` value.
+async fn bearer<Q: serde::Serialize, T: serde::de::DeserializeOwned>(
+    h: &Harness,
+    path: &str,
+    token: &str,
+    req: &Q,
+) -> R<T> {
+    let resp = h
+        .http
+        .post(format!("{}{}", h.base, path))
+        .header("content-type", CBOR)
+        .header("authorization", format!("Bearer {token}"))
+        .body(to_cbor(req))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap();
+    if status == 200 {
+        Ok(from_cbor(&body).unwrap())
+    } else {
+        Err((status, from_cbor(&body).unwrap()))
+    }
+}
+
+async fn create_token(h: &Harness, tok: &[u8], user: &User, expires: Option<u64>) -> R<ApiToken> {
+    let req = ApiTokenCreate {
+        user: user.fp(),
+        label: Some("ci bot".into()),
+        expires_unix: expires,
+    };
+    h.call("/v1/auth/tokens/create", Some(tok), &req).await
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_tokens_are_off_by_default() {
+    let h = Harness::start().await;
+    let (admin, bot) = (User::new(1), User::new(2));
+    h.claim(&admin, &[&bot]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    assert_eq!(
+        code(create_token(&h, &tok, &bot, None).await),
+        (403, "method_disabled".into())
+    );
+    let auth = h.get::<Info>("/v1/info").await.auth.unwrap();
+    assert!(!auth.methods.contains(&"api_token".to_string()));
+
+    // A token stored while the method was on is refused while it is off.
+    let secret = [9u8; 32];
+    let id = zen_server::token::token_id(&secret);
+    let user: [u8; 32] = bot.fp().try_into().unwrap();
+    let rec = zen_server::cred::CredRecord {
+        method: AuthMethod::ApiToken.id(),
+        created_unix: now(),
+        ..Default::default()
+    };
+    let mut t = h.server.state.store.begin(None).await.unwrap();
+    zen_server::cred::put(&mut t, &user, &id, &rec);
+    t.commit().await.unwrap();
+    use base64::Engine;
+    let text = format!(
+        "{API_TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret)
+    );
+    let (status, e) = bearer::<_, ReadVersion>(&h, "/v1/grv", &text, &Empty {})
+        .await
+        .unwrap_err();
+    assert_eq!(status, 401);
+    assert!(e.message.contains("disabled"), "{}", e.message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_tokens_create_use_revoke_expire() {
+    let h = Harness::start_with(|c| c.auth.api_tokens = true).await;
+    let (admin, bot, carol) = (User::new(1), User::new(2), User::new(3));
+    let doc1 = h.claim(&admin, &[&bot, &carol]).await;
+    let admin_tok = h.sign_in(&admin).await.unwrap();
+    let carol_tok = h.sign_in(&carol).await.unwrap();
+    let auth = h.get::<Info>("/v1/info").await.auth.unwrap();
+    assert!(auth.methods.contains(&"api_token".to_string()));
+    assert_ne!(auth.default.as_deref(), Some("api_token"));
+
+    // Only admins issue tokens, only for members, never already expired.
+    assert_eq!(code(create_token(&h, &carol_tok, &bot, None).await).0, 403);
+    assert_eq!(
+        code(create_token(&h, &admin_tok, &User::new(9), None).await).0,
+        400
+    );
+    assert_eq!(
+        code(create_token(&h, &admin_tok, &bot, Some(now() - 1)).await).0,
+        400
+    );
+    let t = create_token(&h, &admin_tok, &bot, None).await.unwrap();
+    assert!(t.token.starts_with("zen_at_") && t.token.len() == 50);
+
+    // Used directly as a bearer token, with the member's rights.
+    let c = Commit {
+        commit_id: cid(1),
+        writes: vec![Write {
+            fs: 1,
+            key: vec![1; 16],
+            value: Some(vec![2; 64]),
+        }],
+        ..Default::default()
+    };
+    let r: CommitResult = bearer(&h, "/v1/commit", &t.token, &c).await.unwrap();
+    // The token id is the device: a replay from the same token is
+    // idempotent, from another device it is refused.
+    let again: CommitResult = bearer(&h, "/v1/commit", &t.token, &c).await.unwrap();
+    assert_eq!(again.versionstamp, r.versionstamp);
+    let r2: R<CommitResult> = h.call("/v1/commit", Some(&carol_tok), &c).await;
+    assert_eq!(code(r2), (409, "commit_id_reused".into()));
+    // …and on the stream, as the `auth` token.
+    let ws = connect(&h, t.token.as_bytes()).await;
+    drop(ws);
+
+    // Listed as metadata; never the secret.
+    let list = creds(&h, &admin_tok, Some(&bot)).await.unwrap().credentials;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, t.id);
+    assert_eq!(list[0].method, "api_token");
+    assert_eq!(list[0].label.as_deref(), Some("ci bot"));
+
+    // A token can't manage sign-in, and is not a session.
+    let r: R<Credentials> = bearer(
+        &h,
+        "/v1/auth/credentials/list",
+        &t.token,
+        &CredentialsList::default(),
+    )
+    .await;
+    assert_eq!(code(r).0, 403);
+    let r: R<Empty> = bearer(&h, "/v1/auth/logout", &t.token, &Empty {}).await;
+    assert_eq!(code(r).0, 400);
+    let own = create_token(&h, &admin_tok, &admin, None).await.unwrap();
+    let r: R<OriginState> = bearer(&h, "/v1/admin/origins/get", &own.token, &Empty {}).await;
+    assert_eq!(code(r).0, 403);
+    let r: R<ApiToken> = bearer(
+        &h,
+        "/v1/auth/tokens/create",
+        &own.token,
+        &ApiTokenCreate {
+            user: bot.fp(),
+            label: None,
+            expires_unix: None,
+        },
+    )
+    .await;
+    assert_eq!(code(r).0, 403);
+
+    // A wrong or malformed token.
+    let mut wrong = t.token.clone();
+    wrong.replace_range(10..11, if &wrong[10..11] == "A" { "B" } else { "A" });
+    let r: R<ReadVersion> = bearer(&h, "/v1/grv", &wrong, &Empty {}).await;
+    assert_eq!(code(r).0, 401);
+
+    // Revoked by an admin: refused at once.
+    let rm = CredentialId { id: t.id.clone() };
+    let r: R<Empty> = h
+        .call("/v1/auth/credentials/remove", Some(&admin_tok), &rm)
+        .await;
+    r.unwrap();
+    let r: R<ReadVersion> = bearer(&h, "/v1/grv", &t.token, &Empty {}).await;
+    assert_eq!(code(r).0, 401);
+
+    // Expiry: refused once expired, and swept.
+    let short = create_token(&h, &admin_tok, &bot, Some(now() + 2))
+        .await
+        .unwrap();
+    let r: R<ReadVersion> = bearer(&h, "/v1/grv", &short.token, &Empty {}).await;
+    r.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+    let r: R<ReadVersion> = bearer(&h, "/v1/grv", &short.token, &Empty {}).await;
+    assert_eq!(code(r).0, 401);
+    assert_eq!(
+        creds(&h, &admin_tok, Some(&bot))
+            .await
+            .unwrap()
+            .credentials
+            .len(),
+        1
+    );
+    zen_server::sweep_once(&h.server.state).await.unwrap();
+    assert!(
+        creds(&h, &admin_tok, Some(&bot))
+            .await
+            .unwrap()
+            .credentials
+            .is_empty()
+    );
+
+    // Leaving the ACL ends the member's tokens.
+    let t = create_token(&h, &admin_tok, &bot, None).await.unwrap();
+    let (v2, _) = signed_acl(
+        &admin,
+        2,
+        Some(&doc1),
+        &[&admin],
+        &[&admin, &carol],
+        vec![],
+        vec![],
+    );
+    h.put_acl(v2, None).await.unwrap();
+    let r: R<ReadVersion> = bearer(&h, "/v1/grv", &t.token, &Empty {}).await;
+    assert_eq!(code(r).0, 401);
+}

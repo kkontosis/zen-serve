@@ -511,6 +511,38 @@ pub struct Credentials {
     pub credentials: Vec<Credential>,
 }
 
+/// The prefix of an API token (spec/auth.md §9).
+pub const API_TOKEN_PREFIX: &str = "zen_at_";
+
+/// `POST /v1/auth/tokens/create` request (admins).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApiTokenCreate {
+    /// The member the token acts as (user fingerprint).
+    #[serde(with = "serde_bytes")]
+    pub user: Vec<u8>,
+    /// A label, for listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Expiry, unix seconds; absent: never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+}
+
+/// `POST /v1/auth/tokens/create` response. The token is shown only here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApiToken {
+    /// `zen_at_` ‖ base64url(32-byte secret): send as
+    /// `Authorization: Bearer <token>`, or as the stream's `auth` token
+    /// (its UTF-8 bytes).
+    pub token: String,
+    /// The credential id.
+    #[serde(with = "serde_bytes")]
+    pub id: Vec<u8>,
+    /// Expiry, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+}
+
 // ---------------------------------------------------------------- ACL, fs
 
 /// `POST /v1/acl/put` request.

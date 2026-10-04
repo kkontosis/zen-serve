@@ -206,6 +206,24 @@ To sign in, the device signs the challenge and the origin (formats.md §10) and 
 
 > **Placeholder.** Password sign-in with the OPAQUE augmented PAKE. It shares the login-name index of §4.2 with method 6. Not implemented.
 
+## 9. Method 4: API tokens
+
+Bearer secrets for services and bots, **off by default** (`[auth] api_tokens = false`).
+
+* **Issuing.** An admin, signed in interactively, calls `POST /v1/auth/tokens/create` (api.md §3.8) for a **member**, with an optional label and expiry. The server picks a 32-byte random secret and returns it **once**, as the token text `zen_at_` ‖ base64url(secret) (50 characters). It stores only the id, `BLAKE3.derive_key("zen-serve 2026 api token", secret)`, in the credential store (§4), with the label, the expiry and the issuing admin.
+* **Use: directly, without a session.** A service sends `Authorization: Bearer zen_at_…` on every request, and the UTF-8 bytes of the same text as the stream's `auth` token (api.md §9). The prefix and the length tell it apart from a session token. Exchanging tokens for sessions would add a renewal loop to every service for no security gain: a session token is a bearer secret too.
+* **Checked on every request**, like a session (§3): the method is on, the credential exists, it hasn't expired, and its user is a member of the head ACL. A node caches the lookup for up to 10 s.
+* **Rights.** A token acts as its member, with the member's grants, admin included. It can't manage sign-in: `/v1/auth/credentials/*`, `/v1/auth/password/set`, `/v1/auth/tokens/create` and `/v1/admin/origins/*` refuse it with 403. `/v1/auth/logout` refuses it with 400.
+* **The device.** The token id is the caller's device (§3): fencing tokens, idempotency, the op chain and the ephemeral rate limit are per token.
+* **Listing and revoking.** `/v1/auth/credentials/list` shows tokens as metadata (id, label, created, expires); the secret can't be shown again. `/v1/auth/credentials/remove` revokes one: at once on the node that revokes, within 10 s on the others. Revoking takes an admin, or the member signed in interactively.
+* **Expiry.** An expired token is refused at once, and the sweeper deletes it.
+
+**Threats.**
+* A token is a bearer secret with the member's full rights and no origin binding: whoever reads it, from a config file, a log or a CI variable, is the member until it is revoked or expires.
+* Give each service its **own member**, with only the grants it needs (`TD-AUTH-TOKEN-SCOPES`), and an expiry.
+* The server stores only a hash, so a dump or backup holds no usable tokens.
+* A token never unlocks data keys (§12). A service that needs to read data also needs the fs keys, from a keyslot.
+
 ## 10. Method 5: TLS client certificates (reserved)
 
 > **Placeholder.** Sign-in with a TLS client certificate, either terminated by zen-serve itself (native TLS) or by a trusted reverse proxy that forwards the verified certificate. Not implemented; `mtls = true` has no effect yet.
