@@ -147,6 +147,34 @@ impl Storage for Fdb {
         self.0.hub.watch(key).await
     }
 
+    async fn advance_version(&self, at_least: Version) -> Result<()> {
+        // What `fdbcli advanceversion` does: the cluster recovers at a
+        // version of at least `\xff/minRequiredCommitVersion`.
+        let target = i64::try_from(at_least.saturating_add(1)).map_err(|_| Error::TooOld)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let trx = self.0.db.create_trx().map_err(map_err)?;
+            let rv = trx.get_read_version().await.map_err(map_err)?;
+            if rv >= target {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(Error::Io("advance_version: timed out".into()));
+            }
+            trx.set_option(foundationdb::options::TransactionOption::AccessSystemKeys)
+                .map_err(map_err)?;
+            trx.set(b"\xff/minRequiredCommitVersion", &target.to_le_bytes());
+            if let Err(e) = trx.commit().await {
+                // The recovery the write triggers can fail the commit itself.
+                let e = FdbError::from(e);
+                if !e.is_retryable() && !e.is_maybe_committed() {
+                    return Err(map_err(e));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn now_version(&self) -> Result<Version> {
         let mut c = self.0.clock.lock().await;
         if c.0.elapsed() > Duration::from_millis(100) {

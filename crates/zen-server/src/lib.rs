@@ -11,6 +11,7 @@ pub mod cbor;
 pub mod commit;
 pub mod config;
 pub mod consume;
+pub mod dump;
 pub mod eph;
 pub mod error;
 pub mod ids;

@@ -268,12 +268,17 @@ pub async fn session(
     let hash = token_hash(&token);
     let used = keys::challenge(&challenge);
     let chal_exp = u32::from_be_bytes(challenge[12..16].try_into().expect("4")) as u64;
-    txn_loop!(st.store, None, |t| {
+    // Idempotent: a retry after an unknown result finds its own session.
+    let sess_key = keys::session(&hash);
+    txn_loop!(st.store, None, idempotent, |t| {
+        if t.get(&sess_key).await?.is_some() {
+            return Ok(());
+        }
         if t.get(&used).await?.is_some() {
             return Err(unauthorized("challenge already used"));
         }
         t.set(&used, &chal_exp.to_be_bytes());
-        t.set(&keys::session(&hash), &encode_session(&info));
+        t.set(&sess_key, &encode_session(&info));
         Ok(())
     })?;
     st.sessions.lock().expect("session lock").insert(

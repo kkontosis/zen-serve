@@ -121,6 +121,11 @@ pub trait Storage: Send + Sync + 'static {
     /// The current reading of the version clock (for expiry decisions). It
     /// may lag the newest read version slightly.
     async fn now_version(&self) -> Result<Version>;
+
+    /// Make every later commit version greater than `at_least` (after
+    /// importing data written by another store, whose versionstamps must
+    /// stay older than new ones). Never moves the clock back.
+    async fn advance_version(&self, at_least: Version) -> Result<()>;
 }
 
 /// One optimistic transaction.

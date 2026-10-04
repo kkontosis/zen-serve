@@ -1,0 +1,34 @@
+# zen-serve on a FoundationDB cluster it supervises (spec/operations.md).
+#
+#   node 1:  zen-serve init -c zen-serve-fdb.toml      (prints a join token)
+#   node n:  zen-serve join <token> -c zen-serve-fdb.toml
+#   later:   zen-serve serve -c zen-serve-fdb.toml
+#
+# Build with: cargo build -p zen-server --release --features fdb
+
+listen = "0.0.0.0:8080"
+data_dir = "/var/lib/zen"
+public_origins = ["https://zen.example.org"]
+
+[[fs]]
+id = 1
+
+[storage]
+backend = "fdb"
+# cluster_file = "/etc/foundationdb/fdb.cluster"   # default: data_dir/fdb.cluster
+# key_prefix = "clone-2026-10-03/"                 # serve a restored clone
+
+[fdb]
+processes = 2              # fdbserver processes on this node
+listen_ip = "10.0.0.5"     # private network address of this node
+port = 4500
+auto_redundancy = true     # single → double at 3 nodes → triple at 5
+# tls_cert = "/etc/zen/fdb.pem"
+# tls_key = "/etc/zen/fdb.key"
+# tls_ca = "/etc/zen/ca.pem"
+
+[backup]
+agents = true              # run backup_agent for `zen-serve backup`
+
+[limits]
+ephemeral_ttl_secs = 60

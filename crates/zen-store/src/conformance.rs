@@ -32,6 +32,7 @@ cases!(
     versionstamped_value_unreadable,
     watch_wakes_on_write,
     bank_transfers_keep_total,
+    advance_version,
 );
 
 /// Run every case, each on a fresh store from `make`.
@@ -316,4 +317,17 @@ pub async fn bank_transfers_keep_total(s: Arc<dyn Storage>) {
         START * ACCOUNTS as i64,
         "after {conflicts} conflicts"
     );
+}
+
+/// After `advance_version(v)`, commits and read versions are past `v`.
+pub async fn advance_version(s: Arc<dyn Storage>) {
+    let now = s.now_version().await.unwrap();
+    let target = now + 5 * crate::VERSIONS_PER_SEC;
+    s.advance_version(target).await.unwrap();
+    s.advance_version(target - 1).await.unwrap();
+    let mut t = s.begin(None).await.unwrap();
+    assert!(t.read_version() >= target);
+    t.set(b"after", b"1");
+    let stamp = t.commit().await.unwrap();
+    assert!(crate::version_of(&stamp) > target);
 }

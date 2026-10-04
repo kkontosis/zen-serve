@@ -26,7 +26,8 @@ jobs:
       - name: wasm32 check
         run: cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown
 
-  # The FoundationDB backend against a real single-process cluster.
+  # The FoundationDB backend, the supervisor and every server test against
+  # a real cluster that zen-serve itself starts.
   fdb:
     runs-on: ubuntu-latest
     steps:
@@ -35,19 +36,25 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install FoundationDB
+      - name: Install FoundationDB (pinned)
         run: sudo scripts/install-fdb.sh /opt/foundationdb
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Start a cluster
+      - name: Start a cluster with zen-serve init
         run: |
-          mkdir -p /tmp/fdb/data /tmp/fdb/log
-          echo "ci:ci@127.0.0.1:4500" > /tmp/fdb/fdb.cluster
-          /opt/foundationdb/usr/sbin/fdbserver -C /tmp/fdb/fdb.cluster -p 127.0.0.1:4500 \
-            -d /tmp/fdb/data -L /tmp/fdb/log &
-          /opt/foundationdb/usr/bin/fdbcli -C /tmp/fdb/fdb.cluster --timeout 60 \
-            --exec "configure new single ssd"
+          cargo build -p zen-server --features fdb
+          mkdir -p /tmp/zen-ci
+          printf 'data_dir = "/tmp/zen-ci/data"\n[fdb]\nport = 4500\nauto_redundancy = false\n' > /tmp/zen-ci/node.toml
+          nohup ./target/debug/zen-serve init --no-api -c /tmp/zen-ci/node.toml > /tmp/zen-ci/init.log 2>&1 &
+          for i in $(seq 90); do
+            ./target/debug/zen-serve status -c /tmp/zen-ci/node.toml && break
+            sleep 2
+          done
       - name: Test (fdb)
         env:
-          ZEN_TEST_CLUSTER_FILE: /tmp/fdb/fdb.cluster
-        run: cargo test -p zen-store --features fdb
+          ZEN_TEST_CLUSTER_FILE: /tmp/zen-ci/data/fdb.cluster
+          ZEN_TEST_BACKEND: fdb
+        run: cargo test -p zen-store -p zen-server --features fdb
+      - name: Supervisor log
+        if: failure()
+        run: cat /tmp/zen-ci/init.log

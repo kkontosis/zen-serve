@@ -6,6 +6,7 @@ use crate::cbor::Cbor;
 use crate::error::*;
 use crate::keys;
 use crate::state::Shared;
+use crate::txn::txn_loop;
 use axum::extract::State;
 use std::collections::{HashMap, HashSet};
 use zen_core::kdf::acl_hash;
@@ -270,24 +271,24 @@ pub async fn put(State(st): State<Shared>, Cbor(req): Cbor<AclPut>) -> ApiResult
             return Err(forbidden("version 1 requires the claim token"));
         }
     }
-    let mut t = st.store.begin(None).await?;
-    let current = t
-        .get(&keys::acl_head())
-        .await?
-        .map(|b| u64::from_be_bytes(b.try_into().unwrap_or_default()))
-        .unwrap_or(0);
-    if current != head.version {
-        return Err(version_mismatch("the ACL changed concurrently"));
-    }
-    t.set(&keys::acl(new.version), &req.acl);
-    t.set(&keys::acl_head(), &new.version.to_be_bytes());
-    match t.commit().await {
-        Ok(_) => {}
-        Err(zen_store::Error::Conflict) => {
+    txn_loop!(st.store, None, idempotent, |t| {
+        let current = t
+            .get(&keys::acl_head())
+            .await?
+            .map(|b| u64::from_be_bytes(b.try_into().unwrap_or_default()))
+            .unwrap_or(0);
+        // A retry after an unknown result finds its own write.
+        if current == new.version && t.get(&keys::acl(new.version)).await? == Some(req.acl.clone())
+        {
+            return Ok(());
+        }
+        if current != head.version {
             return Err(version_mismatch("the ACL changed concurrently"));
         }
-        Err(e) => return Err(e.into()),
-    }
+        t.set(&keys::acl(new.version), &req.acl);
+        t.set(&keys::acl_head(), &new.version.to_be_bytes());
+        Ok(())
+    })?;
     let version = new.version;
     st.set_acl(new);
     if version == 1 {

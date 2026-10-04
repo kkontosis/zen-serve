@@ -305,6 +305,32 @@ impl Storage for Embedded {
         let st = self.0.state.lock().expect("state lock");
         Ok(st.last.max(unix_micros()))
     }
+
+    async fn advance_version(&self, at_least: Version) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut st = store.0.state.lock().expect("state lock");
+            if st.last >= at_least {
+                return Ok(());
+            }
+            let w = store.0.db.begin_write().map_err(io)?;
+            {
+                let mut t = w.open_table(TABLE).map_err(io)?;
+                t.insert(
+                    meta_version_key().as_slice(),
+                    at_least.to_be_bytes().as_slice(),
+                )
+                .map_err(io)?;
+            }
+            w.commit().map_err(io)?;
+            st.last = at_least;
+            st.max_rv = st.max_rv.max(at_least);
+            st.latest = None;
+            Ok(())
+        })
+        .await
+        .map_err(io)?
+    }
 }
 
 enum Op {

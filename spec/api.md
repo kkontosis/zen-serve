@@ -297,3 +297,13 @@ Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5
 * `GET /unencrypted/*`, the root aliases, and the SPA fallback for `GET` with `Accept: text/html` (DESIGN-3 §4.2).
 * Responses carry a default `Content-Security-Policy` with `require-trusted-types-for 'script'` (G15), plus `X-Content-Type-Options: nosniff`.
 * When `cross_origin_isolation = true`, **every** response, `/v1` included, also carries COOP `same-origin`, COEP `require-corp` and CORP `same-origin`.
+
+## 11. `POST /v1/admin/status`
+
+`{}` → storage health, admins only (operations.md §3.1):
+
+```
+{ backend: "embedded" | "fdb", available: bool, healthy: bool,
+  redundancy?: text,           // FoundationDB: "single", "double", "triple"
+  machines: u32, processes: u32, coordinators: u32, messages: [text] }
+```

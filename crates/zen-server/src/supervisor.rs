@@ -351,6 +351,23 @@ pub async fn fdbcli(cfg: &Config, cluster: &Path, cmd: &str) -> Result<String, S
     }
 }
 
+/// Run a FoundationDB tool (`fdbbackup`, `fdbrestore`) with the node's TLS
+/// options, passing its output through.
+pub async fn run_tool(cfg: &Config, name: &str, args: &[String]) -> Result<(), String> {
+    let status = Command::new(find_bin(cfg, name)?)
+        .args(args)
+        .args(tls_args(cfg))
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("{name}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{name} failed ({status})"))
+    }
+}
+
 /// `configure new single ssd`, retried until the new processes answer.
 pub async fn configure_new(cfg: &Config) -> Result<(), String> {
     let cluster = cluster_file(cfg);

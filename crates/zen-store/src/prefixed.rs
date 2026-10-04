@@ -50,6 +50,10 @@ impl Storage for Prefixed {
     async fn now_version(&self) -> Result<Version> {
         self.inner.now_version().await
     }
+
+    async fn advance_version(&self, at_least: Version) -> Result<()> {
+        self.inner.advance_version(at_least).await
+    }
 }
 
 struct PrefixedTxn {
