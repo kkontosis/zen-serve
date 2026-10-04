@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use zen_proto::AuthMethod;
 
 /// Server configuration.
 #[derive(Clone, Debug, Deserialize)]
@@ -38,6 +39,9 @@ pub struct Config {
     /// CORS allowlist (G17). Empty: same-origin only.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Sign-in methods and origin policy (spec/auth.md §2).
+    #[serde(default)]
+    pub auth: AuthConfig,
     /// Limits.
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -125,6 +129,53 @@ impl Default for FdbConfig {
 pub struct BackupConfig {
     /// Run `backup_agent` processes under the supervisor.
     pub agents: bool,
+}
+
+/// `[auth]`: which sign-in methods are on (spec/auth.md §2). A method that
+/// is off refuses its endpoints with 403 `method_disabled`, and the
+/// sessions it created stop working until it is turned on again.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Method 1: per-device keys certified in the signed ACL.
+    pub device_keys: bool,
+    /// Method 2: WebAuthn passkeys.
+    pub passkeys: bool,
+    /// Method 3: OPAQUE passwords.
+    pub opaque: bool,
+    /// Method 4: admin-issued API tokens.
+    pub api_tokens: bool,
+    /// Method 5: TLS client certificates.
+    pub mtls: bool,
+    /// Method 6: password-derived keys, the default method.
+    pub password_keys: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        AuthConfig {
+            device_keys: true,
+            passkeys: true,
+            opaque: false,
+            api_tokens: false,
+            mtls: true,
+            password_keys: true,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Whether `m` is turned on (implemented or not).
+    pub fn enabled(&self, m: AuthMethod) -> bool {
+        match m {
+            AuthMethod::DeviceKey => self.device_keys,
+            AuthMethod::Passkey => self.passkeys,
+            AuthMethod::Opaque => self.opaque,
+            AuthMethod::ApiToken => self.api_tokens,
+            AuthMethod::Mtls => self.mtls,
+            AuthMethod::PasswordKey => self.password_keys,
+        }
+    }
 }
 
 /// One filesystem.
@@ -257,6 +308,7 @@ impl Config {
             csp: default_csp(),
             cross_origin_isolation: false,
             cors_origins: Vec::new(),
+            auth: AuthConfig::default(),
             limits: LimitsConfig::default(),
             storage: StorageConfig::default(),
             fdb: FdbConfig::default(),
@@ -323,5 +375,37 @@ impl Config {
     /// Whether `fs` is configured.
     pub fn has_fs(&self, fs: u32) -> bool {
         self.fs.iter().any(|f| f.id == fs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_configs_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        for name in ["zen-serve.toml", "zen-serve-fdb.toml"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            Config::from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    #[test]
+    fn auth_defaults() {
+        let c = Config::from_toml("data_dir = \"/tmp/x\"").unwrap();
+        let on: Vec<_> = AuthMethod::ALL
+            .into_iter()
+            .filter(|m| c.auth.enabled(*m))
+            .collect();
+        assert_eq!(
+            on,
+            [
+                AuthMethod::DeviceKey,
+                AuthMethod::Passkey,
+                AuthMethod::Mtls,
+                AuthMethod::PasswordKey
+            ]
+        );
     }
 }

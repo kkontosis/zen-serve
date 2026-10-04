@@ -83,6 +83,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             ephemeral_bytes_per_sec: l.ephemeral_bytes_per_sec,
             ephemeral_burst_bytes: l.ephemeral_burst_bytes,
         },
+        auth: Some(auth::info(&st)),
     })
 }
 

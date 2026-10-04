@@ -77,6 +77,78 @@ pub struct Info {
     pub time_ms: u64,
     /// Server limits.
     pub limits: Limits,
+    /// Sign-in methods and origin policy (spec/auth.md). Absent from
+    /// servers older than the multi-method sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthInfo>,
+}
+
+/// `/v1/info` `auth`: what a client needs to sign in (spec/auth.md §2).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthInfo {
+    /// The sign-in methods this server offers: enabled and implemented
+    /// ([`AuthMethod::name`]).
+    pub methods: Vec<String>,
+    /// The method a client offers first, if any is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// A sign-in method (spec/auth.md §1). The discriminant is its id, stored
+/// in session records and credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AuthMethod {
+    /// 1: a per-device hybrid key certified in the signed ACL.
+    DeviceKey = 1,
+    /// 2: WebAuthn passkeys (reserved).
+    Passkey = 2,
+    /// 3: OPAQUE password authentication (reserved).
+    Opaque = 3,
+    /// 4: admin-issued bearer tokens for services and bots.
+    ApiToken = 4,
+    /// 5: TLS client certificates (reserved).
+    Mtls = 5,
+    /// 6: a hybrid key derived from a password on the client.
+    PasswordKey = 6,
+}
+
+impl AuthMethod {
+    /// Every method, by id.
+    pub const ALL: [AuthMethod; 6] = [
+        AuthMethod::DeviceKey,
+        AuthMethod::Passkey,
+        AuthMethod::Opaque,
+        AuthMethod::ApiToken,
+        AuthMethod::Mtls,
+        AuthMethod::PasswordKey,
+    ];
+
+    /// The method's id.
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// The method with this id.
+    pub fn from_id(id: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.id() == id)
+    }
+
+    /// The wire name, as in `/v1/info`.
+    pub fn name(self) -> &'static str {
+        match self {
+            AuthMethod::DeviceKey => "device_key",
+            AuthMethod::Passkey => "passkey",
+            AuthMethod::Opaque => "opaque",
+            AuthMethod::ApiToken => "api_token",
+            AuthMethod::Mtls => "mtls",
+            AuthMethod::PasswordKey => "password_key",
+        }
+    }
+
+    /// The method with this wire name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
 }
 
 /// Server limits (spec/api.md §2).
@@ -174,9 +246,13 @@ pub struct Session {
     /// The user's fingerprint.
     #[serde(with = "serde_bytes")]
     pub user_fp: Vec<u8>,
-    /// The device's fingerprint.
+    /// The device's fingerprint; for methods other than `device_key`, the
+    /// credential id (spec/auth.md §3).
     #[serde(with = "serde_bytes")]
     pub device_fp: Vec<u8>,
+    /// The sign-in method ([`AuthMethod::name`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
 }
 
 /// Max length of an origin.
@@ -1376,6 +1452,17 @@ pub enum Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_methods_have_stable_ids_and_names() {
+        for (i, m) in AuthMethod::ALL.into_iter().enumerate() {
+            assert_eq!(m.id() as usize, i + 1);
+            assert_eq!(AuthMethod::from_id(m.id()), Some(m));
+            assert_eq!(AuthMethod::from_name(m.name()), Some(m));
+        }
+        assert_eq!(AuthMethod::from_id(0), None);
+        assert_eq!(AuthMethod::from_id(7), None);
+    }
 
     #[test]
     fn origins_are_validated() {

@@ -14,6 +14,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 400 | `bad_request` | no |
   | 401 | `unauthorized` (no or expired session) | after signing in again |
   | 403 | `forbidden` (ACL) | no |
+  | 403 | `method_disabled` (the sign-in method is turned off on this server, auth.md §2) | no |
   | 404 | `not_found` (unknown fs, group, …) | no |
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
   | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
@@ -45,7 +46,8 @@ No authentication. Returns:
             ephemeral_bytes_per_sec, ephemeral_burst_bytes,
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
-            chunk_grace_secs } }
+            chunk_grace_secs },
+  auth?: { methods: [text], default?: text } }   // sign-in methods (auth.md §2)
 ```
 
 Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
@@ -54,28 +56,36 @@ Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,0
 
 ## 3. Sessions
 
+The sign-in methods, their configuration, the credential store and the origin policy are specified in [auth.md](auth.md). Every method ends in a session token, except API tokens, which are bearer tokens themselves (auth.md §9).
+
 ### 3.1 `POST /v1/auth/challenge`
 
 `{}` → `{challenge: bytes(32)}`. Challenges are single-use and expire after 60 s. Any node of a cluster accepts a challenge issued by another: a challenge is `nonce(12) ‖ u32 expires_unix ‖ MAC(16)` under a cluster-wide key, and its use is recorded when the session is created. Clients treat it as opaque.
 
 ### 3.2 `POST /v1/auth/session`
 
+Device sign-in (method 1, auth.md §6).
+
 ```
 { challenge: bytes(32), origin: text,
   user: bytes,          // user's public identity (formats.md §7.2)
   cert: bytes,          // device certificate issued by `user` (formats.md §7.4)
   sig: bytes }          // device signature, purpose zen/v1/sig/session (formats.md §10)
-→ { token: bytes(32), expires_unix: u64, user_fp: bytes(32), device_fp: bytes(32) }
+→ Session
+
+Session = { token: bytes(32), expires_unix: u64, user_fp: bytes(32),
+            device_fp: bytes(32),   // the device, or for other methods the credential id (auth.md §3)
+            method?: text }         // the sign-in method (auth.md §1)
 ```
 
-The server checks all of these, or returns 401:
+403 `method_disabled` if device keys are off. Otherwise the server checks all of these, or returns 401:
 * the challenge is live
 * `origin` is one the server accepts (§3.3)
 * `user` is a member of the current ACL
 * `cert` verifies against `user`, and the certified device is listed under that member
 * `sig` verifies with the certified device's signing key
 
-A session is checked again on every request: it stops working as soon as an ACL version removes its device. Sessions are stored (hashed) in the keyspace, so every node of a cluster accepts them. Each node caches a session for up to 10 s.
+A session is checked again on every request (auth.md §3): it stops working as soon as an ACL version removes its device, or its user for other methods, and while its method is turned off. Sessions are stored (hashed) in the keyspace, so every node of a cluster accepts them. Each node caches a session for up to 10 s.
 
 ### 3.4 `POST /v1/auth/logout`
 

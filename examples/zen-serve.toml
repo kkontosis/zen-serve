@@ -18,6 +18,15 @@ cross_origin_isolation = false
 # Extra origins allowed to call the API (G17). Empty: same-origin only.
 cors_origins = []
 
+# Sign-in methods (spec/auth.md §2). Each can be turned off on its own.
+[auth]
+device_keys = true     # 1: per-device keys certified in the signed ACL
+passkeys = true        # 2: WebAuthn (not implemented yet)
+opaque = false         # 3: OPAQUE passwords (not implemented yet)
+api_tokens = false     # 4: admin-issued bearer tokens for services
+mtls = true            # 5: TLS client certificates (not implemented yet)
+password_keys = true   # 6: password-derived keys, the default method
+
 [[fs]]
 id = 1   # "/"
 

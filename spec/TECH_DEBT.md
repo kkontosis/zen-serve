@@ -1,0 +1,19 @@
+# Technical debt
+
+Work that was knowingly deferred. Each entry has a **stable reference name**, `TD-<AREA>-<SLUG>`, that code comments, specs and issues can cite. An entry is never renumbered or renamed; when it is done, its status becomes `resolved` with a pointer to the change, and the entry stays.
+
+Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why deferred**, **What it would take**.
+
+## TD-AUTH-INVITES
+
+* **Status:** open
+* **Context:** Adding a member is an admin-signed ACL change (formats.md §9): the admin needs the new user's public identity, and for device keys a device certificate, before the user can sign in by any method. There is no invite link, no one-time enrolment code and no self-service onboarding.
+* **Why deferred:** An invite flow needs a design of its own: who may invite, how an invitee proves possession of the invite, how the invitee's identity reaches an admin for signing, and how this fits the rule that the signed ACL is the only source of membership. The multi-method sign-in work (auth.md) did not need it.
+* **What it would take:** An invite record in the keyspace (hashed one-time secret, expiry, inviting admin, intended grants); an unauthenticated endpoint where the invitee submits their public identity with the secret; a pending-members list that admins read and sign into the next ACL version; spec in auth.md and api.md; tests for expiry, reuse and revocation.
+
+## TD-AUTH-WEBAUTHN-PRF-KEYSLOT
+
+* **Status:** open (method 2, passkeys, may resolve it)
+* **Context:** Passkeys (auth.md §7) only give server access. The WebAuthn PRF extension can return a per-credential secret on the client, which could unlock data keys the way a passphrase does.
+* **Why deferred:** It needs a new keyslot type (formats.md §6) and passkeys are not implemented yet.
+* **What it would take:** A keyslot type 4 whose secret is the PRF output for a fixed, per-slot salt; the slot stores the credential id and the PRF salt; new labels; vectors; and a fallback when the authenticator has no PRF support.

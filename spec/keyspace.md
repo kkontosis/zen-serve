@@ -88,12 +88,13 @@ Every node of a cluster shares these, so a request can go to any node.
 
 | Key | Value |
 |---|---|
-| `pack("sess", H(token))` | `user_fp(32) ‖ device_fp(32) ‖ u64 expires_unix` |
+| `pack("sess", H(token))` | `user_fp(32) ‖ cred(32) ‖ u64 expires_unix ‖ u8 method` |
 | `pack("chal", challenge)` | `u64 expires_unix`: a consumed challenge, kept until it would have expired |
 | `pack("eph", fs, vs)` | ephemeral message: `u16 len ‖ topic ‖ sender_fp(32) ‖ data` |
 | `pack("eh", fs)` | `versionstamp` of the last ephemeral message; watched by each node's tailer |
 
 * `H(token)` is `BLAKE3.derive_key("zen-serve 2025 session token", token)`, so a dump or backup holds no usable bearer tokens.
+* `cred` is the device fingerprint for a device session and the credential id for the other sign-in methods; `method` is the method id (auth.md §1, §3). A record written before sign-in methods existed is 72 bytes, without `method`, and is a device session.
 * The sweeper deletes expired sessions and consumed challenges, and ephemeral entries older than `limits.ephemeral_ttl_secs` (api.md §9.1).
 
 Leases are never deleted: the stored token is what keeps fencing tokens increasing.

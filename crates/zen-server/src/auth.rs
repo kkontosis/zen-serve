@@ -1,4 +1,5 @@
-//! Device sign-in (api.md §3) and the [`Caller`] extractor.
+//! Sessions and device sign-in (api.md §3, auth.md §3, §6) and the
+//! [`Caller`] extractor.
 
 use crate::acl::{AclState, Fp, R_READ};
 use crate::cbor::Cbor;
@@ -15,16 +16,52 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zen_core::labels;
 use zen_core::sig::{PublicIdentity, verify_device_cert};
-use zen_proto::{Challenge, Empty, Session, SessionRequest, session_message};
+use zen_proto::{AuthInfo, AuthMethod, Challenge, Empty, Session, SessionRequest, session_message};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
-/// An authenticated request: the device is in the current ACL.
+/// The sign-in methods this server implements. A method also needs its
+/// `[auth]` flag ([`crate::state::AppState::method_on`]).
+pub const IMPLEMENTED: &[AuthMethod] = &[AuthMethod::DeviceKey];
+
+/// The order in which a client offers sign-in methods: the first one that
+/// is on is `/v1/info`'s `auth.default`. API tokens are for services, never
+/// the default.
+const PREFERENCE: &[AuthMethod] = &[
+    AuthMethod::PasswordKey,
+    AuthMethod::Passkey,
+    AuthMethod::DeviceKey,
+    AuthMethod::Opaque,
+    AuthMethod::Mtls,
+];
+
+/// `/v1/info` `auth` (auth.md §2).
+pub fn info(st: &Shared) -> AuthInfo {
+    AuthInfo {
+        methods: AuthMethod::ALL
+            .into_iter()
+            .filter(|m| st.method_on(*m))
+            .map(|m| m.name().to_string())
+            .collect(),
+        default: PREFERENCE
+            .iter()
+            .find(|m| st.method_on(**m))
+            .map(|m| m.name().to_string()),
+    }
+}
+
+/// An authenticated request: the user is a member of the current ACL and
+/// the credential it signed in with is still valid.
 pub struct Caller {
     /// User fingerprint.
     pub user: Fp,
-    /// Device fingerprint.
+    /// "The device": the device fingerprint for `device_key` sessions, the
+    /// stable credential id for every other method (auth.md §3). Fencing
+    /// tokens, idempotency records, the filesystem op chain and ephemeral
+    /// rate limits are keyed by it.
     pub device: Fp,
+    /// How the caller signed in.
+    pub method: AuthMethod,
     /// Hash of the session token.
     pub session: [u8; 32],
     /// The ACL the request was authorized against.
@@ -70,19 +107,30 @@ pub fn token_hash(token: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("zen-serve 2025 session token", token)
 }
 
-fn encode_session(s: &SessionInfo) -> Vec<u8> {
-    let mut v = Vec::with_capacity(72);
+/// Session record: `user_fp(32) ‖ cred(32) ‖ u64 expires_unix ‖ u8 method`
+/// (keyspace.md §3.5).
+pub fn encode_session(s: &SessionInfo) -> Vec<u8> {
+    let mut v = Vec::with_capacity(73);
     v.extend_from_slice(&s.user);
-    v.extend_from_slice(&s.device);
+    v.extend_from_slice(&s.cred);
     v.extend_from_slice(&s.expires_unix.to_be_bytes());
+    v.push(s.method.id());
     v
 }
 
+/// Records written before sign-in methods existed have no method byte:
+/// they are device sessions.
 fn decode_session(v: &[u8]) -> Option<SessionInfo> {
-    (v.len() == 72).then(|| SessionInfo {
+    let method = match v.len() {
+        72 => AuthMethod::DeviceKey,
+        73 => AuthMethod::from_id(v[72])?,
+        _ => return None,
+    };
+    Some(SessionInfo {
         user: v[..32].try_into().expect("32"),
-        device: v[32..64].try_into().expect("32"),
-        expires_unix: u64::from_be_bytes(v[64..].try_into().expect("8")),
+        cred: v[32..64].try_into().expect("32"),
+        method,
+        expires_unix: u64::from_be_bytes(v[64..72].try_into().expect("8")),
     })
 }
 
@@ -133,13 +181,31 @@ pub async fn resolve(st: &Shared, token: &[u8]) -> ApiResult<Caller> {
     if s.expires_unix <= unix_now() {
         return Err(unauthorized("session expired"));
     }
+    // A session outlives its method being turned off, but isn't accepted
+    // while it is off (auth.md §3).
+    if !st.method_on(s.method) {
+        return Err(unauthorized(format!(
+            "the session's sign-in method {} is disabled",
+            s.method.name()
+        )));
+    }
     let acl = st.acl();
-    if !acl.has_device(&s.user, &s.device) {
-        return Err(unauthorized("device no longer in the ACL"));
+    match s.method {
+        AuthMethod::DeviceKey => {
+            if !acl.has_device(&s.user, &s.cred) {
+                return Err(unauthorized("device no longer in the ACL"));
+            }
+        }
+        _ => {
+            if !acl.members.contains_key(&s.user) {
+                return Err(unauthorized("no longer a member"));
+            }
+        }
     }
     Ok(Caller {
         user: s.user,
-        device: s.device,
+        device: s.cred,
+        method: s.method,
         session: hash,
         acl,
     })
@@ -220,20 +286,23 @@ fn origin_ok(st: &Shared, headers: &HeaderMap, origin: &str) -> bool {
     origin == format!("http://{host}") || origin == format!("https://{host}")
 }
 
-/// `POST /v1/auth/session`.
+/// A live challenge from a request field, or 401.
+pub fn check_challenge(st: &Shared, c: &[u8]) -> ApiResult<[u8; 32]> {
+    let challenge: [u8; 32] = c.try_into().map_err(|_| unauthorized("bad challenge"))?;
+    if !challenge_ok(st, &challenge) {
+        return Err(unauthorized("unknown or expired challenge"));
+    }
+    Ok(challenge)
+}
+
+/// `POST /v1/auth/session`: device sign-in (auth.md §6).
 pub async fn session(
     State(st): State<Shared>,
     headers: HeaderMap,
     Cbor(req): Cbor<SessionRequest>,
 ) -> ApiResult<Cbor<Session>> {
-    let challenge: [u8; 32] = req
-        .challenge
-        .as_slice()
-        .try_into()
-        .map_err(|_| unauthorized("bad challenge"))?;
-    if !challenge_ok(&st, &challenge) {
-        return Err(unauthorized("unknown or expired challenge"));
-    }
+    st.require_method(AuthMethod::DeviceKey)?;
+    let challenge = check_challenge(&st, &req.challenge)?;
     if !origin_ok(&st, &headers, &req.origin) {
         return Err(unauthorized("origin not accepted"));
     }
@@ -258,26 +327,51 @@ pub async fn session(
             &req.sig,
         )
         .map_err(|_| unauthorized("bad session signature"))?;
+    issue_session(
+        &st,
+        user_fp,
+        device_fp,
+        AuthMethod::DeviceKey,
+        Some(&challenge),
+    )
+    .await
+}
+
+/// Create a session for `user`, signed in with credential `cred` by
+/// `method`, spending `challenge` if the method signed one. Every sign-in
+/// method ends here (auth.md §3).
+pub async fn issue_session(
+    st: &Shared,
+    user: Fp,
+    cred: Fp,
+    method: AuthMethod,
+    challenge: Option<&[u8; 32]>,
+) -> ApiResult<Cbor<Session>> {
     let token = random32();
     let ttl = st.cfg.limits.session_ttl_secs;
     let info = SessionInfo {
-        user: user_fp,
-        device: device_fp,
+        user,
+        cred,
+        method,
         expires_unix: unix_now() + ttl,
     };
     let hash = token_hash(&token);
-    let used = keys::challenge(&challenge);
-    let chal_exp = u32::from_be_bytes(challenge[12..16].try_into().expect("4")) as u64;
+    let used = challenge.map(|c| {
+        let exp = u32::from_be_bytes(c[12..16].try_into().expect("4")) as u64;
+        (keys::challenge(c), exp)
+    });
     // Idempotent: a retry after an unknown result finds its own session.
     let sess_key = keys::session(&hash);
     txn_loop!(st.store, None, idempotent, |t| {
         if t.get(&sess_key).await?.is_some() {
             return Ok(());
         }
-        if t.get(&used).await?.is_some() {
-            return Err(unauthorized("challenge already used"));
+        if let Some((used, exp)) = &used {
+            if t.get(used).await?.is_some() {
+                return Err(unauthorized("challenge already used"));
+            }
+            t.set(used, &exp.to_be_bytes());
         }
-        t.set(&used, &chal_exp.to_be_bytes());
         t.set(&sess_key, &encode_session(&info));
         Ok(())
     })?;
@@ -291,8 +385,9 @@ pub async fn session(
     Ok(Cbor(Session {
         token: token.to_vec(),
         expires_unix: info.expires_unix,
-        user_fp: user_fp.to_vec(),
-        device_fp: device_fp.to_vec(),
+        user_fp: user.to_vec(),
+        device_fp: cred.to_vec(),
+        method: Some(method.name().into()),
     }))
 }
 

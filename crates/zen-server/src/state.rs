@@ -7,15 +7,19 @@ use crate::error::{ApiResult, not_found};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use zen_proto::AuthMethod;
 use zen_store::Storage;
 
-/// A signed-in device.
+/// A session (spec/auth.md §3).
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     /// User fingerprint.
     pub user: Fp,
-    /// Device fingerprint.
-    pub device: Fp,
+    /// The device fingerprint (`device_key`) or the credential id (other
+    /// methods): what the rest of the server treats as "the device".
+    pub cred: Fp,
+    /// How the session was created.
+    pub method: AuthMethod,
     /// Expiry, unix seconds.
     pub expires_unix: u64,
 }
@@ -97,6 +101,23 @@ impl AppState {
     pub fn consume_claim_token(&self) {
         *self.claim.lock().expect("claim lock") = None;
         remove_claim_token(&self.cfg.data_dir);
+    }
+
+    /// Whether sign-in method `m` is implemented and turned on.
+    pub fn method_on(&self, m: AuthMethod) -> bool {
+        self.cfg.auth.enabled(m) && crate::auth::IMPLEMENTED.contains(&m)
+    }
+
+    /// 403 `method_disabled` unless `m` is on.
+    pub fn require_method(&self, m: AuthMethod) -> ApiResult<()> {
+        if self.method_on(m) {
+            Ok(())
+        } else {
+            Err(crate::error::method_disabled(format!(
+                "the sign-in method {} is disabled on this server",
+                m.name()
+            )))
+        }
     }
 
     /// 404 unless `fs` is configured.

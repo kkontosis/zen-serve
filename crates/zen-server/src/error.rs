@@ -41,6 +41,7 @@ macro_rules! ctor {
 ctor!(bad_request, BAD_REQUEST, "bad_request");
 ctor!(unauthorized, UNAUTHORIZED, "unauthorized");
 ctor!(forbidden, FORBIDDEN, "forbidden");
+ctor!(method_disabled, FORBIDDEN, "method_disabled");
 ctor!(not_found, NOT_FOUND, "not_found");
 ctor!(conflict, CONFLICT, "conflict");
 ctor!(too_old, CONFLICT, "too_old");
