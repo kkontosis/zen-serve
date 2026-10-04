@@ -140,3 +140,33 @@ Push after each green step. A new PR at the end.
   4. `zen-serve status`
   5. `zen-serve export` / `import` round-trip
   6. `zen-serve backup start --dest file:///tmp/zb`, write data, then `zen-serve restore --timestamp … --add-prefix`, and check the clone with a second server
+
+## Outcome
+
+Done. Differences from the plan above:
+
+* **FoundationDB release.** Pinned to **7.3.79**, the newest 7.3 release (`scripts/install-fdb.sh`, sha256 of Apple's `.deb` packages). The script unpacks the packages, and starts no service.
+* **`Txn::commit` returns the versionstamp**, not the version. FoundationDB's batch order is not always 0, so the API's `versionstamp` comes from the backend.
+* **New trait method `advance_version`.** It makes `import`/`migrate` correct on both backends. On FoundationDB it writes `\xff/minRequiredCommitVersion` from the client, the same as `fdbcli advanceversion`, so no `fdbcli` is needed.
+* **Challenges are stateless:** a MAC under a cluster-wide key (`meta/"challenge_key"`), plus a "consumed" record written when the session is created. Unauthenticated requests no longer write to storage.
+* **The session cache is 10 s**, not 30 s, so logout reaches the other nodes faster.
+* **Leader for the redundancy policy.** The node that owns the lowest process address in `status json` acts. No lease in FoundationDB: the policy only raises the mode, so a rare double action is harmless.
+* **Lease expiry inside transactions uses the transaction's read version**, not the cached clock. On an idle FoundationDB cluster versions advance in ~2 s steps, so expiry can be late by that much, never early (api.md §8.2).
+* **Retryable storage errors.**
+  * `txn_loop!` also retries `TooOld` and the transient errors FoundationDB maps to it.
+  * `commit_unknown` is retried only where the body detects its own earlier commit: `/v1/commit`, ACL put and session creation. Everything else returns 409 `commit_unknown`.
+* **Expired `km` claims** still need no sweep: a claim exists only while its key is in the ready list, and the next claim overwrites it.
+* **`[storage] backend` is optional.** It defaults to `fdb` on a node set up by `init`/`join`.
+* **Not done:** clearing a restored clone is a documented `fdbcli clearrange` (spec/operations.md §5.3), not a zen-serve command.
+
+Tests:
+* the zen-store conformance suite (13 cases) on embedded, Prefixed(embedded) and FoundationDB
+* all server tests on both backends
+* new tests: multi-node (sessions, challenges, logout, ephemeral, subscriptions, fencing across nodes), export/import/migrate round trips, and the supervisor (init, crash restart)
+
+The CI `fdb` job starts its cluster with `zen-serve init --no-api`.
+
+Checked by hand:
+* three nodes (`init` + 2 × `join`) went to `double` with 3 coordinators automatically
+* a killed `fdbserver` was restarted
+* a backup restored at a timestamp into a prefix held exactly the data written before that time
