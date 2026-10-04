@@ -483,7 +483,7 @@ With `[tls] client_ca` set and `mtls` on, the API listener asks every client for
   * ECDSA on P-256 or P-384, and Ed25519;
   * RSA with a 2048- to 4096-bit modulus and an odd public exponent from 65537 to 2³² − 1, the policy of passkeys (§7): PKCS#1 v1.5 or PSS signatures with SHA-256, SHA-384 or SHA-512 on certificates, and PSS in the handshake, as TLS 1.3 requires.
 
-  A key or CA outside these fails the handshake: a 1024-bit RSA CA, for example. RSA verification uses the pure-Rust `rsa` crate's release candidate (`TD-AUTH-WEBAUTHN-RS256` has the follow-up); only its public-key operations are used.
+  A key or CA outside these fails the handshake: a 1024-bit RSA CA, or an RSA key with the exponent 3, for example. Both builds of zen-serve (operations.md §8.4) verify exactly this set, with the same policy: the default build with ring's primitives, the policy checked in front of them (ring alone would take up to 8192 bits and exponents from 3); the pure-Rust build with RustCrypto's, RSA through the `rsa` crate's release candidate (`TD-AUTH-WEBAUTHN-RS256` has the follow-up), of which only public-key operations are used.
 * **No revocation checks.** zen-serve reads no CRLs and asks no OCSP responder (`TD-AUTH-MTLS-REVOCATION`). To revoke a certificate, remove its registration (§10.3); to revoke a whole CA, remove it from `client_ca` and restart.
 * With `mtls` off, the listener doesn't ask for certificates, and `client_ca` is not read.
 

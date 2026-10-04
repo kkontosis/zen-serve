@@ -220,9 +220,11 @@ key = "/etc/zen/api.key"          # PEM private key
 ```
 
 * **TLS 1.3 only**, ALPN `http/1.1`. WebSocket (`/v1/stream`) runs over the same connection type. Current browsers and HTTP libraries all speak TLS 1.3.
-* **Pure Rust**: rustls with a crypto provider on RustCrypto (`tls::provider` in zen-server): no OpenSSL and no C or assembly. The provider's glue is zen-serve's own and hasn't had an independent security review yet (`TD-TLS-PROVIDER-AUDIT`); an optional ring or aws-lc-rs provider is `TD-TLS-RING-PROVIDER`.
-* **Key exchange**, preferred first: the post-quantum hybrid **`X25519MLKEM768`**, then `X25519` and `secp256r1`. Browsers that support the hybrid get it; others fall back. **Ciphers**: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.
-* **The server key must be ECDSA or Ed25519**: P-256 or P-384 (PKCS#8 or SEC1 PEM), or Ed25519 (PKCS#8). An RSA server key stops the start with a message saying so: the pure-Rust `rsa` crate's private-key operations are not constant-time, and the server would be open to the Marvin timing attack (RUSTSEC-2023-0071, `TD-TLS-RSA-SERVER-KEY`). Ask your CA for an ECDSA certificate; the chain above it may be RSA-signed, since only clients verify it (a Let's Encrypt ECDSA certificate works). RSA **client** certificates and client CAs are fine (§8.2).
+* **rustls, no OpenSSL**, with one of two crypto providers, chosen when zen-serve is built (§8.4): **ring** (the default build) or **RustCrypto** (the pure-Rust build). The start-up log names the build's provider.
+* **Key exchange**, preferred first: the post-quantum hybrid **`X25519MLKEM768`**, then `X25519`, `secp256r1`, and in the default build `secp384r1`. Browsers that support the hybrid get it; others fall back. Both builds offer the hybrid, which is zen-serve's own on RustCrypto (ML-KEM-768 and X25519) in either. **Ciphers**: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`, preferred in that order.
+* **The server key**: ECDSA P-256 or P-384 (PKCS#8 or SEC1 PEM), Ed25519 (PKCS#8), or, in the default build only, **RSA** (PKCS#1 or PKCS#8 PEM) with a 2048- to 4096-bit modulus and an odd public exponent from 65537 to 2³² − 1, signing with RSA-PSS as TLS 1.3 requires. ring's RSA signing is constant-time. An RSA key outside those limits stops the start with a message saying why.
+  * **The pure-Rust build refuses RSA server keys**: the start stops with a message saying it was built without the `ring` feature. Its only RSA implementation, the `rsa` crate, has private-key operations that are not constant-time, and the server would be open to the Marvin timing attack (RUSTSEC-2023-0071, `TD-TLS-RSA-SERVER-KEY`). Use the default build, or ask your CA for an ECDSA certificate; the chain above it may be RSA-signed, since only clients verify it (a Let's Encrypt ECDSA certificate works).
+  * RSA **client** certificates and client CAs work in both builds (§8.2).
 * **Start-up checks.** A file that can't be read, a key that doesn't match the certificate, or a `client_ca` without certificates stops the start with a message naming the setting.
 * **Rotation.** The files are read at start-up: restart zen-serve after renewing the certificate. Automatic certificates (ACME) and reloading without a restart are deferred (`TD-TLS-ACME`).
 * **Limits.** A handshake must finish within 10 s; at most 1024 run at once, and further connections wait in the kernel's accept queue.
@@ -230,7 +232,7 @@ key = "/etc/zen/api.key"          # PEM private key
 
 ### 8.2 Client certificates
 
-With `client_ca` set and `[auth] mtls` on, the listener asks clients for a certificate from that CA, without requiring one, for sign-in method 5 (auth.md §10.1). A client that presents a certificate the CA didn't issue, or an expired one, fails the handshake. The client CA, its certificates and the clients' keys may be ECDSA (P-256, P-384), Ed25519, or RSA of 2048 to 4096 bits (auth.md §10.1); a smaller RSA key, or a larger one, fails the handshake. Only the server's own key must not be RSA (§8.1).
+With `client_ca` set and `[auth] mtls` on, the listener asks clients for a certificate from that CA, without requiring one, for sign-in method 5 (auth.md §10.1). A client that presents a certificate the CA didn't issue, or an expired one, fails the handshake. The client CA, its certificates and the clients' keys may be ECDSA (P-256, P-384), Ed25519, or RSA of 2048 to 4096 bits (auth.md §10.1); a smaller RSA key, or a larger one, fails the handshake. Both builds verify the same keys and signatures (§8.4).
 
 A small CA with OpenSSL:
 
@@ -296,3 +298,30 @@ mtls_trusted_proxies = ["10.0.0.5"]    # the nginx host
 Other proxies: Caddy (`header_up X-Client-Cert {http.request.tls.client.certificate_der_base64}`), HAProxy (`http-request set-header X-Client-Cert %[ssl_c_der,base64]` when `ssl_c_verify` is 0) and Traefik (`passTLSClientCert` with `pem: true`, header `X-Forwarded-Tls-Client-Cert`, set as `mtls_proxy_header`) all send formats zen-serve reads.
 
 zen-serve itself may also listen with `[tls]` behind the proxy: the proxy's own certificate, if it presents one, is not taken for a user's.
+
+### 8.4 Builds and crypto providers
+
+zen-server has a Cargo feature **`ring`**, on by default, that chooses the TLS crypto provider:
+
+| | Default build (`ring`) | Pure-Rust build (`--no-default-features`) |
+|---|---|---|
+| Provider | rustls's provider on [ring](https://github.com/briansmith/ring) (`tls::ring` in zen-server) | zen-serve's own on RustCrypto (`tls::rustcrypto`) |
+| Record protection, HKDF, signature verification, signing, randomness | ring | RustCrypto |
+| `X25519MLKEM768` | zen-serve's, on RustCrypto (ring has no ML-KEM) | the same |
+| `X25519`, `secp256r1` | ring | RustCrypto |
+| `secp384r1` key exchange | ring | not offered |
+| RSA server keys | yes (§8.1) | refused (`TD-TLS-RSA-SERVER-KEY`) |
+| Verified signatures (client certificates, CAs) | ECDSA P-256/P-384, Ed25519, RSA PKCS#1 v1.5 and PSS, under the same RSA policy (auth.md §10.1) | the same |
+| Builds C and assembly | yes, ring's: a C compiler is needed | no |
+| Independent review | ring and its rustls provider are widely deployed; the hybrid key exchange is zen-serve's (`TD-TLS-PROVIDER-AUDIT`) | not yet (`TD-TLS-PROVIDER-AUDIT`) |
+
+```sh
+cargo build -p zen-server --release                                   # default: ring (needs a C compiler)
+cargo build -p zen-server --release --no-default-features             # pure Rust
+cargo build -p zen-server --release --no-default-features --features fdb
+```
+
+* ring brings C, assembly and `unsafe` code into the build. Its RSA verification alone would take 2048- to 8192-bit keys and public exponents from 3, so zen-serve applies the policy of auth.md §10.1 in front of it.
+* The pure-Rust build needs no C compiler. With one installed, `blake3` still assembles its SIMD code; adding `--features blake3/pure` turns that off too, so that nothing calls a C compiler (FoundationDB's `libfdb_c` is a C library either way).
+* Passkey RS256 verification (auth.md §7) uses the `rsa` crate in both builds.
+* The two builds speak the same TLS and accept the same client certificates; only RSA server keys and the extra `secp384r1` group differ.
