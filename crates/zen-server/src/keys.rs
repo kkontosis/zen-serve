@@ -189,3 +189,40 @@ pub fn acl(version: u64) -> Vec<u8> {
 pub fn acl_head() -> Vec<u8> {
     Key::new().str("acl_head").finish()
 }
+
+// ---- sessions, challenges, ephemeral ring, metadata
+
+/// A session, by the hash of its bearer token.
+pub fn session(token_hash: &[u8; 32]) -> Vec<u8> {
+    Key::new().str("sess").bytes(token_hash).finish()
+}
+
+/// All sessions.
+pub fn session_prefix() -> Vec<u8> {
+    Key::new().str("sess").finish()
+}
+
+/// A consumed challenge.
+pub fn challenge(c: &[u8]) -> Vec<u8> {
+    Key::new().str("chal").bytes(c).finish()
+}
+
+/// All consumed challenges.
+pub fn challenge_prefix() -> Vec<u8> {
+    Key::new().str("chal").finish()
+}
+
+/// `("eph", fs)`: the ephemeral ring.
+pub fn eph_prefix(fs: u32) -> Key {
+    Key::new().str("eph").int(fs.into())
+}
+
+/// Ephemeral ring head, watched by tailers.
+pub fn eph_head(fs: u32) -> Vec<u8> {
+    Key::new().str("eh").int(fs.into()).finish()
+}
+
+/// Server metadata.
+pub fn meta(name: &str) -> Vec<u8> {
+    Key::new().str("meta").str(name).finish()
+}

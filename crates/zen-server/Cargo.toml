@@ -10,11 +10,16 @@ repository.workspace = true
 name = "zen-serve"
 path = "src/main.rs"
 
+[features]
+# FoundationDB backend and supervisor commands (needs libfdb_c).
+fdb = ["zen-store/fdb"]
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+blake3 = "1.8"
 getrandom = "0.4"
 include_dir = "0.7"
 mime_guess = "2"

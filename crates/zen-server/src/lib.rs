@@ -11,6 +11,7 @@ pub mod cbor;
 pub mod commit;
 pub mod config;
 pub mod consume;
+pub mod eph;
 pub mod error;
 pub mod ids;
 pub mod keys;
@@ -34,11 +35,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zen_proto::{API_VERSION, Info, Limits};
 use zen_store::Storage;
 use zen_store::embedded::{Embedded, Options};
+use zen_store::prefixed::Prefixed;
 
 /// `GET /v1/info`.
 async fn info(State(st): State<Shared>) -> Cbor<Info> {
@@ -93,6 +95,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/info", get(info))
         .route("/v1/auth/challenge", post(auth::challenge))
         .route("/v1/auth/session", post(auth::session))
+        .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/acl/put", post(acl::put))
         .route("/v1/acl/get", post(acl::get))
         .route("/v1/fs/list", post(acl::fs_list))
@@ -159,31 +162,66 @@ fn claim_token(cfg: &Config) -> std::io::Result<String> {
     Ok(t)
 }
 
-/// Background housekeeping (G13): expired idempotency records, claims,
-/// sessions and challenges.
+/// Background housekeeping (G13): expired idempotency records, sessions,
+/// consumed challenges and the ephemeral ring. Every node runs it; each
+/// sweep is an idempotent transaction.
 async fn sweeper(st: Shared) {
     let period = Duration::from_secs(st.cfg.limits.sweep_interval_secs.max(1));
     loop {
         tokio::time::sleep(period).await;
-        let now = Instant::now();
-        st.sessions
-            .lock()
-            .expect("session lock")
-            .retain(|_, s| s.expires > now);
-        st.challenges
-            .lock()
-            .expect("challenge lock")
-            .retain(|_, e| *e > now);
-        let swept = match st.store.now_version().await {
-            Ok(now) => commit::sweep(&st, now).await,
-            Err(e) => Err(e.into()),
-        };
-        match swept {
-            Ok(n) if n > 0 => tracing::debug!(removed = n, "expired idempotency records"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e.message, "sweep failed"),
+        if let Err(e) = sweep_once(&st).await {
+            tracing::warn!(error = %e.message, "sweep failed");
         }
     }
+}
+
+/// One sweeper pass.
+pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
+    let now = st.store.now_version().await?;
+    let n = commit::sweep(st, now).await?;
+    if n > 0 {
+        tracing::debug!(removed = n, "expired idempotency records");
+    }
+    let n = auth::sweep(st).await?;
+    if n > 0 {
+        tracing::debug!(removed = n, "expired sessions and challenges");
+    }
+    let cutoff = now.saturating_sub(st.cfg.limits.ephemeral_ttl_secs * zen_store::VERSIONS_PER_SEC);
+    for f in &st.cfg.fs {
+        st.eph.sweep(f.id, cutoff).await?;
+    }
+    Ok(())
+}
+
+/// Open the configured storage backend.
+pub fn open_store(cfg: &Config) -> Result<Arc<dyn Storage>, String> {
+    let store: Arc<dyn Storage> = match cfg.storage.backend {
+        config::Backend::Embedded => {
+            std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
+            Arc::new(
+                Embedded::open(cfg.data_dir.join("zen.redb"), Options::default())
+                    .map_err(|e| format!("open database: {e}"))?,
+            )
+        }
+        #[cfg(feature = "fdb")]
+        config::Backend::Fdb => {
+            let file = cfg.cluster_file();
+            let file = file.as_ref().map(|p| p.to_string_lossy().into_owned());
+            Arc::new(
+                zen_store::fdb::Fdb::open(file.as_deref())
+                    .map_err(|e| format!("open FoundationDB: {e}"))?,
+            )
+        }
+        #[cfg(not(feature = "fdb"))]
+        config::Backend::Fdb => {
+            return Err("this zen-serve was built without the fdb feature".into());
+        }
+    };
+    Ok(if cfg.storage.key_prefix.is_empty() {
+        store
+    } else {
+        Arc::new(Prefixed::new(store, cfg.storage.key_prefix.as_bytes()))
+    })
 }
 
 /// A running server.
@@ -208,10 +246,10 @@ impl Server {
 pub async fn start(cfg: Config) -> Result<Server, String> {
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
-    let store: Arc<dyn Storage> = Arc::new(
-        Embedded::open(cfg.data_dir.join("zen.redb"), Options::default())
-            .map_err(|e| format!("open database: {e}"))?,
-    );
+    let store = open_store(&cfg)?;
+    let challenge_key = auth::challenge_key(store.as_ref())
+        .await
+        .map_err(|e| format!("challenge key: {}", e.message))?;
     let is_fs = |fs| cfg.has_fs(fs);
     let acl = acl::load(store.as_ref(), &is_fs)
         .await
@@ -228,7 +266,7 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let st: Shared = Arc::new(AppState::new(cfg, store, acl, claim.clone()));
+    let st: Shared = Arc::new(AppState::new(cfg, store, acl, claim.clone(), challenge_key));
     tokio::spawn(acl::follow(st.clone()));
     tokio::spawn(sweeper(st.clone()));
     let app = router(st.clone());

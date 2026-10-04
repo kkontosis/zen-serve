@@ -3,11 +3,12 @@
 
 use crate::acl::{R_APPEND, R_READ};
 use crate::auth::{Caller, resolve};
+use crate::eph::EphMsg;
 use crate::error::{ApiError, ApiResult, bad_request};
 use crate::ids::{Offset, check_prefix, check_topic, parse_offset};
 use crate::keys;
 use crate::log::{read_prefix, read_topic};
-use crate::state::{EphMsg, Shared};
+use crate::state::Shared;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -99,7 +100,7 @@ async fn run(st: Shared, sock: WebSocket) {
             }
         };
         let caller = match (&frame, &token) {
-            (Frame::Auth { token: t }, _) => match resolve(&st, t) {
+            (Frame::Auth { token: t }, _) => match resolve(&st, t).await {
                 Ok(_) => {
                     token = Some(t.clone());
                     let _ = out.send(Frame::Ok { id: None }).await;
@@ -119,7 +120,7 @@ async fn run(st: Shared, sock: WebSocket) {
                     .await;
                 break;
             }
-            (_, Some(t)) => match resolve(&st, t) {
+            (_, Some(t)) => match resolve(&st, t).await {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = out.send(err_frame(None, &e)).await;
@@ -185,9 +186,12 @@ async fn run(st: Shared, sock: WebSocket) {
                     }
                     Ok(target)
                 })();
+                let started = match started {
+                    Ok(target) => st.eph.subscribe(fs).await.map(|rx| (target, rx)),
+                    Err(e) => Err(e),
+                };
                 match started {
-                    Ok(target) => {
-                        let rx = st.eph.subscribe();
+                    Ok((target, rx)) => {
                         let _ = out.send(Frame::Ok { id: Some(id) }).await;
                         let h = tokio::spawn(ephemeral(
                             st.clone(),
@@ -221,15 +225,12 @@ async fn run(st: Shared, sock: WebSocket) {
                     }
                     Ok(())
                 })();
+                let r = match r {
+                    Ok(()) => st.eph.publish(fs, &topic, &caller.device, &data).await,
+                    Err(e) => Err(e),
+                };
                 match r {
-                    Ok(()) => {
-                        let _ = st.eph.send(Arc::new(EphMsg {
-                            fs,
-                            topic,
-                            data,
-                            sender: caller.device,
-                        }));
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         let _ = out.send(err_frame(None, &e)).await;
                     }
@@ -250,8 +251,8 @@ async fn run(st: Shared, sock: WebSocket) {
 }
 
 /// Re-authorize a long-lived task against the current ACL.
-fn recheck(st: &Shared, token: &[u8], fs: u32, target: &Target) -> ApiResult<Caller> {
-    let caller = resolve(st, token)?;
+async fn recheck(st: &Shared, token: &[u8], fs: u32, target: &Target) -> ApiResult<Caller> {
+    let caller = resolve(st, token).await?;
     caller.require_topic(fs, target.bytes(), R_READ)?;
     Ok(caller)
 }
@@ -293,7 +294,7 @@ async fn subscription(
             Target::Prefix(_) => keys::fs_head(fs),
         };
         loop {
-            recheck(&st, &token, fs, &target)?;
+            recheck(&st, &token, fs, &target).await?;
             // Watch first, then read: an append between the two still wakes us.
             let w = st.store.watch(&head_key).await?;
             let more = match &target {
@@ -318,7 +319,7 @@ async fn subscription(
                 Target::Prefix(p) => {
                     let (events, last, more) =
                         read_prefix(st.store.as_ref(), fs, p, &cursor, BATCH).await?;
-                    let caller = resolve(&st, &token)?;
+                    let caller = resolve(&st, &token).await?;
                     for (topic, e) in events {
                         if caller.require_topic(fs, &topic, R_READ).is_err() {
                             continue;
@@ -367,7 +368,7 @@ async fn ephemeral(
         if m.fs != fs || !target.matches(&m.topic) {
             continue;
         }
-        if let Err(e) = recheck(&st, &token, fs, &target) {
+        if let Err(e) = recheck(&st, &token, fs, &target).await {
             let _ = out.send(err_frame(Some(id), &e)).await;
             return;
         }

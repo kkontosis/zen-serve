@@ -19,7 +19,7 @@ The layout zen-serve uses in its ordered key-value store. Both backends use exac
 
 ## 2. Versions, versionstamps, offsets
 
-* **Version** (`u64`). A commit version from a clock running at about 1,000,000 versions per second. Every commit gets one, and versions strictly increase. The embedded backend computes `max(last + 1, unix_micros)`. Leases and claims expire at a version (DESIGN-3 §3.1).
+* **Version** (`u64`). A commit version from a clock running at about 1,000,000 versions per second. Every commit gets one, and versions strictly increase. The embedded backend computes `max(last + 1, unix_micros)`. FoundationDB's versions also advance at about 1,000,000 per second, but from the cluster's creation rather than the unix epoch; `zen-serve migrate` advances a new cluster past the embedded versions (operations.md). Leases and claims expire at a version (DESIGN-3 §3.1).
 * **Versionstamp** (10 bytes). `u64(version) ‖ u16(batch_order)`. The embedded backend always uses batch order 0.
 * **Offset** (12 bytes). An event's position: `versionstamp ‖ u16(index)`, where `index` is the append's position in the commit's `append` list. Offsets are unique, totally ordered across an fs and strictly increasing in commit order.
   * The zero offset (12 × `0x00`) means "before the first event".
@@ -77,8 +77,20 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 | `pack("cix", vs, commit_id)` | empty: expiry index for idempotency records, oldest first |
 | `pack("acl", version)` | signed ACL (formats.md §9), every version kept (the membership log) |
 | `pack("acl_head")` | `u64 version` of the current ACL |
-| `pack("meta", name)` | backend-private metadata, e.g. `"version"` in the embedded backend |
+| `pack("meta", name)` | metadata: `"version"` (embedded backend's version clock), `"challenge_key"` (32 random bytes, the cluster-wide challenge MAC key, api.md §3.1) |
 
-Sessions, challenges and ephemeral subscriptions are kept in memory, not in the keyspace. (With several zen-serve nodes on FoundationDB, sessions move into the keyspace in milestone 3.)
+### 3.5 Sessions, challenges, ephemeral ring
+
+Every node of a cluster shares these, so a request can go to any node.
+
+| Key | Value |
+|---|---|
+| `pack("sess", H(token))` | `user_fp(32) ‖ device_fp(32) ‖ u64 expires_unix` |
+| `pack("chal", challenge)` | `u64 expires_unix`: a consumed challenge, kept until it would have expired |
+| `pack("eph", fs, vs)` | ephemeral message: `u16 len ‖ topic ‖ sender_fp(32) ‖ data` |
+| `pack("eh", fs)` | `versionstamp` of the last ephemeral message; watched by each node's tailer |
+
+* `H(token)` is `BLAKE3.derive_key("zen-serve 2025 session token", token)`, so a dump or backup holds no usable bearer tokens.
+* The sweeper deletes expired sessions and consumed challenges, and ephemeral entries older than `limits.ephemeral_ttl_secs` (api.md §9.1).
 
 Leases are never deleted: the stored token is what keeps fencing tokens increasing.
