@@ -145,6 +145,8 @@ The sweeper (every node runs it) keeps the tree bounded:
 
   Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed, plus a by-id entry (keyspace.md §3.6, `tp`) that refuses later operations on the node (§3.4) until the tombstone is dropped.
 
+  The sweeper works through the trash in bounded rounds, each resuming where the last one stopped (keyspace.md §3.6, `tq`) and starting over after the last child of `TRASH`. So a subtree that can't be purged yet doesn't hold up the others. A subtree too large for one round is removed over several, leaves first: a node is removed only in a round that also removes all of its children, so an interrupted purge never leaves an orphan.
+
   A purge can still contradict an operation that is inside the horizon but has not arrived yet: an offline device that moved a file out of a directory before the directory was trashed, and syncs after the purge. Its operation is refused with `stale_op` rather than applied to a node whose content is gone; the client shows the file as deleted.
 * **Chunks:** unreferenced chunks are deleted after the grace period (§4.1).
 * **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Logged moves of a purged node itself (a skipped move can name one) are passed over by undo and redo. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.

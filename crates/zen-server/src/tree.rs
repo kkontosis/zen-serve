@@ -1122,11 +1122,7 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
         };
         for tree in trees {
             trim_log(st, fs, &tree, cutoff_ms).await?;
-            for _ in 0..100 {
-                if purge_trash(st, fs, &tree, cutoff_ms).await? == 0 {
-                    break;
-                }
-            }
+            purge_tree(st, fs, &tree, cutoff_ms, PURGE).await?;
             drop_tombstones(st, fs, &tree, &horizon_cvs).await?;
         }
         for _ in 0..100 {
@@ -1159,51 +1155,224 @@ fn add_quota(t: &mut Box<dyn Txn>, fs: u32, bytes: i64, nkeys: i64) {
     }
 }
 
-/// Purge one batch of old trash subtrees; returns the nodes purged.
-async fn purge_trash(st: &Shared, fs: u32, tree: &Id, cutoff_ms: u64) -> ApiResult<usize> {
-    const BATCH: usize = 500;
-    let (n, _) = txn_loop!(st.store, None, |t| {
-        let tpfx = keys::children(fs, tree, &TRASH).finish();
-        let tops = t.get_range(&tpfx, &keys::end_of(&tpfx), 100, false).await?;
-        let mut doomed: Vec<(Id, NodeRec)> = Vec::new();
-        'tops: for (k, _) in tops {
-            let top = tail_id(&k, tpfx.len())?;
-            // Post-order walk: children before parents, so a partial purge
-            // only ever removes leaves.
-            let mut order = Vec::new();
-            let mut stack = vec![(top, false)];
-            while let Some((n, expanded)) = stack.pop() {
+/// Trash-purge sizes. They are independent of each other: a node with more
+/// children than one page is never purged in that round, nor are its
+/// ancestors.
+#[derive(Clone, Copy, Debug)]
+struct PurgeSizes {
+    /// `TRASH` children examined per round.
+    tops: usize,
+    /// Nodes purged per round (one transaction).
+    batch: usize,
+    /// Children read per node per round.
+    page: usize,
+}
+
+const PURGE: PurgeSizes = PurgeSizes {
+    tops: 100,
+    batch: 500,
+    page: 500,
+};
+
+/// Rounds per tree per sweeper pass.
+const PURGE_ROUNDS: usize = 100;
+
+/// What one purge round did.
+#[derive(Debug)]
+struct PurgeRound {
+    /// Nodes purged.
+    purged: usize,
+    /// The round started at the first `TRASH` child.
+    from_start: bool,
+    /// The round reached the last `TRASH` child: the next starts over.
+    wrapped: bool,
+}
+
+/// Purge a tree's old trash for one sweeper pass: rounds resume where the
+/// previous one stopped (the `tq` cursor), so subtrees that can't be purged
+/// yet don't hold up the ones after them. Stops after a whole cycle through
+/// the trash that purged nothing.
+async fn purge_tree(
+    st: &Shared,
+    fs: u32,
+    tree: &Id,
+    cutoff_ms: u64,
+    z: PurgeSizes,
+) -> ApiResult<()> {
+    for _ in 0..PURGE_ROUNDS {
+        let r = purge_trash(st, fs, tree, cutoff_ms, z).await?;
+        if r.purged == 0 && r.from_start && r.wrapped {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The id after `id` (the next round's start), if any.
+fn id_after(id: &Id) -> Option<Id> {
+    u128::from_be_bytes(*id)
+        .checked_add(1)
+        .map(u128::to_be_bytes)
+}
+
+/// How walking one `TRASH` child went.
+enum Walk {
+    /// A node of the subtree moved after the cutoff: none of it is purged.
+    Blocked,
+    /// The whole subtree is in the order.
+    Purged,
+    /// Only part of it is (possibly nothing): the rest needs more rounds.
+    Partial,
+}
+
+/// One node on the purge walk.
+struct Frame {
+    id: Id,
+    rec: NodeRec,
+    parent: Option<usize>,
+    /// Children read, and how many of them are in the order.
+    read: usize,
+    purged: usize,
+    /// Every child was read.
+    all_read: bool,
+}
+
+/// Walk the subtree of the `TRASH` child `top` in post-order and list at
+/// most `room` nodes to purge (returned with the outcome), children before
+/// parents. A node is listed
+/// only when all of its children were read and listed, so a partial purge
+/// never leaves an orphan, whatever the page and batch sizes.
+async fn walk_top(
+    t: &mut Box<dyn Txn>,
+    fs: u32,
+    tree: &Id,
+    top: Id,
+    cutoff_ms: u64,
+    z: PurgeSizes,
+    room: usize,
+) -> ApiResult<(Walk, Vec<(Id, NodeRec)>)> {
+    enum Step {
+        Enter(Id, Option<usize>),
+        Exit(usize),
+    }
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut stack = vec![Step::Enter(top, None)];
+    let mut out = Vec::new();
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Enter(n, parent) => {
                 let Some(rec) = t
                     .get(&keys::node(fs, tree, &n))
                     .await?
                     .map(|v| NodeRec::decode(&v))
                     .transpose()?
                 else {
+                    // A children entry without a record: nothing to purge.
+                    match parent {
+                        Some(p) => frames[p].purged += 1,
+                        None => return Ok((Walk::Purged, out)),
+                    }
                     continue;
                 };
                 if hlc_ms(rec.move_ts.hlc) >= cutoff_ms {
-                    continue 'tops; // moved recently: a late op may still need it
+                    // A late op may still need it.
+                    return Ok((Walk::Blocked, Vec::new()));
                 }
-                if expanded {
-                    order.push((n, rec));
-                    if doomed.len() + order.len() >= BATCH {
-                        break;
-                    }
-                    continue;
-                }
-                stack.push((n, true));
                 let cpfx = keys::children(fs, tree, &n).finish();
-                for (ck, _) in t
-                    .get_range(&cpfx, &keys::end_of(&cpfx), BATCH, false)
-                    .await?
-                {
-                    stack.push((tail_id(&ck, cpfx.len())?, false));
+                let kids = t
+                    .get_range(&cpfx, &keys::end_of(&cpfx), z.page + 1, false)
+                    .await?;
+                let i = frames.len();
+                frames.push(Frame {
+                    id: n,
+                    rec,
+                    parent,
+                    read: kids.len().min(z.page),
+                    purged: 0,
+                    all_read: kids.len() <= z.page,
+                });
+                stack.push(Step::Exit(i));
+                for (ck, _) in kids.iter().take(z.page) {
+                    stack.push(Step::Enter(tail_id(ck, cpfx.len())?, Some(i)));
                 }
             }
+            Step::Exit(i) => {
+                let f = &frames[i];
+                if !f.all_read || f.purged < f.read {
+                    continue; // not a leaf yet: neither it nor its ancestors go
+                }
+                out.push((f.id, f.rec.clone()));
+                match f.parent {
+                    Some(p) => frames[p].purged += 1,
+                    None => return Ok((Walk::Purged, out)),
+                }
+                if out.len() >= room {
+                    break; // the ancestors still on the stack stay
+                }
+            }
+        }
+    }
+    Ok((Walk::Partial, out))
+}
+
+/// One purge round (one transaction): examine up to `z.tops` `TRASH`
+/// children from the tree's purge cursor on, purge up to `z.batch` nodes of
+/// the subtrees whose every node moved before the cutoff, and move the
+/// cursor past the subtrees examined.
+async fn purge_trash(
+    st: &Shared,
+    fs: u32,
+    tree: &Id,
+    cutoff_ms: u64,
+    z: PurgeSizes,
+) -> ApiResult<PurgeRound> {
+    let (round, _) = txn_loop!(st.store, None, |t| {
+        let cursor = keys::trash_cursor(fs, tree);
+        let start: Option<Id> = t
+            .get(&cursor)
+            .await?
+            .and_then(|v| v.as_slice().try_into().ok());
+        let tkey = keys::children(fs, tree, &TRASH);
+        let tpfx = tkey.clone().finish();
+        let begin = match &start {
+            Some(s) => tkey.clone().bytes(s).finish(),
+            None => tpfx.clone(),
+        };
+        let tops = t
+            .get_range(&begin, &keys::end_of(&tpfx), z.tops, false)
+            .await?;
+        let mut doomed: Vec<(Id, NodeRec)> = Vec::new();
+        // Where the next round starts; `None` is the beginning.
+        let mut next = None;
+        let mut all = true;
+        for (k, _) in &tops {
+            let top = tail_id(k, tpfx.len())?;
+            let room = z.batch - doomed.len();
+            let (walk, order) = walk_top(&mut t, fs, tree, top, cutoff_ms, z, room).await?;
+            let progress = !order.is_empty();
             doomed.extend(order);
-            if doomed.len() >= BATCH {
+            match walk {
+                // More of it can go next round: resume there.
+                Walk::Partial if progress => {
+                    next = Some(top);
+                    all = false;
+                    break;
+                }
+                // Blocked for now, purged, or stuck: move on.
+                _ => next = id_after(&top),
+            }
+            if doomed.len() >= z.batch {
+                all = false;
                 break;
             }
+        }
+        let wrapped = all && tops.len() < z.tops;
+        if wrapped {
+            next = None;
+        }
+        match next {
+            Some(n) => t.set(&cursor, &n),
+            None => t.clear(&cursor),
         }
         let (mut bytes, mut nkeys) = (0i64, 0i64);
         for (i, (n, rec)) in doomed.iter().enumerate() {
@@ -1243,9 +1412,13 @@ async fn purge_trash(st: &Shared, fs: u32, tree: &Id, cutoff_ms: u64) -> ApiResu
             add_quota(&mut t, fs, bytes, nkeys);
             t.set_versionstamped_value(&keys::tree_head(fs, tree), &[], &[]);
         }
-        Ok(doomed.len())
+        Ok(PurgeRound {
+            purged: doomed.len(),
+            from_start: start.is_none(),
+            wrapped,
+        })
     })?;
-    Ok(n)
+    Ok(round)
 }
 
 /// Drop tombstones older than the horizon; later cursors before them resync.
@@ -1342,4 +1515,176 @@ pub async fn all_nodes(store: &dyn Storage, fs: u32, tree: &Id) -> ApiResult<Vec
         out.push((n, NodeRec::decode(&v)?));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::AclState;
+    use crate::config::Config;
+    use crate::state::AppState;
+    use std::sync::Arc;
+    use zen_store::embedded::{Embedded, Options};
+
+    const FS: u32 = 1;
+    const TREE: Id = [0x7E; 16];
+    const HOUR_MS: u64 = 3_600_000;
+
+    fn id(n: u8) -> Id {
+        [n; 16]
+    }
+
+    fn state() -> (Shared, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(Embedded::open(dir.path().join("zen.redb"), Options::default()).unwrap());
+        let cfg = Config::with_data_dir(dir.path().to_path_buf());
+        let st = AppState::new(cfg, store, AclState::default(), None, [0; 32]);
+        (Arc::new(st), dir)
+    }
+
+    /// Apply `(node, parent, unix_ms)` moves in one commit.
+    async fn moves(st: &Shared, ops: &[(Id, Id, u64)]) {
+        txn_loop!(st.store, None, |t| {
+            let mut e = Engine::new(st, [7; 32]);
+            for (i, (node, parent, ms)) in ops.iter().enumerate() {
+                let op = CrdtOp::Move {
+                    fs: FS,
+                    tree: TREE.to_vec(),
+                    node: node.to_vec(),
+                    parent: parent.to_vec(),
+                    hlc: zfs::hlc(*ms, i as u16),
+                    meta: None,
+                };
+                e.apply(&mut t, &op).await?;
+            }
+            e.flush(&mut t)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    async fn nodes(st: &Shared) -> BTreeMap<Id, NodeRec> {
+        all_nodes(st.store.as_ref(), FS, &TREE)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    /// No node's parent is missing (an orphan).
+    async fn assert_no_orphans(st: &Shared) {
+        let all = nodes(st).await;
+        for (n, r) in &all {
+            let p = r.parent.expect("has a parent");
+            assert!(
+                p == ROOT || p == TRASH || all.contains_key(&p),
+                "{n:?} orphaned: parent {p:?} purged first"
+            );
+        }
+    }
+
+    /// Run rounds one by one until a full cycle purges nothing, checking
+    /// for orphans after each.
+    async fn purge_checked(st: &Shared, cutoff_ms: u64, z: PurgeSizes) -> usize {
+        let mut purged = 0;
+        for _ in 0..200 {
+            let r = purge_trash(st, FS, &TREE, cutoff_ms, z).await.unwrap();
+            assert_no_orphans(st).await;
+            purged += r.purged;
+            if r.purged == 0 && r.from_start && r.wrapped {
+                return purged;
+            }
+        }
+        panic!("purge did not settle");
+    }
+
+    /// A directory with more children than one page is purged only after
+    /// all of them, whatever the page and batch sizes.
+    #[tokio::test]
+    async fn purge_is_safe_for_any_page_and_batch_size() {
+        let old = unix_ms() - HOUR_MS;
+        let cutoff = unix_ms() - 60_000;
+        for z in [
+            PurgeSizes {
+                tops: 100,
+                batch: 100,
+                page: 2,
+            },
+            PurgeSizes {
+                tops: 1,
+                batch: 3,
+                page: 2,
+            },
+            PurgeSizes {
+                tops: 2,
+                batch: 1,
+                page: 5,
+            },
+        ] {
+            let (st, _dir) = state();
+            // D(1) → {E(2) → {30..35}, 20..24}; F(3) → {40}; all in trash.
+            let mut ops = vec![(id(1), ROOT, old), (id(2), id(1), old)];
+            ops.extend((20..25).map(|n| (id(n), id(1), old)));
+            ops.extend((30..36).map(|n| (id(n), id(2), old)));
+            ops.extend([(id(3), ROOT, old), (id(40), id(3), old)]);
+            ops.extend([(id(1), TRASH, old + 1), (id(3), TRASH, old + 1)]);
+            ops.push((id(9), ROOT, old)); // live
+            moves(&st, &ops).await;
+            let n = purge_checked(&st, cutoff, z).await;
+            assert_eq!(n, 15, "{z:?}");
+            let left: Vec<Id> = nodes(&st).await.into_keys().collect();
+            assert_eq!(left, vec![id(9)], "{z:?}");
+            let mut t = st.store.begin(None).await.unwrap();
+            assert!(
+                t.get(&keys::trash_cursor(FS, &TREE))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "cursor cleared at the end"
+            );
+        }
+    }
+
+    /// Subtrees with a recent move don't hold up the ones after them, and
+    /// keep every node (the horizon rule).
+    #[tokio::test]
+    async fn purge_moves_past_recent_subtrees() {
+        let old = unix_ms() - HOUR_MS;
+        let recent = unix_ms();
+        let cutoff = unix_ms() - 60_000;
+        let (st, _dir) = state();
+        let mut ops = Vec::new();
+        for n in 1..=8 {
+            ops.push((id(n), ROOT, old));
+        }
+        ops.push((id(50), id(5), old));
+        ops.push((id(51), id(50), old));
+        for n in 3..=8 {
+            ops.push((id(n), TRASH, old + 1));
+        }
+        moves(&st, &ops).await;
+        // The lowest ids were trashed recently; under 5 a node moved recently.
+        moves(
+            &st,
+            &[
+                (id(1), TRASH, recent),
+                (id(2), TRASH, recent),
+                (id(52), id(51), recent),
+            ],
+        )
+        .await;
+        let z = PurgeSizes {
+            tops: 2,
+            batch: 100,
+            page: 100,
+        };
+        purge_tree(&st, FS, &TREE, cutoff, z).await.unwrap();
+        let left: Vec<Id> = nodes(&st).await.into_keys().collect();
+        assert_eq!(left, vec![id(1), id(2), id(5), id(50), id(51), id(52)]);
+        assert_no_orphans(&st).await;
+        // Once they are old too, the rest goes.
+        purge_tree(&st, FS, &TREE, recent + 1, z).await.unwrap();
+        assert!(nodes(&st).await.is_empty());
+    }
 }

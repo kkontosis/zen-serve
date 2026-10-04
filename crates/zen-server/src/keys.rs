@@ -293,6 +293,12 @@ pub fn changes(fs: u32, tree: &[u8]) -> Key {
     Key::new().str("tv").int(fs.into()).bytes(tree)
 }
 
+/// The tree's trash-purge cursor: `("tq", fs, tree)` → the `TRASH` child
+/// the next purge round starts at.
+pub fn trash_cursor(fs: u32, tree: &[u8]) -> Vec<u8> {
+    Key::new().str("tq").int(fs.into()).bytes(tree).finish()
+}
+
 /// `("tx", fs, tree)`: tombstones.
 pub fn tombstones(fs: u32, tree: &[u8]) -> Key {
     Key::new().str("tx").int(fs.into()).bytes(tree)
