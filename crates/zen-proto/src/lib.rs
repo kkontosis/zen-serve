@@ -179,6 +179,67 @@ pub struct Session {
     pub device_fp: Vec<u8>,
 }
 
+/// Max length of an origin.
+pub const MAX_ORIGIN_LEN: usize = 255;
+
+/// Whether `o` is a serialized origin as browsers send it (spec/auth.md
+/// §5): `http://` or `https://`, a lowercase ASCII host (a name, an IPv4
+/// address or a bracketed IPv6 address), an optional port 1–65535, and
+/// nothing else, not even a trailing slash.
+pub fn valid_origin(o: &str) -> bool {
+    if o.len() > MAX_ORIGIN_LEN {
+        return false;
+    }
+    let Some(rest) = o
+        .strip_prefix("https://")
+        .or_else(|| o.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let Some((h, after)) = v6.split_once(']') else {
+            return false;
+        };
+        if h.is_empty()
+            || !h
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return false;
+        }
+        match after {
+            "" => (h, None),
+            p => match p.strip_prefix(':') {
+                Some(p) => (h, Some(p)),
+                None => return false,
+            },
+        }
+    } else {
+        let (h, p) = match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.';
+        if h.is_empty() || !h.bytes().all(ok) {
+            return false;
+        }
+        (h, p)
+    };
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    match port {
+        None => true,
+        Some(p) => {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && !p.starts_with('0')
+                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+        }
+    }
+}
+
 /// The session-signature message: `lp(challenge) ‖ lp(origin)`
 /// (spec/formats.md §10).
 pub fn session_message(challenge: &[u8], origin: &str) -> Vec<u8> {
@@ -1315,6 +1376,40 @@ pub enum Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origins_are_validated() {
+        for ok in [
+            "https://zen.example.org",
+            "http://127.0.0.1:8080",
+            "https://[::1]:443",
+            "http://localhost",
+            "https://a-b.example:65535",
+        ] {
+            assert!(valid_origin(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "zen.example.org",
+            "ftp://zen.example.org",
+            "https://",
+            "https://zen.example.org/",
+            "https://zen.example.org/app",
+            "https://Zen.example.org",
+            "HTTPS://zen.example.org",
+            "https://user@zen.example.org",
+            "https://zen.example.org:0",
+            "https://zen.example.org:65536",
+            "https://zen.example.org:080",
+            "https://zen.example.org:",
+            "https://zen.example.org?x",
+            "https://[::1",
+            "https://[::1]x",
+            "https://zen example.org",
+        ] {
+            assert!(!valid_origin(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn frames_roundtrip() {

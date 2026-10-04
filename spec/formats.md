@@ -218,6 +218,7 @@ AclDoc = {
   grants:    [Grant],
   limits:    [{fs: u32, max_keys: u64?, max_bytes: u64?}],
   members:   [{devices: [bytes], identity: bytes}],   // device certs (§7.4), public identity (§7.2)
+  origins?:  [text],               // origins the admins vouch for (auth.md §5.3); omitted when empty
   version:   u64,                  // 1, 2, 3, …
   prev_hash: bytes(32),            // H(previous doc bytes), 32 zero bytes for version 1
 }
@@ -226,6 +227,7 @@ Grant = {fs: u32, topic: bytes?, rights: [text], subject: bytes(32)}
 
 * **Grants.** A grant without `topic` is an **fs grant**, with rights in {`read`, `write`}. A grant with `topic` is a **topic grant** covering every topic id with that byte prefix, with rights in {`read`, `append`, `consume`}. An empty `topic` covers all topics of the fs.
 * **Admins.** Being an admin carries the `admin` right: it can change the ACL and fs headers. It grants no data access by itself.
+* **Origins.** `origins` lists server origins (`scheme://host[:port]`, auth.md §5) that the admins sign for. A server uses them only when its `acl_origins` setting is on (auth.md §5.3). The field is **omitted when empty**, so a document without origins has exactly the bytes, and the hash, it had before the field existed. Readers that don't know the field ignore it.
 
 ### 9.2 Signing and hashing
 
@@ -247,6 +249,7 @@ Verifiers hash and verify the **received bytes of `doc`**. They never re-encode 
    * every grant subject is a member, and every right is valid for its grant kind
    * grant topics are 16·n bytes with n ≤ 16
    * every grant and limit `fs` is a configured, non-zero fs_id
+   * `origins` holds at most 16 distinct entries, each a valid origin (auth.md §5): `http` or `https`, a lowercase host, an optional port, and no path or trailing slash
 
 Clients pin the head they've verified, and refuse a chain that doesn't extend it.
 

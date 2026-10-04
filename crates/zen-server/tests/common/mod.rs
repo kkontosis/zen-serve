@@ -71,15 +71,33 @@ pub fn signed_acl(
     grants: Vec<Grant>,
     limits: Vec<FsLimit>,
 ) -> (Vec<u8>, Vec<u8>) {
-    let doc = AclDoc {
+    let doc = acl_doc(version, prev_doc, admins, members, grants, limits);
+    sign_doc(signer, &doc)
+}
+
+/// An unsigned ACL doc.
+pub fn acl_doc(
+    version: u64,
+    prev_doc: Option<&[u8]>,
+    admins: &[&User],
+    members: &[&User],
+    grants: Vec<Grant>,
+    limits: Vec<FsLimit>,
+) -> AclDoc {
+    AclDoc {
         admins: admins.iter().map(|u| ByteBuf::from(u.fp())).collect(),
         grants,
         limits,
         members: members.iter().map(|u| u.member()).collect(),
+        origins: Vec::new(),
         version,
         prev_hash: prev_doc.map_or(vec![0; 32], |d| acl_hash(d).to_vec()),
-    };
-    let doc_bytes = to_cbor(&doc);
+    }
+}
+
+/// Sign an ACL doc. Returns the signed ACL and the doc bytes.
+pub fn sign_doc(signer: &User, doc: &AclDoc) -> (Vec<u8>, Vec<u8>) {
+    let doc_bytes = to_cbor(doc);
     let sig = signer.id.sign(labels::SIG_ACL, &doc_bytes).unwrap();
     let signed = SignedAcl {
         doc: doc_bytes.clone(),
