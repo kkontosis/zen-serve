@@ -355,7 +355,8 @@ fn challenge_ok(st: &Shared, c: &[u8; 32]) -> bool {
 /// Load or create the cluster-wide challenge key.
 pub async fn challenge_key(store: &dyn zen_store::Storage) -> ApiResult<[u8; 32]> {
     let key = keys::meta("challenge_key");
-    let (k, _) = txn_loop!(store, None, |t| {
+    // Idempotent: a retry after an unknown commit result reads the key back.
+    let (k, _) = txn_loop!(store, None, idempotent, |t| {
         Ok(match t.get(&key).await? {
             Some(v) if v.len() == 32 => v.try_into().expect("32"),
             _ => {

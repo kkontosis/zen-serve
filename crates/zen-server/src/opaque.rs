@@ -59,7 +59,8 @@ pub async fn setup(st: &Shared) -> ApiResult<Arc<ServerSetup<Suite>>> {
             .clone());
     }
     let key = keys::opaque_setup();
-    let (bytes, _) = txn_loop!(st.store, None, |t| {
+    // Idempotent: a retry after an unknown commit result reads the setup back.
+    let (bytes, _) = txn_loop!(st.store, None, idempotent, |t| {
         Ok(match t.get(&key).await? {
             Some(v) => v,
             None => {

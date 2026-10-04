@@ -260,7 +260,8 @@ pub async fn params_key(st: &Shared) -> ApiResult<[u8; 32]> {
         return Ok(*UNCLAIMED_KEY.get_or_init(random32));
     }
     let key = keys::params_key();
-    let (k, _) = txn_loop!(st.store, None, |t| {
+    // Idempotent: a retry after an unknown commit result reads the key back.
+    let (k, _) = txn_loop!(st.store, None, idempotent, |t| {
         Ok(match t.get(&key).await? {
             Some(v) if v.len() == 32 => v.try_into().expect("32"),
             _ => {
