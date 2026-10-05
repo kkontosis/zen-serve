@@ -209,9 +209,8 @@ These later-milestone formats are out of scope here:
 * event checkpoints and filesystem tree checkpoints
 * the authenticated (Merkle) integrity tier
 * CRDT objects other than the filesystem (§11)
-* zen-db catalog and row encodings
 
-They'll reuse §4 and §7 and the labels already registered.
+They'll reuse §4 and §7 and the labels already registered. zen-db's catalog, row, index and message encodings are in [zendb.md](zendb.md).
 
 ## 9. Signed ACL and membership log (G1)
 

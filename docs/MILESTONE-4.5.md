@@ -256,3 +256,28 @@ Push after each commit.
 * **Leakage.** There is a leakage section per part.
 * **Respected facts.** Per-fs group names, per-device leases and no WS push are all respected.
 * **Docs build.** Links resolve (`grep` the anchors); the docs have no model names.
+
+## Outcome
+
+Done. Specs: [`spec/zendb.md`](../spec/zendb.md) (part A the database, part B the broker, part C the class) and [`docs/EXAMPLES.md`](EXAMPLES.md). Differences from the plan above:
+
+* **Labels needed a few lines of code.** `tests/labels.rs` checks that spec/labels.md and `zen_core::labels::ALL` list the same labels, so the six new labels are constants in zen-core too (`DB`, `DB_BOUNDARY`, `DB_NODE_ID`, `DB_PARTS_DIGEST`, `BROKER_GROUP`, `SIG_DB_ROOT`). No other code changed.
+* **Keys sit under `("zen", "db", ns)`**, and tables and indexes have random ids, so renames touch only the catalog. The KV element and topic segment `"zen"` are reserved.
+* **Private-index nodes are content-addressed** (a keyed hash of the node). They never change, so only the index root goes into a transaction's read set, and cached nodes never go stale (G9). The price: every writer of one index conflicts on its root, which optional shards relieve.
+* **The server's group names are derived** from the app's name and the topic (`zen/v1/broker-group`). One app name works on many topics, and names never reach the server.
+* **System tables** (`$cursors`, `$sched`, `$sagas`, `$inbox`) hold durable `on` cursors, scheduled messages, saga state and dedup records.
+* **Causation is defined:** the consumed event's `topic_id ‖ offset` (formats.md §5).
+* **Additions:**
+  * spread work queues (`per_key` with one key per message)
+  * `retry: "delay"` through the scheduler
+  * ephemeral replies
+  * scatter-gather requests
+  * message bodies too large for an envelope, stored as parts with a `gc` schedule
+* **No `TD-CONSUME-PROCESS-HOLDER`.** Leases are held per device, but the token makes them exclusive between processes of one device as well (zendb.md §9.1). New tech debt: `TD-BROKER-SERVER-TIMERS`, `TD-CONSUME-COMPETING`, `TD-CONSUME-PUSH`. `TD-LOG-RETENTION` has a note.
+
+Review checklist:
+* Every method maps to M4 client calls and api.md endpoints (zendb.md §16.1). No new server field is used.
+* Commit sizes are budgeted (zendb.md §7.5). Long-mode ranges must fit one response, which `auto` respects.
+* Guarantees and failures are in zendb.md §13, including a crash between the commit and its response, a dead scheduler and a closing owner tab.
+* Leakage is in zendb.md §15. Test vectors and tests for milestone 5 are in §17.
+* zen-core's tests pass with the new labels.

@@ -66,6 +66,8 @@ The same pattern applies to large event bodies (event → chunk refs), freed by 
 * Migrations are client-run, resumable jobs: build the index, then flip it to active in one transaction.
 * Clients check the schema version on open.
 
+**Decided (milestone 4.5):** as proposed. The catalog is `("zen", "db", ns, "cat", …)`, with tables and indexes under random ids; index builds are paged backfills with dual writes; see spec/zendb.md §3, §8.
+
 ---
 
 ## Tier 2: before the matching milestone
@@ -93,6 +95,8 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 **Proposal:**
 1. A subscription is `(cursor)` → the server streams `after cursor` from storage, then switches to live push with no gap. The FoundationDB watch only wakes it; the data always comes from a range read.
 2. Every cached item keeps its version. Cached nodes used by a transaction go into `expect` or the read set, so stale cache causes a retry, never a wrong commit. An optional invalidation feed per filesystem handles freshness.
+
+**Decided:** subscriptions as proposed (milestone 2, api.md §9). For zen-db (milestone 4.5): private-index nodes are content-addressed and immutable, so only the index root goes into the read set; cached rows and catalog records carry their version; change topics serve as the invalidation feed (spec/zendb.md §5.4.3, §7.7).
 
 ### G10. Server-side CRDT inside FoundationDB's limits
 **Gap:**
@@ -150,7 +154,7 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 | # | Gap | Proposal |
 |---|---|---|
 | G15 | **Browser key storage.** ML-DSA / X-Wing aren't in WebCrypto, so private keys sit in WASM memory and can be stolen by XSS. | Wrap them at rest with a non-extractable WebCrypto AES key. Strict CSP + Trusted Types headers on `/unencrypted` by default. Document the XSS risk. |
-| G16 | **Multiple tabs:** duplicate connections, caches and leases. | A SharedWorker (with a Web Locks fallback) owns the connection and cache per origin. |
+| G16 | **Multiple tabs:** duplicate connections, caches and leases. | A SharedWorker (with a Web Locks fallback) owns the connection and cache per origin. **Decided (milestone 4.5):** one owner per database through a Web Lock, a SharedWorker where available, other tabs proxy over `BroadcastChannel` (spec/zendb.md §9). |
 | G17 | **Cross-origin apps** using a zen-serve instance. | Same-origin by default. An explicit CORS allowlist in config. |
 | G18 | **TLS for family self-hosting.** | Built-in ACME (Let's Encrypt) in zen-serve. TLS between FoundationDB nodes on by default when there's more than one node. |
 | G19 | **Logs and metrics leak metadata** (tokens, ids, timing). | Logging policy: no key or topic tokens in logs, only aggregate metrics. Debug logging is opt-in. |
