@@ -245,4 +245,4 @@ The server never sees names (namespaces, tables, columns, topics, paths), keys, 
 4.5. zen-db and the embedded broker client, specs only: one class for CRUD, events and transactions, with app examples and proof-of-concept targets ([`docs/MILESTONE-4.5.md`](MILESTONE-4.5.md)).
 5. zen-db and the broker as specified in [`spec/zendb.md`](../spec/zendb.md), with the app examples of [`docs/EXAMPLES.md`](EXAMPLES.md); zen-fs client (local replica, POSIX-ish API over the CRDT filesystem), Loro adapter.
 6. Authenticated-namespace Merkle tree, `zen-ublk`. (Ephemeral pub/sub shipped in milestone 2–3.)
-7. Later: `fips` suite, ORAM, more server CRDT types (`lww_map`, `or_set`, `counter`).
+7. Later: `fips` suite, ORAM, more server CRDT types (`lww_map`, `or_set`, `counter`; specified for zen-db rows in [`spec/zendb.md`](../spec/zendb.md) §19, `TD-CRDT-ROWS-SERVER`).

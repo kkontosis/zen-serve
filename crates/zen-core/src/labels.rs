@@ -41,6 +41,8 @@ pub const DB: &str = "zen/v1/db";
 pub const DB_BOUNDARY: &str = "zen/v1/db-boundary";
 /// KDF: PRF key for private-index node ids.
 pub const DB_NODE_ID: &str = "zen/v1/db-node-id";
+/// KDF: PRF key for a zen-db CRDT table's field and element tokens.
+pub const DB_CRDT: &str = "zen/v1/db-crdt";
 /// Hash: fingerprint of public key material.
 pub const FINGERPRINT: &str = "zen/v1/fingerprint";
 /// Hash: chain hash of a signed ACL document.
@@ -74,6 +76,8 @@ pub const AAD_FS_META: &str = "zen/v1/aad/fs-meta";
 pub const AAD_FS_MANIFEST: &str = "zen/v1/aad/fs-manifest";
 /// AAD domain: filesystem chunk.
 pub const AAD_FS_CHUNK: &str = "zen/v1/aad/fs-chunk";
+/// AAD domain: zen-db CRDT value (kind 7, reserved).
+pub const AAD_CRDT_VALUE: &str = "zen/v1/aad/crdt-value";
 
 /// Signature domain prefix, prepended to every signed message.
 pub const SIG_DOMAIN: &str = "zen/v1/sig";
@@ -120,6 +124,7 @@ pub const ALL: &[&str] = &[
     DB,
     DB_BOUNDARY,
     DB_NODE_ID,
+    DB_CRDT,
     FINGERPRINT,
     ACL_CHAIN,
     RANGE_HASH,
@@ -135,6 +140,7 @@ pub const ALL: &[&str] = &[
     AAD_FS_META,
     AAD_FS_MANIFEST,
     AAD_FS_CHUNK,
+    AAD_CRDT_VALUE,
     SIG_DOMAIN,
     SIG_DEVICE_CERT,
     SIG_COMMIT,

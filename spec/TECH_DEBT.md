@@ -197,3 +197,10 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** Long-polling gives the same delivery semantics, and the stream's subscription machinery covers only reads.
 * **What it would take:** A `cons` stream operation that leases or claims and pushes deliveries, with the same tokens and gate as `next`; flow control (`max_inflight`); reconnect semantics that never hand out an event twice to live holders; api.md §9 changes and tests next to the `next` ones.
 
+## TD-CRDT-ROWS-SERVER
+
+* **Status:** open
+* **Context:** zen-db CRDT tables (spec/zendb.md §19) need server-merged row objects: last-writer-wins row and field registers, per-device counters and add-wins sets, with the `row`, `lww`, `ctr`, `add` and `rem` operations in `crdt_ops`, the `/v1/crdt/get` and `/v1/crdt/range` reads, and a `"crdt_rows"` feature flag. The server implements only the filesystem's CRDT objects (spec/fs.md).
+* **Why deferred:** Milestone 4.5 is specs only. DESIGN-3 §6 places further server CRDT types (`lww_map`, `or_set`, `counter`) in milestone 7; this entry is where the work is tracked until it is scheduled.
+* **What it would take:** The operations and their merge rules inside the commit transaction, the keyspace of zendb.md §19.5 (moved into keyspace.md), the sweeper purge of deleted objects past the horizon, the reads, api.md §6 and §12-style sections, zen-proto types, and the property test of §19.9 against an in-memory reference, on both backends.
+

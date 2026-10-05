@@ -13,7 +13,7 @@ It sends them as **one** `/v1/commit`, so everything applies or nothing does (ap
 
 The server is unchanged. Everything here is built from api.md §5–9 and §12. What the server lacks is listed in §18 and in TECH_DEBT.md.
 
-Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code.
+Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges; it waits on server work (TD-CRDT-ROWS-SERVER).
 
 ## 1. Conventions
 
@@ -112,7 +112,9 @@ TableRecord = { 1: name: text,
                 4: indexes: [IndexDef],
                 5: changes?: ChangeDef,          // §12.7
                 6: pad: bool,                    // §4.3
-                7: state: "active" | "dropping" }
+                7: state: "active" | "dropping",
+                8?: merge: "txn" | "crdt",       // default "txn"; "crdt": a CRDT table (§19)
+                9?: crdt_fields: {text: "lww" | "counter" | "set"} }   // CRDT tables: field types, default "lww"
 
 IndexDef    = { 1: name: text,
                 2: id: bytes(16),
@@ -716,6 +718,7 @@ Every database has these tables, created with the DbRecord. They don't count as 
 | `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic: [bytes]`, `key?: bytes`, `msg: bytes` (CBOR Msg), `gc?: [[bytes]]` (KV paths to delete) | private on `at` |
 | `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` | – |
 | `$inbox` | `[scope, id]` | `at: int` | – |
+| `$ixrows` | `[table_id, pk]` | `values: {index_id: value}` (the values last indexed) | – (§19.6) |
 
 ## 12. Patterns
 
@@ -978,6 +981,9 @@ const id = await db.schedule(db.topic('mail'), 'nudge', {}, { at: Date.now() + 3
 const checkout = db.saga('checkout', [{ name: 'pay', command: db.topic('pay'), compensate: db.topic('refund'), timeoutMs: 30_000 }, …]);
 await db.transaction(async (tx) => { tx.table(orders).insert(o); checkout.start({ order: o.id }, tx); });
 orders.on((change) => refresh(change.pk));                        // change events
+const cards = db.table<Card>('cards');                            // a CRDT table (§19): merge "crdt"
+await cards.patch(id, { title: 'New title' });                    // per-field last writer wins, works offline
+await cards.incr(id, 'votes', 1); await cards.add(id, 'labels', 'urgent');
 db.publishEphemeral(db.topic('presence'), 'typing', { room });    // not stored
 ```
 
@@ -1048,3 +1054,158 @@ What the server lacks for this layer, deferred (spec/TECH_DEBT.md):
 * **TD-CONSUME-COMPETING:** competing consumers for unkeyed events, without per-key state per message
 * **TD-CONSUME-PUSH:** delivery over the stream instead of long-polling (DESIGN-4 §1.4)
 * **TD-LOG-RETENTION:** events, inboxes, change topics and message parts are never trimmed. Change events and request/reply make this more pressing.
+
+---
+
+# Part D: CRDT tables
+
+## 19. CRDT tables (server-merged)
+
+**Status:** specified; the server side isn't implemented yet (TD-CRDT-ROWS-SERVER). A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
+
+### 19.1 Model
+
+A table with `merge: "crdt"` holds rows that the **server merges** field by field, on ciphertext (DESIGN-4 §2.1–2.2), the way it merges filesystem trees.
+
+* **Writes never conflict.** In long mode they are always accepted.
+* **Offline writes work.** They are queued with their HLCs and sent later, up to the horizon.
+* **Concurrent writes to different fields both survive.**
+
+| Field type | Merge | Typical use |
+|---|---|---|
+| `lww` (default) | last writer wins per field, by `ts = (hlc, device)` | titles, text, status |
+| `counter` | PN-counter: one cumulative value per device; the value is their sum | votes, likes, quantities |
+| `set` | add-wins observed-remove set (OR-set) | labels, members, tags |
+| row existence | last writer wins on an `alive` register | insert, delete |
+
+**What is given up:** cross-field and cross-row invariants. There are no unique indexes, no balance checks, and no reading of one row to decide another. Those need transactional tables. A transaction can still carry CRDT operations atomically with rows of transactional tables, emits and consumes. It just can't make them conditional.
+
+Deletes are by `ts`. A delete with a greater `ts` than an insert hides the row, and field updates don't resurrect it; only a later `row` operation with `alive: true` does.
+
+### 19.2 Tokens and sealing
+
+```
+K_crdt   = KDF("zen/v1/db-crdt", K_db, table_id)
+object   = the stored key of D ‖ ("t", table_id, pk)       (the server's object id; 16 bytes per element)
+field    = PRF16(K_crdt, 0x00 ‖ lp(field_name))
+elem     = PRF16(K_crdt, 0x01 ‖ lp(field_name) ‖ lp(pk element) ‖ lp(CBOR(element)))
+```
+
+* **Element tokens** include the pk, so the same element in two rows has unrelated tokens.
+* **Field tokens** are the same in every row of a table, like columns.
+
+Values are sealed as **kind 7, CRDT value** (formats.md §4):
+* **AAD** label `zen/v1/aad/crdt-value`
+* **context** `u32(fs) ‖ lp(object) ‖ field(16 bytes; zeros for the row register) ‖ elem(16 bytes; zeros if none)`
+* **key** the KV AEAD key of `key_epoch`
+
+Plaintexts:
+
+| Value of | Plaintext (CBOR) |
+|---|---|
+| row register | `{1: pk}`, so scans return keys |
+| `lww` field | `{1: value}` |
+| `counter` entry | `{1: total: int}`: this device's cumulative sum of increments and decrements |
+| `set` element | `{1: element}` |
+
+### 19.3 Operations
+
+New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
+
+```
+{fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}            // insert (alive) or delete
+{fs, op: "lww", object, field: bytes(16), hlc: u64, value?: bytes}              // set; value absent = unset
+{fs, op: "ctr", object, field: bytes(16), seq: u64, value: bytes}              // this device's new total
+{fs, op: "add", object, field: bytes(16), elem: bytes(16), value: bytes}       // gets a dot
+{fs, op: "rem", object, field: bytes(16), elem: bytes(16), dots: [bytes(12)]}  // removes observed dots
+```
+
+* `device` is the session's device fingerprint, set by the server as in fs.md §2.
+* **`row` and `lww`:** keep the value with the greatest `(hlc, device)`.
+  * A second operation with the same `(hlc, device)` on the same register is refused (400).
+  * `clock_skew` and the horizon apply as in fs.md §3.4: an `hlc` too far ahead gets `clock_skew`, and one older than `crdt_horizon_secs` gets `stale_op`.
+* **`ctr`:** for each `(object, field, device)`, keep the operation with the greatest `seq`. A `seq` not greater than the stored one is ignored, so a replay is harmless. A device only ever writes its own entry.
+* **`add`:**
+  * The element gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s. Dots are returned with the commit result, next to fs `dots`.
+  * The element is present while it has at least one dot.
+* **`rem`:** deletes the listed dots of `(object, field, elem)` that still exist. An `add` the remover hadn't seen keeps its dot, so concurrent add and remove resolve as add-wins.
+* **Rights and limits.** Each operation needs fs `write`, and each `value` is at most `max_value_bytes`. Operations count toward the fs quotas like KV writes.
+* **Isolation (G11).**
+  * In long mode the server retries its own conflicts, so CRDT operations never fail with `conflict`.
+  * In short mode the state the server reads conflicts like any read.
+
+### 19.4 Reads
+
+```
+POST /v1/crdt/get   {fs, objects: [bytes], read_version?}                → {read_version, objects: [ObjState]}
+POST /v1/crdt/range {fs, begin: bytes, end?: bytes, limit?, read_version?} → {read_version, objects: [ObjState], more}
+
+ObjState = { object: bytes,
+             row?: {hlc, device, alive, value},
+             lww:  [{field, hlc, device, value}],
+             ctr:  [{field, device, seq, value}],
+             set:  [{field, elem, dot, device, value}],
+             version: bytes(10) }                 // versionstamp of the object's last change
+```
+
+* Both need fs `read`, and `range` pages like `/v1/kv/range`.
+* The client opens every value and builds the merged row:
+  * `lww` fields as stored
+  * counters summed over devices
+  * sets as the elements with at least one dot
+  * the row visible if its register is `alive`
+* **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
+
+### 19.5 Server state (proposal for the implementation)
+
+| Key | Value |
+|---|---|
+| `pack("cr", fs, object)` | row register: `hlc ‖ device ‖ alive ‖ value` |
+| `pack("cw", fs, object, field)` | `lww` register: `hlc ‖ device ‖ value?` |
+| `pack("cn", fs, object, field, device)` | counter entry: `seq ‖ value` |
+| `pack("cs", fs, object, field, elem, dot)` | set element: `device ‖ value` |
+| `pack("cv", fs, object)` | the object's last-change versionstamp |
+| `pack("cd", fs, hlc, object)` | deleted-object index, for the sweeper |
+
+**Garbage collection:**
+* An object whose row register is `alive: false` and older than the horizon is purged with all its entries.
+* So is an object that has no row register and no change within the horizon.
+* An operation that names a purged object and is older than the horizon gets `stale_op`. A newer one starts the object afresh.
+
+### 19.6 Indexes
+
+* **Kinds.** CRDT tables allow `fast`, `private`, `sealed` and `oblivious` indexes, never `unique`.
+* **The indexer.** Writers don't maintain them, since the merged value is known only after the server merges. Instead:
+  * **Change topic.** A CRDT table with indexes must declare `changes` (§12.7). Every commit with operations on a row also appends a change event keyed by the pk; the class adds it.
+  * **Indexer group.** The **indexer** is a `per_key` consumer group `"$index"` on that topic, run by the owner (§9.2) like the scheduler. For each event it does one short transaction with the consume step:
+    1. read the row's merged state
+    2. read its `$ixrows` entry: the values it last indexed
+    3. update every index from the old values to the new ones
+    4. write `$ixrows`
+* **Freshness.** Indexes on CRDT tables are **eventually consistent**: they lag by the indexer's delay, and stop while no instance runs it. Queries always re-check their predicates on the fetched merged rows, so a stale entry never returns a wrong row. A row changed very recently may be missing from a result until it is indexed.
+
+### 19.7 Offline use
+
+* **Queue.** While offline, the class keeps operations and their change events in a local queue: in memory, or encrypted at rest (§9.3). It sends them as long-mode commits when back online.
+* **Clock.** It uses one HLC per session, the M4 tree clock.
+* **Old operations.** An operation older than the horizon gets `stale_op`. The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users.
+
+### 19.8 Leakage
+
+Beyond §15, the server sees, per CRDT row:
+* which fields (by token) exist and change, when, and from which device
+* the `hlc` of every write, which is wall-clock time to the millisecond
+* deletes, through the plaintext `alive` flag
+* for counters, how often each device changes each one (`seq`)
+* for sets, how many elements each field holds and when each is added or removed. Element tokens are per row, so equal elements in different rows aren't linkable.
+
+### 19.9 Test vectors
+
+Added to §17:
+* `K_crdt`, field and element tokens
+* kind-7 sealed values for each field type
+* the encoding of each operation
+* a merged `ObjState` from a fixed set of operations, with its client-side view
+
+Property test: operations from three devices, applied in random orders, give the same merged state.
+
