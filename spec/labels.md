@@ -24,6 +24,9 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/device-sig` | device secret | empty | device identity seed |
 | `zen/v1/device-kem` | device secret | empty | X-Wing decapsulation seed |
 | `zen/v1/password-sig` | Argon2id output of a password (formats.md §7.5) | empty | identity seed of a password-derived key |
+| `zen/v1/db` | NK | `u32(fs_id) ‖ lp(ns)` | root secret of a zen-db database (zendb.md §2.2) |
+| `zen/v1/db-boundary` | K_db | `index_id` (16 B) | PRF key choosing private-index node boundaries and shards (zendb.md §5.4) |
+| `zen/v1/db-node-id` | K_db | `index_id` (16 B) | PRF key of private-index node ids (zendb.md §5.4.2) |
 
 ## Hash labels (`BLAKE3.derive_key(label, data)`)
 
@@ -35,6 +38,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/tree-op-chain` | per-tree chain over filesystem operations (formats.md §11.5) |
 | `zen/v1/passkey-id` | a passkey's credential-store id from its WebAuthn credential id (auth.md §4.1, formats.md §6) |
 | `zen/v1/opaque-keyslot` | the secret of an OPAQUE export-key keyslot from the 64-byte export key (formats.md §6, type 5) |
+| `zen/v1/db-parts-digest` | digest of a zen-db value split into parts: a large row or message body (zendb.md §4.2, §10.3) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 

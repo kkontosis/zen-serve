@@ -33,6 +33,12 @@ pub const DEVICE_SIG: &str = "zen/v1/device-sig";
 pub const DEVICE_KEM: &str = "zen/v1/device-kem";
 /// KDF: hybrid identity seed of a password-derived key from its Argon2id output.
 pub const PASSWORD_SIG: &str = "zen/v1/password-sig";
+/// KDF: root secret of a zen-db database (spec/zendb.md §2.2).
+pub const DB: &str = "zen/v1/db";
+/// KDF: PRF key for private-index node boundaries and shards.
+pub const DB_BOUNDARY: &str = "zen/v1/db-boundary";
+/// KDF: PRF key for private-index node ids.
+pub const DB_NODE_ID: &str = "zen/v1/db-node-id";
 /// Hash: fingerprint of public key material.
 pub const FINGERPRINT: &str = "zen/v1/fingerprint";
 /// Hash: chain hash of a signed ACL document.
@@ -45,6 +51,8 @@ pub const TREE_OP_CHAIN: &str = "zen/v1/tree-op-chain";
 pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
 /// Hash: the secret of an OPAQUE export-key keyslot from the export key.
 pub const OPAQUE_KEYSLOT: &str = "zen/v1/opaque-keyslot";
+/// Hash: digest of a zen-db value split into parts.
+pub const DB_PARTS_DIGEST: &str = "zen/v1/db-parts-digest";
 
 /// OPAQUE: prefix of the AKE context, `label ‖ 0x00 ‖ origin` (sign-in
 /// method 3).
@@ -104,12 +112,16 @@ pub const ALL: &[&str] = &[
     DEVICE_SIG,
     DEVICE_KEM,
     PASSWORD_SIG,
+    DB,
+    DB_BOUNDARY,
+    DB_NODE_ID,
     FINGERPRINT,
     ACL_CHAIN,
     RANGE_HASH,
     TREE_OP_CHAIN,
     PASSKEY_ID,
     OPAQUE_KEYSLOT,
+    DB_PARTS_DIGEST,
     OPAQUE_CONTEXT,
     AAD_KV,
     AAD_EVENT,
