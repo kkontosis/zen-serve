@@ -21,6 +21,8 @@ pub const TOPIC_DATA_CHAIN: &str = "zen/v1/topic-data-chain";
 pub const EVENT_KEY: &str = "zen/v1/event-key";
 /// KDF: per-topic AEAD key for events.
 pub const EVENT_AEAD: &str = "zen/v1/event-aead";
+/// KDF: per-topic PRF key for consumer-group ids of the zen-db broker.
+pub const BROKER_GROUP: &str = "zen/v1/broker-group";
 /// KDF: key-encryption key of a keyslot.
 pub const KEYSLOT_KEK: &str = "zen/v1/keyslot-kek";
 /// KDF: Ed25519 seed from a hybrid signing seed.
@@ -93,6 +95,8 @@ pub const SIG_SESSION: &str = "zen/v1/sig/session";
 pub const SIG_TREE_CHECKPOINT: &str = "zen/v1/sig/tree-checkpoint";
 /// Signature purpose: sign-in challenge signed by a password-derived key.
 pub const SIG_PASSWORD_SESSION: &str = "zen/v1/sig/password-session";
+/// Signature purpose: zen-db signed root (authenticated tier, milestone 6).
+pub const SIG_DB_ROOT: &str = "zen/v1/sig/db-root";
 
 /// Every label, for registry checks.
 pub const ALL: &[&str] = &[
@@ -106,6 +110,7 @@ pub const ALL: &[&str] = &[
     TOPIC_DATA_CHAIN,
     EVENT_KEY,
     EVENT_AEAD,
+    BROKER_GROUP,
     KEYSLOT_KEK,
     SIG_ED25519,
     SIG_ML_DSA_65,
@@ -140,6 +145,7 @@ pub const ALL: &[&str] = &[
     SIG_SESSION,
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
+    SIG_DB_ROOT,
 ];
 
 /// Signature purposes accepted by [`crate::sig`].
@@ -153,4 +159,5 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_SESSION,
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
+    SIG_DB_ROOT,
 ];

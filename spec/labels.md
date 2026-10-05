@@ -18,6 +18,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/topic-data-chain` | topic data key D_{i-1} | `lp(segment)` | next topic data key D_i |
 | `zen/v1/event-key` | topic naming key N_topic | empty | key for event key tokens |
 | `zen/v1/event-aead` | topic data key D_topic | empty | AEAD key for events |
+| `zen/v1/broker-group` | topic naming key N_topic | empty | PRF key turning an app's consumer-group name into the server's group id (zendb.md §11.3) |
 | `zen/v1/keyslot-kek` | slot secret | `slot_id` (16 B) | keyslot key-encryption key |
 | `zen/v1/sig-ed25519` | identity seed | empty | Ed25519 secret seed |
 | `zen/v1/sig-ml-dsa-65` | identity seed | empty | ML-DSA-65 seed ξ |
@@ -73,6 +74,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig/event` | device | a single event (later milestone) |
 | `zen/v1/sig/tree-checkpoint` | device | filesystem tree checkpoint over (state hash, count, chain) (fs.md §9, later milestone) |
 | `zen/v1/sig/password-session` | password-derived key | sign-in challenge (formats.md §7.5, §10) |
+| `zen/v1/sig/db-root` | device | zen-db signed root of the authenticated integrity tier (zendb.md §14, milestone 6) |
 
 Signing with a purpose not in this table is an error.
 

@@ -374,7 +374,7 @@ The function may run several times (retries, `auto`), so **it must have no side 
 | the bound delivery's consume step | `consume` |
 | file chunks and file operations (§7.6) | `chunks`, `crdt_ops` |
 
-The commit's random `commit_id` makes it idempotent (api.md §6.1). M4's `sendCommit` replays it after a network error or `commit_unknown`.
+The commit's random `commit_id` makes it idempotent (api.md §6, step 1). M4's `sendCommit` replays it after a network error or `commit_unknown`.
 
 ### 7.4 What every write transaction reads
 
@@ -477,3 +477,449 @@ In a browser, every tab of one origin is the same device and shares the same cac
 ### 9.3 Local state
 
 A database keeps no plaintext on disk by default. Caches are in memory. A persistent cache, if added, is encrypted at rest with a non-extractable WebCrypto key (DESIGN-2 §4), and milestone 5 decides on it.
+
+---
+
+# Part B: the broker
+
+## 10. Messages
+
+### 10.1 Encoding
+
+A message is an event (formats.md §5) whose `payload` is the CBOR of:
+
+```
+Msg = { 1: type: text,                   // app-defined, e.g. "order.paid"; "zen." prefixes are reserved
+        2: id: bytes(16),                // random, chosen by the sender before commit
+        3?: corr: bytes(16),             // correlation id (§12.3)
+        4?: reply_to: [bytes],           // topic path of the reply inbox (§12.3)
+        5?: deliver_at: u64,             // unix ms, set on scheduled messages (§12.4)
+        6?: saga: bytes(16),             // saga instance (§12.5)
+        7?: step: text,                  // saga step (§12.5)
+        8?: headers: {text: text},       // app metadata
+        9?: body: any,                   // the content, any CBOR value
+        10?: body_ref: BodyRef }         // instead of 9, for large bodies (§10.3)
+```
+
+* **Who sent it.** The event body around it carries the sending device (`sender_fp`) and an HLC (formats.md §5). `sender_fp` is authenticated only as "written by a member": any member holding the topic key can seal any value there (§14).
+* **Optional key.** A message may carry an event key (DESIGN-4 §1.1), given at emit time. Its token orders the message within `per_key` and `partitioned` groups.
+* **Ids.** `id` is the message's identity across redeliveries. A DLQ retry re-appends the same envelope, so it has the same `id` and a new offset (api.md §8.4). Use `id`, not the offset, as the idempotency key of external effects (§12.6).
+
+### 10.2 Causation
+
+An event's id is `topic_id ‖ offset` (16·n + 12 bytes).
+* **Filled automatically.** A transaction bound to a delivery (§11.3) fills the `causation` of every event it appends with the consumed event's id.
+* **Other events** have an empty causation.
+
+So any chain of handled messages can be followed back to its first cause.
+
+### 10.3 Large bodies
+
+* **When it applies.** The CBOR of `body` can make the sealed envelope exceed `max_envelope_bytes`. The body is then:
+  * cut into parts stored at `D ‖ ("m", id, u32(i))` of the sender's database, in the same commit as the append
+  * referenced by `body_ref`:
+
+  ```
+  BodyRef = { 1: ns: text, 2: parts: u32, 3: digest: bytes(32) }    // digest = H("zen/v1/db-parts-digest", CBOR(body))
+  ```
+
+* **Reading.** A reader fetches the parts (it needs fs `read`) and checks the digest.
+* **Deleting.** The parts are not deleted with the event: the log keeps every event (TD-LOG-RETENTION). The sender gives the message a `ttl`, and the scheduler deletes the parts after it (§12.4, kind `gc`). A consumer that reads the parts later finds them gone and treats the message as poisoned.
+
+## 11. Broker primitives
+
+### 11.1 Emit
+
+`emit(topic, type, body, {key?, id?, headers?})` seals a Msg as an event and appends it:
+* **Inside a transaction** it is one entry of the commit's `append` (M4 `Topic.appendIn`). The message exists only if the transaction commits, and only once, even across `commit_id` replays (api.md §6).
+* **Outside a transaction** it is a commit of its own (`/v1/log/append`).
+
+### 11.2 Subscribe: `on`
+
+`on(topic | prefix, handler, opts)` is a stream subscription (api.md §9, M4 `Stream.subscribe`). Every member reads every event; no group is involved. Where it starts:
+
+| `opts` | Starts at | Survives a restart |
+|---|---|---|
+| none | the read version when subscribing: new events only | no |
+| `after: offset` | after the given offset, history first, then live (G9) | if the app stores the offset |
+| `cursor: name` | after the offset stored in the system table `$cursors` (§11.5) under `(device_fp, name)` | yes |
+
+* **Plain handlers.** Without `cursor` the handler gets the message only. The stream resumes after the last offset it delivered across reconnects (M4), so a running process misses nothing and sees nothing twice.
+* **Durable handlers.** With `cursor`, the handler is `handler(msg, tx)`. It runs in a transaction that also reads and advances the cursor row, and skips events at or before it. So the handler's database effects happen **exactly once per device and cursor name**, even across crashes.
+  * Events may be batched: one transaction per batch of up to `batch` events (default 1).
+* **Prefix subscriptions** deliver the events of every topic under a prefix. Events of topics the class can't open, because their path isn't known, arrive unopened (M4).
+
+### 11.3 Consume
+
+`consume({group, topic, mode, partitions?, key?, maxInflight?, maxAttempts?, onPoison?, start?}, handler(msg, tx))` runs a consumer group (api.md §8).
+
+* **Group id.** The server's group name is `PRF16(KDF("zen/v1/broker-group", N_topic, ""), lp(group))`, where `N_topic` is the topic's naming key (formats.md §3.3).
+  * It is unique per topic, so one app name can be used on several topics, although the server scopes group names per fs.
+  * The name itself never reaches the server.
+* **Creation** is idempotent (api.md §8.1). `group_exists` means the parameters changed. Groups are immutable (G8), so the app must create a new group under a new name.
+* **Loop.** For each delivery the class runs one transaction:
+  1. `handler(msg, tx)`
+  2. the consume step of the delivery (M4 `Consumer.ack(d, tx)`)
+  3. `causation` filled in on every emit
+* **Outcomes:**
+
+  | Outcome | Action |
+  |---|---|
+  | commit succeeds | next delivery |
+  | the handler throws | `nack`; after `maxAttempts` the event is dead-lettered (api.md §8.4), or retried forever with `onPoison: "block"` |
+  | `conflict` / `too_old` | the transaction retries: same delivery, handler run again |
+  | 412 `cursor_moved` / `claim_lost` | someone else committed it or took the key: drop the delivery |
+  | 412 `not_leader` | the lease was lost: drop the deliveries, campaign again |
+
+* **Delivery by mode:**
+  * `sequential`, `partitioned` and `single_key` hand out events under a lease: one holder per partition, renewed automatically (M4 `Consumer.deliveries`).
+  * `per_key` hands out keys under 30-second claims (`claim_ttl`), so a handler must commit well within that, or its commit fails with `claim_lost`.
+* **Pull, not push.** Delivery is a long-poll of `/v1/consume/next` (`wait_ms` up to 30 s). The server does not push deliveries over the stream (TD-CONSUME-PUSH).
+* **Other forms.**
+  * `msg.ack()` acknowledges without writes: a commit with only the consume step.
+  * `begin({consumes: msg})` binds a manual transaction to the delivery (§7.2).
+* **Limits:**
+  * at most `max_groups_per_topic` (64) groups per topic
+  * a `per_key` group created at `earliest` on a topic with more than 100,000 events returns 413; create it with `start: "latest"`, or before the topic grows
+
+### 11.4 Ephemeral messages
+
+`publishEphemeral(topic, type, body)` and `onEphemeral(topic, handler)` use `epub`/`esub` (api.md §9) with the M4 sealing: a reserved key token, with HLC replay checks (G21).
+* They are never stored, never part of a transaction, and rate-limited per device (api.md §9.1).
+* They suit presence and typing indicators.
+
+### 11.5 System tables
+
+Every database has these tables, created with the DbRecord. They don't count as app schema, and app table names may not start with `$`.
+
+| Table | pk | Fields | Indexes |
+|---|---|---|---|
+| `$cursors` | `[device, name]` | `topic: [bytes]`, `offset: bytes` | – |
+| `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic: [bytes]`, `key?: bytes`, `msg: bytes` (CBOR Msg), `gc?: [[bytes]]` (KV paths to delete) | private on `at` |
+| `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` | – |
+| `$inbox` | `[scope, id]` | `at: int` | – |
+
+## 12. Patterns
+
+Every pattern below uses only §11, so only api.md §5–9. Each is stated with its commits and its guarantee; the failure cases are in §13.
+
+### 12.1 Publish/subscribe
+
+| Subscriber | Built with | Guarantee |
+|---|---|---|
+| a live view (UI) | `on(topic)` | every event while running, in topic order |
+| a device that must not miss events | `on(topic, {cursor})` | database effects exactly once per device |
+| a service: one handler across devices | `consume({mode: "sequential"})`, one group per service | exactly once per service; at most 64 services per topic |
+
+Publishing is `emit`, usually inside the transaction that made the change (the outbox, §12.6).
+
+### 12.2 Work queues
+
+| Queue | Mode | Parallelism | Order |
+|---|---|---|---|
+| ordered per entity | `per_key`, key = entity | as many workers as ready keys | per key |
+| bounded and parallel | `partitioned(N)`, key = entity or random | N leases | per partition |
+| unordered, spread | `per_key`, key = a fresh random value per message (`spread: true`) | as many workers as messages | none |
+| one at a time | `sequential` | 1 | total |
+
+* **Spread queues.** A spread queue is the server's `per_key` mode used with one key per message. Every message becomes its own ready key, so any worker on any device takes the next one.
+  * Its cost is per-key bookkeeping that the server never deletes (`kc` entries, keyspace.md §3.3).
+  * A queue with high traffic should use `partitioned(N)` instead.
+  * Native competing consumers are TD-CONSUME-COMPETING.
+* **Retries.** The default is `retry: "nack"`: immediate redelivery and order kept, then the DLQ.
+  * `retry: "delay"` instead acknowledges the message and, in the same transaction, schedules (§12.4) a copy for `now + backoff(attempt)` with header `zen.attempt` incremented. That gives backoff, but loses the order within the key.
+  * After `maxAttempts` the copy goes to the dead letters of the class: a scheduled `emit` to `<topic>/zen.dlq`.
+
+### 12.3 Request/reply
+
+* **Inbox.** Each app instance (each owner, §9.2) has an inbox topic `("zen", "inbox", instance)`. The class subscribes to it with `on`, from now, on first use.
+* **Requester:** `request(topic, type, body, {timeoutMs, key?})` emits `Msg {type, id, corr: random, reply_to: inbox path, body}`. Inside a transaction it is sent when the transaction commits. The requester then waits for a message on its inbox with the same `corr`:
+  * a timeout fails the request with `timeout`
+  * late replies are dropped
+* **Responder:** `serve({group, topic, mode}, handler(msg, tx) → reply)` is a `consume` whose handler returns the reply body. The class emits `Msg {type: msg.type + ".reply", corr: msg.corr, body: reply}` to `reply_to` **in the same transaction** that consumes the request. So the request's database effects and the reply happen together, exactly once.
+  * A handler that throws `ReplyError` sends an error reply (`type ".error"`) and consumes the request.
+  * Any other throw goes through `nack`.
+* **Repeated requests.** A requester that retries after a timeout sends the request again with the same `corr`. A responder with `dedup: true` records `($inbox, scope = group, id = corr)` in the handling transaction and replies again without re-running the handler.
+* **Ephemeral replies.** `reply: "ephemeral"` sends the reply with `epub` after the commit, not as an event.
+  * It costs no log space, but may be lost, and is rate-limited.
+  * It suits cheap queries such as "who is online".
+* **Scatter-gather.** A request to a topic that several `on` subscribers answer collects every reply until the timeout.
+* **Grants (formats.md §9.1):**
+  * the requester needs `append` on the request topic and `read` on its inbox
+  * the responder needs `consume` on the request topic and `append` on the inbox
+  
+  A grant on the prefix `("zen", "inbox")` gives members both. Inboxes are not secret from other members of the fs: every member can derive every topic key of the fs (formats.md §3.3).
+* **Storage.** Inbox topics are kept forever like every topic (TD-LOG-RETENTION).
+
+### 12.4 Delayed messages
+
+The server has no timers (TD-BROKER-SERVER-TIMERS). A **scheduler leader** inside the app delivers them.
+
+* **`schedule(topic, type, body, {at | delayMs, key?})`**, inside a transaction or alone:
+  * inserts a `$sched` row with a random `id`, `at` (unix ms, by the sender's clock), `kind: "emit"` and the encoded Msg (with `deliver_at = at`)
+  * returns `id`
+  
+  The row appears only if the transaction commits.
+* **`cancel(id)`** deletes the row in a transaction. It returns false if the message was already delivered.
+* **The leader.** Any instance may run it (`scheduler.start()`, on by default in the owner, §9.2).
+  * **Election.** It campaigns for the lease of a `sequential` group `"sched"` on the topic `("zen", "db", ns, "sched")` (M4 `Leader`).
+  * **Loop.** While leading, it repeats:
+    1. A short transaction reads the `$sched` index for rows with `at ≤ now`, up to 100 of them.
+    2. For each row, `kind: "emit"` appends the stored Msg to its topic (with its key), and `kind: "gc"` deletes the listed KV paths.
+    3. It deletes the rows.
+    4. It commits.
+    5. It sleeps until the earliest remaining `at`, at most `poll_ms` (default 1,000), and re-reads the index's RootRecord to see new rows.
+  * **Clock.** `now` is the leader's clock corrected by the server's `time_ms` (api.md §2), as the M4 tree clock does.
+* **Exactly once.** Each row is emitted at most once: the transaction that emits it also deletes it. Two schedulers (a deposed leader, a racing one) conflict on the rows, and one of them retries with the rows gone. The lease only saves duplicate work: correctness doesn't depend on it, as in DESIGN-3 §3.2.
+* **Timing.**
+  * A message is delivered no earlier than `at` by the leader's clock.
+  * It is usually late by up to `poll_ms`, plus a lease takeover (≈ `ttl_ms` 10 s) when a leader dies.
+  * With no instance running a scheduler, messages wait.
+* **Sender.** The delivered event's `sender_fp` is the scheduler's device, not the original sender's.
+
+### 12.5 Sagas
+
+A saga is a series of local transactions in different services, each with a compensation, coordinated by an **orchestrator** in the app.
+
+```
+saga(name, steps: [{name, command: topic, compensate?: topic, timeoutMs?}])
+```
+
+* **State.** One `$sagas` row per instance: `step`, `status` (`running`, `compensating`, `done`, `failed`, `stuck`), app `data`, completed steps, the pending timeout's `$sched` id.
+* **Start:** `start(data)`, usually inside the transaction that created the business object:
+  1. insert the row
+  2. emit step 0's command, `Msg {type: name + "." + step, saga: id, step, reply_to: ("zen", "saga", ns, name), body: data}`
+  3. schedule a timeout to the same reply topic
+* **Participants** are ordinary responders (§12.3). Each one handles the command in its own transaction and replies `ok` or `fail` (with data) in that transaction.
+* **The orchestrator** consumes `("zen", "saga", ns, name)` with `per_key`, keyed by the saga id. So each instance's events are handled one at a time, and different instances in parallel. Each reply or timeout is one transaction:
+  1. Read the saga row. A reply for another step than the current one is stale: acknowledge it and stop.
+  2. On `ok`:
+     * record the step
+     * cancel its timeout
+     * either emit the next command and schedule its timeout, or set `done`
+  3. On `fail` or timeout: set `compensating`, then emit the compensations of the completed steps, one at a time in reverse order, each answered like a command.
+     * When all are done: `failed`.
+     * A compensation that ends in the DLQ leaves the saga `stuck`, for an operator.
+  4. Acknowledge (the consume step).
+* **Guarantee.** Every saga transition happens exactly once: the row update, the next command and the consume step are one commit. A participant's database work is exactly once, too. Its external calls are at least once, with the command's `id` as idempotency key (§12.6).
+* **Compensations** must be idempotent and retriable.
+
+### 12.6 Outbox, inbox and external effects
+
+* **Outbox.** `emit` inside the transaction that changes the rows (§11.1). There is no relay process and no dual write.
+* **Inbox.**
+  * Within one group, each event is committed once (the consume step, api.md §8.3).
+  * Messages may legitimately arrive again: a DLQ retry, a requester's retry, a producer re-emitting the same `id`. A consumer with `dedup: true` records `($inbox, scope, msg.id)` in its transaction and skips ids it has seen. The scheduler drops dedup rows after `dedup_ttl` (default 7 days) through `gc` jobs.
+* **External effects** (email, payments) can't be exactly once (DESIGN-3 §3.3). The handler emits a command to an effects topic in its transaction. An effects worker then:
+  1. calls the outside service with the idempotency key `msg.id`
+  2. acknowledges
+  
+  A crash between the two repeats the call with the same key: at least once.
+* **After commit.** `tx.after(fn)` runs `fn` after a successful commit. It may never run, if the process dies first, so it is for UI updates only.
+
+### 12.7 Change events
+
+* **Declaration.** A table with a `changes` definition (§3.2) appends a change message in every transaction that writes it:
+
+  ```
+  Msg {type: "zen.change", id, body: {op: "put" | "delete", table: name, pk, row?: fields}}
+  ```
+
+  * **Topic:** the definition's `topic`, by default `("zen", "db", ns, "changes", table)`.
+  * **Key:** the pk element, so `per_key` consumers see each row's changes in order.
+  * **Row:** with `image: "full"` the new fields are included when they fit one envelope, and left out otherwise. The consumer reads the row.
+* **One event per row per transaction:** for a row written twice, the final state.
+* **Uses:**
+  * live views (`table.on(handler)`, an `on` of the change topic)
+  * cache freshness (§7.7)
+  * projections and read models, through a `per_key` or `sequential` group
+* **Cost:** one event per changed row, kept forever (TD-LOG-RETENTION).
+
+## 13. Guarantees and failures
+
+### 13.1 Guarantees
+
+| What | Guarantee |
+|---|---|
+| rows, index entries, emits, schedules, file ops of one transaction | atomic: all or nothing, once (`commit_id`) |
+| database effects of a consumer handler | exactly once per group (consume step in the same commit) |
+| database effects of an `on` handler with `cursor` | exactly once per device and cursor name |
+| `on` without `cursor` | every event while the process runs, in order; none across a restart |
+| emitted message | exists if and only if its transaction committed |
+| scheduled message | emitted exactly once, no earlier than `at` |
+| saga transition | exactly once |
+| external effect | at least once, idempotency key = message `id` |
+| order | per topic for `on`; per group mode for consumers (DESIGN-4 §1.2); across topics, by offset (versionstamps are global) |
+
+### 13.2 Failures
+
+The cases of DESIGN-3 §3.2, plus the ones a client library adds:
+
+| Situation | Outcome |
+|---|---|
+| a handler stalls or its process dies before commit | nothing was written; the lease or claim expires; another holder gets the same event |
+| a deposed leader commits late | 412 `not_leader` or `claim_lost`: none of its writes, emits or schedules land |
+| two consumers race without a lease | the cursor check lets one commit; the other gets `cursor_moved` and drops the delivery |
+| network partition | only clients that reach the server commit; the server's storage decides |
+| crash after the commit, before the response | on restart the cursor has moved: no redelivery. In-process, `sendCommit` replays the `commit_id` and gets the original result |
+| a handler always throws | `nack` up to `maxAttempts`, then the DLQ (or `block`) |
+| a request's responder never answers | the requester times out; it may retry with the same `corr` (dedup, §12.3) |
+| the scheduler leader dies mid-batch | its transaction never committed; the next leader emits the same rows |
+| the owner tab closes | another tab takes the Web Lock and resumes from its cursors (§9.2) |
+| an `auto` transaction's reads grow too large for long mode | `too_large`; the app splits the work |
+
+---
+
+# Common sections
+
+## 14. Integrity
+
+* **Basic, the only level now.**
+  * Every value is AEAD-sealed and bound to its key: no forgery, no swapping between keys.
+  * The server **can** serve an older valid version of a value, or an older RootRecord together with the nodes of that older tree. It can also withhold events (G26).
+  * A member can forge another member's `sender_fp`, since all members hold the topic keys (DESIGN-2 §2.6).
+* **Reserved for milestone 6 (the authenticated tier):**
+  * the DbRecord value `integrity: "authenticated"`
+  * the signature purpose `zen/v1/sig/db-root` (spec/labels.md), for a signed root over each index root, a row tree and the catalog
+  * Private-index node ids are already keyed hashes of their content, so a signed root id commits to a whole index. Milestone 6 reuses this.
+* **Event signatures** stay as DESIGN-2 §2.6 and DESIGN-3 §0 describe them, for a later milestone.
+
+## 15. Leakage
+
+The server never sees database, table, field or index names, values, keys, message types or bodies. It does see:
+
+**Database**
+* that the keys under one PRF prefix (the `"zen"` element) belong to zen-db, and how many databases, tables and indexes exist
+* the number of rows per table, and their sizes unless padded (§4.3); parts betray large rows
+* which rows are read and written, when, and together in which transactions
+* **unique:** one key per row; a value's token reappears if the value is reused
+* **fast:** how many rows share each value, and when that changes
+* **private:**
+  * node count and tree height, so roughly the number of rows
+  * per write, which nodes are replaced. Writes that replace the same leaves have nearby values: over time the server learns **coarse order clusters** (about `fanout` neighbouring values)
+  * per query, which nodes are read: the result's size and roughly its position
+* catalog and migration activity
+* **a revoked member who kept NK** can compute key tokens, boundaries and node ids. So they can test guesses about names, values and node contents against what they still see. Rotation doesn't change NK (G2); renaming the keys needs the explicit migration of G2.
+
+**Broker**
+* the topic tree's shape; topics under one prefix share a token prefix, so all inboxes, sagas and change topics group together
+* event counts, sizes and timing per topic; key tokens link the events of one entity within a topic
+* group ids (opaque), modes, lease holders (device fingerprints), lags and DLQ sizes
+* **request and reply:** a request on one topic followed quickly by an append on an inbox links requester and responder, and the inbox count reveals the number of instances
+* **schedules:** the scheduler's emits happen near `at`, so delivery times are visible after the fact
+* **change events:** they are appended in the same commit as their row writes, which links each row's KV token to its event key token
+* ephemeral messages: their timing and size (api.md §9)
+
+---
+
+# Part C: the class (informative)
+
+## 16. API sketch
+
+```ts
+const db = await zen.db(fs, 'shop', {
+  schema: 2,
+  migrations: {
+    1: async (m) => {
+      await m.createTable('orders', { pk: ['id'], changes: { image: 'keys' } });
+      await m.createIndex('orders', 'by_status', { fields: [['status', 'text'], ['created', 'int', 'desc']] });
+    },
+    2: async (m) => m.createIndex('orders', 'by_email', { fields: [['email', 'text']], unique: true, kind: 'none' }),
+  },
+});
+const orders = db.table<Order>('orders');
+
+// CRUD (each one transaction)
+await orders.insert(o); await orders.put(o); await orders.get(id);
+await orders.update(id, (o) => ({ ...o, status: 'paid' })); await orders.delete(id);
+const { rows, cursor } = await orders.query().where('status', '=', 'open').orderBy('created', 'desc').limit(20).page();
+
+// one transaction: rows + messages + schedule + files, one commit
+await db.transaction(async (tx) => {
+  const o = await tx.table(orders).get(id);
+  tx.table(orders).put({ ...o, status: 'paid' });
+  tx.emit(db.topic('billing'), 'order.paid', { id }, { key: o.customer });
+  tx.schedule(db.topic('mail'), 'order.reminder', { id }, { delayMs: 86_400_000 });
+  await tx.fs(tree).write(node, manifest, { replaces });    // milestone 5
+}, { mode: 'auto' });
+
+// broker
+db.emit(db.topic('audit'), 'login', { who });
+const sub = db.on(db.topic('chat', room), (msg) => render(msg), { after: lastOffset });
+db.on(db.topic('billing'), async (msg, tx) => { /* exactly once per device */ }, { cursor: 'billing-view' });
+db.consume({ group: 'invoicer', topic: db.topic('billing'), mode: 'per_key' }, async (msg, tx) => {
+  tx.table(invoices).insert({ id: msg.body.id, … });
+  tx.emit(db.topic('mail'), 'invoice.ready', { id: msg.body.id });
+});
+const reply = await db.request(db.topic('stock'), 'reserve', { sku, n }, { timeoutMs: 5000 });
+db.serve({ group: 'stock', topic: db.topic('stock'), mode: 'per_key' }, async (msg, tx) => ({ ok: true }));
+const id = await db.schedule(db.topic('mail'), 'nudge', {}, { at: Date.now() + 3600_000 }); await db.cancel(id);
+const checkout = db.saga('checkout', [{ name: 'pay', command: db.topic('pay'), compensate: db.topic('refund'), timeoutMs: 30_000 }, …]);
+await db.transaction(async (tx) => { tx.table(orders).insert(o); checkout.start({ order: o.id }, tx); });
+orders.on((change) => refresh(change.pk));                        // change events
+db.publishEphemeral(db.topic('presence'), 'typing', { room });    // not stored
+```
+
+### 16.1 Methods and what they use
+
+| Method | M4 client (packages/client) | api.md |
+|---|---|---|
+| `zen.db(fs, ns, opts)` | `UnlockedFs.kv`, `transaction` | `kv/get`, `commit` |
+| `table.get`, `query` | `Kv.getEntries`, `Kv.rangeStored` | §5 `kv/get`, `kv/range` |
+| `table.insert/put/update/delete` | `Transaction.get/set/delete` | §6 `writes`, `read_conflicts` / `expect` |
+| `db.transaction(fn, {mode})` | `transaction()` | §6 |
+| `db.begin({mode, consumes})` | `Transaction`, `sendCommit` | §6 |
+| `emit` | `Topic.appendIn(tx)`, `Topic.append` | §6 `append`, §7.1 |
+| `on` | `Stream.subscribe` | §9 `sub` |
+| `consume`, `serve`, `msg.ack` | `Topic.group` → `Consumer.deliveries/next/ack(d, tx)/nack/dlq` | §8.1–8.5, §6 `consume` |
+| `request` | `Stream.subscribe` (inbox), `Topic.appendIn` | §9, §6 |
+| `schedule`, `cancel` | `Transaction` (rows of `$sched`) | §6 |
+| scheduler, migrations' optional leader | `Topic.leader` → `Leader.campaign/renew` | §8.2 |
+| `saga` | `consume` + rows + `schedule` | as above |
+| `tx.fs(tree)` | `Tree` operations into `Transaction.extra` (new in milestone 5) | §6 `chunks`, `crdt_ops`; fs.md |
+| `publishEphemeral`, `onEphemeral` | `Stream.publish`, `Stream.subscribeEphemeral` | §9 `epub`, `esub` |
+
+### 16.2 One commit, everything in it
+
+The transaction below handles a `card.attach` command: it moves a kanban card, attaches a file whose chunks were uploaded before, emits a notification, and consumes the command. Its commit:
+
+```
+{ commit_id,
+  read_version,
+  read_conflicts: [ TableRecord("cards"), Row(card), RootRecord(by_column) ],
+  writes:   [ Row(card)',                                   // new column, attachment ref
+              Node…', RootRecord(by_column)', Node… = null ],   // private index path rewritten
+  append:   [ {topic: id("zen","db","kanban","changes","cards"), key_token, envelope},   // change event
+              {topic: id("board", b), envelope} ],          // notification for live boards
+  consume:  [ {group: G("attach"), key_token, from, to, token} ],   // the command, per_key
+  crdt_ops: [ {op: "write", tree, node: attachment, replaces: [], chunks: [c1, c2], manifest} ] }
+```
+
+If any part fails (a stale claim, a conflict on the card or the index, a `stale_op`), nothing applies. The command is redelivered, or the transaction retries.
+
+## 17. Test vectors and tests (milestone 5)
+
+Generated by zen-core's `gen_vectors` into `spec/test-vectors/zendb.json`, checked byte-exactly in CI:
+* `K_db`, `K_boundary` and `K_node` for fixed inputs; the group id of §11.3
+* Row encodings, a row split into parts with its digest, padding buckets
+* the sort keys of §5.1: every type, `desc`, escaping, composite keys with a pk
+* a canonical prolly tree for a fixed entry set with `fanout` 4: every node's bytes and id, the RootRecord; the same after inserting and deleting entries; shard selection
+* Msg encodings, BodyRef, an event id for causation
+
+Tests (G23):
+* **properties:**
+  * random insert and delete orders give the same root (history independence)
+  * query results equal a naive in-memory model
+  * concurrent writers never lose an index entry
+* **every pattern of §12 against a spawned server**, with fault injection:
+  * killed handlers, deposed leaders, dropped connections
+  * replayed commits, a scheduler failover
+* **the five targets of docs/EXAMPLES.md**, end to end
+
+## 18. Gaps
+
+What the server lacks for this layer, deferred (spec/TECH_DEBT.md):
+* **TD-BROKER-SERVER-TIMERS:** delayed delivery without a polling leader
+* **TD-CONSUME-COMPETING:** competing consumers for unkeyed events, without per-key state per message
+* **TD-CONSUME-PUSH:** delivery over the stream instead of long-polling (DESIGN-4 §1.4)
+* **TD-LOG-RETENTION:** events, inboxes, change topics and message parts are never trimmed. Change events and request/reply make this more pressing.
