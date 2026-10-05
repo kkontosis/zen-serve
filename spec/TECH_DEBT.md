@@ -138,6 +138,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Status:** open
 * **Context:** Event-log appends (`log`, `lk`, `gl`, `lp` keys) are never deleted. A busy topic grows without bound; nothing in zen-serve frees it (docs/STATS.md §2–3).
 * **Why deferred:** Retention interacts with consumer cursors (a group behind the retention point must not lose events silently), per-key ready lists, DLQs and the partition index, so it needs its own design.
+* **Note (milestone 4.5):** zen-db's change events, request/reply inboxes and message-body parts (spec/zendb.md §10.3, §12) add to the log and make this more pressing.
 * **What it would take:** Per-topic retention (age or size) in the group-aware sense: trimming only below the slowest group's cursor unless forced, a `retained_from` offset per topic that readers below it get a clear error for, the sweeper trimming `log`/`lk`/`gl`/`lp` and quota counters together, an admin trim command, and tests with lagging consumers.
 
 ## TD-FS-LARGE-FILES
@@ -174,3 +175,25 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** `zen-mount` (packages/fuse) has no local replica: it lists directories from the server (cached until the change feed reports a change), reads file contents by chunk range, and writes a whole new version when a file is closed or synced. It is not POSIX-complete: no hard links, symlinks or xattrs; `mmap` isn't coherent across devices; there is no offline use and no persistent chunk cache (`--cache-dir` is reserved).
 * **Why deferred:** The local replica and the POSIX layer over it are the zen-fs client of milestone 5; milestone 4 needed a working mount on the operations API.
 * **What it would take:** The milestone-5 replica (node table and chunk store on disk, synced through the change feed), then `zen-mount` on top of it, with symlinks (the `symlink` node type exists), xattrs in the sealed meta, and writes of changed chunks only.
+
+## TD-BROKER-SERVER-TIMERS
+
+* **Status:** open
+* **Context:** The server has no timers or scheduled delivery. zen-db's delayed messages (spec/zendb.md §12.4) are rows in a `$sched` table that a scheduler leader inside an app polls and emits, so a message waits while no instance runs a scheduler, and is late by the poll interval plus any leader takeover.
+* **Why deferred:** Milestone 4.5 builds the broker from the existing primitives only; the polling leader is correct (exactly once, never early) and enough for family-sized apps.
+* **What it would take:** A `deliver_at` on appends (or a per-fs delay index) that the server makes visible to readers and groups only once due, driven by the commit-version clock (DESIGN-3 §3.1) so no wall clock is trusted; wake-ups through the existing watches; api.md and keyspace.md changes; tests across nodes and a failover. The zen-db scheduler would then become a thin wrapper.
+
+## TD-CONSUME-COMPETING
+
+* **Status:** open
+* **Context:** Unkeyed events can be spread over any number of workers only by giving each message its own key in a `per_key` group (spec/zendb.md §12.2). Every such key leaves a `kc` entry (keyspace.md §3.3) that is never deleted, so a busy queue grows server state per message. `partitioned(N)` avoids that but caps parallelism at N.
+* **Why deferred:** DESIGN-2 §2.4 deferred competing consumers; the per-key workaround and partitions cover family-scale queues.
+* **What it would take:** Either a `shared` group mode (claims on individual events, a low watermark, no per-key cursor), or garbage collection of `kc` entries whose key has no pending events and whose claim token is no longer needed for fencing; api.md §8 and keyspace.md changes; tests with many workers and lost claims.
+
+## TD-CONSUME-PUSH
+
+* **Status:** open
+* **Context:** DESIGN-4 §1.4 sketched `WS /v1/stream {consume: group}`, with the server pushing ready events and claim tokens. It was not built: consumers long-poll `/v1/consume/next` (`wait_ms` up to 30 s, api.md §8.3), so each idle consumer holds an HTTP request open.
+* **Why deferred:** Long-polling gives the same delivery semantics, and the stream's subscription machinery covers only reads.
+* **What it would take:** A `cons` stream operation that leases or claims and pushes deliveries, with the same tokens and gate as `next`; flow control (`max_inflight`); reconnect semantics that never hand out an event twice to live holders; api.md §9 changes and tests next to the `next` ones.
+

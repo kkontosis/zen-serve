@@ -21,6 +21,8 @@ pub const TOPIC_DATA_CHAIN: &str = "zen/v1/topic-data-chain";
 pub const EVENT_KEY: &str = "zen/v1/event-key";
 /// KDF: per-topic AEAD key for events.
 pub const EVENT_AEAD: &str = "zen/v1/event-aead";
+/// KDF: per-topic PRF key for consumer-group ids of the zen-db broker.
+pub const BROKER_GROUP: &str = "zen/v1/broker-group";
 /// KDF: key-encryption key of a keyslot.
 pub const KEYSLOT_KEK: &str = "zen/v1/keyslot-kek";
 /// KDF: Ed25519 seed from a hybrid signing seed.
@@ -33,6 +35,12 @@ pub const DEVICE_SIG: &str = "zen/v1/device-sig";
 pub const DEVICE_KEM: &str = "zen/v1/device-kem";
 /// KDF: hybrid identity seed of a password-derived key from its Argon2id output.
 pub const PASSWORD_SIG: &str = "zen/v1/password-sig";
+/// KDF: root secret of a zen-db database (spec/zendb.md §2.2).
+pub const DB: &str = "zen/v1/db";
+/// KDF: PRF key for private-index node boundaries and shards.
+pub const DB_BOUNDARY: &str = "zen/v1/db-boundary";
+/// KDF: PRF key for private-index node ids.
+pub const DB_NODE_ID: &str = "zen/v1/db-node-id";
 /// Hash: fingerprint of public key material.
 pub const FINGERPRINT: &str = "zen/v1/fingerprint";
 /// Hash: chain hash of a signed ACL document.
@@ -45,6 +53,8 @@ pub const TREE_OP_CHAIN: &str = "zen/v1/tree-op-chain";
 pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
 /// Hash: the secret of an OPAQUE export-key keyslot from the export key.
 pub const OPAQUE_KEYSLOT: &str = "zen/v1/opaque-keyslot";
+/// Hash: digest of a zen-db value split into parts.
+pub const DB_PARTS_DIGEST: &str = "zen/v1/db-parts-digest";
 
 /// OPAQUE: prefix of the AKE context, `label ‖ 0x00 ‖ origin` (sign-in
 /// method 3).
@@ -85,6 +95,8 @@ pub const SIG_SESSION: &str = "zen/v1/sig/session";
 pub const SIG_TREE_CHECKPOINT: &str = "zen/v1/sig/tree-checkpoint";
 /// Signature purpose: sign-in challenge signed by a password-derived key.
 pub const SIG_PASSWORD_SESSION: &str = "zen/v1/sig/password-session";
+/// Signature purpose: zen-db signed root (authenticated tier, milestone 6).
+pub const SIG_DB_ROOT: &str = "zen/v1/sig/db-root";
 
 /// Every label, for registry checks.
 pub const ALL: &[&str] = &[
@@ -98,18 +110,23 @@ pub const ALL: &[&str] = &[
     TOPIC_DATA_CHAIN,
     EVENT_KEY,
     EVENT_AEAD,
+    BROKER_GROUP,
     KEYSLOT_KEK,
     SIG_ED25519,
     SIG_ML_DSA_65,
     DEVICE_SIG,
     DEVICE_KEM,
     PASSWORD_SIG,
+    DB,
+    DB_BOUNDARY,
+    DB_NODE_ID,
     FINGERPRINT,
     ACL_CHAIN,
     RANGE_HASH,
     TREE_OP_CHAIN,
     PASSKEY_ID,
     OPAQUE_KEYSLOT,
+    DB_PARTS_DIGEST,
     OPAQUE_CONTEXT,
     AAD_KV,
     AAD_EVENT,
@@ -128,6 +145,7 @@ pub const ALL: &[&str] = &[
     SIG_SESSION,
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
+    SIG_DB_ROOT,
 ];
 
 /// Signature purposes accepted by [`crate::sig`].
@@ -141,4 +159,5 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_SESSION,
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
+    SIG_DB_ROOT,
 ];

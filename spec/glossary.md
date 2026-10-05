@@ -31,5 +31,10 @@
 | **version** | One content value of a file node: chunk ids plus a sealed manifest. Concurrent writes leave several versions, called **siblings**. |
 | **dot** | A version's 12-byte id, `versionstamp ‖ u16(i)`, assigned by the server. |
 | **chunk** | An immutable sealed piece of file content (64 KiB of plaintext), with a random 16-byte id. |
+| **database** | A zen-db database: `(fs, ns)`, its rows, indexes and catalog under the KV path `("zen", "db", ns)` (zendb.md §2). |
+| **catalog** | A database's encrypted schema records: tables, indexes, schema version, migration log (zendb.md §3, G6). |
+| **private index** | A zen-db index stored as a prolly tree of sealed, content-addressed nodes; supports order and ranges (zendb.md §5.4). |
+| **message** | A broker event whose payload is a typed `Msg` with an id, optional correlation and saga fields (zendb.md §10). |
+| **saga** | A series of local transactions in different services, coordinated by an orchestrator, with compensations on failure (zendb.md §12.5). |
 | **horizon** | How far back (default 7 days) a late operation may reach. Older ones are refused with `stale_op` and **rebased**: reissued with a fresh HLC. |
 

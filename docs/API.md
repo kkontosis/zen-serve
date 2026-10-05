@@ -71,6 +71,8 @@ This replaces the per-device `device_seq` gap rule from DESIGN-2 §2.3, so concu
 
 ## 2. Client library: `@zen/client` (TypeScript over the WASM core)
 
+> **Superseded by [`spec/zendb.md`](../spec/zendb.md) for zen-db and events** (milestone 4.5): the class is `Db` from `zen.db(fs, ns)`, `db.transact` is `db.transaction`, `tx.publish` / `topic.publish` are `tx.emit` / `db.emit`, `topic.subscribe` is `db.on`, and `zen.consumer(…).run` is `db.consume`. The sketch below is kept as history.
+
 ```ts
 // connect & unlock
 const zen = await Zen.connect("https://family.example", { device });   // device key in IndexedDB / file
