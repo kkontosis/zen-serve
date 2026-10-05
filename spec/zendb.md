@@ -48,6 +48,9 @@ A **database** is `(fs, ns)`, where `ns` is a text name chosen by the app. An fs
 | `D ‖ ("f", index_id, value, pk)` | `{1: pk}` | fast-index entry (§5.3) |
 | `D ‖ ("r", index_id, u32(shard))` | RootRecord (§5.4) | root of a private index tree |
 | `D ‖ ("n", index_id, node_id)` | Node (§5.4) | node of a private index tree |
+| `D ‖ ("s", index_id)`, `D ‖ ("s", index_id, u32(i))` | SealedHead, raw bytes | a sealed index: its head and parts (§5.7) |
+| `D ‖ ("p", index_id)`, `D ‖ ("p", index_id, u32(i))` | OHead, stash slots | an oblivious index: its head and stash (§5.8) |
+| `D ‖ ("q", index_id, u32(bucket))` | Z slots | an oblivious index: one ORAM bucket (§5.8) |
 | `D ‖ ("m", msg_id, u32(i))` | raw bytes | part `i` of a large message body (§10.3) |
 
 * `table_id` and `index_id` are random 16-byte ids, assigned when the table or index is created. So renaming a table touches only the catalog, and a dropped-and-recreated table never meets its old keys.
@@ -114,21 +117,25 @@ TableRecord = { 1: name: text,
 IndexDef    = { 1: name: text,
                 2: id: bytes(16),
                 3: fields: [[name: text, type: Type, desc: bool]],
-                4: kind: "private" | "fast" | "none",
+                4: kind: "private" | "fast" | "none" | "sealed" | "oblivious",
                 5: unique: bool,
                 6: state: "building" | "active" | "dropping",
                 7: fanout?: u32,                 // private: target entries per node, default 64
                 8: shards?: u32,                 // private: number of trees, default 1 (§5.4.5)
-                9: built_to?: bytes }            // building: the stored key the backfill reached (§8.2)
+                9: built_to?: bytes,             // building: the stored key the backfill reached (§8.2)
+                10: decoys?: u32,                // private: decoy leaves re-salted per write, default 0 (§5.4.6)
+                11: max_bytes?: u32,             // sealed: size cap of the index, default 1,048,576 (§5.7)
+                12: blocks?: u32 }               // oblivious: ORAM capacity in blocks, a power of two (§5.8)
 
 Type        = "text" | "bytes" | "int" | "float" | "bool"
 ChangeDef   = { 1: topic: [bytes], 2: image: "keys" | "full" }
 ```
 
-* **Mutability.** An index's `fields`, `kind`, `unique`, `fanout` and `shards` never change. To change them, build a new index and drop the old one.
+* **Mutability.** An index's `fields`, `kind`, `unique`, `fanout`, `shards`, `decoys`, `max_bytes` and `blocks` never change. To change them, build a new index and drop the old one.
 * **Index kinds.**
   * `kind: "none"` with `unique: true` is an index used only for uniqueness and equality lookups through its unique entries.
   * `kind: "none"` with `unique: false` is invalid.
+  * `kind: "sealed"` and `kind: "oblivious"` with `unique: true` check uniqueness inside the index itself, with no unique entries (§5.7, §5.8).
 * **Visibility by state.**
   * Writers maintain every index whose state is `building` or `active`.
   * Queries use only `active` indexes.
@@ -248,7 +255,9 @@ The tree for a set of entries is defined level by level, so two clients with the
 
 ```
 Node       = { 1: level: u8,
-               2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), count: u64]] (above) }
+               2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), count: u64]] (above),
+               3?: salt: bytes(16),     // only with decoys (§5.4.6)
+               4?: pad: bytes }         // only with decoys: zero bytes up to the node size bucket
 node_id    = PRF16(K_node, CBOR(Node))
 RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }
 ```
@@ -288,6 +297,21 @@ Every writer of a shard rewrites its RootRecord. So **concurrent writers of one 
   * A range query reads all K roots and merges the K ordered streams.
 * `shards` is fixed when the index is created. Choose it for the expected number of concurrent writers. The default of 1 suits a family-sized app.
 
+#### 5.4.6 Decoy rewrites
+
+A private index with `decoys: k > 0` blurs which leaves a write touches (the locality leak, §15). Every commit that changes the tree also **re-salts** `k` other leaves:
+
+* **Choosing them.** Pick a uniformly random level-0 entry by descending with the `count` fields. Its leaf gets a fresh random `salt`. Its id changes, and so do the ids of its ancestors up to the root, exactly as for a real change.
+* **Padding.** With decoys, every Node is padded with `4: pad` to the smallest size bucket that fits (1 KiB, 2 KiB, 4 KiB, then multiples of 4 KiB). Otherwise a changed entry count shows in the ciphertext size and tells a real leaf from a decoy.
+* **Canonical tree.** The tree stays canonical in its entries and boundaries (§5.4.1), but node ids are no longer history-independent. Test vectors use unsalted nodes.
+* **Cost:** about `k × height` more node writes and deletes per commit.
+* **What it doesn't hide.**
+  * Splits and merges still change the node count.
+  * Reads still show which leaves a query visits.
+  * Over many writes a real hot region still stands out statistically.
+  
+  Decoys raise the cost of the analysis; they don't remove the leak. For that, use `sealed` or `oblivious`.
+
 ### 5.5 Maintenance on write
 
 For each index in state `building` or `active`, a write compares the old row's indexed value with the new one:
@@ -307,6 +331,100 @@ Several changes to one private index in one transaction are applied to the tree 
 | lookup by a unique value (email, slot) | `unique: true, kind: "none"` | existence of the value only |
 | equality on a frequent value, fast | `kind: "fast"` | how many rows share each value |
 | equality, ranges, ordering, paging | `kind: "private"` (default) | tree shape and write locality (§15) |
+| the same, with locality blurred | `kind: "private", decoys: k` | as above, statistically weaker |
+| the same for a small index, no locality leak | `kind: "sealed"` (§5.7) | the index's size class; every write rewrites it whole |
+| the same for a larger index, no access-pattern leak | `kind: "oblivious"` (§5.8) | the capacity and the number of accesses; every access, even a read, rewrites ORAM paths |
+
+### 5.7 Sealed: the whole index in one blob
+
+A `sealed` index stores its entire entry list as one sealed blob, rewritten on every change. The server sees neither order nor locality, only how big the index is.
+
+* **Content.** The entries are the sort keys of §5.1, in order: `Blob = { 1: entries: [bytes] }`. Its CBOR is cut into parts of at most `max_value_bytes − 1024` bytes.
+* **Padding.** The number of parts is padded up to a power of two with parts of zero bytes. So the server learns only a size class.
+* **Layout:**
+
+  | KV path | Value |
+  |---|---|
+  | `D ‖ ("s", index_id)` | `SealedHead = {1: parts: u32, 2: digest: bytes(32), 3: count: u64}`, `digest = H("zen/v1/db-parts-digest", CBOR(Blob))` |
+  | `D ‖ ("s", index_id, u32(i))` | part `i` |
+
+* **Writing.** A transaction that changes the index reads the head (into its read set), applies its changes to the entry list and writes every part and the head. A change that would exceed `max_bytes` fails with `too_large`; the app then moves to `oblivious` or `private`.
+* **Reading.** A reader reads the head, then all parts, and checks the digest.
+  * The head's version validates a cached copy (§7.7), so an unchanged index costs one `get`.
+  * Every query reads the whole index, so the server can't tell queries apart.
+* **Unique** is checked against the entry list. The head in the read set makes that serializable, and no unique entries (§5.2) are written.
+* **Contention.** Every writer conflicts on the head, as with an unsharded private index.
+* **Cost:** each write uploads the whole index. With the default `max_bytes` of 1 MiB, that suits up to roughly 10,000–20,000 short entries.
+
+### 5.8 Oblivious: a B+tree inside Path ORAM
+
+An `oblivious` index hides **which entries any access touches**, for reads as well as writes. It is a B+tree whose nodes are stored in a Path ORAM (Stefanov et al., "Path ORAM", CCS 2013). Parent nodes hold their children's positions, as in Wang et al., "Oblivious Data Structures" (CCS 2014), so no separate position map is needed.
+
+#### 5.8.1 Layout
+
+* **Parameters:**
+  * block size `B = 2,048` bytes of plaintext
+  * bucket size `Z = 4` blocks
+  * `blocks` (a power of two, fixed at creation) blocks of capacity
+  * a tree of `L = log2(blocks)` levels below its root: `2^L` leaves and `2^(L+1) − 1` buckets
+* **Bucket** `b` (heap order, root = 1) is at `D ‖ ("q", index_id, u32(b))`. It holds `Z` slots, each a Block or a dummy, padded to exactly `B` bytes. So every bucket's ciphertext has the same size.
+
+  ```
+  Block = { 1: id: bytes(16),        // random, fixed for the node's life
+            2: leaf: u32,            // the ORAM leaf the block is mapped to
+            3: node: ONode }
+  ONode = { 1: level: u8,
+            2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), child_leaf: u32, count: u64]] (above) }
+  ```
+
+  A dummy slot is a Block with an all-zero `id`.
+* **Head** `D ‖ ("p", index_id)`:
+
+  ```
+  OHead = { 1: root: bytes(16), 2: root_leaf: u32, 3: height: u8, 4: count: u64 }
+  ```
+
+* **Stash** at `D ‖ ("p", index_id, u32(i))` for `i` in `0..2`: 64 slots in total, 32 per value, padded like buckets. It holds blocks that couldn't be written back yet.
+  * The stash is shared by every client, so it is stored, not kept in memory.
+  * A stash that would need more than 64 blocks fails the access with `oram_overflow`; the index must then be rebuilt. With `Z = 4` the probability is negligible (about 14 · 0.6^64).
+* **Node size.** ONodes are B+tree nodes that fit one block. Leaves split when full. Deletes don't rebalance: a node may become underfull, and an empty leaf is removed from its parent.
+
+#### 5.8.2 An access
+
+One **operation** is a lookup, an insert, a delete, or a page of a range scan. Each one performs exactly `A` path accesses, where `A = height_max + 2` and `height_max = ⌈log_{fanout/2}(blocks)⌉ + 1`.
+
+1. Read the head and the stash.
+2. **Descend.** For each node on the way from the root:
+   1. read every bucket on the path from the ORAM root to the node's leaf
+   2. move the real blocks found into the in-memory stash
+   3. take the node out of the stash, assign it a fresh uniformly random leaf, and record that leaf in its parent (or in the head, for the root)
+3. **Pad.** If the operation needed fewer than `A` path accesses, read random paths until it has done `A`.
+4. **Change.** Change the leaf node: insert or delete the entry, split it if needed.
+   * New nodes from splits get random ids and leaves, and enter the stash.
+   * A range-scan page reads up to `A − height` consecutive leaves, by re-descending; that is part of the `A` accesses.
+5. **Evict.** For each path read, from the leaf bucket up, fill its buckets with the stash blocks that can go deepest (Path ORAM's greedy eviction). Fill the rest with dummies.
+6. **Commit** in one commit: the `A` paths' buckets, the head, the stash values, plus the row writes of the same transaction. The head is in the read set.
+
+* **Reads write too.** A lookup also remaps and rewrites paths, so every operation commits, and operations on one index serialize on its head. Concurrent operations conflict and retry, so throughput is about one operation per commit round trip.
+* **Many readers.** An app with many readers can route them through one instance, for example the database's owner (§9.2) through request/reply (§12.3).
+* **Unique** is checked by the insert's own lookup. No unique entries (§5.2) are written.
+* **Cost per operation:** `A · (L + 1)` bucket reads and writes of 8 KiB each, plus the head and the stash. For example, `blocks = 2,048` and `height_max = 4` give 6 · 12 = 72 buckets, about 576 KiB each way.
+
+#### 5.8.3 What it hides and what it doesn't
+
+The server sees the same thing for every operation:
+* `A` uniformly random paths read
+* the same buckets rewritten
+* fixed-size ciphertexts
+
+It doesn't learn which entries, positions or neighbours were involved, or whether the operation was a read or a write. It does learn:
+* the capacity (`blocks`) and the number and timing of operations
+* the rows a transaction then reads or writes by their pk, which the index can't hide. An oblivious index hides **order and locality**; the row accesses still show **which rows**.
+
+### 5.9 Unchanged rules for the new kinds
+
+* **`sealed` and `oblivious`** follow §5.5 for maintenance and §8.2 for building. A backfill page applies its changes to the blob, or performs its ORAM operations, in the page's transaction.
+* **Queries (§6)** use them where §6.1 would use a private index.
 
 ## 6. Queries
 
@@ -794,10 +912,13 @@ The server never sees database, table, field or index names, values, keys, messa
 * which rows are read and written, when, and together in which transactions
 * **unique:** one key per row; a value's token reappears if the value is reused
 * **fast:** how many rows share each value, and when that changes
-* **private:**
+* **private** (`kind: "private"`; see §5.6 for the alternatives):
   * node count and tree height, so roughly the number of rows
   * per write, which nodes are replaced. Writes that replace the same leaves have nearby values: over time the server learns **coarse order clusters** (about `fanout` neighbouring values)
   * per query, which nodes are read: the result's size and roughly its position
+  * with `decoys`, the same, statistically blurred (§5.4.6)
+* **sealed:** the index's size class, and when it is written or read (§5.7)
+* **oblivious:** the capacity, and the number and timing of operations. Not which entries, nor whether an operation read or wrote (§5.8.3).
 * catalog and migration activity
 * **a revoked member who kept NK** can compute key tokens, boundaries and node ids. So they can test guesses about names, values and node contents against what they still see. Rotation doesn't change NK (G2); renaming the keys needs the explicit migration of G2.
 
@@ -904,6 +1025,8 @@ Generated by zen-core's `gen_vectors` into `spec/test-vectors/zendb.json`, check
 * Row encodings, a row split into parts with its digest, padding buckets
 * the sort keys of §5.1: every type, `desc`, escaping, composite keys with a pk
 * a canonical prolly tree for a fixed entry set with `fanout` 4: every node's bytes and id, the RootRecord; the same after inserting and deleting entries; shard selection
+* a sealed index: the blob, its parts, padding and head
+* an oblivious index: the bucket, Block, head and stash encodings, and one access with a fixed RNG
 * Msg encodings, BodyRef, an event id for causation
 
 Tests (G23):
@@ -911,6 +1034,8 @@ Tests (G23):
   * random insert and delete orders give the same root (history independence)
   * query results equal a naive in-memory model
   * concurrent writers never lose an index entry
+  * `sealed` and `oblivious` indexes answer like `private` ones
+  * an oblivious access always shows `A` paths and identical write sizes, and its stash stays bounded over long random runs
 * **every pattern of §12 against a spawned server**, with fault injection:
   * killed handlers, deposed leaders, dropped connections
   * replayed commits, a scheduler failover
