@@ -32,7 +32,7 @@ Building blocks:
 * Milestone 3 (FoundationDB backend, supervisor, backup/PITR, [`docs/MILESTONE-3.md`](docs/MILESTONE-3.md)): done.
 * Milestone 3.5 (server-merged CRDT filesystem, [`spec/fs.md`](spec/fs.md), [`docs/MILESTONE-3.5.md`](docs/MILESTONE-3.5.md)): done on the server side.
 * Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
-* Milestone 4.5 (zen-db and the embedded broker, specs only, [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): planned.
+* Milestone 4.5 (zen-db and the embedded broker client, specs only): planned.
 
 ## Building
 
