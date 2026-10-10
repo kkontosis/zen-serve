@@ -28,6 +28,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/db` | NK | `u32(fs_id) ‖ lp(ns)` | root secret of a zen-db database (zendb.md §2.2) |
 | `zen/v1/db-boundary` | K_db | `index_id` (16 B) | PRF key choosing private-index node boundaries and shards (zendb.md §5.4) |
 | `zen/v1/db-node-id` | K_db | `index_id` (16 B) | PRF key of private-index node ids (zendb.md §5.4.2) |
+| `zen/v1/db-crdt` | K_db | `table_id` (16 B) | PRF key of a CRDT table's field and element tokens (zendb.md §19.2) |
 
 ## Hash labels (`BLAKE3.derive_key(label, data)`)
 
@@ -52,6 +53,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/fs-meta` | filesystem node meta (kind 4) |
 | `zen/v1/aad/fs-manifest` | filesystem manifest (kind 5) |
 | `zen/v1/aad/fs-chunk` | filesystem chunk (kind 6) |
+| `zen/v1/aad/crdt-value` | CRDT value (kind 7, reserved; zendb.md §19.2) |
 
 ## OPAQUE (auth.md §8)
 

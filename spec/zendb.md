@@ -13,7 +13,7 @@ It sends them as **one** `/v1/commit`, so everything applies or nothing does (ap
 
 The server is unchanged. Everything here is built from api.md §5–9 and §12. What the server lacks is listed in §18 and in TECH_DEBT.md.
 
-Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code.
+Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges; its server side comes in milestone 5 (TD-CRDT-ROWS-SERVER).
 
 ## 1. Conventions
 
@@ -48,6 +48,9 @@ A **database** is `(fs, ns)`, where `ns` is a text name chosen by the app. An fs
 | `D ‖ ("f", index_id, value, pk)` | `{1: pk}` | fast-index entry (§5.3) |
 | `D ‖ ("r", index_id, u32(shard))` | RootRecord (§5.4) | root of a private index tree |
 | `D ‖ ("n", index_id, node_id)` | Node (§5.4) | node of a private index tree |
+| `D ‖ ("s", index_id)`, `D ‖ ("s", index_id, u32(i))` | SealedHead, raw bytes | a sealed index: its head and parts (§5.7) |
+| `D ‖ ("p", index_id)`, `D ‖ ("p", index_id, u32(i))` | OHead, stash slots | an oblivious index: its head and stash (§5.8) |
+| `D ‖ ("q", index_id, u32(bucket))` | Z slots | an oblivious index: one ORAM bucket (§5.8) |
 | `D ‖ ("m", msg_id, u32(i))` | raw bytes | part `i` of a large message body (§10.3) |
 
 * `table_id` and `index_id` are random 16-byte ids, assigned when the table or index is created. So renaming a table touches only the catalog, and a dropped-and-recreated table never meets its old keys.
@@ -109,26 +112,32 @@ TableRecord = { 1: name: text,
                 4: indexes: [IndexDef],
                 5: changes?: ChangeDef,          // §12.7
                 6: pad: bool,                    // §4.3
-                7: state: "active" | "dropping" }
+                7: state: "active" | "dropping",
+                8?: merge: "txn" | "crdt",       // default "txn"; "crdt": a CRDT table (§19)
+                9?: crdt_fields: {text: "lww" | "counter" | "set"} }   // CRDT tables: field types, default "lww"
 
 IndexDef    = { 1: name: text,
                 2: id: bytes(16),
                 3: fields: [[name: text, type: Type, desc: bool]],
-                4: kind: "private" | "fast" | "none",
+                4: kind: "private" | "fast" | "none" | "sealed" | "oblivious",
                 5: unique: bool,
                 6: state: "building" | "active" | "dropping",
                 7: fanout?: u32,                 // private: target entries per node, default 64
                 8: shards?: u32,                 // private: number of trees, default 1 (§5.4.5)
-                9: built_to?: bytes }            // building: the stored key the backfill reached (§8.2)
+                9: built_to?: bytes,             // building: the stored key the backfill reached (§8.2)
+                10: decoys?: u32,                // private: decoy leaves re-salted per write, default 0 (§5.4.6)
+                11: max_bytes?: u32,             // sealed: size cap of the index, default 1,048,576 (§5.7)
+                12: blocks?: u32 }               // oblivious: ORAM capacity in blocks, a power of two (§5.8)
 
 Type        = "text" | "bytes" | "int" | "float" | "bool"
 ChangeDef   = { 1: topic: [bytes], 2: image: "keys" | "full" }
 ```
 
-* **Mutability.** An index's `fields`, `kind`, `unique`, `fanout` and `shards` never change. To change them, build a new index and drop the old one.
+* **Mutability.** An index's `fields`, `kind`, `unique`, `fanout`, `shards`, `decoys`, `max_bytes` and `blocks` never change. To change them, build a new index and drop the old one.
 * **Index kinds.**
   * `kind: "none"` with `unique: true` is an index used only for uniqueness and equality lookups through its unique entries.
   * `kind: "none"` with `unique: false` is invalid.
+  * `kind: "sealed"` and `kind: "oblivious"` with `unique: true` check uniqueness inside the index itself, with no unique entries (§5.7, §5.8).
 * **Visibility by state.**
   * Writers maintain every index whose state is `building` or `active`.
   * Queries use only `active` indexes.
@@ -248,7 +257,9 @@ The tree for a set of entries is defined level by level, so two clients with the
 
 ```
 Node       = { 1: level: u8,
-               2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), count: u64]] (above) }
+               2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), count: u64]] (above),
+               3?: salt: bytes(16),     // only with decoys (§5.4.6)
+               4?: pad: bytes }         // only with decoys: zero bytes up to the node size bucket
 node_id    = PRF16(K_node, CBOR(Node))
 RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }
 ```
@@ -288,6 +299,21 @@ Every writer of a shard rewrites its RootRecord. So **concurrent writers of one 
   * A range query reads all K roots and merges the K ordered streams.
 * `shards` is fixed when the index is created. Choose it for the expected number of concurrent writers. The default of 1 suits a family-sized app.
 
+#### 5.4.6 Decoy rewrites
+
+A private index with `decoys: k > 0` blurs which leaves a write touches (the locality leak, §15). Every commit that changes the tree also **re-salts** `k` other leaves:
+
+* **Choosing them.** Pick a uniformly random level-0 entry by descending with the `count` fields. Its leaf gets a fresh random `salt`. Its id changes, and so do the ids of its ancestors up to the root, exactly as for a real change.
+* **Padding.** With decoys, every Node is padded with `4: pad` to the smallest size bucket that fits (1 KiB, 2 KiB, 4 KiB, then multiples of 4 KiB). Otherwise a changed entry count shows in the ciphertext size and tells a real leaf from a decoy.
+* **Canonical tree.** The tree stays canonical in its entries and boundaries (§5.4.1), but node ids are no longer history-independent. Test vectors use unsalted nodes.
+* **Cost:** about `k × height` more node writes and deletes per commit.
+* **What it doesn't hide.**
+  * Splits and merges still change the node count.
+  * Reads still show which leaves a query visits.
+  * Over many writes a real hot region still stands out statistically.
+  
+  Decoys raise the cost of the analysis; they don't remove the leak. For that, use `sealed` or `oblivious`.
+
 ### 5.5 Maintenance on write
 
 For each index in state `building` or `active`, a write compares the old row's indexed value with the new one:
@@ -307,6 +333,100 @@ Several changes to one private index in one transaction are applied to the tree 
 | lookup by a unique value (email, slot) | `unique: true, kind: "none"` | existence of the value only |
 | equality on a frequent value, fast | `kind: "fast"` | how many rows share each value |
 | equality, ranges, ordering, paging | `kind: "private"` (default) | tree shape and write locality (§15) |
+| the same, with locality blurred | `kind: "private", decoys: k` | as above, statistically weaker |
+| the same for a small index, no locality leak | `kind: "sealed"` (§5.7) | the index's size class; every write rewrites it whole |
+| the same for a larger index, no access-pattern leak | `kind: "oblivious"` (§5.8) | the capacity and the number of accesses; every access, even a read, rewrites ORAM paths |
+
+### 5.7 Sealed: the whole index in one blob
+
+A `sealed` index stores its entire entry list as one sealed blob, rewritten on every change. The server sees neither order nor locality, only how big the index is.
+
+* **Content.** The entries are the sort keys of §5.1, in order: `Blob = { 1: entries: [bytes] }`. Its CBOR is cut into parts of at most `max_value_bytes − 1024` bytes.
+* **Padding.** The number of parts is padded up to a power of two with parts of zero bytes. So the server learns only a size class.
+* **Layout:**
+
+  | KV path | Value |
+  |---|---|
+  | `D ‖ ("s", index_id)` | `SealedHead = {1: parts: u32, 2: digest: bytes(32), 3: count: u64}`, `digest = H("zen/v1/db-parts-digest", CBOR(Blob))` |
+  | `D ‖ ("s", index_id, u32(i))` | part `i` |
+
+* **Writing.** A transaction that changes the index reads the head (into its read set), applies its changes to the entry list and writes every part and the head. A change that would exceed `max_bytes` fails with `too_large`; the app then moves to `oblivious` or `private`.
+* **Reading.** A reader reads the head, then all parts, and checks the digest.
+  * The head's version validates a cached copy (§7.7), so an unchanged index costs one `get`.
+  * Every query reads the whole index, so the server can't tell queries apart.
+* **Unique** is checked against the entry list. The head in the read set makes that serializable, and no unique entries (§5.2) are written.
+* **Contention.** Every writer conflicts on the head, as with an unsharded private index.
+* **Cost:** each write uploads the whole index. With the default `max_bytes` of 1 MiB, that suits up to roughly 10,000–20,000 short entries.
+
+### 5.8 Oblivious: a B+tree inside Path ORAM
+
+An `oblivious` index hides **which entries any access touches**, for reads as well as writes. It is a B+tree whose nodes are stored in a Path ORAM (Stefanov et al., "Path ORAM", CCS 2013). Parent nodes hold their children's positions, as in Wang et al., "Oblivious Data Structures" (CCS 2014), so no separate position map is needed.
+
+#### 5.8.1 Layout
+
+* **Parameters:**
+  * block size `B = 2,048` bytes of plaintext
+  * bucket size `Z = 4` blocks
+  * `blocks` (a power of two, fixed at creation) blocks of capacity
+  * a tree of `L = log2(blocks)` levels below its root: `2^L` leaves and `2^(L+1) − 1` buckets
+* **Bucket** `b` (heap order, root = 1) is at `D ‖ ("q", index_id, u32(b))`. It holds `Z` slots, each a Block or a dummy, padded to exactly `B` bytes. So every bucket's ciphertext has the same size.
+
+  ```
+  Block = { 1: id: bytes(16),        // random, fixed for the node's life
+            2: leaf: u32,            // the ORAM leaf the block is mapped to
+            3: node: ONode }
+  ONode = { 1: level: u8,
+            2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), child_leaf: u32, count: u64]] (above) }
+  ```
+
+  A dummy slot is a Block with an all-zero `id`.
+* **Head** `D ‖ ("p", index_id)`:
+
+  ```
+  OHead = { 1: root: bytes(16), 2: root_leaf: u32, 3: height: u8, 4: count: u64 }
+  ```
+
+* **Stash** at `D ‖ ("p", index_id, u32(i))` for `i` in `0..2`: 64 slots in total, 32 per value, padded like buckets. It holds blocks that couldn't be written back yet.
+  * The stash is shared by every client, so it is stored, not kept in memory.
+  * A stash that would need more than 64 blocks fails the access with `oram_overflow`; the index must then be rebuilt. With `Z = 4` the probability is negligible (about 14 · 0.6^64).
+* **Node size.** ONodes are B+tree nodes that fit one block. Leaves split when full. Deletes don't rebalance: a node may become underfull, and an empty leaf is removed from its parent.
+
+#### 5.8.2 An access
+
+One **operation** is a lookup, an insert, a delete, or a page of a range scan. Each one performs exactly `A` path accesses, where `A = height_max + 2` and `height_max = ⌈log_{fanout/2}(blocks)⌉ + 1`.
+
+1. Read the head and the stash.
+2. **Descend.** For each node on the way from the root:
+   1. read every bucket on the path from the ORAM root to the node's leaf
+   2. move the real blocks found into the in-memory stash
+   3. take the node out of the stash, assign it a fresh uniformly random leaf, and record that leaf in its parent (or in the head, for the root)
+3. **Pad.** If the operation needed fewer than `A` path accesses, read random paths until it has done `A`.
+4. **Change.** Change the leaf node: insert or delete the entry, split it if needed.
+   * New nodes from splits get random ids and leaves, and enter the stash.
+   * A range-scan page reads up to `A − height` consecutive leaves, by re-descending; that is part of the `A` accesses.
+5. **Evict.** For each path read, from the leaf bucket up, fill its buckets with the stash blocks that can go deepest (Path ORAM's greedy eviction). Fill the rest with dummies.
+6. **Commit** in one commit: the `A` paths' buckets, the head, the stash values, plus the row writes of the same transaction. The head is in the read set.
+
+* **Reads write too.** A lookup also remaps and rewrites paths, so every operation commits, and operations on one index serialize on its head. Concurrent operations conflict and retry, so throughput is about one operation per commit round trip.
+* **Many readers.** An app with many readers can route them through one instance, for example the database's owner (§9.2) through request/reply (§12.3).
+* **Unique** is checked by the insert's own lookup. No unique entries (§5.2) are written.
+* **Cost per operation:** `A · (L + 1)` bucket reads and writes of 8 KiB each, plus the head and the stash. For example, `blocks = 2,048` and `height_max = 4` give 6 · 12 = 72 buckets, about 576 KiB each way.
+
+#### 5.8.3 What it hides and what it doesn't
+
+The server sees the same thing for every operation:
+* `A` uniformly random paths read
+* the same buckets rewritten
+* fixed-size ciphertexts
+
+It doesn't learn which entries, positions or neighbours were involved, or whether the operation was a read or a write. It does learn:
+* the capacity (`blocks`) and the number and timing of operations
+* the rows a transaction then reads or writes by their pk, which the index can't hide. An oblivious index hides **order and locality**; the row accesses still show **which rows**.
+
+### 5.9 Unchanged rules for the new kinds
+
+* **`sealed` and `oblivious`** follow §5.5 for maintenance and §8.2 for building. A backfill page applies its changes to the blob, or performs its ORAM operations, in the page's transaction.
+* **Queries (§6)** use them where §6.1 would use a private index.
 
 ## 6. Queries
 
@@ -598,6 +718,7 @@ Every database has these tables, created with the DbRecord. They don't count as 
 | `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic: [bytes]`, `key?: bytes`, `msg: bytes` (CBOR Msg), `gc?: [[bytes]]` (KV paths to delete) | private on `at` |
 | `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` | – |
 | `$inbox` | `[scope, id]` | `at: int` | – |
+| `$ixrows` | `[table_id, pk]` | `values: {index_id: value}` (the values last indexed) | – (§19.6) |
 
 ## 12. Patterns
 
@@ -794,10 +915,13 @@ The server never sees database, table, field or index names, values, keys, messa
 * which rows are read and written, when, and together in which transactions
 * **unique:** one key per row; a value's token reappears if the value is reused
 * **fast:** how many rows share each value, and when that changes
-* **private:**
+* **private** (`kind: "private"`; see §5.6 for the alternatives):
   * node count and tree height, so roughly the number of rows
   * per write, which nodes are replaced. Writes that replace the same leaves have nearby values: over time the server learns **coarse order clusters** (about `fanout` neighbouring values)
   * per query, which nodes are read: the result's size and roughly its position
+  * with `decoys`, the same, statistically blurred (§5.4.6)
+* **sealed:** the index's size class, and when it is written or read (§5.7)
+* **oblivious:** the capacity, and the number and timing of operations. Not which entries, nor whether an operation read or wrote (§5.8.3).
 * catalog and migration activity
 * **a revoked member who kept NK** can compute key tokens, boundaries and node ids. So they can test guesses about names, values and node contents against what they still see. Rotation doesn't change NK (G2); renaming the keys needs the explicit migration of G2.
 
@@ -857,6 +981,9 @@ const id = await db.schedule(db.topic('mail'), 'nudge', {}, { at: Date.now() + 3
 const checkout = db.saga('checkout', [{ name: 'pay', command: db.topic('pay'), compensate: db.topic('refund'), timeoutMs: 30_000 }, …]);
 await db.transaction(async (tx) => { tx.table(orders).insert(o); checkout.start({ order: o.id }, tx); });
 orders.on((change) => refresh(change.pk));                        // change events
+const cards = db.table<Card>('cards');                            // a CRDT table (§19): merge "crdt"
+await cards.patch(id, { title: 'New title' });                    // per-field last writer wins, works offline
+await cards.incr(id, 'votes', 1); await cards.add(id, 'labels', 'urgent');
 db.publishEphemeral(db.topic('presence'), 'typing', { room });    // not stored
 ```
 
@@ -904,6 +1031,8 @@ Generated by zen-core's `gen_vectors` into `spec/test-vectors/zendb.json`, check
 * Row encodings, a row split into parts with its digest, padding buckets
 * the sort keys of §5.1: every type, `desc`, escaping, composite keys with a pk
 * a canonical prolly tree for a fixed entry set with `fanout` 4: every node's bytes and id, the RootRecord; the same after inserting and deleting entries; shard selection
+* a sealed index: the blob, its parts, padding and head
+* an oblivious index: the bucket, Block, head and stash encodings, and one access with a fixed RNG
 * Msg encodings, BodyRef, an event id for causation
 
 Tests (G23):
@@ -911,6 +1040,8 @@ Tests (G23):
   * random insert and delete orders give the same root (history independence)
   * query results equal a naive in-memory model
   * concurrent writers never lose an index entry
+  * `sealed` and `oblivious` indexes answer like `private` ones
+  * an oblivious access always shows `A` paths and identical write sizes, and its stash stays bounded over long random runs
 * **every pattern of §12 against a spawned server**, with fault injection:
   * killed handlers, deposed leaders, dropped connections
   * replayed commits, a scheduler failover
@@ -923,3 +1054,158 @@ What the server lacks for this layer, deferred (spec/TECH_DEBT.md):
 * **TD-CONSUME-COMPETING:** competing consumers for unkeyed events, without per-key state per message
 * **TD-CONSUME-PUSH:** delivery over the stream instead of long-polling (DESIGN-4 §1.4)
 * **TD-LOG-RETENTION:** events, inboxes, change topics and message parts are never trimmed. Change events and request/reply make this more pressing.
+
+---
+
+# Part D: CRDT tables
+
+## 19. CRDT tables (server-merged)
+
+**Status:** specified; the server side is scheduled for milestone 5 (TD-CRDT-ROWS-SERVER). A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
+
+### 19.1 Model
+
+A table with `merge: "crdt"` holds rows that the **server merges** field by field, on ciphertext (DESIGN-4 §2.1–2.2), the way it merges filesystem trees.
+
+* **Writes never conflict.** In long mode they are always accepted.
+* **Offline writes work.** They are queued with their HLCs and sent later, up to the horizon.
+* **Concurrent writes to different fields both survive.**
+
+| Field type | Merge | Typical use |
+|---|---|---|
+| `lww` (default) | last writer wins per field, by `ts = (hlc, device)` | titles, text, status |
+| `counter` | PN-counter: one cumulative value per device; the value is their sum | votes, likes, quantities |
+| `set` | add-wins observed-remove set (OR-set) | labels, members, tags |
+| row existence | last writer wins on an `alive` register | insert, delete |
+
+**What is given up:** cross-field and cross-row invariants. There are no unique indexes, no balance checks, and no reading of one row to decide another. Those need transactional tables. A transaction can still carry CRDT operations atomically with rows of transactional tables, emits and consumes. It just can't make them conditional.
+
+Deletes are by `ts`. A delete with a greater `ts` than an insert hides the row, and field updates don't resurrect it; only a later `row` operation with `alive: true` does.
+
+### 19.2 Tokens and sealing
+
+```
+K_crdt   = KDF("zen/v1/db-crdt", K_db, table_id)
+object   = the stored key of D ‖ ("t", table_id, pk)       (the server's object id; 16 bytes per element)
+field    = PRF16(K_crdt, 0x00 ‖ lp(field_name))
+elem     = PRF16(K_crdt, 0x01 ‖ lp(field_name) ‖ lp(pk element) ‖ lp(CBOR(element)))
+```
+
+* **Element tokens** include the pk, so the same element in two rows has unrelated tokens.
+* **Field tokens** are the same in every row of a table, like columns.
+
+Values are sealed as **kind 7, CRDT value** (formats.md §4):
+* **AAD** label `zen/v1/aad/crdt-value`
+* **context** `u32(fs) ‖ lp(object) ‖ field(16 bytes; zeros for the row register) ‖ elem(16 bytes; zeros if none)`
+* **key** the KV AEAD key of `key_epoch`
+
+Plaintexts:
+
+| Value of | Plaintext (CBOR) |
+|---|---|
+| row register | `{1: pk}`, so scans return keys |
+| `lww` field | `{1: value}` |
+| `counter` entry | `{1: total: int}`: this device's cumulative sum of increments and decrements |
+| `set` element | `{1: element}` |
+
+### 19.3 Operations
+
+New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
+
+```
+{fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}            // insert (alive) or delete
+{fs, op: "lww", object, field: bytes(16), hlc: u64, value?: bytes}              // set; value absent = unset
+{fs, op: "ctr", object, field: bytes(16), seq: u64, value: bytes}              // this device's new total
+{fs, op: "add", object, field: bytes(16), elem: bytes(16), value: bytes}       // gets a dot
+{fs, op: "rem", object, field: bytes(16), elem: bytes(16), dots: [bytes(12)]}  // removes observed dots
+```
+
+* `device` is the session's device fingerprint, set by the server as in fs.md §2.
+* **`row` and `lww`:** keep the value with the greatest `(hlc, device)`.
+  * A second operation with the same `(hlc, device)` on the same register is refused (400).
+  * `clock_skew` and the horizon apply as in fs.md §3.4: an `hlc` too far ahead gets `clock_skew`, and one older than `crdt_horizon_secs` gets `stale_op`.
+* **`ctr`:** for each `(object, field, device)`, keep the operation with the greatest `seq`. A `seq` not greater than the stored one is ignored, so a replay is harmless. A device only ever writes its own entry.
+* **`add`:**
+  * The element gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s. Dots are returned with the commit result, next to fs `dots`.
+  * The element is present while it has at least one dot.
+* **`rem`:** deletes the listed dots of `(object, field, elem)` that still exist. An `add` the remover hadn't seen keeps its dot, so concurrent add and remove resolve as add-wins.
+* **Rights and limits.** Each operation needs fs `write`, and each `value` is at most `max_value_bytes`. Operations count toward the fs quotas like KV writes.
+* **Isolation (G11).**
+  * In long mode the server retries its own conflicts, so CRDT operations never fail with `conflict`.
+  * In short mode the state the server reads conflicts like any read.
+
+### 19.4 Reads
+
+```
+POST /v1/crdt/get   {fs, objects: [bytes], read_version?}                → {read_version, objects: [ObjState]}
+POST /v1/crdt/range {fs, begin: bytes, end?: bytes, limit?, read_version?} → {read_version, objects: [ObjState], more}
+
+ObjState = { object: bytes,
+             row?: {hlc, device, alive, value},
+             lww:  [{field, hlc, device, value}],
+             ctr:  [{field, device, seq, value}],
+             set:  [{field, elem, dot, device, value}],
+             version: bytes(10) }                 // versionstamp of the object's last change
+```
+
+* Both need fs `read`, and `range` pages like `/v1/kv/range`.
+* The client opens every value and builds the merged row:
+  * `lww` fields as stored
+  * counters summed over devices
+  * sets as the elements with at least one dot
+  * the row visible if its register is `alive`
+* **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
+
+### 19.5 Server state (proposal for the implementation)
+
+| Key | Value |
+|---|---|
+| `pack("cr", fs, object)` | row register: `hlc ‖ device ‖ alive ‖ value` |
+| `pack("cw", fs, object, field)` | `lww` register: `hlc ‖ device ‖ value?` |
+| `pack("cn", fs, object, field, device)` | counter entry: `seq ‖ value` |
+| `pack("cs", fs, object, field, elem, dot)` | set element: `device ‖ value` |
+| `pack("cv", fs, object)` | the object's last-change versionstamp |
+| `pack("cd", fs, hlc, object)` | deleted-object index, for the sweeper |
+
+**Garbage collection:**
+* An object whose row register is `alive: false` and older than the horizon is purged with all its entries.
+* So is an object that has no row register and no change within the horizon.
+* An operation that names a purged object and is older than the horizon gets `stale_op`. A newer one starts the object afresh.
+
+### 19.6 Indexes
+
+* **Kinds.** CRDT tables allow `fast`, `private`, `sealed` and `oblivious` indexes, never `unique`.
+* **The indexer.** Writers don't maintain them, since the merged value is known only after the server merges. Instead:
+  * **Change topic.** A CRDT table with indexes must declare `changes` (§12.7). Every commit with operations on a row also appends a change event keyed by the pk; the class adds it.
+  * **Indexer group.** The **indexer** is a `per_key` consumer group `"$index"` on that topic, run by the owner (§9.2) like the scheduler. For each event it does one short transaction with the consume step:
+    1. read the row's merged state
+    2. read its `$ixrows` entry: the values it last indexed
+    3. update every index from the old values to the new ones
+    4. write `$ixrows`
+* **Freshness.** Indexes on CRDT tables are **eventually consistent**: they lag by the indexer's delay, and stop while no instance runs it. Queries always re-check their predicates on the fetched merged rows, so a stale entry never returns a wrong row. A row changed very recently may be missing from a result until it is indexed.
+
+### 19.7 Offline use
+
+* **Queue.** While offline, the class keeps operations and their change events in a local queue: in memory, or encrypted at rest (§9.3). It sends them as long-mode commits when back online.
+* **Clock.** It uses one HLC per session, the M4 tree clock.
+* **Old operations.** An operation older than the horizon gets `stale_op`. The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users.
+
+### 19.8 Leakage
+
+Beyond §15, the server sees, per CRDT row:
+* which fields (by token) exist and change, when, and from which device
+* the `hlc` of every write, which is wall-clock time to the millisecond
+* deletes, through the plaintext `alive` flag
+* for counters, how often each device changes each one (`seq`)
+* for sets, how many elements each field holds and when each is added or removed. Element tokens are per row, so equal elements in different rows aren't linkable.
+
+### 19.9 Test vectors
+
+Added to §17:
+* `K_crdt`, field and element tokens
+* kind-7 sealed values for each field type
+* the encoding of each operation
+* a merged `ObjState` from a fixed set of operations, with its client-side view
+
+Property test: operations from three devices, applied in random orders, give the same merged state.
+

@@ -65,7 +65,8 @@ off  len  field
   0    1  format_version = 1
   1    1  suite          = 1
   2    1  kind           1 = KV value, 2 = event, 3 = epoch-chain record,
-                         4 = fs node meta, 5 = fs manifest, 6 = fs chunk
+                         4 = fs node meta, 5 = fs manifest, 6 = fs chunk,
+                         7 = CRDT value (reserved, zendb.md §19)
   3    1  reserved       = 0
   4    4  key_epoch      u32
   8   24  nonce          random per seal
@@ -84,6 +85,7 @@ Total = 48 + plaintext length.
 | 4 fs node meta | `zen/v1/aad/fs-meta` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
 | 5 fs manifest | `zen/v1/aad/fs-manifest` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
 | 6 fs chunk | `zen/v1/aad/fs-chunk` | `u32(fs) ‖ chunk_id(16)` | filesystem AEAD key of `key_epoch` |
+| 7 CRDT value (reserved) | `zen/v1/aad/crdt-value` | `u32(fs) ‖ lp(object) ‖ field(16) ‖ elem(16)` (zendb.md §19.2) | KV AEAD key of `key_epoch` |
 
 * A value moved to another key or fs, or an event moved to another topic or event key, fails authentication.
 * Clients read `key_epoch` from the header to pick the right epoch keys before decrypting.

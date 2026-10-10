@@ -214,3 +214,18 @@ Family pocket money or team credits: balances that must never go negative, a ful
    * the statements equal the sums of the entries
    * the audit log has one event per transfer
 3. Restart the projection mid-stream: the totals are unchanged.
+
+## CRDT tables in the examples
+
+The server side of CRDT tables comes in milestone 5 (spec/zendb.md §19, `TD-CRDT-ROWS-SERVER`). With it, two of the examples gain an offline-first variant, demonstrated in milestone 5 as well:
+
+* **Kanban.**
+  * Cards become a CRDT table: `title` and `text` are `lww`, `labels` a `set`, `votes` a `counter`.
+  * Cards edited offline merge field by field on reconnect, and the board's `(column, pos)` index is kept by the indexer (§19.6).
+  * Moving a card between columns stays last-writer-wins, so two concurrent moves end with one winner, never a duplicate.
+* **Chat.**
+  * Reactions are a `counter` per emoji on a CRDT `reactions(message_id)` row, and room membership a `set`.
+  * Both work offline. Neither needs an invariant, so neither needs a transaction.
+
+Slot booking, checkout and the ledger stay transactional: their invariants (one booking per slot, no negative balance) are exactly what CRDT tables give up.
+

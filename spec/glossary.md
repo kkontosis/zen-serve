@@ -36,5 +36,6 @@
 | **private index** | A zen-db index stored as a prolly tree of sealed, content-addressed nodes; supports order and ranges (zendb.md §5.4). |
 | **message** | A broker event whose payload is a typed `Msg` with an id, optional correlation and saga fields (zendb.md §10). |
 | **saga** | A series of local transactions in different services, coordinated by an orchestrator, with compensations on failure (zendb.md §12.5). |
+| **CRDT table** | A zen-db table whose rows the server merges field by field (last writer wins, counters, sets) instead of serializing transactions; works offline (zendb.md §19). |
 | **horizon** | How far back (default 7 days) a late operation may reach. Older ones are refused with `stale_op` and **rebased**: reissued with a fresh HLC. |
 
