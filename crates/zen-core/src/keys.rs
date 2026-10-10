@@ -80,6 +80,13 @@ impl FsKeys {
         )
     }
 
+    /// `K_db = KDF("zen/v1/db", NK, u32(fs) ‖ lp(ns))` (spec/zendb.md §2.2).
+    pub(crate) fn db_key(&self, ns: &[u8]) -> Key32 {
+        let mut info = self.fs_id.to_be_bytes().to_vec();
+        crate::encoding::lp(&mut info, ns);
+        kdf(labels::DB, &self.naming_key, &info)
+    }
+
     /// `KDF("zen/v1/topic-data", MK_e, u32(fs) || u32(e))`: root of the topic data chain.
     pub fn topic_data_root(&self) -> Key32 {
         kdf(labels::TOPIC_DATA, &self.epoch_key, &self.fs_epoch_info())

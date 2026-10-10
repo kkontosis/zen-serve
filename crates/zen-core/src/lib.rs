@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod db;
 mod encoding;
 pub mod error;
 pub mod fs;
@@ -23,6 +24,8 @@ pub mod sig;
 pub mod suite;
 pub mod token;
 
+#[cfg(feature = "test-utils")]
+pub mod db_vectors;
 #[cfg(feature = "test-utils")]
 pub mod vectors;
 

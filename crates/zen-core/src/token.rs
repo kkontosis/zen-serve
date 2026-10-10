@@ -115,6 +115,15 @@ impl TopicKeys {
         prf16(&k, &enc)
     }
 
+    /// `PRF16(KDF("zen/v1/broker-group", N_topic, ""), lp(name))`: the server's
+    /// name of a zen-db consumer group on this topic (spec/zendb.md §11.3).
+    pub fn group_id(&self, name: &[u8]) -> [u8; 16] {
+        let k = kdf(labels::BROKER_GROUP, self.name.key(), &[]);
+        let mut enc = Vec::with_capacity(4 + name.len());
+        lp(&mut enc, name);
+        prf16(&k, &enc)
+    }
+
     /// `KDF("zen/v1/event-aead", D_topic, "")`: the AEAD key for events on this topic.
     pub fn event_aead_key(&self) -> Key32 {
         kdf(labels::EVENT_AEAD, &self.data, &[])

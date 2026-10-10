@@ -183,9 +183,12 @@ The size of a row is bounded by the commit: `max_commit_bytes` (8 MB by default)
 
 A table with `pad: true` pads every Row with `5: pad` (zero bytes) so its encoded size is the smallest bucket that fits:
 * the buckets are 256 B, 1 KiB, 4 KiB, 16 KiB, then the multiples of 16 KiB
-* rows with parts are padded as a Row, and their last part to 16 KiB
+* rows with parts are padded as a Row, and their last part with zero bytes to 16 KiB
+* the pad is the longest that keeps the Row within its bucket. Where CBOR's length heads make the bucket size itself unreachable (a pad of 24, 256 or 65,536 bytes needs a longer head), the Row ends one or two bytes short of it
 
 This hides row sizes within a bucket (DESIGN-3 §2.3).
+
+The digest of §4.2 covers `F` without the padding. `F` is one CBOR item, so a reader decodes the first item of the joined parts and requires every byte after it to be zero.
 
 ### 4.4 Operations
 
@@ -224,6 +227,7 @@ Private indexes need order, so they use an order-preserving **sort key**. For ea
 * **By declared type.** A field is encoded by its declared `Type`, not by the CBOR form of its value: a `float` field encodes every number (an integer included, §1) as a float, and an `int` field every number as an int. A pk component is encoded by the type of its value (integers as int, other numbers as float).
 * Text compares by code point (binary UTF-8 order). There is no collation. An app wanting case-insensitive order stores and indexes a normalized copy of the field.
 * A pk field of a type outside this table (an array or a map) can't be used in a table that has a private index.
+* A sort key longer than 4,096 bytes is refused (`too_large`), so a node of §5.4 always fits one value.
 
 ### 5.2 Unique
 
@@ -252,7 +256,7 @@ The tree for a set of entries is defined level by level, so two clients with the
 1. **Level 0.** The entries are the sort keys (§5.1) of every row, in byte order. Rows with null indexed values are included.
 2. **Boundaries.** Cut a level into nodes, left to right. An entry `e` at level `L` **ends a node** when either:
    * `u32_be(PRF16(K_boundary, u8(L) ‖ lp(key(e)))[0..4]) < 2^32 / fanout`, or
-   * the node would otherwise reach 1,024 entries or 60,000 bytes of encoded Node.
+   * with `e`, the node reaches 1,024 entries, or 60,000 bytes of encoded Node (without `salt` and `pad`).
    
    The last entry of a level always ends a node.
 3. **Levels above.** Level `L+1` has one entry per node of level `L`: `[first_key, child_id, count]`. Here `first_key` is the key of the node's first entry, and `count` is the number of level-0 entries under it.
@@ -268,7 +272,7 @@ Node       = { 1: level: u8,
                3?: salt: bytes(16),     // only with decoys (§5.4.6)
                4?: pad: bytes }         // only with decoys: zero bytes up to the node size bucket
 node_id    = PRF16(K_node, CBOR(Node))
-RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }
+RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }      // height = the root's level + 1
 ```
 
 * A node is stored at `D ‖ ("n", index_id, node_id)`.
@@ -349,7 +353,7 @@ Several changes to one private index in one transaction are applied to the tree 
 A `sealed` index stores its entire entry list as one sealed blob, rewritten on every change. The server sees neither order nor locality, only how big the index is.
 
 * **Content.** The entries are the sort keys of §5.1, in order: `Blob = { 1: entries: [bytes] }`. Its CBOR is cut into parts of at most `max_value_bytes − 1024` bytes.
-* **Padding.** The number of parts is padded up to a power of two with parts of zero bytes. So the server learns only a size class.
+* **Padding.** The number of parts is rounded up to a power of two, and the CBOR is padded with zero bytes to fill them all, so every part is exactly `max_value_bytes − 1024` bytes. The server learns only a size class. A reader decodes the first CBOR item of the joined parts and requires the rest to be zero, as for rows (§4.3).
 * **Layout:**
 
   | KV path | Value |

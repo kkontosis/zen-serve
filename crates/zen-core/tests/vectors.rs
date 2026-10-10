@@ -260,3 +260,74 @@ fn acl_vector_verifies_from_file() {
         .unwrap();
     verify_device_cert(&user, &doc.members[0].devices[0]).unwrap();
 }
+
+#[test]
+fn zendb_vectors_read_back() {
+    use zen_core::db::{self, DbKeys, cbor};
+    use zen_core::db_vectors::from_json;
+    let z = load("zendb.json");
+    for case in z["cbor"]["ok"].as_array().unwrap() {
+        let v = from_json(&case["value"]);
+        let b = cbor::encode(&v).unwrap();
+        assert_eq!(b, hx(&case["cbor"]));
+        assert_eq!(cbor::decode(&b).unwrap(), from_json(&case["decoded"]));
+    }
+    for case in z["cbor"]["refused_decode"].as_array().unwrap() {
+        assert!(cbor::decode(&hx(&case["cbor"])).is_err(), "{}", case["why"]);
+    }
+    let fs = fs_from_file();
+    let dbk = DbKeys::new(&fs, z["database"]["ns"].as_str().unwrap());
+    assert_eq!(dbk.prefix(), hx(&z["database"]["prefix"]));
+    let c = &z["crdt"];
+    let object = hx(&c["object"]);
+    for (_, v) in c["values"].as_object().unwrap() {
+        let field: [u8; 16] = hx(&v["field"]).try_into().unwrap();
+        let elem: [u8; 16] = hx(&v["elem"]).try_into().unwrap();
+        let pt = db::open_crdt_value(&fs, &object, &field, &elem, &hx(&v["sealed"])).unwrap();
+        assert_eq!(pt, hx(&v["plaintext"]));
+        // Bound to the object: another object fails.
+        assert!(db::open_crdt_value(&fs, &object[16..], &field, &elem, &hx(&v["sealed"])).is_err());
+    }
+    // The tree after edits equals a fresh build of the edited entry set.
+    let p = &z["prolly"];
+    let ix = dbk.index(&hx(&p["index_id"]).try_into().unwrap());
+    let built = db::prolly::build(
+        &ix,
+        4,
+        p["entries"].as_array().unwrap().iter().map(hx).collect(),
+    )
+    .unwrap();
+    assert_eq!(
+        hex::encode(built.root.unwrap().encode()),
+        p["tree"]["root"]["record"].as_str().unwrap()
+    );
+}
+
+#[test]
+fn prolly_is_history_independent_and_bounded() {
+    use zen_core::db::prolly::build;
+    let ix = zen_core::db::IndexKeys::from_parts([1; 32], [2; 32]);
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for fanout in [2u32, 4, 64] {
+        let mut set: Vec<Vec<u8>> = (0..600)
+            .map(|_| next().to_be_bytes()[..5].to_vec())
+            .collect();
+        set.sort();
+        set.dedup();
+        let a = build(&ix, fanout, set.clone()).unwrap();
+        set.reverse();
+        let b = build(&ix, fanout, set).unwrap();
+        assert_eq!(a.root, b.root);
+        assert!(
+            a.nodes
+                .iter()
+                .all(|(_, n)| !n.entries.is_empty() && n.entries.len() <= 1024)
+        );
+    }
+}
