@@ -59,18 +59,6 @@ const NO_CAUSE: Uint8Array = new Uint8Array(0);
 // ephemeral message into the log: the log refuses events of this key.
 const EPHEMERAL_KEY = utf8('\u0000zen/v1/ephemeral');
 
-const clocks = new WeakMap<UnlockedFs, InstanceType<typeof zw.Clock>>();
-
-/** The HLC of an unlocked fs (one per fs, shared by its topics). */
-function clockOf(fs: UnlockedFs): InstanceType<typeof zw.Clock> {
-  let c = clocks.get(fs);
-  if (!c) {
-    c = new zw.Clock(0n);
-    clocks.set(fs, c);
-  }
-  return c;
-}
-
 /** The device fingerprint a session's events carry. */
 export function senderOf(session: Session): Uint8Array {
   return session.deviceFp ?? ZERO32;
@@ -127,7 +115,7 @@ export class Topic {
     const keys = this.fs.sealKeys();
     const body: EventBody = {
       sender: senderOf(this.fs.session),
-      hlc: clockOf(this.fs).tick(Date.now()),
+      hlc: this.fs.session.clock.tick(),
       causation,
       payload,
     };
@@ -143,7 +131,7 @@ export class Topic {
     } catch (e) {
       throw new ZenError(0, 'decrypt', e instanceof Error ? e.message : String(e));
     }
-    clockOf(this.fs).observe(body.hlc);
+    this.fs.session.clock.observeUnchecked(body.hlc);
     return body;
   }
 

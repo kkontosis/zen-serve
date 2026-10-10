@@ -144,3 +144,134 @@ describe('transactions', () => {
     void fullGrants;
   });
 });
+
+describe('snapshot reads, expectKey and commit hooks', () => {
+  it('a snapshot read records nothing: a concurrent write does not conflict', async () => {
+    await fs.kv.set(['snap', 'a'], u('1'));
+    let runs = 0;
+    await fs.transaction(async (tx) => {
+      runs++;
+      expect(tx.readVersion).toBeUndefined();
+      const [e, missing] = await tx.snapshotGet([
+        ['snap', 'a'],
+        ['snap', 'none'],
+      ]);
+      expect(tx.readVersion).toBeTypeOf('bigint');
+      expect(missing).toBeUndefined();
+      if (runs === 1) await fs.kv.set(['snap', 'a'], u('2'));
+      // Still at the read version: the value before the concurrent write.
+      expect(s((await tx.snapshotGet([['snap', 'a']]))[0]?.value)).toBe('1');
+      tx.set(['snap', 'copy'], e!.value);
+    });
+    expect(runs).toBe(1);
+    expect(s(await fs.kv.get(['snap', 'copy']))).toBe('1');
+  });
+
+  it("a snapshot range pages, reverses, and sees the transaction's own writes", async () => {
+    await fs.transaction(async (tx) => {
+      for (let i = 0; i < 8; i++) tx.set(['srange', `k${i}`], u(`v${i}`));
+    });
+    await fs
+      .transaction(async (tx) => {
+        tx.delete(['srange', 'k1']);
+        tx.set(['srange', 'k2'], u('mine'));
+        tx.set(['srange', 'new'], u('n'));
+        const got = async (opts?: { limit?: number; reverse?: boolean }) => {
+          const out: (string | undefined)[] = [];
+          for await (const e of tx.snapshotRange(['srange'], opts)) out.push(s(e.value));
+          return out;
+        };
+        // Stored keys are PRF tokens: compare as sets, and check the order
+        // against the stored keys.
+        const all = await got();
+        expect([...all].sort()).toEqual(['mine', 'n', 'v0', 'v3', 'v4', 'v5', 'v6', 'v7']);
+        const keys: Uint8Array[] = [];
+        for await (const e of tx.snapshotRange(['srange'])) keys.push(e.key);
+        const sorted = [...keys].sort(bytes.compare);
+        expect(keys).toEqual(sorted);
+        expect(await got({ reverse: true })).toEqual([...all].reverse());
+        expect(await got({ limit: 3 })).toEqual(all.slice(0, 3));
+        tx.clearPrefix(['srange']);
+        expect(await got()).toEqual([]);
+        // Abort: the clear is longer than this server's max_range_items.
+        throw new Error('abort');
+      })
+      .catch((e) => expect((e as Error).message).toBe('abort'));
+  });
+
+  it('expectKey: a stale version conflicts and re-runs, a current one commits', async () => {
+    await fs.kv.set(['cached'], u('c1'));
+    const [cached] = await fs.kv.getEntries([['cached']]);
+    await fs.transaction(async (tx) => {
+      tx.expectKey(['cached'], cached!.version);
+      tx.set(['derived'], u('from c1'));
+    });
+    await fs.kv.set(['cached'], u('c2'));
+    let runs = 0;
+    await fs.transaction(async (tx) => {
+      runs++;
+      const v = runs === 1 ? cached! : (await fs.kv.getEntries([['cached']]))[0]!;
+      tx.expectKey(['cached'], v.version);
+      tx.set(['derived'], u(`from ${s(v.value)}`));
+    });
+    expect(runs).toBe(2);
+    expect(s(await fs.kv.get(['derived']))).toBe('from c2');
+  });
+
+  it('expectKey: an absent key conflicts once written', async () => {
+    await expect(
+      fs.transaction(
+        async (tx) => {
+          tx.expectKey(['not-yet'], undefined);
+          await fs.kv.set(['not-yet'], u('x'));
+          tx.set(['after-not-yet'], u('y'));
+        },
+        { attempts: 1 },
+      ),
+    ).rejects.toSatisfy((e) => isCode(e, 'conflict'));
+  });
+
+  it('adds CRDT operations to the commit; the result has their set dots', async () => {
+    const object = bytes.randomBytes(16);
+    const field = bytes.randomBytes(16);
+    let committed: Uint8Array[] | undefined;
+    let errors = 0;
+    await fs.transaction(async (tx) => {
+      tx.addCrdtOps(
+        [1, 2].map((i) => ({
+          op: 'add' as const,
+          fs: fs.id,
+          object,
+          field,
+          elem: bytes.randomBytes(16),
+          value: u(`e${i}`),
+        })),
+      );
+      tx.set(['with-crdt'], u('1'));
+      tx.onCommit((r) => {
+        committed = r.set_dots;
+      });
+      tx.onError(async () => {
+        errors++;
+        return false;
+      });
+    });
+    expect(committed).toHaveLength(2);
+    expect(committed![0]!.length).toBe(12);
+    expect(errors).toBe(0);
+  });
+
+  it('an onError hook can ask for a re-run, even after an error that is not retryable', async () => {
+    let runs = 0;
+    await fs.transaction(async (tx) => {
+      runs++;
+      // A malformed object (not a multiple of 16 bytes) on the first run: 400.
+      const object = bytes.randomBytes(runs === 1 ? 5 : 16);
+      tx.addCrdtOps([
+        { op: 'row', fs: fs.id, object, hlc: zw.hlc(Date.now(), 0), alive: true, value: u('r') },
+      ]);
+      tx.onError(async (e) => isCode(e, 'bad_request'));
+    });
+    expect(runs).toBe(2);
+  });
+});

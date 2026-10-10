@@ -2,6 +2,7 @@
 export { type AclVersion, claim, fullGrants, member, verifyNext } from './acl.js';
 export * as bytes from './bytes.js';
 export { Client, type ConnectOptions, connect, type DeviceCredentials } from './client.js';
+export { type ClockStore, memoryClockStore, SessionClock, TreeClock } from './clock.js';
 export { isCode, ZenError } from './errors.js';
 export {
   Fs,
@@ -61,24 +62,23 @@ export {
   type ChangeBatch,
   type ChunkCache,
   type ChunkIndex,
-  type ClockStore,
   type CreateOptions,
   computeChain,
   displayNames,
   type FileVersion,
-  memoryClockStore,
   type NodeStat,
   type OpRecord,
   opBytes,
   type PendingOp,
+  type Prepared,
   ROOT,
   TRASH,
   Tree,
   TreeBatch,
   type TreeChange,
-  TreeClock,
   type TreeNode,
   type TreeOptions,
+  type Upload,
   type WriteOptions,
   type WrittenFile,
 } from './tree.js';

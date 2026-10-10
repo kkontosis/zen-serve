@@ -1,6 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { utf8 } from '../src/bytes.js';
-import { fullGrants, isCode, member, type Session, type UnlockedFs, zw } from '../src/index.js';
+import {
+  fullGrants,
+  isCode,
+  member,
+  memoryClockStore,
+  ROOT,
+  type Session,
+  Tree,
+  TreeClock,
+  type UnlockedFs,
+  zw,
+} from '../src/index.js';
 import { testUser } from '../src/testing/index.js';
 import { type World, world } from './helpers.js';
 
@@ -283,5 +294,46 @@ describe('leaders', () => {
     }
     expect(la.isLeader).toBe(true);
     await la.stop();
+  });
+});
+
+describe('the session clock', () => {
+  it('orders events with tree operations', async () => {
+    const t = ufs.tree(Tree.newId());
+    expect(t.clock).toBe(w.session.clock);
+    const before = await t.prepare([{ op: 'move', node: Tree.newId(), parent: ROOT }]);
+    const topic = ufs.topic('clocked');
+    await topic.append(utf8('between'));
+    const after = await t.prepare([{ op: 'move', node: Tree.newId(), parent: ROOT }]);
+    const [ev] = await all(topic.read());
+    expect(ev!.hlc > before.hlcs[0]!).toBe(true);
+    expect(after.hlcs[0]! > ev!.hlc).toBe(true);
+  });
+
+  it("ignores another device's event timestamp far ahead of the wall clock", async () => {
+    const topic = ufs.topic('far-ahead');
+    const ahead = new TreeClock({ store: memoryClockStore(zw.hlc(Date.now() + 3_600_000, 0)) });
+    // A fresh session of bob's, whose clock nothing has used yet.
+    const fresh = await w.client.signInDevice(testUser(2));
+    fresh.useClock(ahead);
+    const freshFs = await fresh.fs(1).unlock({ recoveryKey });
+    await freshFs.topic('far-ahead').append(utf8('from the future'));
+    const [ev] = await all(topic.read());
+    expect(zw.hlcMs(ev!.hlc)).toBeGreaterThan(Date.now() + 3_000_000);
+    expect(zw.hlcMs(w.session.clock.last)).toBeLessThan(Date.now() + 60_000);
+    expect(() => fresh.useClock(new TreeClock())).toThrow(/already in use/);
+    freshFs.close();
+  });
+
+  it('keeps the counter actor with the clock store', async () => {
+    const store = memoryClockStore();
+    const c1 = new TreeClock({ store });
+    const c2 = new TreeClock({ store });
+    expect(c1.actor).toHaveLength(16);
+    expect(c2.actor).toEqual(c1.actor);
+    expect(new TreeClock().actor).not.toEqual(c1.actor);
+    // A store without an actor: a fresh one per clock.
+    const bare = { load: () => undefined, save: () => {} };
+    expect(new TreeClock({ store: bare }).actor).not.toEqual(new TreeClock({ store: bare }).actor);
   });
 });
