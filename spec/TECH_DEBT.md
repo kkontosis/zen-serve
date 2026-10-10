@@ -201,6 +201,6 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 * **Status:** open
 * **Context:** zen-db CRDT tables (spec/zendb.md §19) need server-merged row objects: last-writer-wins row and field registers, per-device counters and add-wins sets, with the `row`, `lww`, `ctr`, `add` and `rem` operations in `crdt_ops`, the `/v1/crdt/get` and `/v1/crdt/range` reads, and a `"crdt_rows"` feature flag. The server implements only the filesystem's CRDT objects (spec/fs.md).
-* **Why deferred:** Milestone 4.5 is specs only. DESIGN-3 §6 places further server CRDT types (`lww_map`, `or_set`, `counter`) in milestone 7; this entry is where the work is tracked until it is scheduled.
+* **Why deferred:** Milestone 4.5 is specs only. Scheduled for milestone 5 (DESIGN-3 §6), moved forward from 7, so that the offline variants of the app examples can be demonstrated with zen-db.
 * **What it would take:** The operations and their merge rules inside the commit transaction, the keyspace of zendb.md §19.5 (moved into keyspace.md), the sweeper purge of deleted objects past the horizon, the reads, api.md §6 and §12-style sections, zen-proto types, and the property test of §19.9 against an in-memory reference, on both backends.
 

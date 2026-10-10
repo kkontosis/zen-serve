@@ -217,7 +217,7 @@ Family pocket money or team credits: balances that must never go negative, a ful
 
 ## CRDT tables in the examples
 
-Once the server implements CRDT tables (spec/zendb.md §19, `TD-CRDT-ROWS-SERVER`), two of the examples gain an offline-first variant:
+The server side of CRDT tables comes in milestone 5 (spec/zendb.md §19, `TD-CRDT-ROWS-SERVER`). With it, two of the examples gain an offline-first variant, demonstrated in milestone 5 as well:
 
 * **Kanban.**
   * Cards become a CRDT table: `title` and `text` are `lww`, `labels` a `set`, `votes` a `counter`.

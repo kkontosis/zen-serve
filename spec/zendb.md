@@ -13,7 +13,7 @@ It sends them as **one** `/v1/commit`, so everything applies or nothing does (ap
 
 The server is unchanged. Everything here is built from api.md §5–9 and §12. What the server lacks is listed in §18 and in TECH_DEBT.md.
 
-Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges; it waits on server work (TD-CRDT-ROWS-SERVER).
+Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges; its server side comes in milestone 5 (TD-CRDT-ROWS-SERVER).
 
 ## 1. Conventions
 
@@ -1061,7 +1061,7 @@ What the server lacks for this layer, deferred (spec/TECH_DEBT.md):
 
 ## 19. CRDT tables (server-merged)
 
-**Status:** specified; the server side isn't implemented yet (TD-CRDT-ROWS-SERVER). A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
+**Status:** specified; the server side is scheduled for milestone 5 (TD-CRDT-ROWS-SERVER). A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
 
 ### 19.1 Model
 
