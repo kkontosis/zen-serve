@@ -19,7 +19,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
   | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
   | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
-  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4; or a CRDT-row counter `seq` that isn't newer, §13.2) | with a fresh `hlc` or `seq` (rebase); not for a purged node |
+  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4; or a CRDT-row timestamp collision, §13.2) | with a fresh `hlc` (rebase); not for a purged node |
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
@@ -392,7 +392,7 @@ CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), 
                                             chunks?: [bytes(16)], manifest: bytes}
        | {fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}                 // CRDT rows (§13)
        | {fs, op: "lww", object: bytes, field: bytes(16), hlc: u64, value?: bytes}
-       | {fs, op: "ctr", object: bytes, field: bytes(16), seq: u64, value: bytes}
+       | {fs, op: "ctr", object: bytes, field: bytes(16), actor: bytes(16), seq: u64, value: bytes}
        | {fs, op: "add", object: bytes, field: bytes(16), elem: bytes(16), value: bytes}
        | {fs, op: "rem", object: bytes, field: bytes(16), elem: bytes(16), dots: [bytes(12)]}
 ```
@@ -612,7 +612,7 @@ Server-merged rows of zen-db CRDT tables. The server merges them field by field 
 * An object exists from its first operation, and holds:
   * a **row register**: `(hlc, device, alive, value)`, last writer wins
   * per field token, an **`lww` register**: `(hlc, device, value?)`, last writer wins
-  * per field token and device, a **counter entry**: `(seq, value)`, greatest `seq` wins
+  * per field token, device and actor, a **counter entry**: `(seq, value)`, greatest `seq` wins. The actor is a 16-byte id the client creates once per installation, so each entry has a single writer
   * per field token and element token, a set of **dots**, each with its device and value
 * Timestamps are `ts = (hlc, device)`, ordered by `hlc`, then device bytes, as in fs.md §2. `device` is set by the server to the session's device fingerprint.
 * Every `value` is a sealed kind-7 object (formats.md §4), stored verbatim and at most `max_value_bytes`.
@@ -625,16 +625,20 @@ The operations are `crdt_ops` entries of `/v1/commit` (§6). Each needs fs `writ
 |---|---|
 | `row` | if `(hlc, device)` is greater than the row register's, the register becomes `(hlc, device, alive, value)` |
 | `lww` | if `(hlc, device)` is greater than the field's register, the register becomes `(hlc, device, value)`; an absent `value` unsets the field |
-| `ctr` | if `seq` is greater than the stored `seq` of `(field, device)`, the entry becomes `(seq, value)`; otherwise 409 `stale_op` |
+| `ctr` | if `seq` is greater than the stored `seq` of `(field, device, actor)`, the entry becomes `(seq, value)`; otherwise it is ignored |
 | `add` | adds a dot `versionstamp ‖ u16(i)` to `(field, elem)`, with the session's device and `value`; `i` numbers the commit's `add`s from 0 |
 | `rem` | deletes the listed dots of `(field, elem)` that still exist; unknown dots are ignored |
 
-* **Ties.** A `row` or `lww` operation whose `(hlc, device)` equals the stored one is ignored, so a re-sent offline operation is harmless. An older one is ignored as well: that is the merge.
+* **Ties.** A `row` or `lww` operation whose `(hlc, device)` equals the stored one is compared with it whole (the flag and the value bytes):
+  * identical: ignored. It is a re-send of the stored operation, for example by an offline queue after the commit's idempotency record expired.
+  * different: 409 `stale_op`. Two sessions of one device issued the same timestamp; the author rebases with a fresh `hlc`, so its write lands instead of vanishing.
+  
+  An older operation is ignored: that is the merge.
 * **Clocks.** `row` and `lww` are checked like fs operations (fs.md §3.4): an `hlc` more than `crdt_max_skew_ms` ahead of the server clock gets 409 `clock_skew`, and one older than `crdt_horizon_secs` gets 409 `stale_op`.
-* **Counters.** A device writes only its own entry, with its new cumulative total and the next `seq`. `stale_op` on `ctr` means another session of the same device got there first: re-read the entry (§13.3) and reissue the operation on top of it. A replayed commit (`commit_id`, §6) returns its stored result and is not refused.
+* **Counters.** An installation writes only its own entry `(device, actor)`, with its cumulative total and the next `seq`, in order. A `seq` not greater than the stored one is therefore a re-send of an operation already applied, and is ignored. Two sessions of one device use different actors, so they never share an entry. A replayed commit (`commit_id`, §6) returns its stored result.
 * **Order.** Operations apply in list order, after the commit's writes and appends, so a commit may carry several operations on one object.
 * **Isolation (G11).** The registers and entries the server reads are read at the commit's read version in short mode, and conflict like any read. In long mode the server retries its own conflicts, so these operations never fail with `conflict`.
-* **Bad requests (400):** an `object` that is empty, not a multiple of 16 bytes or over `max_key_bytes`; a `field` or `elem` that isn't 16 bytes; a dot that isn't 12 bytes; a `value` over `max_value_bytes`.
+* **Bad requests (400):** an `object` that is empty, not a multiple of 16 bytes or over `max_key_bytes`; a `field`, `elem` or `actor` that isn't 16 bytes; a dot that isn't 12 bytes; a `value` over `max_value_bytes`.
 
 ### 13.3 Reads
 
@@ -647,7 +651,7 @@ POST /v1/crdt/range {fs, begin: bytes, end?: bytes, limit?, read_version?}
 ObjState = { object: bytes,
              row?: {hlc: u64, device: bytes(32), alive: bool, value: bytes},
              lww: [{field: bytes(16), hlc: u64, device: bytes(32), value?: bytes}],
-             ctr: [{field: bytes(16), device: bytes(32), seq: u64, value: bytes}],
+             ctr: [{field: bytes(16), device: bytes(32), actor: bytes(16), seq: u64, value: bytes}],
              set: [{field: bytes(16), elem: bytes(16), dot: bytes(12), device: bytes(32), value: bytes}],
              version: bytes(10) }               // versionstamp of the object's last change
 ```
@@ -655,7 +659,7 @@ ObjState = { object: bytes,
 * Both need fs `read`.
 * **`get`** returns one ObjState per requested object that exists, in request order; unknown objects are left out. `objects` takes at most 1,000 entries.
 * **`range`** returns the objects in `[begin, end)` in byte order (`end` absent: every object after `begin`), at most `limit` (default and cap `max_range_items`) objects and about `max_range_bytes` of state. To continue, set `begin` to the last object ‖ `0x00`. The usual range is a table's prefix, `D ‖ ("t", table_id)` of zendb.md §2.1.
-* **Lists** within an ObjState are in key order: `lww` by field, `ctr` by field then device, `set` by field, element, then dot.
+* **Lists** within an ObjState are in key order: `lww` by field, `ctr` by field, device, then actor, `set` by field, element, then dot.
 * An object whose state alone exceeds `max_range_bytes` returns 413 `too_large`.
 * **`read_version`** works as in KV reads (§5). These reads take no conflict ranges: a transaction that reads CRDT rows doesn't conflict on them (zendb.md §19.4).
 

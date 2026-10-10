@@ -168,7 +168,7 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 |---|---|
 | `pack("co", fs, object)` | row register: `u64 hlc ‖ dev(32) ‖ u8 alive ‖ value` |
 | `pack("cw", fs, object, field)` | `lww` register: `u64 hlc ‖ dev(32) ‖ u8 has_value ‖ [value]` |
-| `pack("cn", fs, object, field, dev)` | counter entry: `u64 seq ‖ value` |
+| `pack("cn", fs, object, field, dev, actor)` | counter entry: `u64 seq ‖ value`; `actor` is a 16-byte byte-string element |
 | `pack("cs", fs, object, field, elem, dot)` | set element: `dev(32) ‖ value` |
 | `pack("cv", fs, object)` | `versionstamp(10)` of the object's last change. One per object: also the object index that `/v1/crdt/range` reads |
 | `pack("cd", fs, vs, object)` | empty: GC candidate (zendb.md §19.5). Present while the object's row register is `alive: false`, or while it has no row register; `vs` is the object's last change |

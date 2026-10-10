@@ -1117,7 +1117,7 @@ Plaintexts:
 |---|---|
 | row register | `{1: pk}`, so scans return keys |
 | `lww` field | `{1: value}` |
-| `counter` entry | `{1: total: int}`: this device's cumulative sum of increments and decrements |
+| `counter` entry | `{1: total: int}`: this installation's cumulative sum of increments and decrements |
 | `set` element | `{1: element}` |
 
 ### 19.3 Operations
@@ -1127,18 +1127,19 @@ New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
 ```
 {fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}            // insert (alive) or delete
 {fs, op: "lww", object, field: bytes(16), hlc: u64, value?: bytes}              // set; value absent = unset
-{fs, op: "ctr", object, field: bytes(16), seq: u64, value: bytes}              // this device's new total
+{fs, op: "ctr", object, field: bytes(16), actor: bytes(16), seq: u64, value: bytes}  // this installation's new total
 {fs, op: "add", object, field: bytes(16), elem: bytes(16), value: bytes}       // gets a dot
 {fs, op: "rem", object, field: bytes(16), elem: bytes(16), dots: [bytes(12)]}  // removes observed dots
 ```
 
 * `device` is the session's device fingerprint, set by the server as in fs.md §2.
 * **`row` and `lww`:** keep the value with the greatest `(hlc, device)`.
-  * An operation with the same `(hlc, device)` as the stored one is ignored, so a re-sent offline operation is harmless.
+  * An operation with the same `(hlc, device)` as the stored one is a no-op if it is identical (flag and value bytes), so a re-sent offline operation is harmless. If it differs, two sessions of one device collided, and it gets `stale_op`: the class rebases it with a fresh `hlc` (§19.7).
   * `clock_skew` and the horizon apply as in fs.md §3.4: an `hlc` too far ahead gets `clock_skew`, and one older than `crdt_horizon_secs` gets `stale_op`.
-* **`ctr`:** for each `(object, field, device)`, keep the operation with the greatest `seq`. A device only ever writes its own entry.
-  * A `seq` not greater than the stored one gets `stale_op`: two sessions of one device raced (two tabs without an owner, §9.2, or two processes sharing a device key). The class re-reads its entry and reissues the increment on top of it, so no increment is lost.
-  * A replayed commit (`commit_id`) returns its stored result, so a replay is harmless.
+* **`ctr`:** for each `(object, field, device, actor)`, keep the operation with the greatest `seq`.
+  * `actor` is a random 16-byte id the class creates once per installation (an IndexedDB store, a Node data directory; per session without a persistent store) and keeps with its HLC. So each entry has one writer, which sends its operations in order: a `seq` not greater than the stored one is a re-send of an operation already applied, and is ignored.
+  * Two sessions of one device (two tabs without an owner, §9.2, or two processes sharing a device key) have different actors, so they never overwrite each other's increments.
+  * A replayed commit (`commit_id`) returns its stored result.
 * **`add`:**
   * The element gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s. Dots are returned in the commit result's `set_dots` (api.md §6), numbered separately from fs `dots`.
   * The element is present while it has at least one dot.
@@ -1157,7 +1158,7 @@ POST /v1/crdt/range {fs, begin: bytes, end?: bytes, limit?, read_version?} → {
 ObjState = { object: bytes,
              row?: {hlc, device, alive, value},
              lww:  [{field, hlc, device, value}],
-             ctr:  [{field, device, seq, value}],
+             ctr:  [{field, device, actor, seq, value}],
              set:  [{field, elem, dot, device, value}],
              version: bytes(10) }                 // versionstamp of the object's last change
 ```
@@ -1165,7 +1166,7 @@ ObjState = { object: bytes,
 * Both need fs `read`, and `range` pages like `/v1/kv/range`.
 * The client opens every value and builds the merged row:
   * `lww` fields as stored
-  * counters summed over devices
+  * counters summed over their `(device, actor)` entries
   * sets as the elements with at least one dot
   * the row visible if its register is `alive`
 * **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
@@ -1195,7 +1196,7 @@ The layout is keyspace.md §3.8: a row register (`co`), `lww` registers (`cw`), 
 
 * **Queue.** While offline, the class keeps operations and their change events in a local queue: in memory, or encrypted at rest (§9.3). It sends them as long-mode commits when back online.
 * **Clock.** It uses one HLC per session, the M4 tree clock.
-* **Old operations.** An operation older than the horizon gets `stale_op`. The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users.
+* **Old operations.** A `row` or `lww` operation older than the horizon gets `stale_op`, as does one whose timestamp collides with another session's (§19.3). The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users. Counters, sets and removals never need a rebase.
 
 ### 19.8 Leakage
 
@@ -1203,7 +1204,7 @@ Beyond §15, the server sees, per CRDT row:
 * which fields (by token) exist and change, when, and from which device
 * the `hlc` of every write, which is wall-clock time to the millisecond
 * deletes, through the plaintext `alive` flag
-* for counters, how often each device changes each one (`seq`)
+* for counters, how often each installation (`actor`) of each device changes each one (`seq`), and so how many installations a device has
 * for sets, how many elements each field holds and when each is added or removed. Element tokens are per row, so equal elements in different rows aren't linkable.
 
 ### 19.9 Test vectors

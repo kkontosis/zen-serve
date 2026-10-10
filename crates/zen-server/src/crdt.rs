@@ -70,12 +70,14 @@ pub fn validate(st: &Shared, op: &CrdtOp) -> ApiResult<usize> {
         CrdtOp::Ctr {
             object,
             field,
+            actor,
             value,
             ..
         } => {
             check_object(st, object)?;
             id_ok(field, "field")?;
-            object.len() + 16 + value_ok(value)?
+            id_ok(actor, "actor")?;
+            object.len() + 32 + value_ok(value)?
         }
         CrdtOp::Add {
             object,
@@ -181,7 +183,9 @@ impl<'a> RowEngine<'a> {
     }
 
     /// Last-writer-wins on a register at `key`: write if `(hlc, device)` is
-    /// greater than the stored timestamp.
+    /// greater than the stored timestamp. An equal timestamp is a re-send
+    /// when the record is identical (a no-op), and a collision otherwise
+    /// (two sessions of one device): `stale_op`, so its author rebases.
     async fn lww(
         &mut self,
         t: &mut Box<dyn Txn>,
@@ -196,12 +200,17 @@ impl<'a> RowEngine<'a> {
             hlc,
             dev: self.device,
         };
-        if let Some(c) = &cur
-            && ts <= ts_of(c)?
-        {
-            return Ok(()); // older or equal: the stored one wins
-        }
         let rec = register(hlc, &self.device, flag, value);
+        if let Some(c) = &cur {
+            match ts.cmp(&ts_of(c)?) {
+                std::cmp::Ordering::Less => return Ok(()), // the stored one wins
+                std::cmp::Ordering::Equal if *c == rec => return Ok(()),
+                std::cmp::Ordering::Equal => {
+                    return Err(stale_op("timestamp collision; rebase with a fresh hlc"));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
         self.put(t, fs, key, cur.map(|c| c.len()), rec);
         self.changed.insert((fs, object.to_vec()));
         Ok(())
@@ -236,20 +245,24 @@ impl<'a> RowEngine<'a> {
                 fs,
                 object,
                 field,
+                actor,
                 seq,
                 value,
             } => {
                 let key = keys::crdt_ctr(*fs, object)
                     .bytes(field)
                     .bytes(&self.device)
+                    .bytes(actor)
                     .finish();
                 let cur = self.get(t, &key).await?;
                 if let Some(c) = &cur {
                     if c.len() < 8 {
                         return Err(internal("bad counter entry"));
                     }
+                    // One writer per entry: an older or equal seq is a
+                    // re-send of an operation already applied.
                     if *seq <= u64::from_be_bytes(c[..8].try_into().expect("8")) {
-                        return Err(stale_op("counter seq is not newer; re-read and reissue"));
+                        return Ok(());
                     }
                 }
                 let mut rec = seq.to_be_bytes().to_vec();
@@ -421,14 +434,15 @@ async fn load(
     let mut ctr = Vec::new();
     let pfx = keys::crdt_ctr(fs, object).finish();
     for (k, v) in read_all(st, t, &pfx).await? {
-        let e = last_elems(&k, pfx.len(), 2)?;
-        if v.len() < 8 || e.len() != 2 {
+        let e = last_elems(&k, pfx.len(), 3)?;
+        if v.len() < 8 || e.len() != 3 {
             return Err(internal("bad counter entry"));
         }
         size += k.len() + v.len();
         ctr.push(CtrEntry {
             field: bytes_elem(&e[0])?,
             device: bytes_elem(&e[1])?,
+            actor: bytes_elem(&e[2])?,
             seq: u64::from_be_bytes(v[..8].try_into().expect("8")),
             value: v[8..].to_vec(),
         });

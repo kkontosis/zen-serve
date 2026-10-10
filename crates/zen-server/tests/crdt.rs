@@ -79,10 +79,16 @@ fn lww(o: &[u8], field: &[u8], hlc: u64, v: Option<&[u8]>) -> CrdtOp {
 }
 
 fn ctr(o: &[u8], field: &[u8], seq: u64, v: &[u8]) -> CrdtOp {
+    ctr_as(o, field, 1, seq, v)
+}
+
+/// A counter op from installation `actor`.
+fn ctr_as(o: &[u8], field: &[u8], actor: u8, seq: u64, v: &[u8]) -> CrdtOp {
     CrdtOp::Ctr {
         fs: 1,
         object: o.to_vec(),
         field: field.to_vec(),
+        actor: vec![0xA0 | actor; 16],
         seq,
         value: v.to_vec(),
     }
@@ -178,9 +184,20 @@ async fn lww_registers_merge_by_timestamp() {
     send(&h, a, vec![lww(&o, &f(1), t - 5, Some(b"old"))])
         .await
         .unwrap();
-    send(&h, b, vec![lww(&o, &f(1), t + 1, Some(b"again"))])
+    // An identical re-send under a new commit id is a no-op; the same
+    // timestamp with other content is a collision, refused for a rebase.
+    send(&h, b, vec![lww(&o, &f(1), t + 1, Some(b"B"))])
         .await
         .unwrap();
+    assert_eq!(
+        code(send(&h, b, vec![lww(&o, &f(1), t + 1, Some(b"again"))]).await),
+        (409, "stale_op".into())
+    );
+    assert_eq!(
+        code(send(&h, a, vec![row(&o, t, false, b"pk")]).await),
+        (409, "stale_op".into())
+    );
+    send(&h, a, vec![row(&o, t, true, b"pk")]).await.unwrap();
     let s = one(&h, a, &o).await.unwrap();
     assert_eq!(field_value(&s, &f(1)), Some(Some(b"B".to_vec())));
     let r = s.row.unwrap();
@@ -244,8 +261,11 @@ async fn delete_wins_over_older_updates_and_reinsert_revives() {
     assert_eq!(field_value(&s, &f(1)), Some(Some(b"late".to_vec())));
 }
 
+/// `(device, actor, seq, value)`.
+type CtrRow = (Vec<u8>, Vec<u8>, u64, Vec<u8>);
+
 #[tokio::test(flavor = "multi_thread")]
-async fn counters_keep_one_entry_per_device() {
+async fn counters_keep_one_entry_per_actor() {
     let (h, d) = devices(2, |_| {}).await;
     let (a, b) = (&d[0], &d[1]);
     let o = obj(3);
@@ -257,33 +277,51 @@ async fn counters_keep_one_entry_per_device() {
     .await
     .unwrap();
     send(&h, b, vec![ctr(&o, &f(1), 1, b"2")]).await.unwrap();
-    let s = one(&h, a, &o).await.unwrap();
-    let mut entries: Vec<(Vec<u8>, u64, Vec<u8>)> = s
-        .ctr
-        .iter()
-        .map(|c| (c.device.clone(), c.seq, c.value.clone()))
-        .collect();
-    entries.sort();
+    // A second installation of device A races with the first: its own entry.
+    send(&h, a, vec![ctr_as(&o, &f(1), 2, 1, b"7")])
+        .await
+        .unwrap();
+    let entries = |s: ObjState| {
+        let mut v: Vec<CtrRow> = s
+            .ctr
+            .iter()
+            .map(|c| (c.device.clone(), c.actor.clone(), c.seq, c.value.clone()))
+            .collect();
+        v.sort();
+        v
+    };
     let mut want = vec![
-        (a.fp.to_vec(), 2, b"5".to_vec()),
-        (b.fp.to_vec(), 1, b"2".to_vec()),
+        (a.fp.to_vec(), vec![0xA1; 16], 2, b"5".to_vec()),
+        (a.fp.to_vec(), vec![0xA2; 16], 1, b"7".to_vec()),
+        (b.fp.to_vec(), vec![0xA1; 16], 1, b"2".to_vec()),
     ];
     want.sort();
-    assert_eq!(entries, want);
-    // A seq that isn't newer, in a new commit: another session raced.
+    assert_eq!(entries(one(&h, a, &o).await.unwrap()), want);
+    // A re-send under a new commit id (its record expired): an older or
+    // equal seq is an operation already applied, ignored.
+    send(
+        &h,
+        a,
+        vec![ctr(&o, &f(1), 2, b"5"), ctr(&o, &f(1), 1, b"3")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(entries(one(&h, a, &o).await.unwrap()), want);
+    // A replayed commit returns its result and applies nothing again.
     let cid = rcid();
     let first = send_id(&h, b, cid.clone(), vec![ctr(&o, &f(1), 2, b"4")])
         .await
         .unwrap();
-    assert_eq!(
-        code(send(&h, b, vec![ctr(&o, &f(1), 2, b"9")]).await),
-        (409, "stale_op".into())
-    );
-    // A replayed commit returns its result and applies nothing again.
     let again = send_id(&h, b, cid, vec![ctr(&o, &f(1), 2, b"4")])
         .await
         .unwrap();
     assert_eq!(first, again);
+    // Actors are 16 bytes.
+    let mut bad = ctr(&o, &f(1), 9, b"1");
+    if let CrdtOp::Ctr { actor, .. } = &mut bad {
+        actor.truncate(15);
+    }
+    assert_eq!(code(send(&h, a, vec![bad]).await).0, 400);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -509,8 +547,8 @@ async fn sweeper_purges_dead_and_registerless_objects() {
 
 /// `field → (hlc, device, value)`.
 type LwwModel = BTreeMap<Vec<u8>, (u64, [u8; 32], Option<Vec<u8>>)>;
-/// `(field, device) → (seq, value)`.
-type CtrModel = BTreeMap<(Vec<u8>, [u8; 32]), (u64, Vec<u8>)>;
+/// `(field, device, actor) → (seq, value)`.
+type CtrModel = BTreeMap<(Vec<u8>, [u8; 32], Vec<u8>), (u64, Vec<u8>)>;
 
 /// Reference state of one object, from the operations accepted.
 #[derive(Default, Debug, PartialEq)]
@@ -532,7 +570,12 @@ fn reg_view(s: &ObjState) -> RefObj {
         ctr: s
             .ctr
             .iter()
-            .map(|c| ((c.field.clone(), dev(&c.device)), (c.seq, c.value.clone())))
+            .map(|c| {
+                (
+                    (c.field.clone(), dev(&c.device), c.actor.clone()),
+                    (c.seq, c.value.clone()),
+                )
+            })
             .collect(),
     }
 }
@@ -562,7 +605,7 @@ async fn convergence_matches_reference_in_any_arrival_order() {
         let base = now_ms() - 3_600_000;
         let objects: Vec<Vec<u8>> = (0..3).map(|i| obj(0x40 + i)).collect();
         let mut model: Vec<RefObj> = (0..3).map(|_| RefObj::default()).collect();
-        let mut seqs = [[[0u64; 2]; 3]; 3]; // device, object, field
+        let mut seqs = [[[[0u64; 2]; 3]; 2]; 3]; // device, actor, object, field
         let mut pending = Vec::new();
         for i in 0..90u64 {
             let d = rng.below(3) as usize;
@@ -589,15 +632,16 @@ async fn convergence_matches_reference_in_any_arrival_order() {
                     lww(o, &fl, hlc, v.as_deref())
                 }
                 _ => {
-                    let fi = rng.below(2) as usize;
-                    seqs[d][oi][fi] += 1;
-                    let seq = seqs[d][oi][fi];
+                    // Two installations per device.
+                    let (fi, ai) = (rng.below(2) as usize, rng.below(2) as usize);
+                    seqs[d][ai][oi][fi] += 1;
+                    let seq = seqs[d][ai][oi][fi];
                     let fl = f(fi as u8);
-                    let cur = m.ctr.get(&(fl.clone(), fp));
-                    if cur.is_none_or(|(s0, _)| seq > *s0) {
-                        m.ctr.insert((fl.clone(), fp), (seq, vec![i as u8]));
+                    let k = (fl.clone(), fp, vec![0xA1 + ai as u8; 16]);
+                    if m.ctr.get(&k).is_none_or(|(s0, _)| seq > *s0) {
+                        m.ctr.insert(k, (seq, vec![i as u8]));
                     }
-                    ctr(o, &fl, seq, &[i as u8])
+                    ctr_as(o, &fl, 1 + ai as u8, seq, &[i as u8])
                 }
             };
             pending.push((d, op));
@@ -605,14 +649,14 @@ async fn convergence_matches_reference_in_any_arrival_order() {
         for i in (1..pending.len()).rev() {
             pending.swap(i, rng.below(i as u64 + 1) as usize);
         }
-        for (d, op) in pending {
-            let late_ctr = matches!(op, CrdtOp::Ctr { .. });
-            match send(&h, &devs[d], vec![op]).await {
-                Ok(_) => {}
-                // A counter entry that arrives after a newer one of its
-                // device is refused, and the newer total stands.
-                Err((409, b)) if late_ctr && b.code == "stale_op" => {}
-                Err(e) => panic!("seed {seed}: {e:?}"),
+        // Every op is also re-sent later under a new commit id, as an
+        // offline queue would after its idempotency record expired: no
+        // re-send changes the state. A counter total that arrives after a
+        // newer one of its actor is ignored, and the newer one stands.
+        let resends: Vec<(usize, CrdtOp)> = pending.clone();
+        for (d, op) in pending.into_iter().chain(resends) {
+            if let Err(e) = send(&h, &devs[d], vec![op]).await {
+                panic!("seed {seed}: {e:?}");
             }
         }
         let got = get(&h, &devs[0], &objects).await;

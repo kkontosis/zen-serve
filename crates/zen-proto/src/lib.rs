@@ -2115,7 +2115,7 @@ pub enum CrdtOp {
         #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
         value: Option<Vec<u8>>,
     },
-    /// CRDT row: this device's new counter total.
+    /// CRDT row: this installation's new counter total.
     Ctr {
         /// fs_id.
         fs: u32,
@@ -2127,7 +2127,11 @@ pub enum CrdtOp {
         #[serde(with = "serde_bytes")]
         #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
         field: Vec<u8>,
-        /// Sequence number, greater than the stored one.
+        /// The writing installation (16 bytes): one entry per device and actor.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        actor: Vec<u8>,
+        /// Sequence number; one not greater than the stored one is ignored.
         seq: u64,
         /// Sealed kind-7 value.
         #[serde(with = "serde_bytes")]
@@ -2294,7 +2298,7 @@ pub struct LwwReg {
     pub value: Option<Vec<u8>>,
 }
 
-/// A counter entry of one device.
+/// A counter entry of one device and installation (actor).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts",
@@ -2310,6 +2314,10 @@ pub struct CtrEntry {
     #[serde(with = "serde_bytes")]
     #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub device: Vec<u8>,
+    /// The writing installation.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub actor: Vec<u8>,
     /// Sequence number.
     pub seq: u64,
     /// Sealed value: the device's total.
@@ -2367,7 +2375,7 @@ pub struct ObjState {
     /// `lww` registers, by field.
     #[serde(default)]
     pub lww: Vec<LwwReg>,
-    /// Counter entries, by field then device.
+    /// Counter entries, by field, device, then actor.
     #[serde(default)]
     pub ctr: Vec<CtrEntry>,
     /// Set dots, by field, element, dot.
