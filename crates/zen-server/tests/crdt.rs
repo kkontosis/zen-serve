@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zen_core::fs as zfs;
 use zen_proto::*;
 
@@ -525,18 +525,30 @@ async fn sweeper_purges_dead_and_registerless_objects() {
     // Nothing is older than the horizon yet.
     zen_server::sweep_once(st).await.unwrap();
     assert_eq!(get(&h, a, &[dead.clone(), bare.clone()]).await.len(), 2);
+    // The horizon is measured in commit versions, which on an idle
+    // FoundationDB cluster can trail the wall clock by a couple of seconds.
     tokio::time::sleep(Duration::from_millis(2800)).await;
-    zen_server::sweep_once(st).await.unwrap();
-    let left: Vec<Vec<u8>> = get(
-        &h,
-        a,
-        &[dead.clone(), alive.clone(), bare.clone(), revived.clone()],
-    )
-    .await
-    .into_iter()
-    .map(|s| s.object)
-    .collect();
-    assert_eq!(left, vec![alive, revived]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        zen_server::sweep_once(st).await.unwrap();
+        let left: Vec<Vec<u8>> = get(
+            &h,
+            a,
+            &[dead.clone(), alive.clone(), bare.clone(), revived.clone()],
+        )
+        .await
+        .into_iter()
+        .map(|s| s.object)
+        .collect();
+        if left == vec![alive.clone(), revived.clone()] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "purged past the horizon: {left:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     // A new operation on a purged object starts it afresh.
     send(&h, a, vec![row(&dead, zfs::hlc(now_ms(), 0), true, b"pk")])
         .await

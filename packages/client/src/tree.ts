@@ -12,9 +12,10 @@ import type {
 } from '@zen/wasm';
 import { compare, equal, hex, randomBytes } from './bytes.js';
 import type { Client } from './client.js';
+import type { TreeClock } from './clock.js';
 import { isCode, ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
-import { sendCommit } from './kv.js';
+import { sendCommit, type Transaction } from './kv.js';
 import type { Session } from './session.js';
 import { zw } from './wasm.js';
 
@@ -31,117 +32,6 @@ const MAX_GET_NODES = 1000;
 const MAX_GET_CHUNKS = 64;
 const FETCH_PARALLEL = 4;
 
-// ------------------------------------------------------------------ clock
-
-/** Where a clock keeps its last timestamp across restarts. */
-export interface ClockStore {
-  load(): bigint | undefined;
-  save(last: bigint): void;
-}
-
-/** An in-memory clock store (the default). */
-export function memoryClockStore(initial?: bigint): ClockStore {
-  let v = initial;
-  return {
-    load: () => v,
-    save: (last) => {
-      v = last;
-    },
-  };
-}
-
-/**
- * The hybrid logical clock of a device (fs.md §2, formats.md §11.1). Every
- * tree a device writes may share one: timestamps only need to be unique
- * per tree and device, and a shared clock makes them unique everywhere.
- *
- * The wall clock is corrected by the server's (`/v1/info` `time_ms`, read
- * once before the first operation), so a device whose clock is off still
- * writes timestamps the server accepts.
- */
-export class TreeClock {
-  private readonly store: ClockStore;
-  private clock: InstanceType<typeof zw.Clock>;
-  private offsetMs = 0;
-  private synced: Promise<void> | undefined;
-  /** The highest timestamp the server accepted from this clock. */
-  private accepted = 0n;
-
-  constructor(private readonly opts: { store?: ClockStore; now?: () => number } = {}) {
-    this.store = opts.store ?? memoryClockStore();
-    this.clock = new zw.Clock(this.store.load() ?? 0n);
-  }
-
-  /** The last timestamp issued or observed. */
-  get last(): bigint {
-    return this.clock.last;
-  }
-
-  /** The corrected wall clock, unix ms. */
-  now(): number {
-    return (this.opts.now ?? Date.now)() + this.offsetMs;
-  }
-
-  /** Read the server clock once (again with `force`): wall-clock offset and observation. */
-  sync(client: Client, force = false): Promise<void> {
-    if (force || !this.synced) {
-      const p = this.syncNow(client);
-      this.synced = p.catch((e) => {
-        this.synced = undefined;
-        throw e;
-      });
-    }
-    return this.synced;
-  }
-
-  private async syncNow(client: Client): Promise<void> {
-    const t0 = (this.opts.now ?? Date.now)();
-    const info = await client.info();
-    const t1 = (this.opts.now ?? Date.now)();
-    const server = Number(info.time_ms);
-    this.offsetMs = server - Math.round((t0 + t1) / 2);
-    this.observe(zw.hlc(server, 0));
-  }
-
-  /** A new timestamp, later than everything seen. */
-  tick(): bigint {
-    const h = this.clock.tick(this.now());
-    this.store.save(this.clock.last);
-    return h;
-  }
-
-  /** Observe a timestamp from the server (node states, other devices' ops). */
-  observe(h: bigint | undefined): void {
-    if (h === undefined || h <= this.clock.last) return;
-    this.clock.observe(h);
-    this.store.save(this.clock.last);
-  }
-
-  /** Note a timestamp the server accepted. */
-  accept(h: bigint): void {
-    if (h > this.accepted) this.accepted = h;
-  }
-
-  /**
-   * After `clock_skew`: the clock ran ahead of the server (a wrong wall
-   * clock, persisted). Restart it at the server's time, but never before a
-   * timestamp the server already took from it, so this device's own later
-   * operations still win over its earlier ones.
-   */
-  reset(serverMs: number): void {
-    const start = zw.hlc(serverMs, 0);
-    this.clock.free();
-    this.clock = new zw.Clock(start > this.accepted ? start : this.accepted);
-    this.store.save(this.clock.last);
-  }
-
-  /** Free the WASM clock. */
-  free(): void {
-    this.clock.free();
-  }
-}
-
-const sessionClocks = new WeakMap<Session, TreeClock>();
 const serverInfo = new WeakMap<Client, Promise<Info>>();
 
 function infoOf(client: Client): Promise<Info> {
@@ -230,6 +120,30 @@ export interface WrittenFile {
   commits: number;
 }
 
+/** A file's content uploaded by `Tree.upload`, not yet written to its node. */
+export interface Upload {
+  node: Uint8Array;
+  manifest: Manifest;
+  /** The manifest sealed for this tree and node. */
+  sealedManifest: Uint8Array;
+  /** The content's index, for the next write's `previous`. */
+  index: ChunkIndex;
+  /** Chunks uploaded (the rest were reused). */
+  uploaded: number;
+  /** Commits the upload took. */
+  commits: number;
+}
+
+/** Operations with their timestamps assigned (`Tree.prepare`). */
+export interface Prepared {
+  /** The operations as sent. */
+  ops: CrdtOp[];
+  /** The timestamps taken, in order. */
+  hlcs: bigint[];
+  /** The operations given, to re-prepare after a rebase. */
+  pending: PendingOp[];
+}
+
 /** One change of the feed; `state` absent: the node was purged. */
 export interface TreeChange {
   offset: Uint8Array;
@@ -307,15 +221,7 @@ export class Tree {
     readonly id: Uint8Array,
     readonly opts: TreeOptions = {},
   ) {
-    let c = opts.clock;
-    if (!c) {
-      c = sessionClocks.get(fs.session);
-      if (!c) {
-        c = new TreeClock();
-        sessionClocks.set(fs.session, c);
-      }
-    }
-    this.clock = c;
+    this.clock = opts.clock ?? fs.session.clock;
   }
 
   /** A random id for a new tree; the tree exists once it has an operation. */
@@ -619,6 +525,67 @@ export class Tree {
     data: Uint8Array | AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
     opts: WriteOptions = {},
   ): Promise<WrittenFile> {
+    const st = await this.stage(node, data, opts);
+    const op = await this.writeOp(st.upload, opts.replaces);
+    const limits = await this.limits();
+    const writeCost =
+      OP_OVERHEAD + 48 + op.manifest.length + 16 * op.chunks.length + 12 * op.replaces.length;
+    if (
+      st.pendingBytes() + writeCost > limits.max_commit_bytes ||
+      st.pending().length + 1 > limits.max_commit_ops
+    ) {
+      await st.flush();
+    }
+    const r = await this.send([op], st.pending());
+    const u = st.upload;
+    return {
+      dot: r.dots![0]!,
+      manifest: u.manifest,
+      index: u.index,
+      uploaded: u.uploaded,
+      commits: u.commits + 1,
+    };
+  }
+
+  /**
+   * Upload a file's content without writing it (as `writeFile`, every
+   * chunk in commits of its own). Write it later with `writeOp`, alone
+   * (`send`) or in a transaction (`writeIn`). Chunks never written are
+   * collected after `chunk_grace_secs`.
+   */
+  async upload(
+    node: Uint8Array,
+    data: Uint8Array | AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    opts: Omit<WriteOptions, 'replaces'> = {},
+  ): Promise<Upload> {
+    const st = await this.stage(node, data, opts);
+    await st.flush();
+    return st.upload;
+  }
+
+  /**
+   * The `write` operation of an upload. `replaces` as in `writeFile`
+   * (`'current'`, the default, reads the node's versions now).
+   */
+  async writeOp(
+    u: Upload,
+    replaces: Uint8Array[] | 'current' = 'current',
+  ): Promise<Extract<PendingOp, { op: 'write' }>> {
+    return {
+      op: 'write',
+      node: u.node,
+      replaces: replaces === 'current' ? (await this.versions(u.node)).map((v) => v.dot) : replaces,
+      chunks: u.index.chunks,
+      manifest: u.sealedManifest,
+    };
+  }
+
+  /** Seal and upload chunks; the last ones stay pending for the caller's commit. */
+  private async stage(
+    node: Uint8Array,
+    data: Uint8Array | AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    opts: Omit<WriteOptions, 'replaces'>,
+  ) {
     const keys = this.fs.sealKeys();
     const limits = await this.limits();
     const chunkSize = opts.chunkSize ?? CHUNK_SIZE;
@@ -636,11 +603,11 @@ export class Tree {
     let pendingBytes = 0;
     let size = 0;
     let uploaded = 0;
-    let commits = 0;
+    const upload = { commits: 0 } as Upload;
     const flush = async () => {
       if (!pending.length) return;
       await sendCommit(this.session, { commit_id: randomBytes(16), chunks: pending });
-      commits++;
+      upload.commits++;
       pending = [];
       pendingBytes = 0;
     };
@@ -684,30 +651,14 @@ export class Tree {
         `a file of ${ids.length} chunks exceeds max_value_bytes`,
       );
     }
-    const replaces =
-      opts.replaces === undefined || opts.replaces === 'current'
-        ? (await this.versions(node)).map((v) => v.dot)
-        : opts.replaces;
-    const writeCost =
-      OP_OVERHEAD + 48 + sealedManifest.length + 16 * ids.length + 12 * replaces.length;
-    if (
-      pendingBytes + writeCost > limits.max_commit_bytes ||
-      pending.length + 1 > limits.max_commit_ops
-    ) {
-      await flush();
-    }
-    const r = await this.send(
-      [{ op: 'write', node, replaces, chunks: ids, manifest: sealedManifest }],
-      pending,
-    );
-    commits++;
-    return {
-      dot: r.dots![0]!,
+    Object.assign(upload, {
+      node,
       manifest,
+      sealedManifest,
       index: { chunkSize, chunks: ids, hashes },
       uploaded,
-      commits,
-    };
+    });
+    return { upload, flush, pending: () => pending, pendingBytes: () => pendingBytes };
   }
 
   /**
@@ -812,61 +763,95 @@ export class Tree {
    * re-issued with fresh timestamps (fs.md §3.4).
    */
   async send(ops: PendingOp[], chunks: ChunkPut[] = []): Promise<CommitResult> {
-    const client = this.session.client;
-    await this.clock.sync(client);
     for (let attempt = 1; ; attempt++) {
-      const hlcs: bigint[] = [];
-      const wire: CrdtOp[] = ops.map((o) => {
-        const base = { fs: this.fs.id, tree: this.id, node: o.node };
-        if (o.op === 'write') {
-          return {
-            op: 'write',
-            ...base,
-            replaces: o.replaces,
-            chunks: o.chunks,
-            manifest: o.manifest,
-          };
-        }
-        const hlc = this.clock.tick();
-        hlcs.push(hlc);
-        if (o.op === 'meta') return { op: 'meta', ...base, hlc, meta: o.meta };
-        return { op: 'move', ...base, parent: o.parent, hlc, ...(o.meta ? { meta: o.meta } : {}) };
-      });
+      const p = await this.prepare(ops);
       try {
         const r = await sendCommit(this.session, {
           commit_id: randomBytes(16),
           ...(chunks.length ? { chunks } : {}),
-          crdt_ops: wire,
+          crdt_ops: p.ops,
         });
-        for (const h of hlcs) this.clock.accept(h);
-        this.record(wire);
+        this.accept(p);
         return r;
       } catch (e) {
-        if (attempt >= 3 || !(e instanceof ZenError)) throw e;
-        if (e.code === 'stale_op' && hlcs.length && !e.message.includes('purged')) {
-          await this.clock.sync(client, true);
-          if (attempt === 1) {
-            // Observe what the ops touch: their later moves are what the
-            // server would have had to undo.
-            const touched = ops.flatMap((o) => (o.op === 'move' ? [o.node, o.parent] : [o.node]));
-            await this.get(touched);
-          } else {
-            // Later moves on other nodes: go past anything within the skew.
-            const skew = Number((await this.limits()).crdt_max_skew_ms ?? 60_000n);
-            this.clock.observe(zw.hlc(this.clock.now() + Math.floor(skew / 2), 0));
-          }
-          continue;
-        }
-        if (e.code === 'clock_skew' && hlcs.length) {
-          await this.clock.sync(client, true);
-          const skew = Number((await this.limits()).crdt_max_skew_ms ?? 60_000n);
-          if (zw.hlcMs(this.clock.last) > this.clock.now() + skew / 2)
-            this.clock.reset(this.clock.now());
-          continue;
-        }
-        throw e;
+        if (!(await this.rebase(p, e, attempt))) throw e;
       }
     }
+  }
+
+  /**
+   * Add operations (and chunks) to a transaction's commit. They are
+   * stamped now; if the commit fails with `stale_op` or `clock_skew` they
+   * are rebased as in `send`, and the transaction runs again (calling this
+   * again stamps them afresh).
+   */
+  async writeIn(tx: Transaction, ops: PendingOp[], chunks: ChunkPut[] = []): Promise<Prepared> {
+    const p = await this.prepare(ops);
+    tx.addCrdtOps(p.ops);
+    if (chunks.length) tx.addChunks(chunks);
+    tx.onCommit(() => this.accept(p));
+    tx.onError((e, attempt) => this.rebase(p, e, attempt));
+    return p;
+  }
+
+  /** Assign timestamps (reading the server clock once first). */
+  async prepare(ops: PendingOp[]): Promise<Prepared> {
+    await this.clock.sync(this.session.client);
+    const hlcs: bigint[] = [];
+    const wire: CrdtOp[] = ops.map((o) => {
+      const base = { fs: this.fs.id, tree: this.id, node: o.node };
+      if (o.op === 'write') {
+        return {
+          op: 'write',
+          ...base,
+          replaces: o.replaces,
+          chunks: o.chunks,
+          manifest: o.manifest,
+        };
+      }
+      const hlc = this.clock.tick();
+      hlcs.push(hlc);
+      if (o.op === 'meta') return { op: 'meta', ...base, hlc, meta: o.meta };
+      return { op: 'move', ...base, parent: o.parent, hlc, ...(o.meta ? { meta: o.meta } : {}) };
+    });
+    return { ops: wire, hlcs, pending: ops };
+  }
+
+  /** Note that the server accepted prepared operations. */
+  accept(p: Prepared): void {
+    for (const h of p.hlcs) this.clock.accept(h);
+    this.record(p.ops);
+  }
+
+  /**
+   * After a failed commit of prepared operations: whether they can be
+   * prepared again and resent (the clock was moved for a rebase).
+   */
+  async rebase(p: Prepared, e: unknown, attempt: number): Promise<boolean> {
+    if (attempt >= 3 || !(e instanceof ZenError) || !p.hlcs.length) return false;
+    const client = this.session.client;
+    if (e.code === 'stale_op' && !e.message.includes('purged')) {
+      await this.clock.sync(client, true);
+      if (attempt === 1) {
+        // Observe what the ops touch: their later moves are what the
+        // server would have had to undo.
+        const touched = p.pending.flatMap((o) => (o.op === 'move' ? [o.node, o.parent] : [o.node]));
+        await this.get(touched);
+      } else {
+        // Later moves on other nodes: go past anything within the skew.
+        const skew = Number((await this.limits()).crdt_max_skew_ms ?? 60_000n);
+        this.clock.observe(zw.hlc(this.clock.now() + Math.floor(skew / 2), 0));
+      }
+      return true;
+    }
+    if (e.code === 'clock_skew') {
+      await this.clock.sync(client, true);
+      const skew = Number((await this.limits()).crdt_max_skew_ms ?? 60_000n);
+      if (zw.hlcMs(this.clock.last) > this.clock.now() + skew / 2)
+        this.clock.reset(this.clock.now());
+      return true;
+    }
+    return false;
   }
 
   private record(ops: CrdtOp[]): void {
@@ -994,6 +979,11 @@ export class TreeBatch {
   /** Send the batch (rebasing as `Tree.send` does). */
   commit(): Promise<CommitResult> {
     return this.tree.send(this.ops);
+  }
+
+  /** Add the batch to a transaction's commit (`Tree.writeIn`). */
+  commitIn(tx: Transaction): Promise<Prepared> {
+    return this.tree.writeIn(tx, this.ops);
   }
 }
 

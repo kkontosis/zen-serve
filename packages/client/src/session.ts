@@ -3,6 +3,7 @@ import type { Credential, OriginState, Session as WireSession } from '@zen/wasm'
 import { Acl } from './acl.js';
 import { randomBytes, utf8 } from './bytes.js';
 import type { Client } from './client.js';
+import { TreeClock } from './clock.js';
 import { Fs } from './fs.js';
 import { type Authenticator, passkeyCreate } from './passkey.js';
 import { Stream, type StreamOptions } from './stream.js';
@@ -39,6 +40,29 @@ export class Session {
     readonly unlock: UnlockMaterial,
   ) {
     this.acl = new Acl(this);
+  }
+
+  private sessionClock: TreeClock | undefined;
+
+  /**
+   * The session's hybrid logical clock: events, tree operations and CRDT
+   * rows all take their timestamps from it. In memory unless `useClock`
+   * set a persisted one.
+   */
+  get clock(): TreeClock {
+    this.sessionClock ??= new TreeClock();
+    return this.sessionClock;
+  }
+
+  /**
+   * Use this clock (one with a persisted `ClockStore`) for the session.
+   * Call it before anything takes a timestamp.
+   */
+  useClock(clock: TreeClock): void {
+    if (this.sessionClock && this.sessionClock !== clock) {
+      throw new Error('the session clock is already in use');
+    }
+    this.sessionClock = clock;
   }
 
   /** The device fingerprint, or the credential id for other methods. */

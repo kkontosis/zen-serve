@@ -1,6 +1,16 @@
 // KV and transactions (spec/api.md §5–6, DESIGN-3 §2.4).
-import type { Append, Commit, CommitResult, Expect, ExpectRange, FsRange, Write } from '@zen/wasm';
-import { compare, hex, keyAfter, prefixEnd, randomBytes, utf8 } from './bytes.js';
+import type {
+  Append,
+  ChunkPut,
+  Commit,
+  CommitResult,
+  CrdtOp,
+  Expect,
+  ExpectRange,
+  FsRange,
+  Write,
+} from '@zen/wasm';
+import { compare, equal, hex, keyAfter, prefixEnd, randomBytes, utf8 } from './bytes.js';
 import { ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
 import type { Session } from './session.js';
@@ -24,6 +34,9 @@ export interface RangeOptions {
   limit?: number;
   reverse?: boolean;
 }
+
+const inRange = (k: Uint8Array, begin: Uint8Array, end: Uint8Array | undefined) =>
+  compare(k, begin) >= 0 && (!end || compare(k, end) < 0);
 
 const enc = (p: Path): Uint8Array[] => p.map((e) => (typeof e === 'string' ? utf8(e) : e));
 
@@ -144,24 +157,48 @@ export class Transaction {
   readonly extra: Partial<Commit> = {};
   /** The commit's result, once committed (for appended offsets and dots). */
   result: CommitResult | undefined;
-  private readVersion: bigint | undefined;
+  private rv0: bigint | undefined;
   private readonly conflicts: FsRange[] = [];
   private readonly expects = new Map<string, Expect>();
   private readonly expectRanges: ExpectRange[] = [];
+  private readonly crdtOps: CrdtOp[] = [];
+  private readonly chunks: ChunkPut[] = [];
+  /** @internal */
+  readonly commitHooks: ((r: CommitResult) => void)[] = [];
+  /** @internal */
+  readonly errorHooks: ((e: unknown, attempt: number) => Promise<boolean>)[] = [];
 
   constructor(
     readonly fs: UnlockedFs,
     readonly mode: 'short' | 'long',
   ) {}
 
-  private key(path: Path): Uint8Array {
-    return this.fs.kv.key(path);
+  /**
+   * The version every read of a short transaction is at, set by its first
+   * read (undefined before it, and in long mode).
+   */
+  get readVersion(): bigint | undefined {
+    return this.mode === 'short' ? this.rv0 : undefined;
+  }
+
+  private key(path: Path | Uint8Array): Uint8Array {
+    return path instanceof Uint8Array ? path : this.fs.kv.key(path);
   }
 
   private rv(): { read_version?: bigint } {
-    return this.mode === 'short' && this.readVersion !== undefined
-      ? { read_version: this.readVersion }
-      : {};
+    return this.mode === 'short' && this.rv0 !== undefined ? { read_version: this.rv0 } : {};
+  }
+
+  private noteRv(v: bigint): void {
+    if (this.mode === 'short') this.rv0 ??= v;
+  }
+
+  /** This transaction's own value for a stored key: a write, a clear, or nothing. */
+  private own(key: Uint8Array): { value: Uint8Array | undefined } | undefined {
+    const w = this.writes.get(hex(key));
+    if (w) return { value: w.value ? this.fs.kv.open(key, w.value) : undefined };
+    if (this.clears.some((c) => inRange(key, c.begin, c.end))) return { value: undefined };
+    return undefined;
   }
 
   /** Read a value (sees this transaction's own writes). */
@@ -174,7 +211,7 @@ export class Transaction {
       keys: [key],
       ...this.rv(),
     });
-    this.readVersion ??= r.read_version;
+    this.noteRv(r.read_version);
     const it = r.items[0]!;
     if (this.mode === 'short') {
       this.conflicts.push({ fs: this.fs.id, begin: key, end: keyAfter(key) });
@@ -205,7 +242,7 @@ export class Transaction {
         ...(end ? { end } : {}),
         ...this.rv(),
       });
-      this.readVersion ??= r.read_version;
+      this.noteRv(r.read_version);
       for (const it of r.items) {
         hasher?.update(it.key, it.version!);
         out.push({ key: it.key, value: this.fs.kv.open(it.key, it.value!), version: it.version! });
@@ -243,6 +280,151 @@ export class Transaction {
     return [...merged.values()].sort((a, b) => compare(a.key, b.key));
   }
 
+  /**
+   * Read values (by path or stored key) at the transaction's read version
+   * without recording them: no read conflict, no `expect`. For data whose
+   * consistency is checked another way (content-addressed nodes, records
+   * the caller `expectKey`s). Sees this transaction's own writes.
+   */
+  async snapshotGet(keys: (Path | Uint8Array)[]): Promise<(KvEntry | undefined)[]> {
+    const stored = keys.map((k) => this.key(k));
+    const out: (KvEntry | undefined)[] = new Array(stored.length);
+    const ask: number[] = [];
+    stored.forEach((key, i) => {
+      const own = this.own(key);
+      if (!own) ask.push(i);
+      else if (own.value) out[i] = { key, value: own.value, version: new Uint8Array(10) };
+    });
+    if (!ask.length) return out;
+    const r = await this.fs.session.call('/v1/kv/get', zw.encodeKvGet, zw.decodeKvItems, {
+      fs: this.fs.id,
+      keys: ask.map((i) => stored[i]!),
+      ...this.rv(),
+    });
+    this.noteRv(r.read_version);
+    r.items.forEach((it, j) => {
+      if (it.value && it.version) {
+        out[ask[j]!] = {
+          key: it.key,
+          value: this.fs.kv.open(it.key, it.value),
+          version: it.version,
+        };
+      }
+    });
+    return out;
+  }
+
+  /**
+   * Every entry under a path prefix (an empty prefix: the whole fs), read
+   * at the transaction's read version without recording it, as
+   * `snapshotGet`. Sees this transaction's own writes and clears.
+   */
+  snapshotRange(prefix: Path, opts: RangeOptions = {}): AsyncGenerator<KvEntry> {
+    const begin = prefix.length ? this.key(prefix) : new Uint8Array(0);
+    return this.snapshotRangeStored(begin, prefixEnd(begin), opts);
+  }
+
+  /** `snapshotRange` over the stored-key range `[begin, end)`. */
+  async *snapshotRangeStored(
+    begin: Uint8Array,
+    end: Uint8Array | undefined,
+    opts: RangeOptions = {},
+  ): AsyncGenerator<KvEntry> {
+    const rev = !!opts.reverse;
+    const before = (a: Uint8Array, b: Uint8Array) => (rev ? compare(a, b) > 0 : compare(a, b) < 0);
+    // This transaction's writes in the range, in output order.
+    const mine = [...this.writes.values()]
+      .filter((w) => inRange(w.key, begin, end))
+      .sort((a, b) => (rev ? compare(b.key, a.key) : compare(a.key, b.key)));
+    let m = 0;
+    let left = opts.limit ?? Number.POSITIVE_INFINITY;
+    const ownEntry = (w: Write): KvEntry | undefined =>
+      w.value
+        ? { key: w.key, value: this.fs.kv.open(w.key, w.value), version: new Uint8Array(10) }
+        : undefined;
+    let lo = begin;
+    let hi = end;
+    for (;;) {
+      if (left <= 0) return;
+      const r = await this.fs.session.call('/v1/kv/range', zw.encodeKvRange, zw.decodeKvItems, {
+        fs: this.fs.id,
+        begin: lo,
+        ...(hi ? { end: hi } : {}),
+        ...(Number.isFinite(left) ? { limit: left } : {}),
+        ...(rev ? { reverse: true } : {}),
+        ...this.rv(),
+      });
+      this.noteRv(r.read_version);
+      for (const it of r.items) {
+        // Own writes that come first.
+        while (m < mine.length && before(mine[m]!.key, it.key)) {
+          const e = ownEntry(mine[m++]!);
+          if (e) {
+            yield e;
+            if (--left <= 0) return;
+          }
+        }
+        if (m < mine.length && equal(mine[m]!.key, it.key)) {
+          const e = ownEntry(mine[m++]!);
+          if (e) {
+            yield e;
+            if (--left <= 0) return;
+          }
+          continue;
+        }
+        if (this.clears.some((c) => inRange(it.key, c.begin, c.end))) continue;
+        yield { key: it.key, value: this.fs.kv.open(it.key, it.value!), version: it.version! };
+        if (--left <= 0) return;
+      }
+      const last = r.items.at(-1);
+      if (!r.more || !last) break;
+      if (rev) hi = last.key;
+      else lo = keyAfter(last.key);
+    }
+    for (; m < mine.length && left > 0; m++) {
+      const e = ownEntry(mine[m]!);
+      if (e) {
+        yield e;
+        left--;
+      }
+    }
+  }
+
+  /**
+   * Make the commit depend on a key's version (by path or stored key): it
+   * fails with `conflict` unless the key is still at `version`, or still
+   * absent for `undefined`. Puts a record read earlier (a cache) into the
+   * read set, in either mode.
+   */
+  expectKey(key: Path | Uint8Array, version: Uint8Array | undefined): void {
+    const k = this.key(key);
+    this.expects.set(hex(k), { fs: this.fs.id, key: k, ...(version ? { version } : {}) });
+  }
+
+  /** Add CRDT operations to the commit (`Tree.writeIn`, CRDT rows). */
+  addCrdtOps(ops: CrdtOp[]): void {
+    this.crdtOps.push(...ops);
+  }
+
+  /** Add chunk uploads to the commit. */
+  addChunks(chunks: ChunkPut[]): void {
+    this.chunks.push(...chunks);
+  }
+
+  /** Run `fn` with the result once this attempt commits. */
+  onCommit(fn: (r: CommitResult) => void): void {
+    this.commitHooks.push(fn);
+  }
+
+  /**
+   * Run `fn` when this attempt's commit fails. If any hook returns true
+   * (it fixed what failed, as a tree rebase does), the transaction runs
+   * again, within its attempts.
+   */
+  onError(fn: (e: unknown, attempt: number) => Promise<boolean>): void {
+    this.errorHooks.push(fn);
+  }
+
   /** Write a value. */
   set(path: Path, value: Uint8Array): void {
     const key = this.key(path);
@@ -272,8 +454,10 @@ export class Transaction {
   /** The commit body for this attempt. */
   build(): Commit {
     const c: Commit = { commit_id: randomBytes(16), ...this.extra };
-    if (this.mode === 'short' && this.readVersion !== undefined) {
-      c.read_version = this.readVersion;
+    if (this.crdtOps.length) c.crdt_ops = [...(c.crdt_ops ?? []), ...this.crdtOps];
+    if (this.chunks.length) c.chunks = [...(c.chunks ?? []), ...this.chunks];
+    if (this.mode === 'short' && this.rv0 !== undefined) {
+      c.read_version = this.rv0;
       if (this.conflicts.length) c.read_conflicts = this.conflicts;
     }
     if (this.expects.size) c.expect = [...this.expects.values()];
@@ -291,6 +475,8 @@ export class Transaction {
       !this.writes.size &&
       !this.clears.length &&
       !this.appends.length &&
+      !this.crdtOps.length &&
+      !this.chunks.length &&
       !x.consume?.length &&
       !x.chunks?.length &&
       !x.crdt_ops?.length
@@ -300,7 +486,8 @@ export class Transaction {
 
 /**
  * Run `fn` in a transaction and commit it, re-running it on `conflict` or
- * `too_old`. A transaction that only reads commits nothing.
+ * `too_old`, or when an `onError` hook asks for it. A transaction that only
+ * reads commits nothing.
  */
 export async function transaction<T>(
   fs: UnlockedFs,
@@ -314,10 +501,16 @@ export async function transaction<T>(
     if (tx.empty) return out;
     try {
       tx.result = await sendCommit(fs.session, tx.build());
-      return out;
     } catch (e) {
-      if (!(e instanceof ZenError && e.retryable) || i >= attempts) throw e;
-      await sleep(Math.min(10 * 2 ** i, 1000) * (0.5 + Math.random()));
+      if (i >= attempts) throw e;
+      const retryable = e instanceof ZenError && e.retryable;
+      let again = retryable;
+      for (const h of tx.errorHooks) if (await h(e, i)) again = true;
+      if (!again) throw e;
+      if (retryable) await sleep(Math.min(10 * 2 ** i, 1000) * (0.5 + Math.random()));
+      continue;
     }
+    for (const h of tx.commitHooks) h(tx.result);
+    return out;
   }
 }

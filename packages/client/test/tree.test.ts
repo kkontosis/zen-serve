@@ -337,3 +337,80 @@ describe('large files and limits', () => {
     expect(equal(n.state.move_device, w.session.deviceFp!)).toBe(true);
   });
 });
+
+describe('tree operations in transactions', () => {
+  let w: World;
+  let a: UnlockedFs;
+  let b: UnlockedFs;
+  const u = bytes.utf8;
+  const s = (v: Uint8Array | undefined) => (v ? bytes.fromUtf8(v) : undefined);
+  beforeAll(async () => {
+    w = await world({ limits: { crdt_max_redo: 2 } });
+    ({ a, b } = await setup(w));
+  });
+  afterAll(() => w?.server.stop());
+
+  it('commits tree operations with KV writes; a conflict re-runs both', async () => {
+    const t = a.tree(Tree.newId());
+    await a.kv.set(['tx-tree'], u('0'));
+    let runs = 0;
+    await a.transaction(async (tx) => {
+      runs++;
+      const v = await tx.get(['tx-tree']);
+      if (runs === 1) await a.kv.set(['tx-tree'], u('raced'));
+      const batch = t.batch();
+      batch.mkdir(ROOT, `d${runs}`);
+      await batch.commitIn(tx);
+      tx.set(['tx-tree'], u(`${s(v)}+dir`));
+    });
+    expect(runs).toBe(2);
+    expect(await names(t, ROOT)).toEqual(['d2']);
+    expect(s(await a.kv.get(['tx-tree']))).toBe('raced+dir');
+  });
+
+  it('rebases operations refused with stale_op inside the transaction', async () => {
+    // As in `rebases a move refused with stale_op`, run in a transaction.
+    const id = Tree.newId();
+    const ta = a.tree(id);
+    const x = await ta.mkdir(ROOT, 'x');
+    const y = await ta.mkdir(ROOT, 'y');
+    const ahead = new TreeClock({ store: memoryClockStore(zw.hlc(Date.now() + 30_000, 0)) });
+    const tb = new Tree(b, id, { clock: ahead });
+    for (let i = 0; i < 3; i++) await tb.move(x, i % 2 ? ROOT : y);
+    let runs = 0;
+    const codes = await errorsDuring(w.session, () =>
+      a.transaction(async (tx) => {
+        runs++;
+        await ta.writeIn(tx, [{ op: 'move', node: x, parent: ROOT }]);
+        tx.set(['rebased'], u(String(runs)));
+      }),
+    );
+    expect(codes).toEqual(['stale_op']);
+    expect(runs).toBe(2);
+    const n = (await ta.getOne(x))!;
+    expect(n.parent).toEqual(ROOT);
+    expect(equal(n.state.move_device, w.session.deviceFp!)).toBe(true);
+    expect(s(await a.kv.get(['rebased']))).toBe('2');
+  });
+
+  it('uploads a file, then writes it in a transaction', async () => {
+    const t = a.tree(Tree.newId());
+    const f = await t.create(ROOT, 'f');
+    const data = random(150_000);
+    const up = await t.upload(f, data);
+    expect(up.uploaded).toBe(3);
+    expect(up.commits).toBeGreaterThanOrEqual(1);
+    // Not written yet.
+    expect((await t.versions(f)).length).toBe(0);
+    await a.transaction(async (tx) => {
+      await t.writeIn(tx, [await t.writeOp(up)]);
+      tx.set(['file-index'], up.index.hashes[0]!);
+    });
+    expect(equal(await t.readFile(f), data)).toBe(true);
+    // The next write reuses unchanged chunks through `previous`.
+    data[0] = (data[0]! + 1) & 0xff;
+    const w2 = await t.writeFile(f, data, { previous: up.index });
+    expect(w2.uploaded).toBe(1);
+    expect(equal(await t.readFile(f), data)).toBe(true);
+  });
+});
