@@ -74,7 +74,7 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 
 | Key | Value |
 |---|---|
-| `pack("cid", commit_id)` | idempotency record: `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count` (§3.6) |
+| `pack("cid", commit_id)` | idempotency record: `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count ‖ u16 add_count` (§3.6, §3.8) |
 | `pack("cix", vs, commit_id)` | empty: expiry index for idempotency records, oldest first |
 | `pack("acl", version)` | signed ACL (formats.md §9), every version kept (the membership log) |
 | `pack("acl_head")` | `u64 version` of the current ACL |
@@ -138,7 +138,7 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * A node's old `tv` entry is cleared when it changes again, so the change index holds one entry per live node, plus tombstones.
 * `resync_before` in the tree header is the newest tombstone the sweeper has dropped. A `changes` cursor before it gets 409 `resync`.
 * The sweeper visits only the trees in `ts`. A move is the only operation that adds a move-log entry or a `TRASH` child, and tombstones only come from purging a tree that is listed, so a tree outside the index has nothing to sweep (chunk GC is per fs, through `cz`).
-* The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count`. Records written before milestone 3.5 have no `write_count`, which then reads as 0.
+* The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count ‖ u16 add_count`. Records written before milestone 3.5 have no `write_count`, and records written before milestone 5 no `add_count` (§3.8); a missing count reads as 0.
 
 ### 3.7 Sign-in: credentials and origins (auth.md)
 
@@ -159,3 +159,23 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * OPAQUE (auth.md §8) adds the setup key and a login-index entry per name; a credential is a record with `opaque_record` and `opaque_ksf`. The login state between the two sign-in rounds is not stored: the client carries it, sealed (auth.md §8.3). The single use of its challenge is recorded in `pack("chal", challenge)` (§3.5).
 * A name used by both password methods has two index entries, each pointing to its own credential. A name belongs to one user across methods (auth.md §4.2).
 * TLS client certificates (auth.md §10) add no keys either: a registration is a credential record whose `id` is the SHA-256 of the certificate's public key (auth.md §4.1), so `credx` finds the member from the certificate a connection presents.
+
+### 3.8 CRDT rows (zendb.md §19)
+
+`object` is the stored key of a row (zendb.md §19.2), a byte-string element of at most `max_key_bytes`. `field` and `elem` are 16-byte tokens, `dev` the 32-byte device fingerprint, `hlc` an integer element and `dot` a 12-byte versionstamp element.
+
+| Key | Value |
+|---|---|
+| `pack("co", fs, object)` | row register: `u64 hlc ‖ dev(32) ‖ u8 alive ‖ value` |
+| `pack("cw", fs, object, field)` | `lww` register: `u64 hlc ‖ dev(32) ‖ u8 has_value ‖ [value]` |
+| `pack("cn", fs, object, field, dev)` | counter entry: `u64 seq ‖ value` |
+| `pack("cs", fs, object, field, elem, dot)` | set element: `dev(32) ‖ value` |
+| `pack("cv", fs, object)` | `versionstamp(10)` of the object's last change. One per object: also the object index that `/v1/crdt/range` reads |
+| `pack("cd", fs, vs, object)` | empty: GC candidate (zendb.md §19.5). Present while the object's row register is `alive: false`, or while it has no row register; `vs` is the object's last change |
+
+* `value` is a sealed kind-7 object (formats.md §4), stored verbatim.
+* `cs` keys are written with a versionstamped key, like `tf`. The dot is `versionstamp ‖ u16(i)`, `i` the `add`'s index among the commit's `add`s (api.md §6).
+* **Every change** of an object rewrites `cv`, deletes the `cd` entry of the previous `cv` (if any) and writes a new one when the object is now a candidate.
+* **The sweeper** reads `cd` entries whose versionstamp is older than `crdt_horizon_secs` (in versions: `secs × 1,000,000`), re-checks the object, and clears `co`, `cw`, `cn`, `cs` and `cv` of the object with the `cd` entry, in pages like the rest of the sweeper.
+* The prefix `"cr"` of an earlier draft is the chunk reference count (§3.6).
+* `add_count` in the idempotency record (§3.4) is the number of `add` operations of the commit, so a replay returns the same `set_dots`.

@@ -19,7 +19,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
   | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
   | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
-  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4) | with a fresh `hlc` (rebase); not for a purged node |
+  | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4; or a CRDT-row counter `seq` that isn't newer, §13.2) | with a fresh `hlc` or `seq` (rebase); not for a purged node |
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
@@ -36,7 +36,7 @@ No authentication. Returns:
 { server: text, api: 1,
   suites: [1],                       // supported suite ids (spec/suites.md)
   formats: [1],
-  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs"
+  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows"
   cross_origin_isolation: bool,      // DESIGN-3 §4.2
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
@@ -382,13 +382,19 @@ POST /v1/commit
   consume?: [{fs, group: bytes, partition?: u32, key_token: bytes(16)?,
               from: bytes(12), to: bytes(12), token: u64}],
   chunks?: [{fs, id: bytes(16), data: bytes}],              // filesystem chunks (fs.md §4.1)
-  crdt_ops?: [CrdtOp] }                                     // filesystem operations (fs.md §3, §4)
-→ { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)], dots: [bytes(12)] }
+  crdt_ops?: [CrdtOp] }                                     // filesystem operations (fs.md §3, §4), CRDT rows (§13)
+→ { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)], dots: [bytes(12)],
+    set_dots: [bytes(12)] }                                  // one per `add`, in order (§13)
 
 CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), hlc: u64, meta?: bytes}
        | {fs, tree: bytes(16), op: "meta",  node: bytes(16), hlc: u64, meta: bytes}
        | {fs, tree: bytes(16), op: "write", node: bytes(16), replaces?: [bytes(12)],
                                             chunks?: [bytes(16)], manifest: bytes}
+       | {fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}                 // CRDT rows (§13)
+       | {fs, op: "lww", object: bytes, field: bytes(16), hlc: u64, value?: bytes}
+       | {fs, op: "ctr", object: bytes, field: bytes(16), seq: u64, value: bytes}
+       | {fs, op: "add", object: bytes, field: bytes(16), elem: bytes(16), value: bytes}
+       | {fs, op: "rem", object: bytes, field: bytes(16), elem: bytes(16), dots: [bytes(12)]}
 ```
 
 The whole commit is **one storage transaction**: all of it applies, or none of it.
@@ -406,7 +412,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
-9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` (the stored version holds both, keyspace.md §3.6), which bounds a file at about `max_value_bytes / 32` chunks. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`.
+9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` (the stored version holds both, keyspace.md §3.6), which bounds a file at about `max_value_bytes / 32` chunks. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
 
 ## 7. Log
 
@@ -596,3 +602,65 @@ NodeState = { node: bytes(16),
 * **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`; `max_range_bytes` of node records also sets `more` (§2). `nodes` and `ids` take at most 1,000 and 64 entries. `file/get` returns 413 when a node's versions exceed either cap.
 * **`read_version`** works as in KV reads (§5): several reads at one version see one snapshot.
 
+## 13. CRDT rows (zendb.md §19)
+
+Server-merged rows of zen-db CRDT tables. The server merges them field by field on ciphertext; the model, tokens and sealing are in zendb.md §19, the storage in keyspace.md §3.8. A server that implements this section lists the feature `"crdt_rows"` in `/v1/info`.
+
+### 13.1 Objects
+
+* An **object** is the stored key of a row (zendb.md §19.2): 16·n bytes, at most `max_key_bytes`. The server treats it as opaque bytes.
+* An object exists from its first operation, and holds:
+  * a **row register**: `(hlc, device, alive, value)`, last writer wins
+  * per field token, an **`lww` register**: `(hlc, device, value?)`, last writer wins
+  * per field token and device, a **counter entry**: `(seq, value)`, greatest `seq` wins
+  * per field token and element token, a set of **dots**, each with its device and value
+* Timestamps are `ts = (hlc, device)`, ordered by `hlc`, then device bytes, as in fs.md §2. `device` is set by the server to the session's device fingerprint.
+* Every `value` is a sealed kind-7 object (formats.md §4), stored verbatim and at most `max_value_bytes`.
+
+### 13.2 Operations
+
+The operations are `crdt_ops` entries of `/v1/commit` (§6). Each needs fs `write` and counts as one operation toward `max_commit_ops`, its `value` toward `max_commit_bytes`, and its stored bytes and keys toward the fs quotas.
+
+| `op` | Effect |
+|---|---|
+| `row` | if `(hlc, device)` is greater than the row register's, the register becomes `(hlc, device, alive, value)` |
+| `lww` | if `(hlc, device)` is greater than the field's register, the register becomes `(hlc, device, value)`; an absent `value` unsets the field |
+| `ctr` | if `seq` is greater than the stored `seq` of `(field, device)`, the entry becomes `(seq, value)`; otherwise 409 `stale_op` |
+| `add` | adds a dot `versionstamp ‖ u16(i)` to `(field, elem)`, with the session's device and `value`; `i` numbers the commit's `add`s from 0 |
+| `rem` | deletes the listed dots of `(field, elem)` that still exist; unknown dots are ignored |
+
+* **Ties.** A `row` or `lww` operation whose `(hlc, device)` equals the stored one is ignored, so a re-sent offline operation is harmless. An older one is ignored as well: that is the merge.
+* **Clocks.** `row` and `lww` are checked like fs operations (fs.md §3.4): an `hlc` more than `crdt_max_skew_ms` ahead of the server clock gets 409 `clock_skew`, and one older than `crdt_horizon_secs` gets 409 `stale_op`.
+* **Counters.** A device writes only its own entry, with its new cumulative total and the next `seq`. `stale_op` on `ctr` means another session of the same device got there first: re-read the entry (§13.3) and reissue the operation on top of it. A replayed commit (`commit_id`, §6) returns its stored result and is not refused.
+* **Order.** Operations apply in list order, after the commit's writes and appends, so a commit may carry several operations on one object.
+* **Isolation (G11).** The registers and entries the server reads are read at the commit's read version in short mode, and conflict like any read. In long mode the server retries its own conflicts, so these operations never fail with `conflict`.
+* **Bad requests (400):** an `object` that is empty, not a multiple of 16 bytes or over `max_key_bytes`; a `field` or `elem` that isn't 16 bytes; a dot that isn't 12 bytes; a `value` over `max_value_bytes`.
+
+### 13.3 Reads
+
+```
+POST /v1/crdt/get   {fs, objects: [bytes], read_version?}
+→ {read_version, objects: [ObjState]}
+POST /v1/crdt/range {fs, begin: bytes, end?: bytes, limit?, read_version?}
+→ {read_version, objects: [ObjState], more: bool}
+
+ObjState = { object: bytes,
+             row?: {hlc: u64, device: bytes(32), alive: bool, value: bytes},
+             lww: [{field: bytes(16), hlc: u64, device: bytes(32), value?: bytes}],
+             ctr: [{field: bytes(16), device: bytes(32), seq: u64, value: bytes}],
+             set: [{field: bytes(16), elem: bytes(16), dot: bytes(12), device: bytes(32), value: bytes}],
+             version: bytes(10) }               // versionstamp of the object's last change
+```
+
+* Both need fs `read`.
+* **`get`** returns one ObjState per requested object that exists, in request order; unknown objects are left out. `objects` takes at most 1,000 entries.
+* **`range`** returns the objects in `[begin, end)` in byte order (`end` absent: every object after `begin`), at most `limit` (default and cap `max_range_items`) objects and about `max_range_bytes` of state. To continue, set `begin` to the last object ‖ `0x00`. The usual range is a table's prefix, `D ‖ ("t", table_id)` of zendb.md §2.1.
+* **Lists** within an ObjState are in key order: `lww` by field, `ctr` by field then device, `set` by field, element, then dot.
+* An object whose state alone exceeds `max_range_bytes` returns 413 `too_large`.
+* **`read_version`** works as in KV reads (§5). These reads take no conflict ranges: a transaction that reads CRDT rows doesn't conflict on them (zendb.md §19.4).
+
+### 13.4 Garbage collection
+
+* An object whose row register is `alive: false`, and whose last change is older than `crdt_horizon_secs`, is purged by the sweeper with all its entries. So is an object that has **no** row register and no change within the horizon.
+* An operation naming a purged object starts it afresh. A late `row` or `lww` operation for it is older than the horizon and gets `stale_op` anyway.
+* Clients therefore insert a row (a `row` operation with `alive: true`) before relying on its fields: an object made of field operations alone is purged after the horizon.
