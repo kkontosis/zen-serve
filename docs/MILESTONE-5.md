@@ -66,7 +66,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
   * `Transaction`: `readVersion`, `snapshotGet`, `snapshotRange`/`snapshotRangeStored`, `expectKey(path | storedKey, version)`, `addCrdtOps`, `addChunks`, `onCommit`, `onError`.
   * `Tree`: `prepare`/`accept`/`rebase`, `writeIn(tx, ops, chunks)`, `TreeBatch.commitIn(tx)`, `upload` + `writeOp`.
   * Tests: 72 vitest tests (client and fuse).
-* **Step 5** (`@zen/db` database): next.
+* **Step 5** (`@zen/db` database): next. **Plan it first (user's choice):** after compaction and "go", read `spec/zendb.md` §2–9 (and §1, §17), then write a detailed step 5 plan into this file, split into sub-steps with a PR each (e.g. 5a catalog, rows, unique and fast indexes; 5b private and sealed indexes; 5c queries, transaction modes, migrations, tabs), and stop for approval before building.
 
 ## Facts the work must respect (from the code survey)
 
