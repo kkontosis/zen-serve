@@ -6,7 +6,8 @@
 //!   0    1  format_version (= 1)
 //!   1    1  suite          (= 1, modern)
 //!   2    1  kind           (1 = kv value, 2 = event, 3 = epoch-chain record,
-//!                           4–6 = filesystem meta, manifest, chunk)
+//!                           4–6 = filesystem meta, manifest, chunk,
+//!                           7 = CRDT value)
 //!   3    1  reserved       (= 0)
 //!   4    4  key_epoch      (u32 BE)
 //!   8   24  nonce          (random per seal)
@@ -48,6 +49,8 @@ pub enum Kind {
     FsManifest = 5,
     /// Filesystem chunk (§11.4).
     FsChunk = 6,
+    /// zen-db CRDT value (spec/zendb.md §19.2), sealed in [`crate::db`].
+    CrdtValue = 7,
 }
 
 fn header(kind: Kind, epoch: u32, nonce: &[u8; 24]) -> [u8; HEADER_LEN] {
@@ -142,6 +145,7 @@ pub fn peek(sealed: &[u8]) -> Result<(Kind, u32)> {
         4 => Kind::FsMeta,
         5 => Kind::FsManifest,
         6 => Kind::FsChunk,
+        7 => Kind::CrdtValue,
         _ => return Err(Error::Format),
     };
     Ok((

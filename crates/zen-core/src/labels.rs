@@ -76,7 +76,7 @@ pub const AAD_FS_META: &str = "zen/v1/aad/fs-meta";
 pub const AAD_FS_MANIFEST: &str = "zen/v1/aad/fs-manifest";
 /// AAD domain: filesystem chunk.
 pub const AAD_FS_CHUNK: &str = "zen/v1/aad/fs-chunk";
-/// AAD domain: zen-db CRDT value (kind 7, reserved).
+/// AAD domain: zen-db CRDT value (kind 7).
 pub const AAD_CRDT_VALUE: &str = "zen/v1/aad/crdt-value";
 
 /// Signature domain prefix, prepended to every signed message.

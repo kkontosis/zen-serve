@@ -172,7 +172,7 @@ impl Default for RangeHasher {
 
 /// The keys of one fs at one epoch. Secret: free it when done.
 #[wasm_bindgen]
-pub struct FsKeys(CoreKeys);
+pub struct FsKeys(pub(crate) CoreKeys);
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -412,7 +412,7 @@ impl FsKeys {
 
 /// The keys of one topic. Secret.
 #[wasm_bindgen]
-pub struct TopicKeys(token::TopicKeys);
+pub struct TopicKeys(pub(crate) token::TopicKeys);
 
 #[wasm_bindgen]
 impl TopicKeys {

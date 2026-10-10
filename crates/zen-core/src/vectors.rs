@@ -38,6 +38,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("opaque_keyslot.json", opaque_keyslot_vectors()?),
         ("header.json", header_vectors()?),
         ("acl.json", acl_vectors()?),
+        ("zendb.json", crate::db_vectors::zendb_vectors()?),
     ])
 }
 

@@ -8,6 +8,7 @@
 //! * [`wire`]: CBOR `encode<Type>` / `decode<Type>` for every zen-proto type.
 //! * [`crypto`]: fs keys, keyslots, the fs header, identities, sealing,
 //!   password keys, OPAQUE, the filesystem op encodings.
+//! * [`db`]: zen-db keys, CRDT-row tokens and values, group ids.
 //!
 //! Errors are JS `Error`s named `ZenCryptoError` whose message is a stable
 //! code: `decrypt`, `format`, `param`, `signature`, `rng`, or `wire: …`.
@@ -15,6 +16,7 @@
 use wasm_bindgen::prelude::*;
 
 pub mod crypto;
+pub mod db;
 pub mod wire;
 
 #[wasm_bindgen(typescript_custom_section)]

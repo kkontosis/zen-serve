@@ -53,7 +53,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/fs-meta` | filesystem node meta (kind 4) |
 | `zen/v1/aad/fs-manifest` | filesystem manifest (kind 5) |
 | `zen/v1/aad/fs-chunk` | filesystem chunk (kind 6) |
-| `zen/v1/aad/crdt-value` | CRDT value (kind 7, reserved; zendb.md §19.2) |
+| `zen/v1/aad/crdt-value` | CRDT value (kind 7; zendb.md §19.2) |
 
 ## OPAQUE (auth.md §8)
 

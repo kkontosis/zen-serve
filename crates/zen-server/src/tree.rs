@@ -245,7 +245,25 @@ pub fn id16(b: &[u8], what: &str) -> ApiResult<Id> {
         .map_err(|_| bad_request(format!("{what} must be 16 bytes")))
 }
 
-fn unix_ms() -> u64 {
+/// Refuse an `hlc` too far ahead of `now_ms` (`clock_skew`) or older than
+/// the horizon (`stale_op`), fs.md §3.4.
+pub(crate) fn check_clock(st: &Shared, now_ms: u64, hlc: u64) -> ApiResult<()> {
+    let l = &st.cfg.limits;
+    if hlc > i64::MAX as u64 {
+        return Err(bad_request("hlc out of range"));
+    }
+    if hlc_ms(hlc) > now_ms + l.crdt_max_skew_ms {
+        return Err(clock_skew(format!(
+            "hlc is ahead of the server clock ({now_ms} ms)"
+        )));
+    }
+    if hlc_ms(hlc).saturating_add(l.crdt_horizon_secs * 1000) < now_ms {
+        return Err(stale_op("hlc is older than the horizon; rebase"));
+    }
+    Ok(())
+}
+
+pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -471,20 +489,7 @@ impl<'a> Engine<'a> {
     }
 
     fn check_clock(&self, hlc: u64) -> ApiResult<()> {
-        let l = &self.st.cfg.limits;
-        if hlc > i64::MAX as u64 {
-            return Err(bad_request("hlc out of range"));
-        }
-        if hlc_ms(hlc) > self.now_ms + l.crdt_max_skew_ms {
-            return Err(clock_skew(format!(
-                "hlc is ahead of the server clock ({} ms)",
-                self.now_ms
-            )));
-        }
-        if hlc_ms(hlc).saturating_add(l.crdt_horizon_secs * 1000) < self.now_ms {
-            return Err(stale_op("hlc is older than the horizon; rebase"));
-        }
-        Ok(())
+        check_clock(self.st, self.now_ms, hlc)
     }
 
     async fn apply_move(
@@ -737,6 +742,7 @@ impl<'a> Engine<'a> {
                 let b = zfs::write_bytes(*fs, &tree, &node, &dots, &chunks, manifest);
                 self.chain(t, *fs, tree, &b).await
             }
+            _ => Err(internal("not a filesystem operation")),
         }
     }
 

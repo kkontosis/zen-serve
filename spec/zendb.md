@@ -13,19 +13,25 @@ It sends them as **one** `/v1/commit`, so everything applies or nothing does (ap
 
 The server is unchanged. Everything here is built from api.md §5–9 and §12. What the server lacks is listed in §18 and in TECH_DEBT.md.
 
-Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges; its server side comes in milestone 5 (TD-CRDT-ROWS-SERVER).
+Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges (api.md §13).
 
 ## 1. Conventions
 
 * **Building blocks.** Byte layouts use formats.md conventions: `u32`, `lp`, `‖`, `PRF16` (formats.md §3), `KDF`, and `H(label, x) = BLAKE3.derive_key(label, x)`.
-* **CBOR.** "CBOR" means **deterministic CBOR** (RFC 8949 §4.2.1, G3). Records use small integer map keys; rows use text field names.
+* **CBOR.** "CBOR" means **deterministic CBOR** (RFC 8949 §4.2.1, G3). Records use small integer map keys; rows use text field names. The exact rules, which the JS and Rust encoders share and the vectors check (§17):
+  * **Values.** `null`, `false`, `true`, integers from −2^63 to 2^64−1, 64-bit floats, text (valid UTF-8), bytes, arrays and maps. No tags, no `undefined`, no other simple values.
+  * **Lengths and arguments** use the shortest form, and lengths are definite.
+  * **Numbers.** A number whose value is an integer in −2^53 … 2^53 is encoded as an integer, even if it was a float (so `3.0` is `3`, and `-0.0` is `0`). Any other finite float is encoded in 64 bits (`0xfb`), never shorter. NaN is refused. ±Infinity are 64-bit floats. (JavaScript can't tell `3.0` from `3`, so this is the rule both sides can follow.)
+  * **Maps.** Keys are text in rows, message bodies and other app values, and small unsigned integers in records. A map is encoded with its keys sorted by the bytewise order of their encodings. Duplicate keys are refused.
+  * **Decoding** accepts only these values and definite lengths, refuses duplicate keys, and returns integers outside −2^53 … 2^53 as big integers (JavaScript `bigint`).
+  * **JavaScript mapping.** `Uint8Array` ↔ bytes, `Array` ↔ arrays, plain objects and `Map` → maps (decoded as plain objects for text keys, `Map` otherwise), `number` and `bigint` → numbers as above. An object property whose value is `undefined` is left out.
 * **Paths.**
   * KV paths are lists of elements (formats.md §3.1, §3.2), written `("zen", "db", ns, …)`.
   * A text element is its UTF-8 bytes.
   * `u64(x)` as an element is 8 big-endian bytes.
 * **Topic paths** are lists of segments (formats.md §3.3).
 * **Reserved first elements.** The first KV element `"zen"` and the first topic segment `"zen"` are reserved for this spec and later zen libraries. Apps must not use them for their own data.
-* **Storage.** Every stored value is a sealed kind-1 KV value (formats.md §4), so its AAD binds it to its stored key. Nothing in this spec adds a sealed kind.
+* **Storage.** Every stored value is a sealed kind-1 KV value (formats.md §4), so its AAD binds it to its stored key. The only sealed kind this spec adds is kind 7, the values of CRDT rows (§19.2).
 
 ---
 
@@ -177,9 +183,12 @@ The size of a row is bounded by the commit: `max_commit_bytes` (8 MB by default)
 
 A table with `pad: true` pads every Row with `5: pad` (zero bytes) so its encoded size is the smallest bucket that fits:
 * the buckets are 256 B, 1 KiB, 4 KiB, 16 KiB, then the multiples of 16 KiB
-* rows with parts are padded as a Row, and their last part to 16 KiB
+* rows with parts are padded as a Row, and their last part with zero bytes to 16 KiB
+* the pad is the longest that keeps the Row within its bucket. Where CBOR's length heads make the bucket size itself unreachable (a pad of 24, 256 or 65,536 bytes needs a longer head), the Row ends one or two bytes short of it
 
 This hides row sizes within a bucket (DESIGN-3 §2.3).
+
+The digest of §4.2 covers `F` without the padding. `F` is one CBOR item, so a reader decodes the first item of the joined parts and requires every byte after it to be zero.
 
 ### 4.4 Operations
 
@@ -215,8 +224,10 @@ Private indexes need order, so they use an order-preserving **sort key**. For ea
 | bytes | `0x40 ‖ escape(bytes) ‖ 0x00` |
 
 * `escape` replaces each `0x00` with `0x00 0xFF`, so the encoding is prefix-free and byte order equals value order.
+* **By declared type.** A field is encoded by its declared `Type`, not by the CBOR form of its value: a `float` field encodes every number (an integer included, §1) as a float, and an `int` field every number as an int. A pk component is encoded by the type of its value (integers as int, other numbers as float).
 * Text compares by code point (binary UTF-8 order). There is no collation. An app wanting case-insensitive order stores and indexes a normalized copy of the field.
 * A pk field of a type outside this table (an array or a map) can't be used in a table that has a private index.
+* A sort key longer than 4,096 bytes is refused (`too_large`), so a node of §5.4 always fits one value.
 
 ### 5.2 Unique
 
@@ -245,7 +256,7 @@ The tree for a set of entries is defined level by level, so two clients with the
 1. **Level 0.** The entries are the sort keys (§5.1) of every row, in byte order. Rows with null indexed values are included.
 2. **Boundaries.** Cut a level into nodes, left to right. An entry `e` at level `L` **ends a node** when either:
    * `u32_be(PRF16(K_boundary, u8(L) ‖ lp(key(e)))[0..4]) < 2^32 / fanout`, or
-   * the node would otherwise reach 1,024 entries or 60,000 bytes of encoded Node.
+   * with `e`, the node reaches 1,024 entries, or 60,000 bytes of encoded Node (without `salt` and `pad`).
    
    The last entry of a level always ends a node.
 3. **Levels above.** Level `L+1` has one entry per node of level `L`: `[first_key, child_id, count]`. Here `first_key` is the key of the node's first entry, and `count` is the number of level-0 entries under it.
@@ -261,7 +272,7 @@ Node       = { 1: level: u8,
                3?: salt: bytes(16),     // only with decoys (§5.4.6)
                4?: pad: bytes }         // only with decoys: zero bytes up to the node size bucket
 node_id    = PRF16(K_node, CBOR(Node))
-RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }
+RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }      // height = the root's level + 1
 ```
 
 * A node is stored at `D ‖ ("n", index_id, node_id)`.
@@ -342,7 +353,7 @@ Several changes to one private index in one transaction are applied to the tree 
 A `sealed` index stores its entire entry list as one sealed blob, rewritten on every change. The server sees neither order nor locality, only how big the index is.
 
 * **Content.** The entries are the sort keys of §5.1, in order: `Blob = { 1: entries: [bytes] }`. Its CBOR is cut into parts of at most `max_value_bytes − 1024` bytes.
-* **Padding.** The number of parts is padded up to a power of two with parts of zero bytes. So the server learns only a size class.
+* **Padding.** The number of parts is rounded up to a power of two, and the CBOR is padded with zero bytes to fill them all, so every part is exactly `max_value_bytes − 1024` bytes. The server learns only a size class. A reader decodes the first CBOR item of the joined parts and requires the rest to be zero, as for rows (§4.3).
 * **Layout:**
 
   | KV path | Value |
@@ -1028,6 +1039,7 @@ If any part fails (a stale claim, a conflict on the card or the index, a `stale_
 
 Generated by zen-core's `gen_vectors` into `spec/test-vectors/zendb.json`, checked byte-exactly in CI:
 * `K_db`, `K_boundary` and `K_node` for fixed inputs; the group id of §11.3
+* deterministic CBOR (§1): every value type, the integer and float rules, map key order, and the refusals
 * Row encodings, a row split into parts with its digest, padding buckets
 * the sort keys of §5.1: every type, `desc`, escaping, composite keys with a pk
 * a canonical prolly tree for a fixed entry set with `fanout` 4: every node's bytes and id, the RootRecord; the same after inserting and deleting entries; shard selection
@@ -1061,7 +1073,7 @@ What the server lacks for this layer, deferred (spec/TECH_DEBT.md):
 
 ## 19. CRDT tables (server-merged)
 
-**Status:** specified; the server side is scheduled for milestone 5 (TD-CRDT-ROWS-SERVER). A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
+**Status:** specified; the server side is built in milestone 5. The wire contract is api.md §13, the server storage keyspace.md §3.8. A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
 
 ### 19.1 Model
 
@@ -1105,7 +1117,7 @@ Plaintexts:
 |---|---|
 | row register | `{1: pk}`, so scans return keys |
 | `lww` field | `{1: value}` |
-| `counter` entry | `{1: total: int}`: this device's cumulative sum of increments and decrements |
+| `counter` entry | `{1: total: int}`: this installation's cumulative sum of increments and decrements |
 | `set` element | `{1: element}` |
 
 ### 19.3 Operations
@@ -1115,18 +1127,21 @@ New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
 ```
 {fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}            // insert (alive) or delete
 {fs, op: "lww", object, field: bytes(16), hlc: u64, value?: bytes}              // set; value absent = unset
-{fs, op: "ctr", object, field: bytes(16), seq: u64, value: bytes}              // this device's new total
+{fs, op: "ctr", object, field: bytes(16), actor: bytes(16), seq: u64, value: bytes}  // this installation's new total
 {fs, op: "add", object, field: bytes(16), elem: bytes(16), value: bytes}       // gets a dot
 {fs, op: "rem", object, field: bytes(16), elem: bytes(16), dots: [bytes(12)]}  // removes observed dots
 ```
 
 * `device` is the session's device fingerprint, set by the server as in fs.md §2.
 * **`row` and `lww`:** keep the value with the greatest `(hlc, device)`.
-  * A second operation with the same `(hlc, device)` on the same register is refused (400).
+  * An operation with the same `(hlc, device)` as the stored one is a no-op if it is identical (flag and value bytes), so a re-sent offline operation is harmless. If it differs, two sessions of one device collided, and it gets `stale_op`: the class rebases it with a fresh `hlc` (§19.7).
   * `clock_skew` and the horizon apply as in fs.md §3.4: an `hlc` too far ahead gets `clock_skew`, and one older than `crdt_horizon_secs` gets `stale_op`.
-* **`ctr`:** for each `(object, field, device)`, keep the operation with the greatest `seq`. A `seq` not greater than the stored one is ignored, so a replay is harmless. A device only ever writes its own entry.
+* **`ctr`:** for each `(object, field, device, actor)`, keep the operation with the greatest `seq`.
+  * `actor` is a random 16-byte id the class creates once per installation (an IndexedDB store, a Node data directory; per session without a persistent store) and keeps with its HLC. So each entry has one writer, which sends its operations in order: a `seq` not greater than the stored one is a re-send of an operation already applied, and is ignored.
+  * Two sessions of one device (two tabs without an owner, §9.2, or two processes sharing a device key) have different actors, so they never overwrite each other's increments.
+  * A replayed commit (`commit_id`) returns its stored result.
 * **`add`:**
-  * The element gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s. Dots are returned with the commit result, next to fs `dots`.
+  * The element gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s. Dots are returned in the commit result's `set_dots` (api.md §6), numbered separately from fs `dots`.
   * The element is present while it has at least one dot.
 * **`rem`:** deletes the listed dots of `(object, field, elem)` that still exist. An `add` the remover hadn't seen keeps its dot, so concurrent add and remove resolve as add-wins.
 * **Rights and limits.** Each operation needs fs `write`, and each `value` is at most `max_value_bytes`. Operations count toward the fs quotas like KV writes.
@@ -1137,13 +1152,13 @@ New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
 ### 19.4 Reads
 
 ```
-POST /v1/crdt/get   {fs, objects: [bytes], read_version?}                → {read_version, objects: [ObjState]}
+POST /v1/crdt/get   {fs, objects: [bytes], read_version?}                → {read_version, objects: [ObjState]}     (api.md §13.3)
 POST /v1/crdt/range {fs, begin: bytes, end?: bytes, limit?, read_version?} → {read_version, objects: [ObjState], more}
 
 ObjState = { object: bytes,
              row?: {hlc, device, alive, value},
              lww:  [{field, hlc, device, value}],
-             ctr:  [{field, device, seq, value}],
+             ctr:  [{field, device, actor, seq, value}],
              set:  [{field, elem, dot, device, value}],
              version: bytes(10) }                 // versionstamp of the object's last change
 ```
@@ -1151,26 +1166,19 @@ ObjState = { object: bytes,
 * Both need fs `read`, and `range` pages like `/v1/kv/range`.
 * The client opens every value and builds the merged row:
   * `lww` fields as stored
-  * counters summed over devices
+  * counters summed over their `(device, actor)` entries
   * sets as the elements with at least one dot
   * the row visible if its register is `alive`
 * **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
 
-### 19.5 Server state (proposal for the implementation)
+### 19.5 Server state
 
-| Key | Value |
-|---|---|
-| `pack("cr", fs, object)` | row register: `hlc ‖ device ‖ alive ‖ value` |
-| `pack("cw", fs, object, field)` | `lww` register: `hlc ‖ device ‖ value?` |
-| `pack("cn", fs, object, field, device)` | counter entry: `seq ‖ value` |
-| `pack("cs", fs, object, field, elem, dot)` | set element: `device ‖ value` |
-| `pack("cv", fs, object)` | the object's last-change versionstamp |
-| `pack("cd", fs, hlc, object)` | deleted-object index, for the sweeper |
+The layout is keyspace.md §3.8: a row register (`co`), `lww` registers (`cw`), counter entries (`cn`), set dots (`cs`), the object's last change (`cv`) and a GC-candidate index by last change (`cd`).
 
-**Garbage collection:**
-* An object whose row register is `alive: false` and older than the horizon is purged with all its entries.
-* So is an object that has no row register and no change within the horizon.
-* An operation that names a purged object and is older than the horizon gets `stale_op`. A newer one starts the object afresh.
+**Garbage collection** (api.md §13.4):
+* An object whose row register is `alive: false` and whose last change is older than the horizon is purged with all its entries.
+* So is an object that has no row register and no change within the horizon. The class therefore always inserts a row (a `row` operation with `alive: true`) before writing its fields.
+* An operation naming a purged object starts it afresh. A `row` or `lww` operation for it is older than the horizon and gets `stale_op` anyway.
 
 ### 19.6 Indexes
 
@@ -1188,7 +1196,7 @@ ObjState = { object: bytes,
 
 * **Queue.** While offline, the class keeps operations and their change events in a local queue: in memory, or encrypted at rest (§9.3). It sends them as long-mode commits when back online.
 * **Clock.** It uses one HLC per session, the M4 tree clock.
-* **Old operations.** An operation older than the horizon gets `stale_op`. The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users.
+* **Old operations.** A `row` or `lww` operation older than the horizon gets `stale_op`, as does one whose timestamp collides with another session's (§19.3). The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users. Counters, sets and removals never need a rebase.
 
 ### 19.8 Leakage
 
@@ -1196,7 +1204,7 @@ Beyond §15, the server sees, per CRDT row:
 * which fields (by token) exist and change, when, and from which device
 * the `hlc` of every write, which is wall-clock time to the millisecond
 * deletes, through the plaintext `alive` flag
-* for counters, how often each device changes each one (`seq`)
+* for counters, how often each installation (`actor`) of each device changes each one (`seq`), and so how many installations a device has
 * for sets, how many elements each field holds and when each is added or removed. Element tokens are per row, so equal elements in different rows aren't linkable.
 
 ### 19.9 Test vectors

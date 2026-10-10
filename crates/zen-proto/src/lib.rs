@@ -1427,7 +1427,7 @@ pub struct Commit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub chunks: Vec<ChunkPut>,
-    /// Filesystem operations (spec/fs.md §3, §4).
+    /// Filesystem operations (spec/fs.md §3, §4) and CRDT-row operations (api.md §13).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub crdt_ops: Vec<CrdtOp>,
@@ -1452,6 +1452,9 @@ pub struct CommitResult {
     /// Dots of the versions created by `write` operations, in request order.
     #[serde(default)]
     pub dots: Vec<ByteBuf>,
+    /// Dots of the set elements added by `add` operations, in request order (api.md §13).
+    #[serde(default)]
+    pub set_dots: Vec<ByteBuf>,
 }
 
 /// `POST /v1/log/append` request.
@@ -2000,7 +2003,7 @@ pub struct ChunkPut {
     pub data: Vec<u8>,
 }
 
-/// A filesystem operation in a commit, tagged by `op` (spec/api.md §6).
+/// A filesystem or CRDT-row operation in a commit, tagged by `op` (spec/api.md §6, §13).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts",
@@ -2076,17 +2079,329 @@ pub enum CrdtOp {
         #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
         manifest: Vec<u8>,
     },
+    /// CRDT row register: insert (`alive`) or delete (api.md §13).
+    Row {
+        /// fs_id.
+        fs: u32,
+        /// Object: the row's stored key (spec/zendb.md §19.2).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        object: Vec<u8>,
+        /// Hybrid logical clock.
+        hlc: u64,
+        /// Whether the row exists.
+        alive: bool,
+        /// Sealed kind-7 value.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        value: Vec<u8>,
+    },
+    /// CRDT row: set or unset an `lww` field.
+    Lww {
+        /// fs_id.
+        fs: u32,
+        /// Object: the row's stored key (spec/zendb.md §19.2).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        object: Vec<u8>,
+        /// Field token (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        field: Vec<u8>,
+        /// Hybrid logical clock.
+        hlc: u64,
+        /// Sealed value; absent unsets the field.
+        #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+        value: Option<Vec<u8>>,
+    },
+    /// CRDT row: this installation's new counter total.
+    Ctr {
+        /// fs_id.
+        fs: u32,
+        /// Object: the row's stored key (spec/zendb.md §19.2).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        object: Vec<u8>,
+        /// Field token (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        field: Vec<u8>,
+        /// The writing installation (16 bytes): one entry per device and actor.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        actor: Vec<u8>,
+        /// Sequence number; one not greater than the stored one is ignored.
+        seq: u64,
+        /// Sealed kind-7 value.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        value: Vec<u8>,
+    },
+    /// CRDT row: add a set element (gets a dot).
+    Add {
+        /// fs_id.
+        fs: u32,
+        /// Object: the row's stored key (spec/zendb.md §19.2).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        object: Vec<u8>,
+        /// Field token (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        field: Vec<u8>,
+        /// Element token (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        elem: Vec<u8>,
+        /// Sealed kind-7 value.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        value: Vec<u8>,
+    },
+    /// CRDT row: remove observed dots of a set element.
+    Rem {
+        /// fs_id.
+        fs: u32,
+        /// Object: the row's stored key (spec/zendb.md §19.2).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        object: Vec<u8>,
+        /// Field token (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        field: Vec<u8>,
+        /// Element token (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        elem: Vec<u8>,
+        /// Dots to remove (12 bytes each).
+        dots: Vec<ByteBuf>,
+    },
 }
 
 impl CrdtOp {
-    /// The op's fs and tree.
-    pub fn target(&self) -> (u32, &[u8]) {
+    /// The op's fs.
+    pub fn fs(&self) -> u32 {
         match self {
-            CrdtOp::Move { fs, tree, .. }
-            | CrdtOp::Meta { fs, tree, .. }
-            | CrdtOp::Write { fs, tree, .. } => (*fs, tree),
+            CrdtOp::Move { fs, .. }
+            | CrdtOp::Meta { fs, .. }
+            | CrdtOp::Write { fs, .. }
+            | CrdtOp::Row { fs, .. }
+            | CrdtOp::Lww { fs, .. }
+            | CrdtOp::Ctr { fs, .. }
+            | CrdtOp::Add { fs, .. }
+            | CrdtOp::Rem { fs, .. } => *fs,
         }
     }
+
+    /// The op's tree, for filesystem operations.
+    pub fn tree(&self) -> Option<&[u8]> {
+        match self {
+            CrdtOp::Move { tree, .. } | CrdtOp::Meta { tree, .. } | CrdtOp::Write { tree, .. } => {
+                Some(tree)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `POST /v1/crdt/get` request (api.md §13.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CrdtGet {
+    /// fs_id.
+    pub fs: u32,
+    /// Objects to read.
+    pub objects: Vec<ByteBuf>,
+    /// Snapshot to read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub read_version: Option<u64>,
+}
+
+/// `POST /v1/crdt/range` request (api.md §13.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CrdtRange {
+    /// fs_id.
+    pub fs: u32,
+    /// First object.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub begin: Vec<u8>,
+    /// End object, exclusive; absent = every object after `begin`.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub end: Option<Vec<u8>>,
+    /// At most this many objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub limit: Option<u32>,
+    /// Snapshot to read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub read_version: Option<u64>,
+}
+
+/// A CRDT row's register.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct RowReg {
+    /// Hybrid logical clock.
+    pub hlc: u64,
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// Whether the row exists.
+    pub alive: bool,
+    /// Sealed value.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub value: Vec<u8>,
+}
+
+/// An `lww` field register.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct LwwReg {
+    /// Field token.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub field: Vec<u8>,
+    /// Hybrid logical clock.
+    pub hlc: u64,
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// Sealed value; absent = unset.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub value: Option<Vec<u8>>,
+}
+
+/// A counter entry of one device and installation (actor).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CtrEntry {
+    /// Field token.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub field: Vec<u8>,
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// The writing installation.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub actor: Vec<u8>,
+    /// Sequence number.
+    pub seq: u64,
+    /// Sealed value: the device's total.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub value: Vec<u8>,
+}
+
+/// A dot of a set element.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SetDot {
+    /// Field token.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub field: Vec<u8>,
+    /// Element token.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub elem: Vec<u8>,
+    /// Dot (12 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub dot: Vec<u8>,
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// Sealed value: the element.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub value: Vec<u8>,
+}
+
+/// The state of one CRDT row (api.md §13.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct ObjState {
+    /// Object.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub object: Vec<u8>,
+    /// Row register.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub row: Option<RowReg>,
+    /// `lww` registers, by field.
+    #[serde(default)]
+    pub lww: Vec<LwwReg>,
+    /// Counter entries, by field, device, then actor.
+    #[serde(default)]
+    pub ctr: Vec<CtrEntry>,
+    /// Set dots, by field, element, dot.
+    #[serde(default)]
+    pub set: Vec<SetDot>,
+    /// Versionstamp of the object's last change (10 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub version: Vec<u8>,
+}
+
+/// `/v1/crdt/get` and `/v1/crdt/range` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct ObjStates {
+    /// The snapshot read.
+    pub read_version: u64,
+    /// Objects.
+    pub objects: Vec<ObjState>,
+    /// A limit cut the range short (`range` only).
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// A node's state (spec/api.md §12).
