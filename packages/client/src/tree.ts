@@ -917,6 +917,8 @@ export function opBytes(o: CrdtOp): Uint8Array {
       return zw.metaOpBytes(o.fs, o.tree, o.node, o.hlc, o.meta);
     case 'write':
       return zw.writeOpBytes(o.fs, o.tree, o.node, o.replaces ?? [], o.chunks ?? [], o.manifest);
+    default:
+      throw new Error(`not a filesystem operation: ${o.op}`);
   }
 }
 

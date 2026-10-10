@@ -45,6 +45,24 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
 
 **Branch:** `claude/brave-knuth-gk03mm`. PRs #10 and #11 are merged, so first restart it: `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`, then push with `--force-with-lease`. Open a new short PR at the end.
 
+## Progress and resuming
+
+**Rhythm (user request): one step at a time, a PR per step, compact in between.** After each step:
+1. Run the verification relevant to the step (below).
+2. Update this section: the step's line in the log, with its PR and anything the next step must know.
+3. Commit and push to `claude/brave-knuth-gk03mm`.
+4. PR it:
+   * If the branch's previous PR is merged, the next step starts from main: `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`, then push with `--force-with-lease`. Open a new short PR.
+   * If it is still open, the step's commits join that PR; update its title and body to list the steps it holds.
+5. Stop, so the user can compact. After compaction: re-read this file (the log first), then the files under "After compaction, re-read" that the next step touches.
+
+**Log:**
+* **Step 0** (plan): done, commit `2a15230`.
+* **Step 1** (spec): done. keyspace.md §3.8 (`co`, not `cr`), api.md §6 CrdtOp variants and `set_dots`, api.md §13 (CRDT rows), zendb.md §1 CBOR rules, formats kind 7. Decisions beyond the plan: an op with a `ts` equal to the stored one is ignored (not 400); a `ctr` whose `seq` isn't newer gets `stale_op` (re-read, reissue) instead of being silently dropped; GC needs a row register, so the class always inserts before writing fields.
+* **Step 2** (zen-core, zen-wasm, vectors): done. See "As built" under Step 2. `spec/test-vectors/zendb.json` exists; the TS encoders of steps 5–7 must reproduce its `cbor`, `sort_keys`, `rows`, `prolly`, `sealed_index`, `crdt` and `broker` sections.
+* **Step 3** (server CRDT rows): done. `crates/zen-server/src/crdt.rs` (`RowEngine`, `/v1/crdt/get`, `/v1/crdt/range`, `sweep`); `tree::check_clock` is shared; the idempotency record carries `add_count`; `CrdtOp::target()` became `fs()` and `tree()`; feature `"crdt_rows"` always on. Tests `crates/zen-server/tests/crdt.rs` (9, embedded); FoundationDB runs in CI only (not installed in the session container), and the cross-node test runs only there. WASM is 2.06 MB after the new wire types (STATS updated in step 11). Steps 1–3 went into one PR, the first under this rhythm.
+* **Step 4** (client prerequisites): next.
+
 ## Facts the work must respect (from the code survey)
 
 **Wasm exposure.** JS can't compute any zendb.md derivation today:

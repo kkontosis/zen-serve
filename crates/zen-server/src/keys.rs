@@ -406,3 +406,35 @@ pub fn chunk_gc(fs: u32) -> Key {
 pub fn chunk_gc_ptr(fs: u32, id: &[u8]) -> Vec<u8> {
     Key::new().str("cp").int(fs.into()).bytes(id).finish()
 }
+
+// ---- CRDT rows (keyspace.md §3.8)
+
+/// `("co", fs, object)`: row register.
+pub fn crdt_row(fs: u32, object: &[u8]) -> Vec<u8> {
+    Key::new().str("co").int(fs.into()).bytes(object).finish()
+}
+
+/// `("cw", fs, object)`: the object's `lww` registers.
+pub fn crdt_lww(fs: u32, object: &[u8]) -> Key {
+    Key::new().str("cw").int(fs.into()).bytes(object)
+}
+
+/// `("cn", fs, object)`: the object's counter entries.
+pub fn crdt_ctr(fs: u32, object: &[u8]) -> Key {
+    Key::new().str("cn").int(fs.into()).bytes(object)
+}
+
+/// `("cs", fs, object)`: the object's set dots.
+pub fn crdt_set(fs: u32, object: &[u8]) -> Key {
+    Key::new().str("cs").int(fs.into()).bytes(object)
+}
+
+/// `("cv", fs)`: the object index; `("cv", fs, object)` → last change.
+pub fn crdt_objects(fs: u32) -> Key {
+    Key::new().str("cv").int(fs.into())
+}
+
+/// `("cd", fs)`: GC candidates by last change.
+pub fn crdt_gc(fs: u32) -> Key {
+    Key::new().str("cd").int(fs.into())
+}

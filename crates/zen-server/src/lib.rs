@@ -11,6 +11,7 @@ pub mod cbor;
 pub mod commit;
 pub mod config;
 pub mod consume;
+pub mod crdt;
 pub mod cred;
 pub mod dump;
 pub mod eph;
@@ -64,9 +65,17 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
         api: API_VERSION,
         suites: vec![1],
         formats: vec![1],
-        features: ["kv", "log", "consume", "ephemeral", "static", "fs"]
-            .map(String::from)
-            .to_vec(),
+        features: [
+            "kv",
+            "log",
+            "consume",
+            "ephemeral",
+            "static",
+            "fs",
+            "crdt_rows",
+        ]
+        .map(String::from)
+        .to_vec(),
         cross_origin_isolation: st.cfg.cross_origin_isolation,
         claimed: st.acl().version > 0,
         time_ms: std::time::SystemTime::now()
@@ -270,6 +279,8 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/fs/tree/chain", post(tree::tree_chain))
         .route("/v1/fs/file/get", post(tree::file_get))
         .route("/v1/fs/chunks/get", post(tree::chunks_get))
+        .route("/v1/crdt/get", post(crdt::get))
+        .route("/v1/crdt/range", post(crdt::range))
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/admin/origins/get", post(origin::admin_get))
         .route("/v1/admin/origins/set", post(origin::admin_set))
@@ -348,6 +359,10 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
         tracing::debug!(removed = n, "expired API tokens");
     }
     tree::sweep(st, now).await?;
+    let n = crdt::sweep(st, now).await?;
+    if n > 0 {
+        tracing::debug!(settled = n, "CRDT-row GC entries");
+    }
     let cutoff = now.saturating_sub(st.cfg.limits.ephemeral_ttl_secs * zen_store::VERSIONS_PER_SEC);
     for f in &st.cfg.fs {
         st.eph.sweep(f.id, cutoff).await?;

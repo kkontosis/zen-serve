@@ -19,10 +19,10 @@ use zen_store::{STAMP_LEN, Txn, Version, stamp_of, version_of};
 
 enum Outcome {
     Replay(Vec<u8>),
-    Applied(u16, u16),
+    Applied(u16, u16, u16),
 }
 
-fn result(stamp: &[u8], appended: u16, writes: u16) -> CommitResult {
+fn result(stamp: &[u8], appended: u16, writes: u16, adds: u16) -> CommitResult {
     let stamp: [u8; STAMP_LEN] = stamp[..STAMP_LEN].try_into().expect("10 bytes");
     let offsets = |n: u16| {
         (0..n)
@@ -34,24 +34,26 @@ fn result(stamp: &[u8], appended: u16, writes: u16) -> CommitResult {
         versionstamp: stamp.to_vec(),
         appended: offsets(appended),
         dots: offsets(writes),
+        set_dots: crate::crdt::set_dots(&stamp, adds),
     }
 }
 
 /// Decode an idempotency record for `device`: `stamp ‖ u16 appended ‖
-/// device(32) ‖ [u16 writes]` (keyspace.md §3.6).
+/// device(32) ‖ [u16 writes ‖ [u16 adds]]` (keyspace.md §3.4, §3.6).
 fn replay(rec: &[u8], device: &[u8; 32]) -> ApiResult<CommitResult> {
     let base = STAMP_LEN + 2 + 32;
-    if rec.len() != base && rec.len() != base + 2 {
+    if ![base, base + 2, base + 4].contains(&rec.len()) {
         return Err(internal("bad idempotency record"));
     }
     if &rec[STAMP_LEN + 2..base] != device {
         return Err(commit_id_reused("commit_id was used by another device"));
     }
     let n = u16::from_be_bytes(rec[STAMP_LEN..STAMP_LEN + 2].try_into().expect("2"));
-    let w = rec
-        .get(base..base + 2)
-        .map_or(0, |b| u16::from_be_bytes(b.try_into().expect("2")));
-    Ok(result(&rec[..STAMP_LEN], n, w))
+    let count = |at: usize| {
+        rec.get(at..at + 2)
+            .map_or(0, |b| u16::from_be_bytes(b.try_into().expect("2")))
+    };
+    Ok(result(&rec[..STAMP_LEN], n, count(base), count(base + 2)))
 }
 
 /// Stateless checks: sizes, ids, permissions.
@@ -147,8 +149,7 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     }
     let mut written = HashSet::new();
     for op in &req.crdt_ops {
-        let (fs, _) = op.target();
-        fs_ok(fs, R_WRITE)?;
+        fs_ok(op.fs(), R_WRITE)?;
         match op {
             CrdtOp::Move { meta, .. } => {
                 if meta.as_ref().is_some_and(Vec::is_empty) {
@@ -180,6 +181,7 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
                 }
                 bytes += 48 + manifest.len() + 16 * chunks.len() + 12 * replaces.len();
             }
+            _ => bytes += 64 + crate::crdt::validate(st, op)?,
         }
     }
     if bytes > l.max_commit_bytes as usize {
@@ -378,16 +380,23 @@ pub async fn execute(
         for c in &req.chunks {
             eng.put_chunk(&mut t, c).await?;
         }
+        let mut rows = crate::crdt::RowEngine::new(st, caller.device);
         for op in &req.crdt_ops {
-            eng.apply(&mut t, op).await?;
+            if crate::crdt::is_row_op(op) {
+                rows.apply(&mut t, op).await?;
+            } else {
+                eng.apply(&mut t, op).await?;
+            }
         }
         eng.flush(&mut t)?;
-        for (fs, (b, k)) in &eng.delta {
+        rows.flush(&mut t).await?;
+        for (fs, (b, k)) in eng.delta.iter().chain(rows.delta.iter()) {
             let d = delta.entry(*fs).or_default();
             d.0 += b;
             d.1 += k;
         }
         let writes = eng.writes;
+        let adds = rows.adds;
         for (fs, (bytes, nkeys)) in &delta {
             if let Some(l) = limits.get(fs) {
                 for (what, d, max) in [("bytes", *bytes, l.max_bytes), ("keys", *nkeys, l.max_keys)]
@@ -415,17 +424,20 @@ pub async fn execute(
         let mut rec = n.to_be_bytes().to_vec();
         rec.extend_from_slice(&caller.device);
         rec.extend_from_slice(&writes.to_be_bytes());
+        if adds > 0 {
+            rec.extend_from_slice(&adds.to_be_bytes());
+        }
         t.set_versionstamped_value(&cid_key, &[], &rec);
         let (p, s) = keys::commit_index()
             .vs_incomplete(0)
             .bytes(&req.commit_id)
             .finish_incomplete();
         t.set_versionstamped_key(&p, &s, &[]);
-        Ok(Outcome::Applied(n, writes))
+        Ok(Outcome::Applied(n, writes, adds))
     });
     match res {
         Ok((Outcome::Replay(rec), _)) => replay(&rec, &caller.device),
-        Ok((Outcome::Applied(n, w), stamp)) => Ok(result(&stamp, n, w)),
+        Ok((Outcome::Applied(n, w, a), stamp)) => Ok(result(&stamp, n, w, a)),
         Err(e) if matches!(e.code, "conflict" | "too_old" | "commit_unknown") => {
             // The commit may have landed under an earlier attempt (resend
             // after an unknown result): answer from the record if so.
