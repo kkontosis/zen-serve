@@ -1,7 +1,15 @@
 // zen-db transactions (spec/zendb.md §4.4, §5.5, §7): rows and their index
 // entries on top of an M4 `Transaction`.
-import { bytes, commitTransaction, type Transaction, type Tree, ZenError } from '@zen/client';
+import {
+  bytes,
+  commitTransaction,
+  type Topic,
+  type Transaction,
+  type Tree,
+  ZenError,
+} from '@zen/client';
 import type { CommitResult } from '@zen/wasm';
+import { appendMsg, type Binding, checkType, type EmitOptions } from './broker.js';
 import { encodeTableRecord, type IndexDef, type TableRecord } from './catalog.js';
 import { encode, isPlainObject, type Value } from './cbor.js';
 import type { Db } from './db.js';
@@ -56,6 +64,16 @@ export class DbTransaction implements IndexTx {
   private readonly cached = new Map<string, Used>();
   /** @internal Nodes written by `fs(tree).write` (one write per node per commit). */
   readonly fileWrites = new Set<string>();
+  /** @internal Rows of tables with change events: the first old state and the last (§12.7). */
+  private readonly changed = new Map<
+    string,
+    { t: TableRecord; pk: Value; pkEl: Uint8Array; existed: boolean; row: Fields | undefined }
+  >();
+  /**
+   * The id of the event this transaction handles (§10.2): every event it
+   * appends carries it as `causation`. Set for consumer handlers.
+   */
+  causation: Uint8Array | undefined;
 
   constructor(
     readonly db: Db,
@@ -99,6 +117,70 @@ export class DbTransaction implements IndexTx {
 
   get keys(): Keys {
     return this.db.keys;
+  }
+
+  /**
+   * Emit a message (§11.1): it is appended if and only if this transaction
+   * commits. Returns its id.
+   */
+  emit(topic: Topic, type: string, body: Value, opts: EmitOptions = {}): Uint8Array {
+    this.live();
+    checkType(type);
+    const id = opts.id ?? bytes.randomBytes(16);
+    appendMsg(
+      this,
+      topic,
+      { type, id, ...(opts.headers ? { headers: opts.headers } : {}), body },
+      opts.key,
+    );
+    return id;
+  }
+
+  /**
+   * Run `fn` after a successful commit (§12.6). It may never run, if the
+   * process dies first: use it for UI updates only.
+   */
+  after(fn: () => void): void {
+    this.raw.onCommit(() => {
+      try {
+        fn();
+      } catch (e) {
+        this.db.warn(`after: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    });
+  }
+
+  /** @internal A row of a table with change events was written. */
+  noteChange(
+    t: TableRecord,
+    pk: Value,
+    pkEl: Uint8Array,
+    old: Fields | undefined,
+    row: Fields | undefined,
+  ): void {
+    const k = `${bytes.hex(t.id)}/${bytes.hex(pkEl)}`;
+    const c = this.changed.get(k);
+    if (c) c.row = row;
+    else this.changed.set(k, { t, pk, pkEl, existed: old !== undefined, row });
+  }
+
+  /** Append one change event per changed row, with its final state (§12.7). */
+  private emitChanges(): void {
+    for (const c of this.changed.values()) {
+      const def = c.t.changes;
+      if (!def || (!c.existed && !c.row)) continue;
+      const lean = { op: c.row ? 'put' : 'delete', table: c.t.name, pk: c.pk };
+      const m = { type: 'zen.change', id: bytes.randomBytes(16) };
+      const full = def.image === 'full' && c.row ? { ...lean, row: c.row } : undefined;
+      appendMsg(
+        this,
+        this.db.topic(...def.topic),
+        { ...m, body: full ?? lean },
+        c.pkEl,
+        full ? { ...m, body: lean } : undefined,
+      );
+    }
+    this.changed.clear();
   }
 
   get mode(): 'short' | 'long' {
@@ -223,6 +305,7 @@ export class DbTransaction implements IndexTx {
    */
   async finish(): Promise<void> {
     this.live();
+    this.emitChanges();
     for (const p of this.ops.values()) {
       if (p.ops.size) await applyPrivate(this, p.ix, p.shard, p.ops);
     }
@@ -450,6 +533,7 @@ export class TableTx<T extends Fields = Fields> {
       raw.delete(this.keys.row(t.id, pkEl));
     }
     for (let i = parts; i < (old?.parts ?? 0); i++) raw.delete(this.keys.part(t.id, pkEl, i));
+    if (t.changes) this.tx.noteChange(t, pk, pkEl, old?.fields, row);
     for (const ix of maintained(t)) {
       const neu = row ? indexedValue(ix, row) : undefined;
       if (neu) checkTypes(ix, neu);
@@ -511,6 +595,15 @@ export async function changeIndex(
  */
 export class ManualTransaction extends DbTransaction {
   private closed = false;
+
+  /** @internal Bind to a delivery (§11.3): the commit carries its consume step. */
+  consumes(b: Binding, cause: Uint8Array): void {
+    this.causation = cause;
+    void b.consumer.ack(b.delivery, this.raw);
+    this.raw.onCommit(() => {
+      b.acked = true;
+    });
+  }
 
   override live(): void {
     if (this.closed) throw new DbError('closed', 'the transaction was committed or aborted');

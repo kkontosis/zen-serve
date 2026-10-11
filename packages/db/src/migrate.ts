@@ -18,6 +18,7 @@ import type { Db } from './db.js';
 import { DbError } from './errors.js';
 import { decodeRow, type Fields } from './row.js';
 import type { FieldType } from './sortkey.js';
+import { checkAppTable } from './system.js';
 import { changeIndex, checkTypes, type DbTransaction, indexedValue } from './txn.js';
 
 /** One step's migration function (§8.1). */
@@ -95,6 +96,7 @@ export class Migrator {
   /** Create a table (no-op if it exists). */
   createTable(name: string, opts: CreateTableOptions): Promise<void> {
     if (!opts.pk.length) throw new DbError('bad_value', 'a table needs a primary key');
+    checkAppTable(name);
     return this.run(async (tx) => {
       if (await tx.tableRecordOrNone(name)) return true;
       const t: TableRecord = {
@@ -118,6 +120,8 @@ export class Migrator {
 
   /** Rename a table (no-op if it already has the new name). */
   renameTable(from: string, to: string): Promise<void> {
+    checkAppTable(from);
+    checkAppTable(to);
     return this.run(async (tx) => {
       const t = await tx.tableRecordOrNone(from);
       if (!t) {
@@ -133,6 +137,7 @@ export class Migrator {
 
   /** Drop a table: mark it dropping, clear its keys in pages, remove it (§8.3). */
   dropTable(name: string): Promise<void> {
+    checkAppTable(name);
     return this.run(async (tx) => {
       const t = await tx.tableRecordOrNone(name);
       if (!t) return true;

@@ -25,7 +25,11 @@ export type DbErrorCode =
   /** A unique index whose backfill found duplicates (§8.2). */
   | 'building'
   /** A manual transaction used after its `commit` or `abort` (§7.2). */
-  | 'closed';
+  | 'closed'
+  /** A message that can't be read: not a Msg, or its body's parts are gone (§10.3). */
+  | 'poisoned'
+  /** A request with no reply in time (§12.3). */
+  | 'timeout';
 
 /** A zen-db error. */
 export class DbError extends Error {

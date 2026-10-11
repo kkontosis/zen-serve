@@ -232,7 +232,7 @@ export class Transaction {
    */
   async getEntries(paths: (Path | Uint8Array)[]): Promise<(TxEntry | undefined)[]> {
     const keys = paths.map((p) => this.key(p));
-    const out: (TxEntry | undefined)[] = new Array(keys.length);
+    const out: (TxEntry | undefined)[] = keys.map(() => undefined);
     const need: number[] = [];
     keys.forEach((k, i) => {
       const own = this.own(k);
@@ -354,7 +354,8 @@ export class Transaction {
    */
   async snapshotGet(keys: (Path | Uint8Array)[]): Promise<(KvEntry | undefined)[]> {
     const stored = keys.map((k) => this.key(k));
-    const out: (KvEntry | undefined)[] = new Array(stored.length);
+    // Dense, so that `some`/`every` see the absent entries.
+    const out: (KvEntry | undefined)[] = stored.map(() => undefined);
     const ask: number[] = [];
     stored.forEach((key, i) => {
       const own = this.own(key);

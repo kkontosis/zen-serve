@@ -7,6 +7,7 @@ import { encodeRoot } from '../src/index/node.js';
 import { type Change, rewrite, treeKeys } from '../src/index/prolly.js';
 import { blobParts, encodeBlob, encodeHead } from '../src/index/sealed.js';
 import { Keys, u64 } from '../src/keys.js';
+import { decodeMsg, encodeBodyRef, encodeMsg, eventId } from '../src/msg.js';
 import { cutParts, encodeRow, joinParts, partsDigest, rowBucket } from '../src/row.js';
 import { decodeSortKey, type FieldType, sortKey } from '../src/sortkey.js';
 import { MemStore } from './memstore.js';
@@ -246,5 +247,39 @@ describe('sealed index (§5.7)', () => {
     const id = unhex(V.prolly.index_id);
     expect(hex(k.sealedHead(id))).toBe(S.head_key);
     expect(hex(k.sealedPart(id, 1))).toBe(S.part_key_1);
+  });
+});
+
+describe('broker (§10, §11.3)', () => {
+  const B = () => V.broker;
+
+  it('Msg', () => {
+    const v = val(B().msg.value) as Map<Value, Value>;
+    // The vector value encodes as given, and the codec reproduces it.
+    expect(hex(encode(v))).toBe(B().msg.cbor);
+    const m = decodeMsg(unhex(B().msg.cbor));
+    expect(m.type).toBe('order.paid');
+    expect(m.replyTo!.slice(0, 2).map(bytes.fromUtf8)).toEqual(['zen', 'inbox']);
+    expect(m.body).toEqual({ order: 'o-7', amount: 1250 });
+    expect(hex(encodeMsg(m))).toBe(B().msg.cbor);
+  });
+
+  it('BodyRef', () => {
+    const body = val(B().body_ref.body);
+    const want = val(B().body_ref.value) as Map<Value, Value>;
+    expect(hex(partsDigest(encode(body)))).toBe(hex(want.get(3) as Uint8Array));
+    const ref = { ns: 'app', parts: 2, digest: partsDigest(encode(body)) };
+    expect(hex(encodeBodyRef(ref))).toBe(B().body_ref.cbor);
+  });
+
+  it('event id and group ids', () => {
+    const E = B().event_id;
+    expect(hex(eventId(unhex(E.topic_id), unhex(E.offset)))).toBe(E.id);
+    const fsKeys = zw.FsKeys.fromBundle(unhex(K.fs_epoch0.bundle));
+    const t = fsKeys.topic([bytes.utf8('shop'), bytes.utf8('pay')]);
+    expect(hex(t.id)).toBe(E.topic_id);
+    for (const g of B().group_ids) expect(hex(t.groupId(g.name)), g.name).toBe(g.id);
+    t.free();
+    fsKeys.free();
   });
 });

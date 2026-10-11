@@ -123,7 +123,41 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `kv.test.ts` +3.
       * `expectCanonical` moved to `packages/db/test/helpers.ts`.
       * 161 vitest tests in all.
-* **Step 6** (broker): planned (see Step 6: sub-steps 6a, 6b and 6c, a PR each). PR #16 is merged, so the plan commit restarts the branch from main and opens a new PR, which 6a joins.
+* **Step 6** (broker): planned (see Step 6: sub-steps 6a, 6b and 6c, a PR each). PR #16 is merged, so the plan commit restarts the branch from main and opens a new PR, which 6a joins (PR #17).
+  * **6a** (messages, emit, `on`, consume, change events, ephemeral): done, PR #17. As planned, with these details for 6b and 6c:
+    * **Files:**
+      * `msg.ts`: Msg and BodyRef codecs, `eventId`, `Message`.
+      * `broker.ts`:
+        * `appendMsg(tx, topic, msg, key, lean?)` writes large bodies to parts at `keys.msgPart`. With `lean`, the change events' row is dropped instead.
+        * `openMessage`.
+        * `StreamSource` / `DirectSource`. **6c puts the proxy behind this interface.**
+        * `OnSubscription`.
+        * `ConsumerHandle`:
+          * owner-gated via `db.onOwner`
+          * group id from `TopicKeys.groupId`
+          * leased modes loop on `deliveries()`, `partitioned` with one loop per partition
+          * `per_key` uses `next({limit: maxInflight})`
+          * `not_leader` → forget the lease, wait ttl/3, campaign again
+          * `cursor_moved` / `claim_lost` → drop the delivery; anything else → `nack`
+          * a `group` getter (DLQ)
+      * `system.ts`: the system tables. `init()` creates missing ones in the DbRecord transaction (one `getAll`). `createTable`, `renameTable` and `dropTable` refuse `$` names.
+    * **API:**
+      * `db.topic(...path)`, cached and closed by `close()`.
+      * `db.emit` (its own transaction) and `tx.emit`, which return the message id. `zen.` types are refused for apps.
+      * `tx.after(fn)`.
+      * `tx.causation` (set by consumers; every emit carries it).
+      * `db.on(target, handler, {after, cursor, batch, txn, onError})`. The `$cursors` row is `{device, name, topic, offset}`; a durable handler that throws stops the subscription (`active` false).
+      * `db.consume(opts, (msg, tx))`, and `db.consumeManual(opts, (msg))`, which acks with `msg.ack()` or `db.begin({consumes: msg})`.
+      * `db.publishEphemeral` / `db.onEphemeral`.
+      * `table.on(handler)` (change events).
+      * `db.device`. `db.tableNames()` leaves out the system tables.
+      * New error codes `poisoned` and `timeout`.
+    * **Change events:** `DbTransaction.noteChange` is recorded in `TableTx.write` and emitted in `finish()`: one per row, final state. A row inserted then deleted emits nothing.
+    * **Client fix:** `Transaction.snapshotGet` and `getEntries` returned sparse arrays, so `some((e) => !e)` missed absent entries (missing row parts too). They are dense now, with a test in `kv.test.ts`.
+    * **Tests:**
+      * `packages/db/test/broker.test.ts` (15), with its own copy of `FakeLocks`.
+      * `vectors.test.ts` +3 (Msg, BodyRef, event and group ids).
+      * 180 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

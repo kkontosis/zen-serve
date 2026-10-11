@@ -403,6 +403,24 @@ describe('retry filter, getEntries, commitTransaction', () => {
     });
   });
 
+  it('absent entries are undefined, not holes (`some` sees them)', async () => {
+    await fs.kv.set(['dense', 'a'], u('1'));
+    await fs.transaction(async (tx) => {
+      const keys = [
+        ['dense', 'a'],
+        ['dense', 'b'],
+      ];
+      for (const got of [
+        await tx.snapshotGet(keys),
+        await tx.getEntries(keys),
+        await tx.getAll(keys),
+      ]) {
+        expect(got.length).toBe(2);
+        expect(got.some((e) => !e)).toBe(true);
+      }
+    });
+  });
+
   it('commitTransaction commits, runs the hooks, and sends nothing when empty', async () => {
     const tx = new Transaction(fs, 'short');
     expect(await commitTransaction(tx)).toBeUndefined();

@@ -3,19 +3,46 @@
 import {
   bytes,
   Transaction as RawTransaction,
+  type Topic,
   type Transaction,
   type UnlockedFs,
   ZenError,
 } from '@zen/client';
 import type { IndexKeys, Limits } from '@zen/wasm';
-import { decodeDbRecord, decodeTableRecord, encodeDbRecord, type TableRecord } from './catalog.js';
+import {
+  bindingOf,
+  type ChangeBody,
+  type ConsumeOptions,
+  ConsumerHandle,
+  checkType,
+  type Delivered,
+  DirectSource,
+  type EmitOptions,
+  type EphemeralMsg,
+  type OnHandler,
+  type OnOptions,
+  OnSubscription,
+  type OnTarget,
+  openEphemeral,
+  type SourceSub,
+  type StreamSource,
+} from './broker.js';
+import {
+  decodeDbRecord,
+  decodeTableRecord,
+  encodeDbRecord,
+  encodeTableRecord,
+  type TableRecord,
+} from './catalog.js';
 import type { Value } from './cbor.js';
 import { DbError } from './errors.js';
 import type { Node } from './index/node.js';
 import { Keys } from './keys.js';
 import { type MigrationFn, migrate } from './migrate.js';
+import { encodeMsg } from './msg.js';
 import { type Page, Query } from './query.js';
 import type { Fields } from './row.js';
+import { SYSTEM_TABLES, systemTable } from './system.js';
 import { type LockManagerLike, Owner } from './tabs.js';
 import { DbTransaction, ManualTransaction, type ReadRow, SwitchToLong } from './txn.js';
 
@@ -101,6 +128,10 @@ export class Db {
   /** Rows by stored key (hex), least recently used first. */
   private readonly rows = new Map<string, CachedRow>();
   private owner: Owner | undefined;
+  private readonly topics = new Map<string, Topic>();
+  private stream: StreamSource | undefined;
+  private readonly subs = new Set<OnSubscription | SourceSub>();
+  private readonly consumers = new Set<ConsumerHandle>();
   /** The stored schema version after opening. */
   schema = 0;
   /** Cache counters. */
@@ -140,7 +171,13 @@ export class Db {
     const target = this.opts.schema ?? 0;
     const key = this.keys.dbRecord();
     const rec = await this.transaction(async (tx) => {
-      const b = await tx.raw.get(key);
+      const sys = SYSTEM_TABLES.map((n) => this.keys.tableRecord(n));
+      const [b, ...have] = await tx.raw.getAll([key, ...sys]);
+      // The system tables come with the DbRecord, or on the first open of
+      // a database created before them (§11.5).
+      have.forEach((h, i) => {
+        if (!h) tx.raw.set(sys[i]!, encodeTableRecord(systemTable(SYSTEM_TABLES[i]!)));
+      });
       if (b) return decodeDbRecord(b);
       const r = {
         format: FORMAT,
@@ -176,9 +213,11 @@ export class Db {
     }
   }
 
-  /** The tables (from the catalog cache). */
+  /** The app's tables (from the catalog cache); the system tables (§11.5) are left out. */
   tableNames(): string[] {
-    return [...this.catalog.values()].flatMap((e) => (e.record ? [e.record.name] : []));
+    return [...this.catalog.values()].flatMap((e) =>
+      e.record && !e.record.name.startsWith('$') ? [e.record.name] : [],
+    );
   }
 
   /** Rows per migration page. */
@@ -242,12 +281,19 @@ export class Db {
    * A transaction the app commits or aborts itself (§7.2), with no
    * automatic retry: `conflict` reaches the caller.
    */
-  begin(opts: { mode?: 'short' | 'long' } = {}): ManualTransaction {
+  begin(opts: { mode?: 'short' | 'long'; consumes?: Delivered<unknown> } = {}): ManualTransaction {
     const mode = opts.mode ?? 'short';
     if ((mode as string) === 'auto') {
       throw new DbError('bad_value', 'a manual transaction is short or long');
     }
-    return new ManualTransaction(this, new RawTransaction(this.fs, mode));
+    const tx = new ManualTransaction(this, new RawTransaction(this.fs, mode));
+    if (opts.consumes) {
+      // Bound to a delivery (§11.3): the commit consumes it.
+      const b = bindingOf(opts.consumes);
+      if (!b) throw new DbError('bad_value', 'consumes: not a delivered message');
+      tx.consumes(b, opts.consumes.eventId);
+    }
+    return tx;
   }
 
   /**
@@ -306,8 +352,114 @@ export class Db {
     return this.owner!.changed();
   }
 
-  /** Free the database keys and caches, and hand the owner role over. */
+  // ------------------------------------------------------------ broker
+
+  /** A topic of this database's fs, by path (cached). */
+  topic(...path: (string | Uint8Array)[]): Topic {
+    const k = path.map((p) => bytes.hex(typeof p === 'string' ? bytes.utf8(p) : p)).join('/');
+    let t = this.topics.get(k);
+    if (!t) {
+      t = this.fs.topic(...path);
+      this.topics.set(k, t);
+    }
+    return t;
+  }
+
+  /** Emit a message in a transaction of its own (§11.1). Returns its id. */
+  emit(topic: Topic, type: string, body: Value, opts: EmitOptions = {}): Promise<Uint8Array> {
+    const id = opts.id ?? bytes.randomBytes(16);
+    return this.transaction(async (tx) => tx.emit(topic, type, body, { ...opts, id }));
+  }
+
+  /**
+   * Subscribe to a topic or a prefix (§11.2). Plain handlers get every
+   * event from now (or after `after`) while the subscription runs; with
+   * `cursor`, the handler runs in a transaction that advances a durable
+   * cursor, exactly once per device and name.
+   */
+  async on<B = Value>(
+    target: OnTarget,
+    handler: OnHandler<B>,
+    opts: OnOptions = {},
+  ): Promise<OnSubscription> {
+    const sub = new OnSubscription(this, target, handler as OnHandler<never>, opts);
+    await sub.start();
+    this.subs.add(sub);
+    return sub;
+  }
+
+  /**
+   * Run a consumer group (§11.3): each delivery is one transaction with the
+   * handler's writes and emits and the consume step. It runs while this
+   * instance is the owner (§9.2).
+   */
+  consume<B = Value>(
+    opts: ConsumeOptions,
+    handler: (msg: Delivered<B>, tx: DbTransaction) => unknown,
+  ): ConsumerHandle {
+    const h = new ConsumerHandle(this, opts, handler as never, false);
+    this.consumers.add(h);
+    return h;
+  }
+
+  /**
+   * A consumer whose handler acknowledges each message itself: `msg.ack()`,
+   * or a `db.begin({consumes: msg})` it commits. A throw, or neither, nacks.
+   */
+  consumeManual<B = Value>(
+    opts: ConsumeOptions,
+    handler: (msg: Delivered<B>) => unknown,
+  ): ConsumerHandle {
+    const h = new ConsumerHandle(this, opts, handler as never, true);
+    this.consumers.add(h);
+    return h;
+  }
+
+  /** Publish an ephemeral message (§11.4): never stored, best effort, rate-limited. */
+  async publishEphemeral(topic: Topic, type: string, body: Value): Promise<void> {
+    checkType(type);
+    await this.source.publish(topic, encodeMsg({ type, id: bytes.randomBytes(16), body }));
+  }
+
+  /** Receive ephemeral messages published from now on (§11.4). */
+  async onEphemeral<B = Value>(
+    topic: Topic,
+    handler: (m: EphemeralMsg<B>) => void,
+  ): Promise<SourceSub> {
+    const sub = await this.source.subscribeEphemeral(topic, {
+      onEvent: (e) => {
+        const m = openEphemeral<B>(topic, e);
+        if (m) handler(m);
+      },
+    });
+    this.subs.add(sub);
+    return sub;
+  }
+
+  /** @internal The stream subscriptions come from. */
+  get source(): StreamSource {
+    this.stream ??= new DirectSource(this.fs.session, (e) => this.warn(`stream: ${e.message}`));
+    return this.stream;
+  }
+
+  /** @internal This device's fingerprint (durable cursors are per device). */
+  get device(): Uint8Array {
+    return this.fs.session.deviceFp ?? new Uint8Array(32);
+  }
+
+  /**
+   * Free the database keys and caches, stop its consumers and
+   * subscriptions, and hand the owner role over.
+   */
   close(): void {
+    for (const c of this.consumers) void c.stop();
+    this.consumers.clear();
+    for (const s of this.subs) void s.close().catch(() => {});
+    this.subs.clear();
+    this.stream?.close();
+    this.stream = undefined;
+    for (const t of this.topics.values()) t.close();
+    this.topics.clear();
     this.owner?.close();
     for (const k of this.ixKeys.values()) k.free();
     this.ixKeys.clear();
@@ -445,6 +597,13 @@ export class Table<T extends Fields = Fields> {
 
   delete(pk: Value): Promise<boolean> {
     return this.db.transaction((tx) => tx.table<T>(this.name).delete(pk));
+  }
+
+  /** Subscribe to this table's change events (§12.7). */
+  async on(handler: OnHandler<ChangeBody<T>>, opts: OnOptions = {}): Promise<OnSubscription> {
+    const t = await this.db.transaction((tx) => tx.tableRecord(this.name));
+    if (!t.changes) throw new DbError('bad_value', `table ${this.name} has no change events`);
+    return this.db.on(this.db.topic(...t.changes.topic), handler, opts);
   }
 
   /** A query, run in a read-only transaction of its own. */
