@@ -219,6 +219,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** §19.6 (the indexer, wrong types left out, the backfill rule, freshness), §11.5 (`$ixrows` values), §8.3 (dropping a CRDT table clears `$ixrows` and its index entries).
     * **Docs:** `docs/DB.md` §19 "Indexes on CRDT tables".
     * **Tests:** `crdtindex.test.ts` (9): refusals, fast/private/sealed queries, merged counters from two installations, lag and re-check, resume after a stop, deletes and wrong types, backfills (also during writes with the indexer on), drops. The `unsupported` createIndex case left `crdt.test.ts`.
+    * PR #22 merged, CI green (commit `96672cb`).
+  * **7c** (offline queue, read modes, property test): planned in detail (see Step 7, 7c). #22 is merged, so the plan commit restarts the branch from main and opens a new PR.
 
 ## Facts the work must respect (from the code survey)
 
@@ -1259,37 +1261,132 @@ Step 7 builds the class side.
   * `npx vitest run` three times
   * CI green on the new PR before stopping
 
-### 7c: the offline queue, read modes, the property test (outline; detailed after 7b)
-* **Read modes** (user decision) on `get` and `query`: `{read: 'auto' | 'cache' | 'server'}`, and `DbOptions.crdtRead` for the default.
-  * **The cache:** an LRU per `Db` of merged CRDT states, with the object's `version` (the ObjState's 10-byte versionstamp) and when it was checked.
-  * **`auto` (default):**
-    * An entry younger than `crdtCacheMs` (default 5,000) is served as it is.
-    * An older one is checked with **`POST /v1/crdt/versions {fs, objects}` → `{read_version, versions: [bytes(10) | null]}`**, a new thin server endpoint (api.md §13.3; zen-proto, zen-server, wasm). The full state is fetched (`crdt/get`) only for changed objects.
-    * Offline (a network error), the cached state is served.
-  * **`cache`:** the cached state regardless of age. The server is read only for a row never cached, and a miss offline is `unsupported_offline`, or undefined; to be decided in 7c.
-  * **`server`:** always `crdt/get`, and fails offline.
-  * Every mode overlays the queued operations.
-  * Queries scan the server in `auto` and `server`. In `cache` they answer from the cached rows (documented as possibly incomplete).
-* **The queue (`crdtq.ts`, §19.7):** as outlined before:
-  * **Entries:** an atomic entry for a CRDT-only transaction (the default, `{queue: false}` opts out); a single-op entry for a `Table` call.
-  * **Stamping:** `row` / `lww` at queue time; `ctr` `seq` and totals at send time; `rem` dots observed at queue time plus the `set_dots` of earlier queued adds.
-  * **Sending:** batching up to the limits (`batchMs`); coalescing of single-op entries; a built commit kept with its `commit_id`, rebuilt on `stale_op` / `clock_skew`.
-  * **Resolving:** once queued by default (`{wait: true}`: on commit); `db.crdt.pending`, `flushed()` and `onSync`.
-  * **Offline:** backoff from 100 ms to 30 s, plus `online` events. Mixed transactions drain the queue first.
-  * **Store:** `QueueStore` `{load, append, remove}` in memory; step 8 adds persisted ones.
-* **Tests:**
-  * the read modes: hits, the version check, offline fallback
-  * offline edits on two installations merging after reconnect (a fake transport dropping requests)
-  * batching, coalescing, atomic entries kept whole
-  * a `stale_op` rebase past the horizon
-  * the 3-device property test of §19.9 (random ops, random orders, the same merged state)
+### 7c: the offline queue, read modes, the property test (detailed plan)
+
+**Context.** 7a and 7b (PRs #21, #22, merged; CI green) give CRDT tables online, with indexes kept by the indexer. Every CRDT read still goes to the server (`crdt/get` / `crdt/range`), and every write is a commit sent at once, so nothing works offline. 7c finishes step 7 (zendb.md §19.4, §19.7, §19.9):
+* **read modes** with a per-`Db` cache of merged states, checked by a new thin endpoint
+* **the offline queue** for CRDT writes
+* **the 3-device property test**
+
+**User decisions (step 7 replanning):**
+* **Queueing:** a CRDT-only `db.transaction` is queued by default as one atomic entry; `{queue: false}` commits it directly. A `Table` call (`patch`, `incr`, …) is a single-op entry. The queue batches entries into as few commits as the limits allow.
+* **Resolving:** writes resolve once queued; `{wait: true}` waits for the commit.
+* **Store:** memory, behind a `QueueStore` interface (persisted stores come in step 8).
+* **Reads:** three modes:
+  * **default `auto`:** an expiring cache; an expired entry costs a thin version check (a new endpoint is fine)
+  * **`cache`:** offline first, the cached state regardless of age
+  * **`server`:** online only, always fresh
+
+**After compaction, re-read:**
+* this section and the 7a/7b log lines
+* `spec/zendb.md` §19.3, §19.4, §19.7, §19.9; `spec/api.md` §6 (idempotency), §13.3
+* `packages/db/src/{crdt,txn,db,query,ixer}.ts`
+* `packages/client/src/kv.ts` (`sendCommit`, `Transaction.build`, `commitTransaction`)
+* `crates/zen-proto/src/lib.rs` (`CrdtGet` ~2209, `ObjState` ~2359, `ObjStates` ~2390)
+* `crates/zen-server/src/crdt.rs` (`get` ~490, `load` ~395) and `lib.rs` (routes ~282)
+* `crates/zen-wasm/src/wire.rs` (CRDT lines ~103)
+* `crates/zen-server/tests/crdt.rs` (`get` helper ~135)
+* `packages/db/test/{crdt,crdtindex}.test.ts` (setup, `installation`, `commitsDuring`)
+
+**Branch/PR.** #22 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7c plan`), and open a new PR that 7c joins.
+
+#### Server: `POST /v1/crdt/versions` (⚠️ api.md §13.3)
+* **zen-proto:** `CrdtVersionsReq {fs, objects: [bytes], read_version?}` and `CrdtVersions {read_version, versions: [bytes]}`, where an **empty** entry means no such object. zen-proto has no `Vec<Option<_>>` precedent, and the names `Version`/`Versions` are taken by fs file versions. Same derives and `ts` attributes as `CrdtGet`.
+* **zen-server `crdt.rs`:** `versions` handler:
+  * `check_read`, at most 1,000 objects, `check_object` on each
+  * one `snapshot_get` of the `cv` key per object (as `load` does), no conflict ranges
+  * route `/v1/crdt/versions` in `lib.rs`
+  * It needs no new feature string: it ships with `"crdt_rows"`, which this milestone introduces.
+* **zen-wasm:** `encodeCrdtVersionsReq` / `decodeCrdtVersions` in `wire.rs`.
+* **Test (`tests/crdt.rs`):** versions equal `get`'s `version`s, change after a write, are empty for an unknown object; the 1,000 limit and the read right. Both backends.
+
+#### Client: `Transaction.commitId` (`packages/client/src/kv.ts`)
+`build()` uses a `commitId` fixed when the `Transaction` is made, instead of a fresh one per build. Each `transaction()` attempt already makes a new `Transaction`, so nothing changes there. The queue can then send one built transaction again after a network error, with the same `commit_id` (api.md §6 idempotency, kept 24 h). Test in `kv.test.ts`: two `commitTransaction` calls on one transaction apply once.
+
+#### `@zen/db`
+1. **`crdtcache.ts`: read modes (§19.4).**
+   * **The cache:** an LRU per `Db` of `object hex → {state: ObjState, checked: ms}`. `DbOptions.crdtCache` sets its size (default 1,024; 0 turns it off), and `DbOptions.crdtCacheMs` how long an entry is fresh (default 5,000).
+   * **`crdtStates(db, objects, mode, rv?)`** replaces the direct `crdtGet` calls of reads (`TableTx.crdtRows`, `remove`'s dots, the backfill keeps `crdtGet`):
+     * **`auto`:** fresh entries as they are. For the others, one `/v1/crdt/versions` call; equal versions are marked checked, and only changed or uncached objects are fetched with `crdt/get`. On a network error (`ZenError` `network`), cached entries are served however old, and a miss throws `DbError('offline')`, a new code.
+     * **`cache`:** cached entries regardless of age; misses go to the server (`crdt/get`), and offline a miss throws `offline`.
+     * **`server`:** always `crdt/get` (at the transaction's read version), filling the cache; offline it fails.
+   * **Filling:** every `crdt/get` and `crdt/range` result (scans included) refreshes the cache. A commit with CRDT ops marks its objects stale, so the next `auto` read checks them.
+   * **API:** `get(pk, {read})`, `query().read(mode)`, `DbOptions.crdtRead` (default `auto`). Transactions take `db.transaction(fn, {read})` as the default for their CRDT reads.
+   * **Queries:**
+     * `auto` and `server` run as now (index paths fetch their rows through `crdtStates`, so index fetches use the cache).
+     * In `auto`, a network error falls back to the `cache` answer.
+     * **`cache`:** the table's cached rows plus the rows that exist only in the queue. Predicates, `orderBy` and `limit` are applied in memory; paging by pk (path `cache`). Documented as possibly incomplete.
+2. **`crdtq.ts`: the queue (§19.7).**
+   * **Entry:** `{id, single: boolean, rows: [{table, tableId, pk, ops: QOp[]}], changes, at}`.
+     * `QOp` is a `Pending` with its stamp: `row` / `lww` carry the `hlc` ticked **at queue time** (the edit's time, so offline edits keep their place in the order; no clock sync needed offline).
+     * `ctr` keeps its delta; `seq` and the total come at send time.
+     * `rem` keeps the dots seen at queue time (from the cache in any mode, so it works offline).
+     * `changes` are the change notes (`{table, pk, alive}`); the events are appended at send time, in the same commit as the ops (§19.7).
+   * **Queuing a transaction** (`DbTransaction.finish`):
+     * **CRDT-only** means its built commit has no writes, clears, appends, consumes, chunks, `read_conflicts` or `expect_ranges`, and every `expect` is a catalog record it read. Its emits, schedules, files or KV reads make it mixed.
+     * A CRDT-only transaction with `queue !== false` gives its `CrdtWrites` and change notes to `db.crdtQueue.add(entry)`. Its commit is then empty, and the read-only catalog check is skipped (the catalog is checked again at send time). So it completes offline.
+     * `Table.patch` / `incr` / `add` / `remove` / `delete` / `insert` on a CRDT table are one-op transactions: entries with `single: true`.
+     * **Mixed transactions** commit directly as now. Before they commit, the queue is flushed (`await flush()`), so this device's commits stay in order. Offline, that flush throws and the transaction fails, as it would anyway.
+   * **Overlay:** every read overlays the queued operations of its rows (in queue order), then the transaction's own (`overlay`). A row inserted only in the queue shows in `get` and in `cache` queries.
+   * **Sending** (one sender per `Db`, after `batchMs`, default 10):
+     * **Batch:** entries in order, packed until the next would pass `max_commit_ops` / `max_commit_bytes` (`checkLimits`). Single-op entries are coalesced per row and field: the last `lww` wins, `ctr` deltas add up, an `add` then a `rem` of one element cancel out. Atomic entries are never split or merged into others' coalescing.
+     * **Build:** a `ManualTransaction`. Each row's TableRecord is read by name and must have the entry's table id; otherwise the table was dropped or replaced, and its ops are dropped with a warning. The ops go through `CrdtWrites` with their stamps: `row` / `lww` keep their queued `hlc`; `ctr` takes the actor lock, `seq` = a tick and the total; `rem` adds the `set_dots` the queue learned from earlier queued `add`s of that element. Then the change events.
+     * **Send:** `commitTransaction` on the same transaction until it succeeds or fails for sure.
+       * `network` / `commit_unknown` → resend the same commit (same `commit_id`) after a backoff from 100 ms to 30 s (also woken by `online` events and by `flush()`). The actor lock stays held meanwhile, so no other counter commit can overtake it.
+       * `conflict` (the catalog changed) → rebuild the batch.
+       * `stale_op` / `clock_skew` → `rebase` (clock sync), then rebuild with fresh `hlc`s for its `row` / `lww` ops: the offline edit then wins over edits made since, as documented (§19.7).
+       * `too_large` → split the batch; a single entry that is too large fails.
+       * **Any other error** fails the batch's entries: their `wait` promises reject, `onError` reports them, and they leave the queue.
+     * **On success:** `set_dots` are kept for later `rem`s; the entries are removed from the store; their objects are marked stale in the cache; the `wait` promises resolve.
+   * **API:**
+     * **`db.crdt`:** `pending` (entries), `online`, `flush()` (resolves when the queue is empty; offline it rejects), `onSync(fn)` (after each sent batch, and when going offline or online).
+     * **`db.transaction(fn, {queue, wait})`;** `db.table(name, {wait: true})` gives a handle whose CRDT calls wait for the commit (variadic `add`/`remove` leave no room for an options argument).
+   * **Store:** `QueueStore {load(): Promise<Entry[]>, put(e): Promise<void>, remove(ids): Promise<void>}`, with `memoryQueueStore()` as the default. `DbOptions.crdtQueue` takes another. An entry is in the store before its write resolves. The built commit isn't stored, so after a restart a commit whose outcome was unknown is rebuilt (new `commit_id`); step 8's persisted stores add that (noted in TECH_DEBT if not done there).
+   * **Close:** `db.close()` stops the sender; entries stay in the store.
+3. **`txn.ts`, `db.ts`, `query.ts`:** the hooks above (`finish` queues, `crdtRows` via `crdtStates` with the queue overlay, `remove` dots from the cache, mixed commits flush first). `DbError` gains `offline`.
+4. **Spec (⚠️ `spec:` commit):**
+   * **api.md §13.3:** `/v1/crdt/versions`.
+   * **zendb.md §19.4:** the read modes and the cache.
+   * **zendb.md §19.7:** queued entries, stamping (`row` / `lww` at queue time, counters at send time, `rem` dots and `set_dots`), batching and coalescing, the same `commit_id` on resends, rebuild rules, the flush before mixed transactions, `QueueStore`.
+   * **§16:** the example's `{wait}`.
+   * The new error code `offline`.
+5. **Docs:** `docs/DB.md` §19 gains "Offline" (queueing, `wait`, `db.crdt`, what fails offline) and "Read modes". `docs/CLIENT.md`: `commitId`.
+
+#### Tests
+* **Server** (`tests/crdt.rs`): above.
+* **`packages/db/test/crdtoffline.test.ts`** (its own server; `world({limits: {crdt_horizon_secs: 1, claim_ttl_ms: 1000}})`). Offline is simulated by wrapping `session.call` to throw `ZenError('network')` while a flag is set, as `commitsDuring` does.
+  * **Read modes:**
+    * `auto`: a fresh hit costs no call. An expired entry costs one `versions` call and no `get` when unchanged, and a `get` when another installation changed it. Offline, the cached row is served, and an uncached one throws `offline`.
+    * `cache`: an old entry is served without a call.
+    * `server`: always a `get`; offline it fails.
+    * Queries: `cache` answers from cached and queued rows; `auto` falls back offline.
+  * **Queue:**
+    * Writes resolve while offline, are visible locally at once (`get`, `cache` queries), and arrive after going online (`flush()`); `{wait: true}` resolves only then.
+    * **Two installations edit offline, then reconnect:** different fields both survive; counters sum; add-wins sets.
+    * **Batching:** 50 single-op `incr`s → one or two commits (counted) with the right total. Coalescing: patches of one field → one op.
+    * **Atomic entries are kept whole:** a transaction of 3 rows, with a low `max_commit_ops` that cuts the batch, still lands in one commit.
+    * **A lost response** (the commit applied, then a network error is injected on the reply): the resend with the same `commit_id` applies once (counter total right).
+    * **`stale_op` past the horizon:** an offline `patch` older than 1 s → rebased on send, and it wins over an online edit made meanwhile.
+    * A mixed transaction flushes the queue first; `{queue: false}` commits directly; a dropped table's queued ops are dropped with a warning.
+    * A remove offline of an element added offline earlier in the queue removes it (`set_dots`).
+  * **Property test (§19.9):**
+    * Three installations (three sessions and clocks) on one database.
+    * Seeded xorshift, three seeds. Each device runs random ops (insert, delete, patch, incr, add, remove) on a few rows, in random offline/online phases, with random reconnect order.
+    * Afterwards all three `flush()`; `server` reads on every device must be equal for every row.
+    * Counters must equal the sum of every device's increments.
+    * Sets must hold every element some device added and never removed.
+* **Verification:**
+  * Rust: `cargo fmt --check`, clippy (default and `--no-default-features`), `cargo test -p zen-server --test crdt`, `scripts/build-wasm.sh`
+  * JS: `npx biome check`; tsc for client, fuse and db test; `npx vitest run` three times
+  * CI green on the PR before stopping
+* **Disk:** `CARGO_INCREMENTAL=0`; check disk before the Rust build (6.9 GB free).
 
 ### Rhythm
 1. Restart from main, log the step 7 plan line, commit, push, open a new PR.
 2. Build 7a on the user's go: the `spec:` commit, then the code commit.
 3. Log the 7a line, push, update the PR, confirm CI is green, stop for compaction.
 4. 7b: restart from main, commit the 7b plan (`docs: milestone 5 step 7b plan`), open a new PR. Build it on the user's go (the `spec:` commit, then the code commit), log, push, confirm CI is green, stop.
-5. 7c the same way: plan in detail, then build.
+5. 7c the same way: restart from main, commit the 7c plan (`docs: milestone 5 step 7c plan`), open a new PR; build on the user's go (`spec:` commit, then code), log, push, confirm CI is green, stop. Step 7 is then done; step 8 (`@zen/fs`) is next.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
 * **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).
