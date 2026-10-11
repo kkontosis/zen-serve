@@ -382,6 +382,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** fs.md §11.1, formats.md §11.2 (`zen.` names), zendb.md §9.3 (`queue`, `index`, the kept `info`).
     * **Docs:** `docs/CLIENT.md` §8 (writes), TECH_DEBT TD-FUSE-REPLICA progress.
     * **Tests:** `packages/fs/test/writes.test.ts` (13: each operation online, offline with a restart, a lost reply with a crash, changed chunks only online and offline, handles, a conflict resolved by unlink, a move cycle, a refusal, a rebase past the horizon, tabs with handover, eviction); `large.test.ts` +2 (`seal` with a sink, known chunks), `tree.test.ts` +1 (a preset `hlc`, re-ticked by a rebase). The inflight resend and the eviction guard were each checked to fail when removed. 359 vitest tests in all.
+    * PR #31 merged.
+  * **8c** planned in detail (see "8c: zen-mount on `@zen/fs`"); the plan commit restarts the branch from main and opens a new PR, which 8c joins.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2355,11 +2357,110 @@ This is TypeScript only: the server already makes chunk and page re-uploads idem
 * CI green on the PR
 * Rust unchanged
 
-### 8c: zen-mount on `@zen/fs`
-* `mount(replica, mountpoint, opts)`: lookups, `getattr` and `readdir` from the in-memory node table (stable inode numbers from a node-id map), reads through the replica (cached), writes through `FileHandle`s (changed chunks only; no whole-file buffer), `symlink`/`readlink`, `setxattr`/`getxattr`/`listxattr`/`removexattr` (user namespace; `zen.*` mapped to `user.zen.*`), `chmod`/`utimens`/`chown` as now. Kernel caches are invalidated from `replica.onChange`.
-* **CLI:** `--cache-dir DIR` (a sealed Node disk store: the replica, its lock and the kept header), `--cache-size BYTES`, `--pin PATH` (repeatable), `--vault DIR` (sign in and unlock from the vault; `--save-device FILE` imports a `--device-key` JSON into it), `--offline-ok` (mount from the cache when the server is down).
-* **Tests:** the existing mount tests unchanged and green; symlinks and xattrs through the kernel; a warm restart with `--cache-dir` reads cached files with the server stopped; changed-chunk writes through the kernel (counted chunk uploads); `--vault` mounts with no secret given.
-* **Docs:** `docs/CLIENT.md` (the replica, zen-mount), TECH_DEBT: TD-FUSE-REPLICA resolved; the M8 upload-session note for resumes past the grace period.
+### 8c: zen-mount on `@zen/fs` (detailed plan)
+
+**Context.** 8a and 8b (PRs #30, #31) give `@zen/fs` a replica that reads and writes, offline too. `zen-mount` (`packages/fuse`) still works straight on a `Tree`:
+* it lists directories from the server (a cache dropped on every feed change)
+* it reads chunk ranges
+* it buffers a file opened for writing whole in memory and writes it on close
+* it has no symlinks, xattrs, offline use or disk cache (`--cache-dir` is parsed and ignored)
+
+8c moves it onto the replica and resolves TD-FUSE-REPLICA. Step 8 is then done.
+
+**After compaction, re-read:** this section and the 8a/8b log lines; `packages/fuse/src/{mount,cli}.ts`; `packages/fuse/test/mount.test.ts`; `packages/fs/src/{replica,handle}.ts` (the public API); `packages/client/src/local/vault.ts`; `.github/workflows/ci.yml` (client job); `node_modules/@cocalc/fuse-native/index.js` (xattr and symlink op signatures).
+
+**Survey facts:**
+* fuse-native has no `use_ino` option and no kernel invalidation call. So inode numbers stay the kernel's, and the kernel's caches expire by `attrTimeout`/`entryTimeout`, as now; the plan's "stable inode numbers" and "invalidated from `onChange`" are dropped.
+* Its `getxattr` callback takes `(err, Buffer)` (a size query has a zero-length buffer); `listxattr` takes `(err, names)`; `setxattr` takes `(path, name, value, position, flags, cb)`; `symlink` takes `(src = target, dest = path, cb)`; `readlink` takes `(err, target)`.
+* The CLI test runs `packages/fuse/dist/cli.js`, which imports `@zen/fs` from its `dist`. So CI must build `@zen/fs`, and `@zen/fuse` gains the dependency.
+
+#### `mount.ts`: on the replica
+* **Signature:** `mount(replica: Replica, mountpoint, {readOnly, attrTimeout, verbose})`. Its own directory cache, size cache, conflict names and change-feed loop go. `conflictName` is re-exported from `@zen/fs`.
+* **Lookups and attributes:** `getattr` and `readdir` call `replica.stat` and `readdir(path, {withTypes})`, with mode and type bits as now. While a handle has unflushed writes, `getattr` reports its size.
+  * **Decision:** offline, a file whose versions aren't kept stats with size 0, rather than failing (`ls -l` keeps working); reading it fails with `EIO`.
+* **Files:** `open`/`create` → `replica.open(path, flags)`, an fd per `FileHandle`:
+  * `O_ACCMODE` 0 → `r`; `O_TRUNC` → `w`; `O_APPEND` → `a`; otherwise `r+`
+  * `create` → `w` with `{create: true, exclusive: true, mode}`
+  * `read`/`write`/`ftruncate` → the handle
+  * `flush` and `fsync` → `handle.flush()`: the write is queued and stored, durable on the device. It is sent when the server can be reached.
+  * `release` → `handle.close()`
+  * `truncate` by path: an open writable handle of the node takes it (as now), else `replica.truncate`
+  * No whole-file buffer: memory is the dirty chunks.
+* **Operations:** `mkdir`, `unlink`, `rmdir`, `rename`, `chmod`, `utimens` → the replica. `chown` is accepted and ignored, as now. `link` → `EPERM`.
+* **Symlinks:** `symlink(target, path)` → `replica.symlink`; `readlink` → `replica.readlink`. `getattr` reports `S_IFLNK`, and the kernel resolves the target.
+* **xattrs:** the kernel's `user.<x>` is the stored name `<x>` (formats.md §11.2), so `user.zen.content_type` is the media type. Other namespaces (`security.`, `trusted.`, `system.`) → `ENOTSUP`. `getxattr` of a missing name → `ENODATA`.
+* **Errors:**
+
+  | Replica error | errno |
+  |---|---|
+  | `not_found` | `ENOENT` |
+  | `not_dir` | `ENOTDIR` |
+  | `is_dir` | `EISDIR` |
+  | `exists` | `EEXIST` |
+  | `not_empty` | `ENOTEMPTY` |
+  | `no_attr` | `ENODATA` |
+  | `bad_value` | `EINVAL` (writing to a conflict copy: `EACCES`) |
+  | `closed` | `EBADF` |
+  | 403 | `EACCES` |
+  | `too_large` | `EFBIG` |
+  | `offline`, anything else | `EIO` |
+
+* **Read-only:** every change → `EROFS`, as now.
+* **`Mount.unmount()`** closes the open handles (each queues its flush), then unmounts. The replica is the caller's to flush and close.
+
+#### CLI (`cli.ts`)
+* **`--cache-dir DIR`:** `sealedStore(nodeDiskLocalStore(DIR))` (the device layer) holds the replica (its lock file means one mount per directory) and the kept fs header (`unlock(how, {local})`). Without it, a memory store.
+* **`--cache-size BYTES`** (default 1 GiB) → `cacheBytes`.
+* **`--pin PATH`** (repeatable): pinned after the first sync. Pins are kept in the store, so a later mount keeps them.
+* **`--vault DIR`:** `credentialVault(sealedStore(nodeDiskLocalStore(DIR)))`.
+  * With `--device-key FILE` too, the key is first stored in the vault (identity public bytes, device seed, cert). The file can then be deleted.
+  * After any sign-in, the session is stored.
+  * With no sign-in option, `vault.signIn(client)`. The fs is unlocked with the vault's device when no other unlock option is given.
+  * Replaces the planned `--save-device`.
+* **`--offline-ok`:** when the server can't be reached at start, mount from the cache:
+  * sign in from the vault (the stored session, resumed)
+  * unlock from the kept header
+  * use the replica's kept table
+  * Without it, a `network` error at start exits with status 1.
+  * It needs `--cache-dir`, and `--vault` or another offline-capable sign-in (checked at parse time).
+* **Stopping** (SIGINT/SIGTERM): unmount, then `replica.flush()` for up to 10 s.
+  * With `--cache-dir`, writes still queued stay for the next mount (a line says how many).
+  * With a memory store they would be lost, so it waits for the flush until the server answers, with a warning every 10 s; a second signal stops at once.
+  * Then `replica.close()` and `ufs.close()`.
+* `--help` is updated; the `--cache-dir` "reserved" line goes.
+
+#### Wiring
+* `packages/fuse/package.json`: dependency `@zen/fs`.
+* CI client job: `npm run build -w @zen/client -w @zen/fs` before the tests (the CLI test compiles fuse against both `dist`s).
+
+#### Docs
+* `docs/CLIENT.md` §9 rewritten:
+  * the replica under the mount
+  * the options
+  * offline use
+  * what `fsync` guarantees
+  * symlinks and xattrs
+  * the limits left: no hard links, no `mmap` coherence across devices, inode numbers from the kernel
+* `spec/TECH_DEBT.md`: TD-FUSE-REPLICA resolved.
+* `docs/MILESTONE-8.md`: a resume past `chunk_grace_secs` is already covered for queued writes, which upload again from the store; the upload sessions there remain for `Tree.upload` resumes.
+
+#### Tests (`packages/fuse/test/mount.test.ts`, run in CI; FUSE isn't in the session container)
+* **The existing tests**, adapted: `mountAt` opens a replica (memory store, `locks: null`) per mount. Files and directories, large files and ranged reads, a second mount and a conflict copy resolved by `unlink`, persistence across mounts, read-only, the paged file.
+* **Symlinks:** `symlink` → `readlink`, `lstat().isSymbolicLink()`, and reading through the link.
+* **xattrs** (through `python3`'s `os.setxattr`, `getxattr`, `listxattr`, `removexattr`, since Node has none):
+  * `user.k` round-trips and is stored as `k` (`replica.getxattr`)
+  * `user.zen.content_type` shows in `stat().contentType`
+  * `trusted.x` → `ENOTSUP`
+  * a missing name → `ENODATA`
+* **Changed chunks only:** in the 2,048-byte world, a 300-chunk file is written by the `Tree`. A 1-byte write through the kernel (`open r+`, `write` at the middle, `close`), then `replica.flush()`, sends one chunk and one page (the replica's session calls counted).
+* **The CLI with a vault and a cache** (its own world; the fs gets a device slot):
+  1. `--device-key FILE --vault V --cache-dir C --pin /docs`: mounts, reads `/docs/a.txt`, stops.
+  2. `--vault V --cache-dir C`, with no secret in the environment: mounts and reads.
+  3. The server is stopped: without `--offline-ok` the CLI exits 1. With it, it mounts, lists `/`, and reads the pinned `/docs/a.txt`; an unpinned, unread file fails with `EIO`.
+* **Verification:** `npx biome check`; tsc for client (test), fuse, db (test), fs (test); `npx vitest run` three times locally (the fuse tests skip there); CI green, where the fuse tests run.
+
+#### Rhythm
+On the user's go: the code commit (no spec change expected; a `spec:` commit first if one turns up). Then log the 8c line in both plan copies (step 8 done), push, update the PR, confirm CI is green, and stop for compaction. Step 9 (`@zen/loro`) is next.
 
 ### Verification (each sub-step)
 * `npx biome check`; tsc for client (test), fuse, db (test), fs (test); `npx vitest run` three times; Rust unchanged unless a sub-step says otherwise.
