@@ -173,7 +173,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Fix (5c row cache):** a read in flight could cache a row after a commit had dropped it, and `insert` trusted that copy and threw `exists` before the commit could catch it as a conflict. `insert` now reads the row from the server (`read(t, pk, fresh)`). Regression test in `txn.test.ts`.
     * **Test fixes:** `txn.test.ts`'s `itemsDb` sets `scheduler: false`, since its tests count reads. The decoy test in `indexes.test.ts` asserted more than 3 nodes, which a random index key misses about 0.3% of the time; it now asserts at least 3.
     * **⚠️ Spec:** §11.5, §12.2 and §12.3, as planned (a separate `spec:` commit).
-    * **Tests:** `packages/db/test/patterns.test.ts` (17), 198 vitest tests in all.
+    * **Tests:** `packages/db/test/patterns.test.ts` (17), 198 vitest tests in all. PR #18 merged, CI green (commit `a91c258`).
+  * **6c** (sagas, tab proxy, fault suite, docs): planned (see 6c below); a new PR, since #18 is merged.
 
 ## Facts the work must respect (from the code survey)
 
@@ -877,53 +878,132 @@ They are all built from 6a's pieces and `$sched` / `$inbox` rows. No server chan
 4. `spec:` commit, then the code commit.
 5. Log the 6b line, push, update the PR, confirm CI is green, stop for compaction.
 
-### 6c: sagas, the tab proxy, the fault suite, docs
-1. **`saga.ts` (§12.5):**
-   * `db.saga(name, steps)` → `Saga {start(data, tx?), get(id)}`.
-   * The orchestrator consumes `("zen", "saga", ns, name)` with `per_key` keyed by saga id, runs only in the owner, and applies the transition table of §12.5.
-   * `$sagas` row, step commands with `reply_to`, timeouts as scheduled messages cancelled on `ok`, compensations in reverse, `stuck` when a compensation dead-letters (orchestrator watches the class DLQ of compensate topics).
-   * Participants are `serve` handlers that return `{ok}` or throw `ReplyError` (fail).
-2. **`proxy.ts`, the tab proxy (TD-DB-TAB-PROXY):**
-   * **Injection:** `DbOptions.channel?: (name) => BroadcastChannelLike | null`, default `globalThis.BroadcastChannel`. Channel name `zen/db/<fs>/<ns>`.
-   * **Protocol** (structured-clone messages tagged with a random tab id):
-     * `sub {sid, target: topic paths / prefix path, after}`
-     * `unsub`
-     * `ev {sid, topic id, offset, keyToken, envelope}`: sealed events. The receiving tab opens them with its own `Topic`, so no plaintext crosses the channel.
-     * `err`
-     * `esub` / `eev` / `epub` for ephemeral
-     * `owner` (announce)
-     * `hello` (a new tab asks for the owner)
-   * **The owner** holds the only stream, subscribes for every remote sub, forwards events, and drops a tab's subs on `unsub` or when the tab says `bye` (pagehide).
-   * **A non-owner** `StreamSource`:
-     * Resolves a plain `on` without `after` to the read version itself (`/v1/grv` → `offsetAfterVersion`, exported from the client if needed), so the start doesn't depend on the owner.
-     * Keeps the last offset per sub, and on an `owner` announce re-sends every sub with `after = last`. So a handover loses and repeats nothing.
-   * **Without `BroadcastChannel`,** or as owner, the source is the direct stream.
-   * **Updates:** TD-DB-TAB-PROXY resolved. TD-DB-SHAREDWORKER stays open.
-3. **Fault suite (`packages/db/test/faults.test.ts`, §13.2):**
-   * a handler process "killed" mid-transaction (abort the consumer loop with the transaction uncommitted): another holder gets the event after the lease or claim expires
-   * a deposed leader commits late → `not_leader`, none of its writes, emits or schedules land
-   * two consumers racing → `cursor_moved` drops one
-   * a dropped stream (`reconnect()`) → `on` misses and repeats nothing
-   * a replayed `commit_id` (send the same built commit twice) → one effect
-   * scheduler failover mid-batch
-   * an owner tab closing: proxied subscriptions continue on the new owner without gaps; consumers move
-   * a responder that never answers → timeout, then a retry with the same `corr` and dedup
-4. **Docs:**
-   * `docs/DB.md` gains the broker part: messages, emit, on, consume, patterns, sagas, tabs, guarantees.
-   * `docs/EXAMPLES.md` needs no change.
-   * TECH_DEBT updates as above.
+### 6c: sagas, the tab proxy, the fault suite, docs (detailed plan)
 
-**Tests 6c:** sagas (happy path; a fail at step 2 compensates step 1 in reverse; a timeout; a stale reply acked; `stuck`); the proxy with a fake `BroadcastChannel` bus and `FakeLocks` (the non-owner receives events and inbox replies, only one stream is opened (counted), and a handover has no gap or duplicate); the fault suite.
+**Context.** 6a and 6b (PRs #17, #18) give messages, `on`, consumers, change events, the scheduler, work queues and request/reply. 6c finishes Part B of zendb.md:
+* sagas (§12.5)
+* the tab proxy (§9.2, TD-DB-TAB-PROXY), as the user decided: only the owner holds a stream, other tabs' `on`, inbox and ephemeral subscriptions go through it
+* the fault suite (§13.2)
+* the broker half of `docs/DB.md`
 
-**Verification (each sub-step):**
-* `npx biome check`
-* tsc: client, fuse, db test
-* `npx vitest run`, three times
-* CI green on the PR before stopping
+**After compaction, re-read:**
+* this section, and the 6a and 6b log lines
+* `spec/zendb.md` §9.2, §12.3, §12.5, §13
+* `packages/db/src/{broker,reply,sched,db,txn,tabs}.ts`
+* `packages/db/test/{patterns,broker,txn}.test.ts` (setup, `until`, `events`, `FakeLocks`)
+* `packages/client/src/stream.ts` (`StreamEvent`, `start`, `offsetAfterVersion`), `log.ts` (`Topic.decode`)
 
-**Rhythm.**
-1. **Now:** restart the branch from main and copy this plan into `docs/MILESTONE-5.md`. Commit (`docs: milestone 5 step 6 plan`), push with `--force-with-lease`, and open a new PR.
-2. **Each sub-step:** log, commit, push, update the PR or open a new one, and confirm CI is green. Then stop for compaction.
+**Branch/PR.** #18 is merged: the branch restarts from main, and the plan commit and 6c are a new PR.
+
+#### Files
+1. **`saga.ts` (§12.5).**
+   * **API:** `db.saga<D>(name, steps, opts?)` → `Saga {start(data, tx?) → id, get(id) → SagaState | undefined, stop()}`.
+     * A step is `{name, command: Topic, compensate?: Topic, timeoutMs?}` (`timeoutMs` default 60,000).
+     * `opts.group` is the orchestrator's group name (default `"orchestrator"`).
+     * `SagaState` is the `$sagas` row: `{id, saga, step, status, data, done, timeout?, corr?}`.
+   * **Topics and keys:**
+     * The reply topic is `("zen", "saga", ns, name)`.
+     * Commands and replies are keyed by the saga id, so a `per_key` orchestrator sees each instance in order.
+   * **Commands:**
+     * Shape: `Msg {type: name + "." + step, id, corr: random, saga, step, reply_to: reply topic, body: data}`.
+     * A compensation has type `name + "." + step + ".compensate"`, sent to `compensate`.
+     * The row's `corr` is the corr of the command (or compensation) in flight.
+   * **Replies:** `replyMsg` / `sendReply` (reply.ts) copy `saga` and `step` from the request, and key the reply by the saga id. So participants are plain `serve` handlers: return a body (ok), or throw `ReplyError` (fail).
+   * **`start(data, tx?)`** runs in `tx` or a transaction of its own:
+     1. insert the row (`status: running`, `step: 0`, `done: []`)
+     2. emit command 0
+     3. schedule the timeout to the reply topic: type `zen.saga.timeout`, same `saga`, `step` and `corr`, keyed by the saga id; its id goes in `timeout`
+   * **The orchestrator** is a `consume({group, topic: reply topic, mode: 'per_key'})` (owner only). It handles each event in one transaction:
+     * **No row, or a `corr` that isn't the row's:** stale. Ack only.
+     * **Running, reply `<type>.reply`:**
+       * cancel the timeout
+       * merge an object body into `data` (shallow)
+       * push the step to `done`
+       * then emit the next command and its timeout, or set `status: done`
+     * **Running, `<type>.error` or a timeout:** set `status: compensating` and start the compensations: the `done` steps that have a `compensate` topic, newest first.
+       * none left → `failed`
+       * an error reply's body is stored in `data.error`
+     * **Compensating, `.compensate.reply`:** the next compensation, or `failed` when none is left.
+     * **Compensating, `.compensate.error` or a timeout:** `stuck`. Decision: compensations run until their participant gives up, so a timeout there means an operator is needed.
+   * **DLQ (stuck):**
+     * The orchestrator also consumes, for each distinct compensate topic, its class DLQ `<compensate>/zen.dlq`: a `sequential` group `"<group>.dlq"`.
+     * A dead-lettered compensation of this saga name whose corr matches its row's corr → `stuck`.
+     * Documented: stuck detection needs participants with `retry: 'delay'`. With `nack`, the server DLQ isn't visible to the orchestrator, and the compensation's timeout covers it.
+   * **Transitions:** each one is one commit, so it happens exactly once (§12.5). The row update, the next command, the timeout schedule, the cancel and the consume step are all in it.
+2. **`proxy.ts`, the tab proxy (TD-DB-TAB-PROXY).**
+   * **Injection:**
+     * `DbOptions.channel?: ((name) => BroadcastChannelLike) | null`, defaulting to `globalThis.BroadcastChannel`.
+     * The proxy is used only when Web Locks are used too (with `locks: null` every instance is its own owner).
+     * The channel name is `zen/db/<fs id>/<ns>`.
+     * Messages are structured-clone objects carrying `{from: tabId, to?}`, with a random tab id.
+   * **`TabSource implements StreamSource`** replaces `DirectSource` as `db.source` when the proxy is on.
+     * **Logical subscriptions:** `{sid, kind: 'sub' | 'esub', target, last, onEvent, onError}`.
+     * **Two routes:**
+       * **direct** while this tab owns: `DirectSource`
+       * **remote** otherwise, to the owner tab named by the last `owner` announce
+     * **Switching routes** (`onOwner`, an `owner` announce, the owner's `bye`) re-subscribes every subscription with `after = last`. Offsets at or before `last` are dropped, so a handover loses nothing and repeats nothing.
+     * **Start offset:** a `sub` without `after` takes `offsetAfterVersion(/v1/grv)` in the tab itself (export `offsetAfterVersion` from `@zen/client`, or add `Session.readVersion()`). So the start doesn't depend on which tab owns.
+     * **Remote subscribe** resolves on the owner's `ok {sid}`, and rejects on `err {sid, message}`. Before any owner is known, it sends `hello` and waits for an `owner` announce.
+   * **Protocol:**
+     * Requests from a tab: `sub {sid, prefix: topic id bytes, after}`, `esub {sid, path}`, `unsub {sid}`, `epub {path, data}`, `hello`, `bye`.
+     * Replies from the owner: `ok`, `err`, and `owner {id}` (announced on becoming owner, and in answer to `hello`).
+   * **Events stay sealed (log):** the owner subscribes with `{fs, prefix: topic id}` and no `topics`, so events arrive unopened, and forwards `ev {sid, topic, offset, keyToken, envelope}`. The tab opens each event with its own `Topic.decode` (exact topic id for a `Topic` target, the known topics for a prefix), which also observes the HLC.
+   * **Ephemeral messages** are forwarded opened (`eev {sid, topic, sender, hlc, data}`): the stream has no sealed form for them. Same-origin only, like IndexedDB, as documented.
+   * **`ProxyHost`, in the owner:**
+     * serves the other tabs' subscriptions from its `DirectSource`
+     * drops a tab's subscriptions on `unsub` or `bye` (sent on `pagehide` and `db.close()`)
+     * publishes `epub` for other tabs
+   * **Unchanged:** transactions stay local in every tab. Consumers, `serve`, the scheduler and the saga orchestrator already run only in the owner (`onOwner`).
+3. **reply.ts and broker changes:** `replyMsg`/`sendReply` carry `saga`/`step` and the saga key (above). The inbox comment says "each `Db`".
+4. **Spec (⚠️ `spec:` commit):**
+   * §11.5 `$sagas`: `corr?: bytes`, and `timeout` is the `$sched` id.
+   * §12.5:
+     * the command, compensation and timeout message types
+     * replies carry `saga`/`step` and the saga key
+     * the stale rule by `corr`
+     * ok bodies merged into `data`, and an error body in `data.error`
+     * a compensation error or timeout → `stuck`
+     * DLQ watching through the class DLQ, which needs `retry: 'delay'`
+   * §9.2: the proxy protocol in brief. Events forwarded sealed, ephemeral ones opened. The start offset is resolved by the subscribing tab.
+5. **Docs:**
+   * `docs/DB.md` gains the broker part: messages and `emit`, `on`, consumers, ephemeral messages, the scheduler, work queues, request/reply, sagas, change events, tabs and the proxy, guarantees and failures (the §13 tables in practice).
+   * `spec/TECH_DEBT.md`: TD-DB-TAB-PROXY resolved; TD-DB-SHAREDWORKER stays.
+
+#### Tests
+* **`packages/db/test/saga.test.ts`** (its own server, `claim_ttl_ms` 1000, fast scheduler). Two participant `serve`s (`reserve` with compensate `release`, `charge` with compensate `refund`) on another `Db`, `retry: 'delay'`.
+  * **Happy path:** `done`, data merged, each participant ran once.
+  * **A fail at step 2** (`ReplyError`): `release` runs once, then `failed`, with `data.error`.
+  * **A timeout:** the step-2 participant never replies, `timeoutMs` 300 → compensation → `failed`. The late reply is stale: acked, and the state is unchanged.
+  * **`start` inside a transaction that throws:** no row, and no command sent.
+  * **`stuck`:** a compensation that always throws, with `maxAttempts` 2, reaches its DLQ → `stuck`.
+  * **Two instances in parallel:** both finish.
+* **`packages/db/test/proxy.test.ts`:**
+  * **Setup:** a `FakeBus` (an in-memory `BroadcastChannel` by name, async delivery, `structuredClone`) plus `FakeLocks`. Two or three `Db`s on one fs and ns as tabs, with `DirectSource` stream opens counted.
+  * **Only the owner opens a stream;** the non-owner's `on` receives events, both plain and `cursor`.
+  * The non-owner's `request` gets its reply through its inbox via the owner, and its `onEphemeral` and `publishEphemeral` work.
+  * **Handover:** the owner closes while events flow, and the second tab becomes owner. Its own and the third tab's subscriptions continue with no gap or duplicate (count and order of offsets), and its consumers start.
+  * Without a channel (or with `locks: null`), the source is direct.
+* **`packages/db/test/faults.test.ts`** (§13.2):
+  * **A handler killed mid-transaction:** `stop()` with the handler blocked and uncommitted. Another instance gets the event after the lease or claim expires, and its effect happens once.
+  * **A deposed leader commits late:** its ack fails `not_leader`, and none of its writes or emits land.
+  * **Two consumers racing on a key:** `cursor_moved` / `claim_lost` drops one, and the effect happens once.
+  * **A dropped stream** (`reconnect()` on the session stream): `on` misses nothing and repeats nothing.
+  * **A replayed `commit_id`** (the same built commit sent twice): one effect.
+  * **Scheduler failover mid-batch:** the leader stops between `runOnce` calls, and the rows are delivered once by the other.
+  * **The owner tab closing** (proxy): covered in `proxy.test.ts`. Only referenced here.
+  * **A responder that never answers:** `timeout`, then a retry with the same `corr` once the responder is back; dedup → one effect.
+* **Verification:**
+  * `npx biome check`
+  * tsc: client, fuse, db test
+  * `npx vitest run`, three times
+  * CI green on the PR before stopping
+
+#### Rhythm
+1. Restart from main, log the 6c plan line, commit (`docs: milestone 5 step 6c plan`), push, and open a new PR.
+2. Build 6c on the user's go: the `spec:` commit, then the code commit.
+3. Log the 6c line (step 6 done), push, update the PR, confirm CI is green, and stop for compaction.
+
+Step 7 (CRDT tables) is next.
 
 ### Original outline
 * **Base:** `msg.ts` (Msg encoding, BodyRef, causation), `emit`, `on` (plain, `after`, `cursor`), `consume` (group id, the loop table of §11.3, `ack`, `begin({consumes})`), the system tables, ephemeral messages.
