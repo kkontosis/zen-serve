@@ -3,7 +3,10 @@
   "compilerOptions": {
     "noEmit": true,
     "rootDir": "..",
-    "paths": { "@zen/client": ["../client/src/index.ts"] }
+    "paths": {
+      "@zen/client": ["../client/src/index.ts"],
+      "@zen/client/node": ["../client/src/node.ts"]
+    }
   },
   "include": ["src", "test"]
 }

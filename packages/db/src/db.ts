@@ -3,6 +3,7 @@
 import {
   bytes,
   Transaction as RawTransaction,
+  type SealedStore,
   type Topic,
   type Transaction,
   type UnlockedFs,
@@ -41,6 +42,7 @@ import { DbError } from './errors.js';
 import type { Node } from './index/node.js';
 import { startIndexers } from './ixer.js';
 import { Keys } from './keys.js';
+import { localQueueStore, localStores } from './localq.js';
 import { type MigrationFn, migrate } from './migrate.js';
 import { encodeMsg, type Msg } from './msg.js';
 import { type BroadcastChannelLike, type ChannelFactory, TabSource } from './proxy.js';
@@ -119,8 +121,17 @@ export interface DbOptions {
    * of going through the queue (§19.7; default true).
    */
   crdtQueue?: boolean;
-  /** Where the queue of CRDT writes is kept (§19.7). Default: in memory. */
+  /**
+   * Where the queue of CRDT writes is kept (§19.7). Default: on `local`
+   * when given, else in memory.
+   */
   crdtStore?: QueueStore;
+  /**
+   * The sealed local store (§9.3) this database keeps its local state on:
+   * the queue of CRDT writes, so it survives restarts. Tabs that share it
+   * (IndexedDB) share the queue, and only the owner sends it.
+   */
+  local?: SealedStore;
   /** How long the queue waits to gather writes into one commit (default 10 ms). */
   crdtBatchMs?: number;
 }
@@ -209,6 +220,9 @@ export class Db {
   /** Rows by stored key (hex), least recently used first. */
   private readonly rows = new Map<string, CachedRow>();
   private owner: Owner | undefined;
+  /** @internal Web Locks, when used (§9.2). */
+  locks: LockManagerLike | undefined;
+  private unQueue: (() => void) | undefined;
   private readonly topics = new Map<string, Topic>();
   private stream: StreamSource | undefined;
   private readonly subs = new Set<OnSubscription | SourceSub>();
@@ -255,19 +269,31 @@ export class Db {
   static async open(fs: UnlockedFs, ns: string, opts: DbOptions = {}): Promise<Db> {
     const info = await fs.session.client.info();
     const db = new Db(fs, ns, new Keys(fs.keys.db(ns)), info.limits, info.features, opts);
-    db.crdtQueue = new CrdtQueue(db, opts.crdtStore ?? memoryQueueStore(), opts.crdtBatchMs ?? 10);
-    await db.init();
-    await db.crdtQueue.load();
     const locks =
       opts.locks === undefined
         ? (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks
         : (opts.locks ?? undefined);
+    db.locks = locks;
     const name = `zen/db/${fs.id}/${ns}`;
-    db.owner = new Owner(opts.owner === false ? undefined : locks, name, opts.owner !== false);
     const BC = (globalThis as { BroadcastChannel?: new (n: string) => BroadcastChannelLike })
       .BroadcastChannel;
     const channel =
       opts.channel === undefined ? (BC ? (n: string) => new BC(n) : undefined) : opts.channel;
+    // A queue on a store the tabs may share is sent by the owner only (§19.7).
+    const store =
+      opts.crdtStore ?? (opts.local ? localQueueStore(opts.local, ns) : memoryQueueStore());
+    const shared = !!locks && !!(opts.crdtStore || opts.local);
+    db.crdtQueue = new CrdtQueue(
+      db,
+      store,
+      opts.crdtBatchMs ?? 10,
+      shared,
+      shared ? channel?.(`${name}/queue`) : undefined,
+    );
+    await db.init();
+    await db.crdtQueue.load();
+    db.owner = new Owner(opts.owner === false ? undefined : locks, name, opts.owner !== false);
+    if (shared) db.unQueue = db.onOwner(() => void db.crdtQueue.start());
     // Without locks every instance owns: nothing to proxy.
     if (locks && channel) db.stream = new TabSource(db, channel(name));
     if (opts.scheduler !== false) {
@@ -710,10 +736,19 @@ export class Db {
   }
 
   /**
+   * Delete everything database `ns` keeps in a local store (§9.3): its
+   * queue of unsent writes too. For sign-out; close the database first.
+   */
+  static async wipe(local: SealedStore, ns: string): Promise<void> {
+    for (const s of localStores(ns)) await local.clear(s);
+  }
+
+  /**
    * Free the database keys and caches, stop its consumers and
    * subscriptions, and hand the owner role over.
    */
   close(): void {
+    this.unQueue?.();
     this.crdtQueue?.close();
     this.crdtCache.clear();
     this.unSched?.();

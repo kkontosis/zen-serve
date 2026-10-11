@@ -287,6 +287,22 @@ describe('broker (§10, §11.3)', () => {
   });
 });
 
+describe('local records (kind 8, §9.3)', () => {
+  it('open under the fixture fs, bound to the store and the key', () => {
+    const fsKeys = zw.FsKeys.fromBundle(unhex(K.fs_epoch0.bundle));
+    for (const r of V.local.records as J[]) {
+      const sealed = unhex(r.sealed);
+      expect(hex(fsKeys.openLocal(r.store, unhex(r.key), sealed))).toBe(r.plaintext);
+      expect(() => fsKeys.openLocal(`${r.store}x`, unhex(r.key), sealed)).toThrow();
+      // Sealing again gives a fresh nonce, and opens the same.
+      const again = fsKeys.sealLocal(r.store, unhex(r.key), unhex(r.plaintext));
+      expect(hex(again)).not.toBe(r.sealed);
+      expect(hex(fsKeys.openLocal(r.store, unhex(r.key), again))).toBe(r.plaintext);
+    }
+    fsKeys.free();
+  });
+});
+
 describe('CRDT tables (§19.9)', () => {
   const C = () => V.crdt;
 

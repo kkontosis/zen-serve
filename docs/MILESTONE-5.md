@@ -237,7 +237,32 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Tests:** `crdtoffline.test.ts` (15: read modes, the queue, a lost response, a rebase past a 1 s horizon, mixed flushes, a dropped table, learned dots, the 3-installation property test with three seeds); `kv.test.ts` +1; `tests/crdt.rs` +1. 256 vitest tests in all.
     * PR #23 merged.
   * **Replanned after 7c (merged, #23):** step 7 gains 7d (a sealed local store, the persisted queue) and 7e (persisted caches, offline open), a PR each. See Step 7, 7d and 7e.
-  * **7d** (sealed local store, persisted queue): planned in detail (see Step 7, 7d). #23 is merged, so the plan commit restarts the branch from main and opens a new PR.
+  * **7d** (sealed local store, persisted queue): done, PR #24 (the plan commit restarted the branch from main). As planned, with these details for 7e:
+    * **Rust:** seal kind 8 (`Kind::Local`, label `zen/v1/aad/local`), zen-core `db::seal_local` / `open_local`, wasm `FsKeys.sealLocal` / `openLocal`, the `local` vectors section.
+    * **`@zen/client` `src/local/`:**
+      * `store.ts`: `LocalStore` (`get`, `put`, `delete`, `list`, `clear`, `deviceKey`, `close`) and `memoryLocalStore`.
+      * `idb.ts`: `indexedDbLocalStore(name, {factory, keyRange})`.
+      * `node.ts`: `nodeDiskLocalStore(dir)`, exported from `@zen/client/node` (new `src/node.ts`, a package export, a vitest alias and a db tsconfig path).
+      * `sealed.ts`: `sealedStore(raw, {fs, device, plaintext, warn})` → `SealedStore` (`raw`, `layers`). The fs layer seals with `fs.keys` and opens with `fs.keysFor`.
+      * **7e puts the caches on the same `SealedStore`**, in stores named per database (`localStores(ns)` in `localq.ts` lists them for `Db.wipe`).
+    * **`@zen/db`:**
+      * `localq.ts`: `localQueueStore(sealed, ns)` (store `queue/<ns>`: `e<id>` entries and `inflight`), `localStores(ns)`.
+      * `crdtq.ts`: `Inflight`; `QueueStore.putInflight/loadInflight/removeInflight` (the memory store has them too); the loop stores the commit before its first send and `resend`s a stored one first; owner-only sending (`start()` on `onOwner`) with `queued` / `flush` / `sync` messages on `zen/db/<fs>/<ns>/queue`.
+      * `crdt.ts`: `actorLock(db)` (the in-tab chain plus the Web Lock `zen/actor/<actor hex>`), `webLock`, `forgetTotals`.
+      * `db.ts`: `DbOptions.local`, `db.locks` (internal), `Db.wipe(local, ns)`. The queue is shared (owner-only) when Web Locks exist and the store is `local` or `crdtStore`.
+    * **Decisions beyond the plan:**
+      * **The counter lock across tabs** doesn't track the last holder over the channel, as planned: that message can arrive after the next tab already holds the lock. A tab with Web Locks forgets its totals on taking the lock and reads them again (one `crdt/get` per counter commit).
+      * **The queue builds its commits in long mode** (catalog reads become `expect`s; no read version). A commit with a read version, sent again after more than the read window, gets `too_old` before the server checks its `commit_id`, so one that had applied would be built again. This also fixes 7c's resend after a long time offline.
+      * **The counter lock is taken at load** when a commit is in flight, before any other commit can stamp.
+      * **IndexedDB** keeps every store in one object store keyed by `[store, hex(key)]`: adding a store would otherwise need a version change, which waits for every other tab to close.
+      * **Failures the owner reports** reach other tabs as `ZenError(0, code, message)`.
+    * **⚠️ Spec:** formats.md §4 (kind 8), labels.md, zendb.md §9.3 (rewritten), §19.3 (the counter lock named), §19.7 (the commit in flight, totals never stored, tabs, the lock across tabs), §17.
+    * **Docs:** `docs/CLIENT.md` §10 (the local store; security notes are §11 now), `docs/DB.md` §19 "A queue that survives restarts", TECH_DEBT (TD-DB-PERSISTENT-CACHE stays open for 7e).
+    * **Tests:**
+      * `packages/client/test/local.test.ts` (19): each backend, the device key (one per backend; a 0600 file in Node), each layer combination, settings that don't mix, tampering and moved records, another fs, an app's key, plaintext on disk.
+      * `vectors.test.ts` +1 (local records).
+      * `crdtpersist.test.ts` (10): a restart, a crash after a lost reply (the same `commit_id`, counted once), a crash before any send, three layer settings, another fs, `Db.wipe`, owner-only sending with handover, and two tabs of one installation incrementing at once. Both crash and counter tests were checked to fail without the change.
+      * New dev dependency `fake-indexeddb` 6.2.5.
 
 ## Facts the work must respect (from the code survey)
 

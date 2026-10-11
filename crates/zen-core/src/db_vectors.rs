@@ -430,6 +430,23 @@ fn crdt_vectors(dbk: &DbKeys) -> Result<J> {
     }))
 }
 
+fn local_vectors() -> Result<J> {
+    let fs = fixture_fs();
+    let seal = |store: &str, key: &[u8], pt: &[u8], seed: &str| -> Result<J> {
+        let s = db::seal_local(&fs, store, key, pt, &mut DetRng::new(seed))?;
+        Ok(
+            json!({"store": store, "key": h(key), "plaintext": h(pt), "rng_seed": seed, "sealed": h(&s)}),
+        )
+    };
+    Ok(json!({
+        "description": "Local records (kind 8, zendb.md §9.3): the fs layer of the sealed local store, bound to the fs, the store name and the record key.",
+        "records": [
+            seal("queue/app", b"e1", &enc(&Value::Map(vec![(int(1), t("entry"))])), "local-1")?,
+            seal("crdt/app", &[0xab; 20], b"", "local-2")?,
+        ],
+    }))
+}
+
 fn msg_vectors() -> Result<J> {
     let fs = fixture_fs();
     let topic = TopicKeys::new(&fs, &["shop", "pay"]);
@@ -496,5 +513,6 @@ pub fn zendb_vectors() -> Result<J> {
         "sealed_index": sealed_index_vectors(&dbk)?,
         "crdt": crdt_vectors(&dbk)?,
         "broker": msg_vectors()?,
+        "local": local_vectors()?,
     }))
 }

@@ -8,6 +8,7 @@ export default defineConfig({
   // Tests run on the client's sources, never a stale build of it.
   resolve: {
     alias: {
+      '@zen/client/node': fileURLToPath(new URL('packages/client/src/node.ts', import.meta.url)),
       '@zen/client': fileURLToPath(new URL('packages/client/src/index.ts', import.meta.url)),
       '@zen/db': fileURLToPath(new URL('packages/db/src/index.ts', import.meta.url)),
     },
