@@ -174,7 +174,16 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Test fixes:** `txn.test.ts`'s `itemsDb` sets `scheduler: false`, since its tests count reads. The decoy test in `indexes.test.ts` asserted more than 3 nodes, which a random index key misses about 0.3% of the time; it now asserts at least 3.
     * **⚠️ Spec:** §11.5, §12.2 and §12.3, as planned (a separate `spec:` commit).
     * **Tests:** `packages/db/test/patterns.test.ts` (17), 198 vitest tests in all. PR #18 merged, CI green (commit `a91c258`).
-  * **6c** (sagas, tab proxy, fault suite, docs): planned (see 6c below); a new PR, since #18 is merged.
+  * **6c** (sagas, tab proxy, fault suite, docs): done, PR #19. **Step 6 is done.** As planned, with these details for step 7 on:
+    * **Files:**
+      * `saga.ts`: `Saga` (`db.saga(name, steps, {group, ttlMs, onError})` → `start(data, tx?)`, `get`, `stop`, `topic`), `SAGA_TIMEOUT`. The orchestrator is a `per_key` consumer of `('zen', 'saga', ns, name)` plus a `sequential` group `<group>.<name>.dlq` on each compensate topic's class DLQ. A timeout's `data.error` is `{message: 'timeout', step}`.
+      * `proxy.ts`: `TabSource` (a `StreamSource`; `streaming` tells whether the tab holds a stream), `ProxyHost` (owner side), `BroadcastChannelLike`, `ChannelFactory`. Used when both `locks` and a channel exist (`DbOptions.channel`, default `BroadcastChannel`; `null` turns it off). The host filters an exact-topic subscription by topic id (it subscribes to the id as a prefix).
+      * `reply.ts`: `RequestMsg` gains `saga`/`step`; replies copy them and are keyed by the saga id.
+      * `DirectSource.reconnect()` (internal, tests).
+    * **Client:** `offsetAfterVersion` is exported and `Session.readVersion()` is new (`/v1/grv`).
+    * **⚠️ Spec:** §9.2 (the proxy protocol), §11.5 (`$sagas.corr`, `timeout`), §12.3 (an inbox per `Db`), §12.5 (rewritten: messages, the stale rule by `corr`, transitions, stuck through the class DLQ).
+    * **Docs:** `docs/DB.md` sections 8 and 10–18 (the broker); TD-DB-TAB-PROXY resolved.
+    * **Tests:** `saga.test.ts` (7), `proxy.test.ts` (4, `FakeBus` + `FakeLocks`), `faults.test.ts` (6; commits are intercepted by wrapping `session.call`). 215 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

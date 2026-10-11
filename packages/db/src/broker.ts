@@ -253,6 +253,11 @@ export class DirectSource implements StreamSource {
     await (await this.get()).publish(topic, data);
   }
 
+  /** @internal Drop the connection; the stream reconnects and resumes (tests). */
+  async reconnect(): Promise<void> {
+    (await this.stream)?.reconnect();
+  }
+
   close(): void {
     this.stream?.then((s) => s.close()).catch(() => {});
     this.stream = undefined;

@@ -51,6 +51,7 @@ export {
 export { type Argon2, Session, type UnlockMaterial } from './session.js';
 export {
   type EphemeralMessage,
+  offsetAfterVersion,
   Stream,
   type StreamEvent,
   type StreamOptions,

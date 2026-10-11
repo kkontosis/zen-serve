@@ -213,7 +213,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-DB-TAB-PROXY
 
-* **Status:** open
+* **Status:** resolved in milestone 5 step 6c (`packages/db/src/proxy.ts`, spec/zendb.md §9.2): the owner tab holds the only stream and forwards subscriptions (log events sealed, ephemeral messages opened) over a `BroadcastChannel`; consumers, `serve`, the scheduler and saga orchestrators run in the owner. Transactions stay local in every tab, as decided, so no transaction protocol was needed.
 * **Context:** zen-db elects one owner tab per database with Web Locks (spec/zendb.md §9.2, `packages/db/src/tabs.ts`), but other tabs still run their own transactions and will run their own subscriptions instead of sending them to the owner over a `BroadcastChannel`.
 * **Why deferred:** Transactions are serializable on the server, so running them in every tab is correct. Forwarding only saves connections and duplicate work, and it matters once subscriptions exist (milestone 5 step 6).
 * **What it would take:** A message protocol over `BroadcastChannel` (request, result, error, subscription events, cancel), which carries transaction functions as named operations because closures can't cross tabs; a fallback to running locally while no owner answers; and tests with simulated tabs. Resolved in step 6 if it lands there.

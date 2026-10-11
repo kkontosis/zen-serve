@@ -80,6 +80,11 @@ export class Session {
     return this.client.transport.call(path, enc, dec, req, this.token);
   }
 
+  /** The server's current read version (`/v1/grv`). */
+  async readVersion(): Promise<bigint> {
+    return (await this.call('/v1/grv', zw.encodeEmpty, zw.decodeReadVersion, {})).read_version;
+  }
+
   /** End the session (§3.4). */
   async logout(): Promise<void> {
     await this.call('/v1/auth/logout', zw.encodeEmpty, zw.decodeEmpty, {});

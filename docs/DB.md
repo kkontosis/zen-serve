@@ -1,6 +1,6 @@
 # @zen/db
 
-`@zen/db` is a client-side database over zen-serve's encrypted KV ([`spec/zendb.md`](../spec/zendb.md) Part A). Rows, indexes and the catalog are sealed KV values under PRF-token keys. The server sees opaque keys and values, and the access pattern that each index kind leaks (§5.6 below). This guide covers the database. The broker (`emit`, `on`, `consume`, …) comes in milestone 5 step 6, and CRDT tables in step 7.
+`@zen/db` is a client-side database over zen-serve's encrypted KV ([`spec/zendb.md`](../spec/zendb.md) Part A). Rows, indexes and the catalog are sealed KV values under PRF-token keys. The server sees opaque keys and values, and the access pattern that each index kind leaks (§5.6 below). Sections 1–9 cover the database (Part A), sections 10–18 the broker (Part B). CRDT tables come in milestone 5 step 7.
 
 ## 1. Opening
 
@@ -156,13 +156,16 @@ Every `Db` keeps four caches, all in memory only (§9.3; a persistent cache is T
 * **Committed writes** drop their rows from the cache.
 * `db.stats` counts row-cache hits and misses.
 
-## 8. Tabs and the owner
+## 8. Tabs, the owner and the proxy
 
 In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lock `zen/db/<fs>/<ns>`.
 * **State:** `db.isOwner`; `db.onOwner(fn)` calls `fn` on becoming the owner (at once if it already is) and returns an unsubscribe function.
-* **Handover:** `close()` releases the lock, and the next waiting instance takes over.
-* **Without Web Locks** (Node, or `locks: null`), every instance is its own owner. With `owner: false`, an instance never is.
-* **What the owner will run (step 6):** consumers, the scheduler and the stream. Until then every tab runs its own transactions, which is safe because they are serializable on the server. Forwarding other tabs' work to the owner is TD-DB-TAB-PROXY.
+* **What runs only in the owner:** consumers, `serve`, the scheduler and saga orchestrators. Other tabs may declare them; they start when the tab becomes the owner.
+* **The proxy.** Only the owner holds a stream. Other tabs send it their subscriptions (`on`, `onEphemeral`, the inbox of `request`) and ephemeral publishes over the `BroadcastChannel` of the same name. Log events come back sealed and each tab opens them itself; ephemeral messages come back opened.
+* **Transactions** run in every tab; they are serializable on the server.
+* **Handover:** `close()` (or a closed page) sends `bye` and releases the lock. The next waiting tab takes over, announces itself, and every tab re-subscribes from the last offset it delivered: no event is lost or repeated. Its consumers and scheduler start.
+* **Without Web Locks** (Node, or `locks: null`), every instance is its own owner and streams itself. `channel: null` turns the proxy off; `owner: false` never campaigns.
+* **Tests** inject `locks` (a `LockManagerLike`) and `channel` (a factory of `BroadcastChannelLike`).
 
 ## 9. Errors
 
@@ -181,4 +184,127 @@ In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lo
 | `corrupt` | a stored value that fails its checks |
 | `format` | an unknown format, integrity level or index kind |
 | `building` | a unique index whose backfill found duplicates |
-| `closed` | a manual transaction used after `commit` or `abort` |
+| `closed` | a manual transaction used after `commit` or `abort`; a request pending when the database closed |
+| `poisoned` | a message that doesn't decode, or whose body parts are gone |
+| `timeout` | a request without a reply in time; no owner tab answering |
+
+---
+
+# The broker
+
+## 10. Messages and `emit`
+
+A message is a `Msg {type, id, body, …}` (§10.1) in an event of a topic. Types and header names starting with `zen.` are reserved.
+
+```ts
+const orders = db.topic('shop', 'orders');
+await db.transaction(async (tx) => {
+  await tx.table('orders').insert(order);
+  tx.emit(orders, 'order.created', order, { key: order.id });   // the outbox: appended iff this commits
+});
+await db.emit(orders, 'order.note', 'hi');                      // a transaction of its own
+```
+
+* **Options:** `key` (order within `per_key` and `partitioned` groups), `spread` (a random key: a spread work queue), `id` (the idempotency key; default random), `headers`, `ttlMs`.
+* **Large bodies** go to parts of the database in the same commit, and the event carries a reference (§10.3). With `ttlMs`, the scheduler deletes the parts later.
+* **Causation:** inside a consumer, every emit carries the consumed event's id.
+* `tx.after(fn)` runs `fn` after a successful commit (UI updates only: it may never run).
+
+## 11. Subscribing: `on`
+
+```ts
+const sub = await db.on(orders, (msg) => render(msg.body));                 // from now
+await db.on(orders, (msg) => …, { after: offset });                          // history, then live
+await db.on(orders, async (msg, tx) => { … }, { cursor: 'projection' });     // durable
+await db.on({ prefix: db.topic('shop'), topics: [orders, payments] }, …);
+```
+
+* **Plain:** every event while the subscription runs, in order. A handler's throw is reported and skipped.
+* **Durable (`cursor`):** the handler runs in a transaction that advances a `$cursors` row, so its database effects happen exactly once per device and cursor name. `batch` events share a transaction. A throw stops the subscription (`sub.active`); a restart retries from the cursor.
+* **A dropped connection** resumes from the last offset received: nothing missed, nothing repeated.
+
+## 12. Consumers
+
+```ts
+db.consume({ group: 'billing', topic: orders, mode: 'per_key', maxInflight: 8 }, async (msg, tx) => {
+  await tx.table('invoices').insert({ id: msg.body.id, … });
+});
+```
+
+* **Modes:** `sequential`, `partitioned` (`partitions`), `per_key` (`maxInflight` at once), `single_key` (`key`).
+* **Each delivery** is one transaction with the handler's writes, its emits and the consume step: exactly once per group.
+* **A throw:** `retry: 'nack'` (default) redelivers at once, then the server DLQ after `maxAttempts` (or `onPoison: 'block'`). `retry: 'delay'` consumes the message and schedules a copy after `backoff(attempt)` (header `zen.attempt`); after `maxAttempts` it goes to the class DLQ `<topic>/zen.dlq` with the same id.
+* **`dedup: true`** records each message id in `$inbox` and skips ids seen before (`dedupTtlMs`, default 7 days).
+* **Manual acks:** `db.consumeManual(opts, (msg) => …)` with `msg.ack()`, or `db.begin({ consumes: msg })` and `commit()`.
+* **Leases and claims** are renewed while the loop runs. A stalled handler loses them; another holder gets the event, and the stalled one's late commit fails (`not_leader`, `claim_lost`) with none of its writes.
+* `handle.stop()` stops a consumer; `db.close()` stops all.
+
+## 13. Ephemeral messages
+
+`db.publishEphemeral(topic, type, body)` and `db.onEphemeral(topic, handler)`: never stored, best effort, rate-limited, only to current subscribers. For presence and typing indicators.
+
+## 14. The scheduler and delayed messages
+
+```ts
+const id = await db.schedule(reminders, 'remind', { booking }, { at: start - 3_600_000 });
+await db.cancel(id);                         // false once delivered
+```
+
+* A `$sched` row, inserted only if the transaction commits. The owner's scheduler (`DbOptions.scheduler`, on by default) delivers due rows while it holds the lease of `("zen", "db", ns, "sched")`: each row is appended in the transaction that deletes it, so it is emitted exactly once, never before `at` (by the session clock corrected to the server's).
+* **Timing:** usually late by up to `pollMs` (1 s); after a leader dies, by its lease (`ttlMs`, 10 s). With no scheduler running, messages wait.
+* The same rows carry `gc` jobs (body parts after `ttlMs`, dedup rows after `dedupTtlMs`).
+
+## 15. Request/reply
+
+```ts
+db.serve({ group: 'quotes', topic: quotes, mode: 'sequential', dedup: true }, async (msg, tx) => {
+  if (!msg.body.sku) throw new ReplyError('no sku');      // an error reply; the request is consumed
+  return { price: await price(tx, msg.body.sku) };         // the reply, in the same commit
+});
+const r = await db.request(quotes, 'quote', { sku }, { timeoutMs: 5000 });
+const all = await db.requestAll(presence, 'who', null, { timeoutMs: 500 });   // scatter-gather
+```
+
+* **Inbox:** each `Db` subscribes to its own inbox topic on first use. A reply's `corr` matches its request; late replies are dropped.
+* **Errors:** `timeout` (counted from the commit), a `ReplyError` for an error reply.
+* **Retries:** send again with the same `corr`; a `dedup` responder replies with its stored reply without running the handler again.
+* **Ephemeral replies:** `serve({ reply: 'ephemeral' })`, or `db.reply(msg, body, { ephemeral: true })` from a plain `on` responder.
+* **Inside a transaction:** `tx.request(…)` is sent only if the transaction commits. Await its promise after the transaction; an attempt that re-runs never settles.
+
+## 16. Sagas
+
+```ts
+const order = db.saga('order', [
+  { name: 'reserve', command: stock, compensate: release },
+  { name: 'charge', command: payments, compensate: refund, timeoutMs: 30_000 },
+  { name: 'ship', command: shipping },
+]);
+await db.transaction(async (tx) => {
+  await tx.table('orders').insert(o);
+  await order.start({ order: o.id }, tx);
+});
+const state = await order.get(id);    // {status, step, data, done, …}
+```
+
+* **Participants** are `serve` handlers on the command and compensate topics: return a body (merged into `data`), or throw `ReplyError` (stored in `data.error`).
+* **On an error reply or a timeout**, the completed steps are compensated newest first, then the saga is `failed`. A compensation that fails, times out or reaches the class DLQ (participants with `retry: 'delay'`) leaves it `stuck` for an operator.
+* **Every transition is one commit**, exactly once; replies to an older message (another `corr`) are ignored.
+* The orchestrator runs in the owner; `saga.stop()` stops it.
+
+## 17. Change events
+
+A table created with `changes: {topic?, image?}` emits one `zen.change` message per changed row per transaction (`{op, table, pk, row?}`), keyed by the pk. `table.on(handler)` subscribes to them; consumers build projections from them.
+
+## 18. Guarantees and failures
+
+| What | Guarantee |
+|---|---|
+| rows, index entries, emits, schedules and file ops of one transaction | all or nothing, once |
+| a consumer handler's database effects | exactly once per group |
+| a durable `on` handler's effects | exactly once per device and cursor |
+| a scheduled message | emitted once, never early |
+| a saga transition | exactly once |
+| an external effect | at least once: use the message `id` as the idempotency key |
+
+The failure cases of §13.2 are tested in `packages/db/test/faults.test.ts` (a stalled or deposed handler, racing claims, a dropped stream, a lost commit response, a scheduler dying mid-batch, a responder that doesn't answer) and `proxy.test.ts` (the owner tab closing).
+

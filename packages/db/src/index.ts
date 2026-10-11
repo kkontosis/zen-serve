@@ -48,6 +48,7 @@ export {
   Migrator,
 } from './migrate.js';
 export { type BodyRef, decodeMsg, encodeMsg, eventId, type Message, type Msg } from './msg.js';
+export { type BroadcastChannelLike, type ChannelFactory, TabSource } from './proxy.js';
 export { type Cursor, compareValues, type Op, type Page, Query } from './query.js';
 export {
   type Reply,
@@ -56,6 +57,14 @@ export {
   type RequestOptions,
 } from './reply.js';
 export { decodeRow, encodeRow, type Fields, layoutRow, rowBucket } from './row.js';
+export {
+  SAGA_TIMEOUT,
+  Saga,
+  type SagaOptions,
+  type SagaState,
+  type SagaStatus,
+  type SagaStep,
+} from './saga.js';
 export { type ScheduleOptions, Scheduler, type SchedulerOptions, type When } from './sched.js';
 export { type FieldType, MAX_SORT_KEY, type SortField, sortKey } from './sortkey.js';
 export { SYSTEM_TABLES } from './system.js';
