@@ -1012,7 +1012,10 @@ await db.transaction(async (tx) => { tx.table(orders).insert(o); checkout.start(
 orders.on((change) => refresh(change.pk));                        // change events
 const cards = db.table<Card>('cards');                            // a CRDT table (§19): merge "crdt"
 await cards.patch(id, { title: 'New title' });                    // per-field last writer wins, works offline
-await cards.incr(id, 'votes', 1); await cards.add(id, 'labels', 'urgent');
+await cards.incr(id, 'votes', 1); await cards.add(id, 'labels', 'urgent');   // resolve once queued (§19.7)
+await db.table<Card>('cards', { wait: true }).patch(id, { title: 'Sent' });  // resolves once committed
+await db.crdt.flush();                                            // the queue is empty
+const c = await cards.get(id, { read: 'cache' });                 // read modes (§19.4)
 db.publishEphemeral(db.topic('presence'), 'typing', { room });    // not stored
 ```
 
@@ -1091,7 +1094,7 @@ What the server lacks for this layer, deferred (spec/TECH_DEBT.md):
 
 ## 19. CRDT tables (server-merged)
 
-**Status:** specified; the server side is built in milestone 5. The wire contract is api.md §13, the server storage keyspace.md §3.8. A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise.
+**Status:** specified; the server side is built in milestone 5. The wire contract is api.md §13, the server storage keyspace.md §3.8. A client checks that `/v1/info` lists the feature `"crdt_rows"` before creating or writing a CRDT table, and fails with `unsupported` otherwise. A read that needs the server while it can't be reached fails with `offline` (§19.4).
 
 ### 19.1 Model
 
@@ -1199,6 +1202,19 @@ ObjState = { object: bytes,
   * sets as the elements with at least one dot
   * the row visible if its register is `alive`
 * **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
+* **The cache.** The class keeps the ObjStates it reads (`get`, `range`) in a cache per database: in memory, least recently used out (default 1,024 objects). A commit of this instance with CRDT operations marks their objects stale. A state fetched while a commit marked its object stale stays stale.
+* **Read modes.** A read takes one of three modes (default `auto`; per database, transaction, `get` or query):
+
+  | Mode | Fresh entry (younger than `crdtCacheMs`, default 5 s) | Older entry | Not cached, or stale | Offline |
+  |---|---|---|---|---|
+  | `auto` | as cached | `/v1/crdt/versions` (api.md §13.3): unchanged → as cached; changed → `/v1/crdt/get` | `/v1/crdt/get` | cached entries however old; a miss is `offline` |
+  | `cache` | as cached | as cached | `/v1/crdt/get` | cached entries; a miss is `offline` |
+  | `server` | `/v1/crdt/get` | `/v1/crdt/get` | `/v1/crdt/get` | fails |
+
+* **The queue in reads.** Every read overlays the operations this instance has queued (§19.7) on the state, in queue order, then the transaction's own. A row that only the queue writes reads from its queued operations, offline too (no `offline` error).
+* **Queries.** In `auto` and `server`, queries run as in §6, fetching their rows as above. A `cache` query, or an `auto` one that finds the server unreachable, answers from the cached rows and the rows only the queue holds: predicates, order and limit are applied locally, pages follow the pk. Such a result may be incomplete.
+* **`remove`** takes the dots of the state it reads in the transaction's mode. Offline without a cached state, it removes only what this instance's queue adds (§19.7).
+* **The indexer** (§19.6) always reads with `server`.
 
 ### 19.5 Server state
 
@@ -1226,7 +1242,21 @@ The layout is keyspace.md §3.8: a row register (`co`), `lww` registers (`cw`), 
 
 ### 19.7 Offline use
 
-* **Queue.** While offline, the class keeps operations and their change events in a local queue: in memory, or encrypted at rest (§9.3). It sends them as long-mode commits when back online.
+* **Entries.** CRDT writes go through a queue, online or not:
+  * A transaction whose commit would hold CRDT operations only is **one entry**, sent whole in one commit: no writes, clears, appends, consume steps or file operations, and nothing in its read set but the catalog records of its tables. Its catalog check moves to the send. `{queue: false}` (or `DbOptions.crdtQueue: false`) commits it at once instead.
+  * A call on a CRDT `Table` (`insert`, `patch`, `incr`, `add`, `remove`, `delete`) is a **single** entry.
+  * A write resolves once its entry is stored; with `{wait: true}` (on the transaction, or `db.table(name, {wait: true})`), once it is committed. `tx.after` runs once queued.
+  * Any other transaction with CRDT operations commits directly, after the queue is **flushed**, so this instance's commits stay in order. Offline that flush, and so the transaction, fails.
+* **Stamping.** A queued `row` or `lww` operation takes its `hlc` when queued: the time of the edit. A counter keeps its delta; its `seq` and total are stamped at send (§19.3). A `rem` keeps the dots seen when queued, plus, at send, the dots the server gave (`set_dots`) to this queue's earlier `add`s of the element.
+* **Batches.** The queue sends its entries in order, packed into as few commits as `max_commit_ops` and `max_commit_bytes` allow. Within a run of single entries, operations are coalesced per row: the last `lww` of a field wins, counter deltas add up, a `rem` cancels the earlier `add`s of its element. Whole entries are never split or coalesced. A batch stops before an entry that removes an element an earlier entry of the batch adds (outside one run of singles), since that dot exists only once the earlier commit is in.
+* **Sending.** One sender per instance, a short delay (`crdtBatchMs`, default 10 ms) after a write. The table of each row is read by name at send and must have the queued table's id; otherwise its operations are dropped with a warning. The change events (§12.7) are appended in the same commit.
+  * A network error or `commit_unknown`: the **same** commit, with the same `commit_id` (api.md §6), again after a backoff (100 ms to 30 s; at once on `flush()` or the browser's `online` event). The actor's counter lock (§19.3) stays held meanwhile.
+  * `conflict` (a catalog record changed): build the batch again.
+  * `stale_op` / `clock_skew`: the rebase below, then build again (at most 3 times).
+  * `too_large`: half the batch; a single entry too large fails. An entry too large on its own is refused when queued (`too_large`).
+  * Any other error fails the batch's entries: their waits reject, `onSync` reports them, and they leave the queue.
+* **Store.** Entries live in a `QueueStore` (`load`, `put`, `remove`): in memory by default. An entry is stored before its write resolves and removed once committed or failed. The built commit isn't stored: after a restart, a commit whose outcome was unknown is built again with a new `commit_id`. A persistent store, encrypted at rest (§9.3), comes with the local replica.
+* **API.** `db.crdt`: `pending` (entries), `online` (the last attempt reached the server), `flush()` (resolves once the queue is empty; rejects `offline` at the next failed attempt), `onSync(fn)` (after each batch, and on going offline or online).
 * **Clock.** It uses one HLC per session, the M4 tree clock.
 * **Old operations.** A `row` or `lww` operation older than the horizon gets `stale_op`, as does one whose timestamp collides with another session's (§19.3). The class reissues it with a fresh `hlc` (a rebase, fs.md §3.4), so the offline edit then wins over edits made since. That is the same rule as files, and it is documented to users. Counters, sets and removals never need a rebase.
 

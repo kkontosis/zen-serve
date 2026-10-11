@@ -663,6 +663,14 @@ ObjState = { object: bytes,
 * An object whose state alone exceeds `max_range_bytes` returns 413 `too_large`.
 * **`read_version`** works as in KV reads (§5). These reads take no conflict ranges: a transaction that reads CRDT rows doesn't conflict on them (zendb.md §19.4).
 
+```
+POST /v1/crdt/versions {fs, objects: [bytes], read_version?}
+→ {read_version, versions: [bytes]}
+```
+
+* **`versions`** returns each object's `version` alone, in request order: an empty entry means the object doesn't exist. A client checks a cached ObjState with it, and fetches the state again only when the version differs (zendb.md §19.4).
+* It needs fs `read`, takes at most 1,000 objects, and takes no conflict ranges. It comes with the `"crdt_rows"` feature.
+
 ### 13.4 Garbage collection
 
 * An object whose row register is `alive: false`, and whose last change is older than `crdt_horizon_secs`, is purged by the sweeper with all its entries. So is an object that has **no** row register and no change within the horizon.
