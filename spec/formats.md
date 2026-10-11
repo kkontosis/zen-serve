@@ -66,7 +66,8 @@ off  len  field
   1    1  suite          = 1
   2    1  kind           1 = KV value, 2 = event, 3 = epoch-chain record,
                          4 = fs node meta, 5 = fs manifest, 6 = fs chunk,
-                         7 = CRDT value (zendb.md §19)
+                         7 = CRDT value (zendb.md §19),
+                         8 = local record (zendb.md §9.3)
   3    1  reserved       = 0
   4    4  key_epoch      u32
   8   24  nonce          random per seal
@@ -86,8 +87,10 @@ Total = 48 + plaintext length.
 | 5 fs manifest | `zen/v1/aad/fs-manifest` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
 | 6 fs chunk | `zen/v1/aad/fs-chunk` | `u32(fs) ‖ chunk_id(16)` | filesystem AEAD key of `key_epoch` |
 | 7 CRDT value | `zen/v1/aad/crdt-value` | `u32(fs) ‖ lp(object) ‖ field(16) ‖ elem(16)` (zendb.md §19.2) | KV AEAD key of `key_epoch` |
+| 8 local record | `zen/v1/aad/local` | `u32(fs) ‖ lp(store) ‖ lp(record_key)` (zendb.md §9.3) | KV AEAD key of `key_epoch` |
 
-* A value moved to another key or fs, or an event moved to another topic or event key, fails authentication.
+* A value moved to another key or fs, or an event moved to another topic or event key, fails authentication. So does a local record moved to another store, record key or fs.
+* Local records (kind 8) never reach the server: they are the fs layer of a device's local store (zendb.md §9.3).
 * Clients read `key_epoch` from the header to pick the right epoch keys before decrypting.
 * **Native block-device blocks** are KV values (DESIGN-3 §1). There's no separate block format, and the layout in DESIGN.md §2.4 is superseded.
 
