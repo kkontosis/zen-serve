@@ -76,7 +76,27 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * Spec: zendb.md §4.3 clarified (the last part of a padded row is padded to a multiple of 16 KiB; a padded Row that its bucket would push past one value goes to parts).
     * Tests: `packages/db/test/vectors.test.ts` (11; the CBOR duplicate-key refusal can't be expressed in JavaScript and is skipped), `db.test.ts` (22). 109 vitest tests in all. CI typechecks `packages/db/tsconfig.test.json`; it maps `@zen/client` to the client's sources.
   * **PR #14 CI fix:** a test checked that writers maintain a building unique index by writing a value an old row held, which the backfill may not have reached yet (stored-key order is random). It now uses values of its own.
-  * **5b** (private and sealed indexes): next, planned in detail under "5b … (detailed plan)". After compaction and "go", build it from there.
+  * **PR #14 merged** before the 5b plan commit, so the branch restarted from main, and the plan commit and 5b are a new PR.
+  * **5b** (private and sealed indexes, ordered queries): done, PR #15. As planned, with these details for the next steps:
+    * **⚠️ Spec change (§5.1):** null's sort-key tag is now `0x01`, not `0x00`. A text field's terminator (`0x00`) followed by a descending null (`0xFF`) read like an escaped zero, so keys didn't decode and `"a"` sorted after `"a\0"`. No component encoding now starts with `0x00` or `0xFF`. zen-core's `sortkey` changed with a test of the failing cases, and the vectors gained the null-after-text cases.
+    * **Other spec additions:** §5.4.6, every node of a decoy index is salted, and decoys need `max_value_bytes` ≥ 65,584 (`createIndex` refuses them otherwise, `bad_value`). §5.7, extra parts are deleted, and an empty sealed index keeps its head and one part.
+    * **Code:**
+      * `index/node.ts`: Node and RootRecord codecs, decoy padding.
+      * `index/prolly.ts`: `rewrite(treeKeys, store, root, changes, {decoys})` is the incremental canonical rewrite. A rewritten node with unchanged entries keeps its old id, and the root is trimmed when the top has one entry. It also has `scan(store, root, lo, hi, reverse)`.
+      * `index/private.ts`:
+        * `TxNodeStore`: `snapshotGet` plus the `Db` node cache; a missing node → `conflict`.
+        * `privateChange` queues changes in `DbTransaction.indexOps` per (index, shard); `applyPrivate` runs in `finish`.
+        * `privateScan` merges shards and the transaction's own pending changes.
+      * `index/sealed.ts`: `SealedState` is loaded once per transaction and changed in place, written in `finish`, cached per `Db` by digest.
+      * `DbTransaction.indexRoot` reads each root once per transaction (its snapshot of the tree).
+      * `query.ts`: plan step 4 (`planRange`). An index that gives the `orderBy` is preferred over fast equality. Cursors carry `{path, key}` for index paths.
+      * `sortkey.ts`: `decodeSortKey`, `encodeComponent`, `encodePrefix`.
+    * **Tests:**
+      * `vectors.test.ts` (15): prolly, sealed, sort-key decoding.
+      * `prolly.test.ts` (9, in memory against `IndexKeys.build`): random batches at fanout 2/4/64, the entry and byte caps, scans, decoys.
+      * `indexes.test.ts` (18, server).
+      * 140 vitest tests in all.
+  * **5c**: next (transaction modes, cache coherence, files, bulk import, tabs). The node cache is per `Db`, memory only, and so is the sealed cache. 5c's row cache (§7.7) can follow the same pattern.
 
 ## Facts the work must respect (from the code survey)
 
