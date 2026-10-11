@@ -147,6 +147,32 @@ for await (const batch of tree.changes(cursor, { waitMs: 25_000 })) { … }
 * **The change feed** yields batches of changed nodes; a batch with `resync: true` means the cursor is too old and the caller must re-read the tree.
 * `verifyChain(ops)` recomputes the tree's operation chain from the operations this client recorded (`TreeOptions.onOp`) and compares it with the server's.
 
+### The local replica (`@zen/fs`)
+
+`@zen/fs` keeps a **replica** of a tree on a sealed local store (spec/fs.md §11): every node, followed through the change feed, and file content as it is read, so listings and kept files work offline. It has no DOM or Node imports, so it runs in workers too.
+
+```ts
+import { openReplica } from '@zen/fs';
+
+const r = await openReplica(ufs, treeId, { local, cacheBytes: 512 << 20 });
+await r.sync();                                   // optional: catch up now (it follows the feed anyway)
+await r.readdir('/docs', { withTypes: true });    // [{name, type}], display names and conflict copies
+await r.stat('/docs/a.txt');                      // {type, mode, size, mtimeMs, node, versions, conflict}
+await r.readFile('/docs/a.txt');
+await r.read('/big.bin', offset, length);         // fetches only the chunks (and pages) it needs
+const s = await r.createReadStream('/big.bin', { start, end });
+await r.readlink('/link'); await r.getxattr('/x', 'user.k'); await r.listxattr('/x');
+await r.pin('/docs');                             // keep a folder's content offline, now and later
+r.onChange((ids) => …);                           // nodes that changed
+await r.close();
+```
+
+* **What is kept:** the whole node table, as the server sends it (meta still sealed); versions, chunks and pages when read, sealed as on the server, least recently used evicted past `cacheBytes` (default 1 GiB). **Pinned** files and folders keep their current content and are refreshed as they change.
+* **Paths** use display names (`foo (2).txt` for a duplicate) and show a file's other sibling versions as read-only conflict copies, `notes (conflict ab12cd34-2).md`.
+* **Offline**, everything kept reads as before; content that isn't kept fails with `offline`, and `status().online` is false until the feed answers again.
+* **Several tabs** on one store (IndexedDB): the owner (a Web Lock) follows the feed and the others reload what it announces on the tab channel. In Node a disk store holds one replica (a lock file; one left by a dead process is taken over). `Replica.wipe(local, fs, tree)` deletes a replica.
+* Writes come in step 8b; until then write through the `Tree` and the replica follows.
+
 ## 9. zen-mount
 
 `zen-mount` (packages/fuse) mounts one tree of an fs as a local directory, through FUSE.

@@ -342,7 +342,19 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** zendb.md §9.3, the `vault/<name>` store and its two records.
     * **Docs:** `docs/CLIENT.md` §10 "Credentials (the vault)"; GAPS G15 partly done.
     * **Tests:** `packages/client/test/vault.test.ts` (14: three backends, resume with one call, offline with the kept header, offline with an expired or no session, an expiring session, a logged-out session, no device, the origin rule, refusals, a bad seed, tampering, unparsable records); the origin check and the 401 fallback were each checked to fail when removed. 330 vitest tests in all.
-* **Step 8** (`@zen/fs`, zen-mount): planned (see Step 8: sub-steps 8a, 8b and 8c, a PR each). PR #29 is merged, so the plan commit restarts the branch from main and opens a new PR, which 8a joins.
+* **Step 8** (`@zen/fs`, zen-mount): planned (see Step 8: sub-steps 8a, 8b and 8c, a PR each). PR #29 is merged, so the plan commit restarts the branch from main and opens a new PR, which 8a joins (#30).
+  * **8a** (the replica that reads): done, PR #30. As planned, with these details for 8b and 8c:
+    * **Client:** `src/local/tabs.ts` holds `Owner`, `LockManagerLike`, `BroadcastChannelLike`, `ChannelFactory`, `defaultLocks`, `defaultChannel` (moved from `@zen/db`, which re-exports them). `LocalStore.lock?(name)` (Node disk: `dir/<name>.lock` with the pid, `O_EXCL`; a dead pid's lock is taken over; `ZenError(0, 'locked')`). `Tree.nodeOf(state)` (public), `Tree.fetchVersions(node)` (wire bytes) and `Tree.openVersions(node, Versions)`: these replace the planned `versionCache` option, since only the replica knows a node's change offset.
+    * **`@zen/fs`** (`packages/fs`, wired like `@zen/db`; vitest alias, workspaces, `check`, CI typecheck):
+      * `store.ts`: `Records` (write-behind, 100 ms), `Content` (the tree's `chunkCache`/`pageCache`, use records, `evict(limit, keep)`), `replicaStores`.
+      * `replica.ts`: `openReplica(fs, tree, {local, cacheBytes, locks, channel, waitMs, owner})` → `Replica`: `sync()`, `onChange`, `isOwner`, `online`, `lookup`/`entries`/`nodeAt`/`node`, `versionsOf`, `stat`, `readdir(path, {withTypes})`, `readFile`, `read`, `createReadStream` (async, returns a `ReadableStream`), `readlink`, `listxattr`, `getxattr` (`no_attr`), `pin`/`unpin` (`idle()` waits for fetches), `evict()`, `status()`, `flush`, `close`, `Replica.wipe`. `conflictName` (copied from `packages/fuse`, which 8c switches over).
+      * `xattr.ts`: `encodeXattrs`/`decodeXattrs` (a CBOR map of text names to bytes; text values read as their UTF-8).
+      * Feed changes apply only when their offset is newer than the node's, so the long-poll and `sync()` may overlap. A `resync` in the long-poll restarts the loop with a full sync; the `full` record makes an interrupted one start again.
+      * Errors: `not_found` (404), `not_dir`, `is_dir`, `offline`, `no_attr`, `locked`.
+    * **Decisions beyond the plan:** `stat` of a file whose versions aren't kept fails `offline` (sizes live in manifests; pin what must stat offline); conflict copies of such a file don't show offline; listeners hear of changes before the store is written, other tabs after.
+    * **⚠️ Spec:** fs.md §11 (the replica), zendb.md §9.3 (the `zfs/…` stores).
+    * **Docs:** `docs/CLIENT.md` §8 "The local replica"; TECH_DEBT TD-FUSE-REPLICA progress.
+    * **Tests:** `packages/fs/test/replica.test.ts` (13: sync and the loop, restart from the cursor offline, a resync dropping a planted node, duplicate names and conflict copies, symlinks and xattrs, ranged reads of a paged file with counted calls, eviction with a pin, a pinned folder's new file, offline reopen and catch-up, the three stores (sealed, wipe), two tabs with handover, the Node lock and a stale one). Eviction keeping pins and the full-sync sweep were each checked to fail when removed. 343 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

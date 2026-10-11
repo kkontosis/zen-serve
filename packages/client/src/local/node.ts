@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fromHex, hex } from '../bytes.js';
+import { ZenError } from '../errors.js';
 import { checkStore, type LocalStore } from './store.js';
 
 const KEY_FILE = 'device.key';
@@ -15,6 +16,40 @@ const STORES = 'stores';
 const missing = (e: unknown) => (e as { code?: string }).code === 'ENOENT';
 
 /** Write `data` to `path` so a crash never leaves it half written. */
+/** Whether process `pid` is alive (another user's counts as alive). */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as { code?: string }).code === 'EPERM';
+  }
+}
+
+/**
+ * Take lock file `path`: created exclusively, holding the pid. One whose pid
+ * is gone (a crash) is taken over; one this process or another live one
+ * holds is refused.
+ */
+async function lockFile(path: string): Promise<() => Promise<void>> {
+  for (let tries = 0; tries < 3; tries++) {
+    try {
+      const f = await open(path, 'wx', 0o600);
+      await f.writeFile(String(process.pid));
+      await f.close();
+      return async () => {
+        await unlink(path).catch((e) => missing(e) || Promise.reject(e));
+      };
+    } catch (e) {
+      if ((e as { code?: string }).code !== 'EEXIST') throw e;
+    }
+    const pid = Number((await readFile(path, 'utf8').catch(() => '')).trim());
+    if (pid && alive(pid)) throw new ZenError(0, 'locked', `${path} is held by process ${pid}`);
+    await unlink(path).catch((e) => missing(e) || Promise.reject(e));
+  }
+  throw new ZenError(0, 'locked', `${path} could not be taken`);
+}
+
 async function writeAtomic(path: string, data: Uint8Array, mode = 0o600): Promise<void> {
   const tmp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
   const f = await open(tmp, 'w', mode);
@@ -44,6 +79,10 @@ export function nodeDiskLocalStore(dir: string): LocalStore {
     crypto.subtle.importKey('raw', raw as BufferSource, 'AES-GCM', false, ['encrypt', 'decrypt']);
 
   return {
+    async lock(name) {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      return lockFile(join(dir, `${encodeURIComponent(name)}.lock`));
+    },
     async get(store, key) {
       try {
         return new Uint8Array(await readFile(join(storeDir(store), hex(key))));
