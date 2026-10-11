@@ -2,7 +2,10 @@
 import { readFileSync } from 'node:fs';
 import { bytes, initWasm, zw } from '@zen/client';
 import { beforeAll, describe, expect, it } from 'vitest';
+import type { TableRecord } from '../src/catalog.js';
 import { decode, encode, type Value } from '../src/cbor.js';
+import { mergeState, viewOf } from '../src/crdt.js';
+import type { Db } from '../src/db.js';
 import { encodeRoot } from '../src/index/node.js';
 import { type Change, rewrite, treeKeys } from '../src/index/prolly.js';
 import { blobParts, encodeBlob, encodeHead } from '../src/index/sealed.js';
@@ -280,6 +283,80 @@ describe('broker (§10, §11.3)', () => {
     expect(hex(t.id)).toBe(E.topic_id);
     for (const g of B().group_ids) expect(hex(t.groupId(g.name)), g.name).toBe(g.id);
     t.free();
+    fsKeys.free();
+  });
+});
+
+describe('CRDT tables (§19.9)', () => {
+  const C = () => V.crdt;
+
+  it('tokens, sealed values and a merged view', () => {
+    const fsKeys = zw.FsKeys.fromBundle(unhex(K.fs_epoch0.bundle));
+    const dbKeys = fsKeys.db(V.database.ns);
+    const tableId = unhex(C().table_id);
+    const ck = dbKeys.crdt(tableId);
+    const pkEl = encode('card-1');
+    expect(hex(pkEl)).toBe(C().pk_element);
+    const k = new Keys(dbKeys);
+    const object = k.row(tableId, pkEl);
+    expect(hex(object)).toBe(C().object);
+    for (const [name, tok] of Object.entries(C().fields)) expect(hex(ck.field(name))).toBe(tok);
+    const el = C().elem;
+    expect(hex(encode(val(el.element)))).toBe(el.element_cbor);
+    expect(hex(ck.elem(el.field, pkEl, unhex(el.element_cbor)))).toBe(el.token);
+    for (const v of Object.values(C().values) as J[]) {
+      const pt = fsKeys.openCrdtValue(object, unhex(v.field), unhex(v.elem), unhex(v.sealed));
+      expect(hex(pt)).toBe(v.plaintext);
+    }
+
+    // An ObjState of those values, with two installations' counter entries.
+    const t: TableRecord = {
+      name: 'cards',
+      id: tableId,
+      pk: ['id'],
+      indexes: [],
+      pad: false,
+      state: 'active',
+      merge: 'crdt',
+      crdtFields: { title: 'lww', votes: 'counter', labels: 'set' },
+    };
+    const db = { crdtKeys: () => ck, fs: { keys: fsKeys } } as unknown as Db;
+    const vs = C().values;
+    const device = new Uint8Array(32).fill(7);
+    const s = {
+      object,
+      row: { hlc: 1n, device, alive: true, value: unhex(vs.row.sealed) },
+      lww: [{ field: unhex(vs.lww.field), hlc: 2n, device, value: unhex(vs.lww.sealed) }],
+      ctr: [1, 2].map((a) => ({
+        field: unhex(vs.counter.field),
+        device,
+        actor: new Uint8Array(16).fill(a),
+        seq: 3n,
+        value: unhex(vs.counter.sealed),
+      })),
+      set: [
+        {
+          field: unhex(vs.set.field),
+          elem: unhex(vs.set.elem),
+          dot: new Uint8Array(12),
+          device,
+          value: unhex(vs.set.sealed),
+        },
+      ],
+      version: new Uint8Array(10),
+    };
+    expect(viewOf(t, mergeState(db, t, s))).toEqual({
+      id: 'card-1',
+      title: 'Buy milk',
+      votes: 6,
+      labels: ['red'],
+    });
+    expect(viewOf(t, mergeState(db, t, { ...s, row: { ...s.row, alive: false } }))).toBeUndefined();
+    // A value sealed for another field doesn't open.
+    const bad = { ...s, lww: [{ ...s.lww[0]!, field: unhex(vs.counter.field) }] };
+    expect(() => mergeState(db, t, bad)).toThrow('corrupt');
+    ck.free();
+    dbKeys.free();
     fsKeys.free();
   });
 });

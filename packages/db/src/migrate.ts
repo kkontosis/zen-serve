@@ -14,6 +14,7 @@ import {
   type TableRecord,
 } from './catalog.js';
 import { decode, encode, type Value } from './cbor.js';
+import { type CrdtFieldType, checkCrdtServer, crdtRange, mergeState } from './crdt.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
 import { decodeRow, type Fields } from './row.js';
@@ -32,6 +33,10 @@ export interface CreateTableOptions {
   pad?: boolean;
   /** A change topic (§12.7); its appends come with the broker. */
   changes?: { topic?: (string | Uint8Array)[]; image?: 'keys' | 'full' };
+  /** `crdt`: a CRDT table, whose rows the server merges (§19). Default `txn`. */
+  merge?: 'txn' | 'crdt';
+  /** CRDT tables: field types; a field not listed is `lww`. */
+  fields?: Record<string, CrdtFieldType>;
 }
 
 /** An indexed field: name, type, and optionally `'desc'`. */
@@ -97,6 +102,22 @@ export class Migrator {
   createTable(name: string, opts: CreateTableOptions): Promise<void> {
     if (!opts.pk.length) throw new DbError('bad_value', 'a table needs a primary key');
     checkAppTable(name);
+    const crdt = opts.merge === 'crdt';
+    if (crdt) {
+      checkCrdtServer(this.db);
+      if (opts.pad) throw new DbError('bad_value', 'CRDT tables are not padded');
+      if (opts.changes?.image === 'full') {
+        throw new DbError('bad_value', 'CRDT change events carry no row (image "keys")');
+      }
+      for (const [f, ty] of Object.entries(opts.fields ?? {})) {
+        if (opts.pk.includes(f)) throw new DbError('bad_value', `pk field ${f} has no CRDT type`);
+        if (!['lww', 'counter', 'set'].includes(ty)) {
+          throw new DbError('bad_value', `field ${f}: no CRDT type ${ty}`);
+        }
+      }
+    } else if (opts.fields) {
+      throw new DbError('bad_value', 'field types are for CRDT tables (merge: "crdt")');
+    }
     return this.run(async (tx) => {
       if (await tx.tableRecordOrNone(name)) return true;
       const t: TableRecord = {
@@ -107,6 +128,10 @@ export class Migrator {
         pad: opts.pad ?? false,
         state: 'active',
       };
+      if (crdt) {
+        t.merge = 'crdt';
+        if (opts.fields && Object.keys(opts.fields).length) t.crdtFields = { ...opts.fields };
+      }
       if (opts.changes) {
         t.changes = {
           topic: (opts.changes.topic ?? ['zen', 'db', this.db.ns, 'changes', name]).map(utf8),
@@ -138,19 +163,43 @@ export class Migrator {
   /** Drop a table: mark it dropping, clear its keys in pages, remove it (§8.3). */
   dropTable(name: string): Promise<void> {
     checkAppTable(name);
-    return this.run(async (tx) => {
+    return this.run(async (tx, key) => {
       const t = await tx.tableRecordOrNone(name);
       if (!t) return true;
       if (t.state !== 'dropping') {
         tx.putTableRecord({ ...t, state: 'dropping' });
         return false;
       }
+      if (t.merge === 'crdt') return this.dropCrdtPage(tx, t, key);
       const ranges = [tx.keys.rows(t.id), tx.keys.range('o', t.id)];
       for (const ix of t.indexes) ranges.push(...indexRanges(tx, ix));
       if (await clearPage(tx, ranges)) return false;
       tx.deleteTableRecord(name);
       return true;
     });
+  }
+
+  /**
+   * One page of dropping a CRDT table: delete its live rows (the server
+   * purges them after the horizon, §19.5), then its record. Returns the
+   * last object as the progress.
+   */
+  private async dropCrdtPage(
+    tx: DbTransaction,
+    t: TableRecord,
+    key: Uint8Array | undefined,
+  ): Promise<boolean | Uint8Array> {
+    const size = Math.min(this.db.pageSize, 1000);
+    const from = key ? bytes.keyAfter(key) : undefined;
+    const { objects, more } = await crdtRange(this.db, t, from, size);
+    for (const s of objects) {
+      if (!s.row?.alive) continue;
+      const pk = mergeState(this.db, t, s).pk!;
+      tx.crdt.setRow(t, pk, encode(pk), false);
+    }
+    if (more && objects.length) return objects.at(-1)!.object;
+    tx.deleteTableRecord(t.name);
+    return true;
   }
 
   /**
@@ -169,6 +218,11 @@ export class Migrator {
     checkIndexOptions(kind, opts, this.db.limits.max_value_bytes);
     return this.run(async (tx) => {
       const t = await tx.tableRecord(table);
+      if (t.merge === 'crdt') {
+        if (opts.unique)
+          throw new DbError('bad_value', 'CRDT tables have no unique indexes (§19.6)');
+        throw new DbError('unsupported', 'indexes on CRDT tables are not built yet');
+      }
       const ix = t.indexes.find((i) => i.name === name);
       if (!ix) {
         const def: IndexDef = {
@@ -243,6 +297,7 @@ export class Migrator {
   ): Promise<void> {
     return this.run(async (tx, key) => {
       const t = await tx.tableRecord(table);
+      if (t.merge === 'crdt') throw new DbError('bad_value', 'CRDT tables are not transformed');
       const [begin, end] = tx.keys.rows(t.id);
       const size = this.db.pageSize;
       const page = await tx.raw.rangeStored(key ? bytes.keyAfter(key) : begin, end, {

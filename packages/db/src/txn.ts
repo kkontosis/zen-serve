@@ -18,7 +18,17 @@ import {
   emitKey,
 } from './broker.js';
 import { encodeTableRecord, type IndexDef, type TableRecord } from './catalog.js';
-import { encode, isPlainObject, type Value } from './cbor.js';
+import { decode, encode, isPlainObject, type Value } from './cbor.js';
+import {
+  CrdtWrites,
+  crdtGet,
+  emptyMerged,
+  fieldType,
+  incrAmount,
+  mergeState,
+  overlay,
+  viewOf,
+} from './crdt.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
 import { TxFiles } from './files.js';
@@ -84,6 +94,8 @@ export class DbTransaction implements IndexTx {
     string,
     { t: TableRecord; pk: Value; pkEl: Uint8Array; existed: boolean; row: Fields | undefined }
   >();
+  /** CRDT operations (§19.3), stamped at `finish`. */
+  private crdtW: CrdtWrites | undefined;
   /** `gc` jobs to insert at `finish` (parts of emits with `ttlMs`). */
   private readonly gcs: { paths: Uint8Array[][]; at: number }[] = [];
   /**
@@ -282,7 +294,8 @@ export class DbTransaction implements IndexTx {
       if (!def || (!c.existed && !c.row)) continue;
       const lean = { op: c.row ? 'put' : 'delete', table: c.t.name, pk: c.pk };
       const m = { type: 'zen.change', id: bytes.randomBytes(16) };
-      const full = def.image === 'full' && c.row ? { ...lean, row: c.row } : undefined;
+      const full =
+        def.image === 'full' && c.row && c.t.merge !== 'crdt' ? { ...lean, row: c.row } : undefined;
       appendMsg(
         this,
         this.db.topic(...def.topic),
@@ -296,6 +309,17 @@ export class DbTransaction implements IndexTx {
 
   get mode(): 'short' | 'long' {
     return this.raw.mode;
+  }
+
+  /** @internal This transaction's CRDT operations. */
+  get crdt(): CrdtWrites {
+    this.crdtW ??= new CrdtWrites(this);
+    return this.crdtW;
+  }
+
+  /** @internal Pending CRDT operations on a row, if any. */
+  crdtPending(t: TableRecord, pkEl: Uint8Array) {
+    return this.crdtW?.pending(t, pkEl) ?? [];
   }
 
   /** File operations in this transaction's commit (§7.6). */
@@ -427,6 +451,7 @@ export class DbTransaction implements IndexTx {
       const keys = [...s.keys];
       this.raw.onCommit(() => this.db.cacheSealed(h, bytes.hex(digest), keys));
     }
+    await this.crdtW?.stamp();
     if (this.raw.empty) {
       if (!this.cached.size) return;
       const used = [...this.cached.values()];
@@ -439,7 +464,12 @@ export class DbTransaction implements IndexTx {
       for (const u of stale) u.drop();
       throw new ZenError(409, 'conflict', 'a cached record changed');
     }
-    this.checkLimits();
+    try {
+      this.checkLimits();
+    } catch (e) {
+      this.crdtW?.release();
+      throw e;
+    }
   }
 
   /** Fail early with `too_large` if the commit would break the server's limits (§7.5). */
@@ -463,9 +493,23 @@ export class DbTransaction implements IndexTx {
     for (const w of c.writes ?? []) size += w.key.length + (w.value?.length ?? 0);
     for (const a of c.append ?? []) size += a.envelope.length;
     for (const ch of c.chunks ?? []) size += ch.data.length;
+    for (const o of c.crdt_ops ?? []) {
+      if ('value' in o && o.value) size += o.value.length;
+      if ('object' in o) size += o.object.length;
+    }
     if (size > l.max_commit_bytes) {
       throw new DbError('too_large', `about ${size} bytes; the server takes ${l.max_commit_bytes}`);
     }
+  }
+}
+
+/** Refuse a read-modify-write on a CRDT table (§19.1). */
+function notCrdt(t: TableRecord, op: string): void {
+  if (t.merge === 'crdt') {
+    throw new DbError(
+      'bad_value',
+      `${op} is not offered on CRDT tables (${t.name}): use patch, incr, add, remove`,
+    );
   }
 }
 
@@ -514,17 +558,26 @@ export class TableTx<T extends Fields = Fields> {
     return this.tx.keys;
   }
 
-  /** The row with this primary key, or undefined. */
+  /**
+   * The row with this primary key, or undefined. A CRDT row is read merged,
+   * outside the read set (§19.4), with this transaction's own operations.
+   */
   async get(pk: Value): Promise<T | undefined> {
     const t = await this.tx.tableRecord(this.name);
+    if (t.merge === 'crdt') return (await this.crdtRows(t, [encode(pk)]))[0] as T | undefined;
     return (await this.read(t, encode(pk)))?.fields as T | undefined;
   }
 
-  /** Insert a row; `exists` if its primary key is taken. */
+  /**
+   * Insert a row; `exists` if its primary key is taken. On a CRDT table
+   * (§19.3) it makes the row exist and sets the fields given (`lww` fields
+   * set, counters incremented, set elements added); a deleted row comes back.
+   */
   async insert(row: T): Promise<void> {
     const t = await this.tx.tableRecord(this.name);
     const pk = pkOf(t, row);
     const pkEl = encode(pk);
+    if (t.merge === 'crdt') return this.crdtInsert(t, pk, pkEl, row);
     // A cached copy may be stale (a read that raced a delete): check `exists` on the server.
     const old = await this.read(t, pkEl, true);
     if (old) throw new DbError('exists', `table ${t.name} already has this row`, { pk });
@@ -534,6 +587,7 @@ export class TableTx<T extends Fields = Fields> {
   /** Insert or replace a row. */
   async put(row: T): Promise<void> {
     const t = await this.tx.tableRecord(this.name);
+    notCrdt(t, 'put');
     const pk = pkOf(t, row);
     const pkEl = encode(pk);
     const old = await this.read(t, pkEl);
@@ -543,6 +597,7 @@ export class TableTx<T extends Fields = Fields> {
   /** Change a row with `fn`; `not_found` if there is none. Returns the new row. */
   async update(pk: Value, fn: (row: T) => T | Promise<T>): Promise<T> {
     const t = await this.tx.tableRecord(this.name);
+    notCrdt(t, 'update');
     const pkEl = encode(pk);
     const old = await this.read(t, pkEl);
     if (!old) throw new DbError('not_found', `table ${t.name} has no such row`, { pk });
@@ -554,10 +609,19 @@ export class TableTx<T extends Fields = Fields> {
     return row;
   }
 
-  /** Delete a row. Returns whether there was one. */
+  /**
+   * Delete a row. Returns whether there was one; on a CRDT table, which
+   * doesn't read, always true. A deleted CRDT row comes back only with
+   * `insert` (§19.1).
+   */
   async delete(pk: Value): Promise<boolean> {
     const t = await this.tx.tableRecord(this.name);
     const pkEl = encode(pk);
+    if (t.merge === 'crdt') {
+      this.tx.crdt.setRow(t, pk, pkEl, false);
+      this.changed(t, pk, pkEl);
+      return true;
+    }
     const old = await this.read(t, pkEl);
     if (!old) return false;
     await this.write(t, pk, pkEl, old, undefined);
@@ -567,6 +631,127 @@ export class TableTx<T extends Fields = Fields> {
   /** A query on this table, in this transaction (§6). */
   query(): Query<T> {
     return new Query<T>(this.name, (run) => run(this.tx));
+  }
+
+  // ------------------------------------------------------------ CRDT tables
+
+  /** Set `lww` fields of a CRDT row (§19.3); `undefined` unsets one. */
+  async patch(pk: Value, fields: Partial<T>): Promise<void> {
+    const t = await this.crdtTable('patch');
+    const pkEl = encode(pk);
+    if (!isPlainObject(fields)) throw new DbError('bad_value', 'patch takes a plain object');
+    for (const [f, v] of Object.entries(fields)) {
+      if (t.pk.includes(f)) throw new DbError('bad_value', `patch can't change the pk field ${f}`);
+      const type = fieldType(t, f);
+      if (type !== 'lww') {
+        throw new DbError(
+          'bad_value',
+          `field ${f} is a ${type}: use ${type === 'set' ? 'add/remove' : 'incr'}`,
+        );
+      }
+      this.tx.crdt.lww(t, pk, pkEl, f, v as Value | undefined);
+    }
+    this.changed(t, pk, pkEl);
+  }
+
+  /** Add `n` (default 1, may be negative) to a counter field of a CRDT row. */
+  async incr(pk: Value, field: string, n: number | bigint = 1): Promise<void> {
+    const t = await this.crdtTable('incr');
+    this.typed(t, field, 'counter');
+    const pkEl = encode(pk);
+    this.tx.crdt.incr(t, pk, pkEl, field, incrAmount(n));
+    this.changed(t, pk, pkEl);
+  }
+
+  /** Add elements to a set field of a CRDT row. */
+  async add(pk: Value, field: string, ...elems: Value[]): Promise<void> {
+    const t = await this.crdtTable('add');
+    this.typed(t, field, 'set');
+    const pkEl = encode(pk);
+    for (const e of elems) this.tx.crdt.add(t, pk, pkEl, field, e);
+    this.changed(t, pk, pkEl);
+  }
+
+  /**
+   * Remove elements from a set field of a CRDT row: the copies seen now.
+   * One added concurrently elsewhere stays (add-wins, §19.3).
+   */
+  async remove(pk: Value, field: string, ...elems: Value[]): Promise<void> {
+    const t = await this.crdtTable('remove');
+    this.typed(t, field, 'set');
+    const pkEl = encode(pk);
+    const keys = this.tx.db.crdtKeys(t.id);
+    const tok = keys.field(field);
+    const [s] = await crdtGet(this.tx.db, [this.keys.row(t.id, pkEl)], this.tx.raw.readVersion);
+    for (const e of elems) {
+      const elem = keys.elem(field, pkEl, encode(e));
+      const dots = (s?.set ?? [])
+        .filter((d) => bytes.equal(d.field, tok) && bytes.equal(d.elem, elem))
+        .map((d) => d.dot);
+      this.tx.crdt.remove(t, pk, pkEl, field, e, dots);
+    }
+    this.changed(t, pk, pkEl);
+  }
+
+  /** @internal The merged rows of CRDT pk elements (undefined where none), with own writes. */
+  async crdtRows(t: TableRecord, pkEls: Uint8Array[]): Promise<(Fields | undefined)[]> {
+    this.tx.live();
+    const objects = pkEls.map((p) => this.keys.row(t.id, p));
+    const states = new Map(
+      (await crdtGet(this.tx.db, objects, this.tx.raw.readVersion)).map((s) => [
+        bytes.hex(s.object),
+        s,
+      ]),
+    );
+    return pkEls.map((pkEl, i) => {
+      const s = states.get(bytes.hex(objects[i]!));
+      const m = s ? mergeState(this.tx.db, t, s) : emptyMerged();
+      return viewOf(t, overlay(m, decode(pkEl), this.tx.crdtPending(t, pkEl)));
+    });
+  }
+
+  private async crdtInsert(t: TableRecord, pk: Value, pkEl: Uint8Array, row: Fields) {
+    if (!isPlainObject(row)) throw new DbError('bad_value', 'a row must be a plain object');
+    const w = this.tx.crdt;
+    w.setRow(t, pk, pkEl, true);
+    for (const [f, v] of Object.entries(row)) {
+      if (t.pk.includes(f) || v === undefined) continue;
+      const type = fieldType(t, f);
+      if (type === 'lww') w.lww(t, pk, pkEl, f, v);
+      else if (type === 'counter') {
+        const n = incrAmount(v as number | bigint);
+        if (n) w.incr(t, pk, pkEl, f, n);
+      } else {
+        if (!Array.isArray(v)) throw new DbError('bad_value', `set field ${f} takes an array`);
+        for (const e of v) w.add(t, pk, pkEl, f, e);
+      }
+    }
+    this.changed(t, pk, pkEl);
+  }
+
+  private async crdtTable(op: string): Promise<TableRecord> {
+    const t = await this.tx.tableRecord(this.name);
+    if (t.merge !== 'crdt')
+      throw new DbError('bad_value', `${op} is for CRDT tables; ${t.name} is not one`);
+    return t;
+  }
+
+  private typed(t: TableRecord, field: string, want: 'counter' | 'set'): void {
+    if (fieldType(t, field) !== want) {
+      throw new DbError('bad_value', `field ${field} of ${t.name} is not a ${want}`);
+    }
+  }
+
+  /**
+   * A CRDT row changed: one change event (§12.7), carrying no row (the
+   * merged state is the server's). `delete` if this transaction's last
+   * insert or delete of the row was a delete, `put` otherwise.
+   */
+  private changed(t: TableRecord, pk: Value, pkEl: Uint8Array): void {
+    if (!t.changes) return;
+    const last = this.tx.crdtPending(t, pkEl).findLast((o) => o.op === 'row');
+    const alive = !last || (last.op === 'row' && last.alive);
+    this.tx.noteChange(t, pk, pkEl, {}, alive ? {} : undefined);
   }
 
   // ------------------------------------------------------------ internals

@@ -8,7 +8,7 @@ import {
   type UnlockedFs,
   ZenError,
 } from '@zen/client';
-import type { IndexKeys, Limits } from '@zen/wasm';
+import type { CrdtKeys, IndexKeys, Limits } from '@zen/wasm';
 import {
   bindingOf,
   type ChangeBody,
@@ -156,6 +156,7 @@ export class Db {
   private readonly catalog = new Map<string, CatalogEntry>();
   private readonly nodes = new Map<string, Node>();
   private readonly ixKeys = new Map<string, IndexKeys>();
+  private readonly crdtKs = new Map<string, CrdtKeys>();
   /** Sealed indexes by index id: the entries of the blob with this digest. */
   private readonly sealed = new Map<string, { digest: string; keys: Uint8Array[] }>();
   /** Rows by stored key (hex), least recently used first. */
@@ -180,6 +181,8 @@ export class Db {
     readonly keys: Keys,
     /** The server's limits (`/v1/info`). */
     readonly limits: Limits,
+    /** The server's features (`/v1/info`). */
+    readonly features: string[],
     private readonly opts: DbOptions,
   ) {}
 
@@ -190,7 +193,7 @@ export class Db {
    */
   static async open(fs: UnlockedFs, ns: string, opts: DbOptions = {}): Promise<Db> {
     const info = await fs.session.client.info();
-    const db = new Db(fs, ns, new Keys(fs.keys.db(ns)), info.limits, opts);
+    const db = new Db(fs, ns, new Keys(fs.keys.db(ns)), info.limits, info.features, opts);
     await db.init();
     const locks =
       opts.locks === undefined
@@ -634,6 +637,8 @@ export class Db {
     this.owner?.close();
     for (const k of this.ixKeys.values()) k.free();
     this.ixKeys.clear();
+    for (const k of this.crdtKs.values()) k.free();
+    this.crdtKs.clear();
     this.rows.clear();
     this.nodes.clear();
     this.sealed.clear();
@@ -684,6 +689,17 @@ export class Db {
     if (!k) {
       k = this.keys.db.index(id);
       this.ixKeys.set(h, k);
+    }
+    return k;
+  }
+
+  /** @internal The token keys of a CRDT table (§19.2). */
+  crdtKeys(tableId: Uint8Array): CrdtKeys {
+    const h = bytes.hex(tableId);
+    let k = this.crdtKs.get(h);
+    if (!k) {
+      k = this.keys.db.crdt(tableId);
+      this.crdtKs.set(h, k);
     }
     return k;
   }
@@ -768,6 +784,26 @@ export class Table<T extends Fields = Fields> {
 
   delete(pk: Value): Promise<boolean> {
     return this.db.transaction((tx) => tx.table<T>(this.name).delete(pk));
+  }
+
+  /** CRDT tables (§19.3): set `lww` fields; `undefined` unsets one. */
+  patch(pk: Value, fields: Partial<T>): Promise<void> {
+    return this.db.transaction((tx) => tx.table<T>(this.name).patch(pk, fields));
+  }
+
+  /** CRDT tables: add `n` (default 1) to a counter. */
+  incr(pk: Value, field: string, n: number | bigint = 1): Promise<void> {
+    return this.db.transaction((tx) => tx.table<T>(this.name).incr(pk, field, n));
+  }
+
+  /** CRDT tables: add elements to a set. */
+  add(pk: Value, field: string, ...elems: Value[]): Promise<void> {
+    return this.db.transaction((tx) => tx.table<T>(this.name).add(pk, field, ...elems));
+  }
+
+  /** CRDT tables: remove the copies of elements seen now (add-wins). */
+  remove(pk: Value, field: string, ...elems: Value[]): Promise<void> {
+    return this.db.transaction((tx) => tx.table<T>(this.name).remove(pk, field, ...elems));
   }
 
   /** Subscribe to this table's change events (§12.7). */

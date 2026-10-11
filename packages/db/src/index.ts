@@ -29,6 +29,7 @@ export type {
 } from './catalog.js';
 export type { Value } from './cbor.js';
 export * as cbor from './cbor.js';
+export { CRDT_FEATURE, type CrdtFieldType } from './crdt.js';
 export {
   Db,
   type DbOptions,

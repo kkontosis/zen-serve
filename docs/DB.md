@@ -187,6 +187,7 @@ In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lo
 | `closed` | a manual transaction used after `commit` or `abort`; a request pending when the database closed |
 | `poisoned` | a message that doesn't decode, or whose body parts are gone |
 | `timeout` | a request without a reply in time; no owner tab answering |
+| `unsupported` | a CRDT table on a server without `"crdt_rows"`; an index on a CRDT table (until the indexer) |
 
 ---
 
@@ -293,7 +294,7 @@ const state = await order.get(id);    // {status, step, data, done, …}
 
 ## 17. Change events
 
-A table created with `changes: {topic?, image?}` emits one `zen.change` message per changed row per transaction (`{op, table, pk, row?}`), keyed by the pk. `table.on(handler)` subscribes to them; consumers build projections from them.
+A table created with `changes: {topic?, image?}` emits one `zen.change` message per changed row per transaction (`{op, table, pk, row?}`), keyed by the pk. `table.on(handler)` subscribes to them; consumers build projections from them. A CRDT table's events never carry the row (§19).
 
 ## 18. Guarantees and failures
 
@@ -307,4 +308,43 @@ A table created with `changes: {topic?, image?}` emits one `zen.change` message 
 | an external effect | at least once: use the message `id` as the idempotency key |
 
 The failure cases of §13.2 are tested in `packages/db/test/faults.test.ts` (a stalled or deposed handler, racing claims, a dropped stream, a lost commit response, a scheduler dying mid-batch, a responder that doesn't answer) and `proxy.test.ts` (the owner tab closing).
+
+---
+
+# CRDT tables
+
+## 19. Rows the server merges
+
+A table created with `merge: 'crdt'` holds rows that the server merges field by field, on ciphertext (zendb.md §19). Writes never conflict and concurrent edits of different fields both survive; in exchange there are no unique indexes, no `put` or `update` (they read before writing), and no invariants across fields or rows. A transaction can still carry CRDT operations atomically with transactional rows, emits and consumes. It needs a server that lists `"crdt_rows"` in `/v1/info` (otherwise `unsupported`).
+
+```ts
+await m.createTable('cards', {
+  pk: ['id'],
+  merge: 'crdt',
+  fields: { votes: 'counter', labels: 'set' },   // others are lww
+  changes: {},                                     // image 'keys' only
+});
+const cards = db.table<Card>('cards');
+await cards.insert({ id, title: 'Buy milk', votes: 0, labels: ['home'] });
+await cards.patch(id, { title: 'Buy oat milk' });  // undefined unsets a field
+await cards.incr(id, 'votes', 1);                   // may be negative
+await cards.add(id, 'labels', 'urgent');
+await cards.remove(id, 'labels', 'home');
+await cards.delete(id);
+```
+
+| Field type | Merge |
+|---|---|
+| `lww` (default) | the latest write wins, by `(hlc, device)` |
+| `counter` | each installation's total; the value is their sum |
+| `set` | add-wins: `remove` takes away the copies it saw, an add it didn't see stays |
+| the row | `insert` makes it exist, `delete` hides it; only `insert` brings it back |
+
+* **`insert`** sets the fields given: `lww` fields, counters incremented by the value, set elements added. Fields not given keep their merged values.
+* **Reads** (`get`, `query`) merge the server's state on the client: declared counters read 0 and sets `[]` until written. Inside a transaction they see its own operations, and are **not** in its read set: a transaction that reads a CRDT row never conflicts on it.
+* **Queries** look up by pk or scan the table (the predicates, `orderBy` and paging as for a scan). Indexes on CRDT tables come with the indexer.
+* **Timestamps** are stamped when the transaction commits, from the session clock. A commit refused with `stale_op` or `clock_skew` is re-run with fresh ones, after reading the server clock.
+* **Counters** need an installation id (the clock's `actor`): a persisted clock store must keep it with the HLC (docs/CLIENT.md). One installation's counter commits go one at a time.
+* **Change events** carry `{op, table, pk}`: `delete` when the transaction last deleted the row, `put` otherwise.
+* **Dropping** a CRDT table deletes its rows in pages; the server purges them after its horizon.
 

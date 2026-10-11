@@ -184,7 +184,30 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** §9.2 (the proxy protocol), §11.5 (`$sagas.corr`, `timeout`), §12.3 (an inbox per `Db`), §12.5 (rewritten: messages, the stale rule by `corr`, transitions, stuck through the class DLQ).
     * **Docs:** `docs/DB.md` sections 8 and 10–18 (the broker); TD-DB-TAB-PROXY resolved.
     * **Tests:** `saga.test.ts` (7), `proxy.test.ts` (4, `FakeBus` + `FakeLocks`), `faults.test.ts` (6; commits are intercepted by wrapping `session.call`). 215 vitest tests in all.
-* **Step 7** (CRDT tables): planned (see Step 7: sub-steps 7a and 7b, a PR each). PR #19 is merged, so the plan commit restarts the branch from main and opens a new PR, which 7a joins.
+* **Step 7** (CRDT tables): planned (see Step 7: sub-steps 7a and 7b, a PR each). PR #19 is merged, so the plan commit restarts the branch from main and opens a new PR (#20), which 7a joins.
+  * **7a** (CRDT tables online): done, PR #20. As planned, with these details for 7b:
+    * **Files:**
+      * `crdt.ts`:
+        * `mergeState(db, t, ObjState) → Merged`, `overlay(merged, pk, pending)`, `viewOf(t, merged)`. **7b's local view of queued operations reuses `overlay`.**
+        * `crdtGet` (batches of 1,000) and `crdtRange` (one page).
+        * `CrdtWrites`: a transaction's pending operations per row, in call order (`Pending`: row/lww/ctr/add/rem). `stamp()` runs in `finish` and stamps them. `release()` undoes it when the commit is never sent.
+        * Counter totals and their lock live per session clock (a `WeakMap` on `TreeClock`), so every `Db` of one installation shares them. A failed commit forgets the totals it touched, which are then re-read with `crdt/get`.
+        * `rebase` handles `stale_op` and `clock_skew` with `clock.sync(force)` (and `reset` when the clock ran ahead), at most 3 times.
+      * `TableTx` dispatches on `merge`. It has `patch`, `incr`, `add`, `remove` and `crdtRows`; `put` and `update` are refused; `delete` returns true without reading.
+      * `query.ts` `crdtScan` (path `'crdt'`, the cursor is the last pk); a bound pk goes through `get`.
+      * `migrate.ts`:
+        * `createTable({merge, fields})` checks the server and the options.
+        * `dropTable` deletes live rows in pages, with the last object as progress.
+        * `createIndex` on CRDT tables: `unique` → `bad_value`, the rest → `unsupported` (**7b replaces this**).
+        * `transform` is refused.
+      * `Db.features` and `Db.crdtKeys(id)` are new; `DbError` gained the code `unsupported`.
+    * **Change events:** `noteChange(t, pk, pkEl, {}, alive ? {} : undefined)`. `emitChanges` never adds `row` for CRDT tables.
+    * **⚠️ Spec:** §3.2, §8.3 (dropping a CRDT table), §12.7, §19.2 (an undeclared field's name, `{1: value, 2: name}`), §19.3 (the class side). The vectors are unchanged.
+    * **Docs:** `docs/DB.md` §19 (CRDT tables) and the `unsupported` error.
+    * **Tests:**
+      * `crdt.test.ts` (15). The second installation is `w.client.signInDevice(w.admin)` plus `unlock({device})`. `commitsDuring` records and injects `/v1/commit` errors.
+      * `vectors.test.ts` +1 (tokens, the sealed values, a merged ObjState).
+      * 231 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
