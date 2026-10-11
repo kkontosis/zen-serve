@@ -117,7 +117,7 @@ jobs:
       - name: Install and build the packages
         run: |
           npm ci
-          npm run build -w @zen/client
+          npm run build -w @zen/client -w @zen/fs
       - name: Lint and typecheck
         run: |
           npx biome check

@@ -202,20 +202,28 @@ r.onError((e, entries) => …);                     // writes the server refused
 
 ## 9. zen-mount
 
-`zen-mount` (packages/fuse) mounts one tree of an fs as a local directory, through FUSE.
+`zen-mount` (packages/fuse) mounts one tree of an fs as a local directory, through FUSE, on a local replica (`@zen/fs`, §8).
 
 ```sh
 sudo apt-get install fuse3 libfuse-dev pkg-config     # libfuse 2 headers: the module compiles at npm ci
-npm run build -w @zen/fuse
-ZEN_PASSWORD=… ZEN_PASSPHRASE=… node packages/fuse/dist/cli.js https://zen.example.org ~/zen \
-  --user alice --passphrase --tree <hex>              # or --new-tree; --foreground; --read-only
+npm run build -w @zen/client -w @zen/fs -w @zen/fuse
+# The first time: store the device key in a vault, keep the replica on disk, pin a folder.
+node packages/fuse/dist/cli.js https://zen.example.org ~/zen --tree <hex> \
+  --device-key device.json --vault ~/.zen/vault --cache-dir ~/.zen/cache --pin /docs
+# Later (device.json can go), also when the server is down:
+node packages/fuse/dist/cli.js https://zen.example.org ~/zen --tree <hex> \
+  --vault ~/.zen/vault --cache-dir ~/.zen/cache --offline-ok
 ```
 
-* Sign-in by password key (`--user`), OPAQUE (`--opaque`, which also unlocks through its keyslot), an API token or a device key file; unlocking by passphrase, recovery key, device key or the sign-in. Secrets come from the environment, files or a prompt, never the command line.
-* Without `--foreground` it detaches once mounted. SIGINT or SIGTERM flushes open files and unmounts.
-* **How it maps:** directories are listed from the server and cached until the tree's change feed reports a change, so other devices' edits appear within a second or so. Reads fetch chunk ranges. A file opened for writing is buffered in memory and written as one new version on `close` or `fsync`, replacing the version it opened.
+* **Sign-in** by password key (`--user`), OPAQUE (`--opaque`, which also unlocks through its keyslot), an API token, a device key file, or the vault. Unlocking by passphrase, recovery key, device key (the file's or the vault's) or the sign-in. Secrets come from the environment, files, a prompt or the vault, never the command line.
+* **`--vault DIR`:** a credential vault (§10) sealed under a key of this machine. A `--device-key` given with it is stored there; every session is stored after sign-in; with neither, the vault signs in (the stored session, else the stored device) and unlocks.
+* **`--cache-dir DIR`:** the replica (node table, content, pins, writes not yet sent) and the kept fs header, in a sealed disk store. One mount per directory (a lock file). Without it, everything is in memory. `--cache-size` bounds the content kept (default 1 GiB; pins don't count), and `--pin PATH` (repeatable, remembered) keeps a file or a folder offline.
+* **`--offline-ok`** (needs `--cache-dir` and `--vault`): when the server can't be reached at start, mount from the cache. Without it the CLI exits with status 1. Offline, the node table lists, kept content reads, and a file whose content isn't kept lists with size 0 and fails to read (`EIO`).
+* Without `--foreground` it detaches once mounted. SIGINT or SIGTERM unmounts (open files queue their writes) and waits up to 10 s for the queue to be sent. With `--cache-dir`, what is left is sent at the next mount; in memory it would be lost, so it waits for the server (a second signal stops at once).
+* **How it maps:** listings, `stat`, symlinks and xattrs come from the replica's node table, kept current through the change feed; the kernel caches them for `attrTimeout` (1 s). Reads go through the replica's content cache. A file open for writing keeps only the chunks written; `flush`, `fsync` and `close` queue one write with only those chunks sealed. **`fsync` makes a write durable on this device** (with `--cache-dir`), not on the server: it is sent as soon as the server can be reached.
+* **Symlinks** are `symlink` nodes. **xattrs:** the kernel's `user.<x>` is the stored `<x>` (`user.zen.content_type` is the media type); other namespaces give `ENOTSUP`.
 * **Conflicts:** two devices writing the same file concurrently leave siblings. The newest is shown as the file and the others as read-only `name (conflict <device>-<n>).ext`; deleting the copy resolves the conflict in favour of the file.
-* **Limits** (`TD-FUSE-REPLICA`): no local replica (no offline use), no hard links, symlinks or xattrs, and no `mmap` coherence across devices. Files can be paged (§8), but a file opened for writing is still buffered whole in memory, until step 8's replica.
+* **Limits:** no hard links (`EPERM`), no `mmap` coherence across devices, inode numbers from the kernel (fuse-native has no `use_ino`), and no cache invalidation pushed to the kernel (changes from elsewhere show within `attrTimeout`).
 
 ## 10. The local store
 

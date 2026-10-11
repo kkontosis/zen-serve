@@ -173,7 +173,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-FUSE-REPLICA
 
-* **Status:** open
+* **Status:** resolved, by the commit "zen-mount on @zen/fs (milestone 5 step 8c)": `zen-mount` mounts a replica (`@zen/fs`): offline use, a sealed `--cache-dir`, pins, symlinks, xattrs, writes of changed chunks only, and the vault for sign-in. Left as documented limits (docs/CLIENT.md §9): no hard links, no `mmap` coherence across devices, inode numbers from the kernel.
 * **Context:** `zen-mount` (packages/fuse) has no local replica: it lists directories from the server (cached until the change feed reports a change), reads file contents by chunk range, and writes a whole new version when a file is closed or synced. It is not POSIX-complete: no hard links, symlinks or xattrs; `mmap` isn't coherent across devices; there is no offline use and no persistent chunk cache (`--cache-dir` is reserved).
 * **Why deferred:** The local replica and the POSIX layer over it are the zen-fs client of milestone 5; milestone 4 needed a working mount on the operations API.
 * **What it would take:** The milestone-5 replica (node table and chunk store on disk, synced through the change feed), then `zen-mount` on top of it, with symlinks (the `symlink` node type exists), xattrs in the sealed meta, and writes of changed chunks only.

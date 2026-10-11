@@ -293,6 +293,48 @@ describe('changed chunks only', () => {
 });
 
 describe('conflicts and cycles', () => {
+  it.each([
+    ['after another write', false],
+    ['as the first thing the replica sees', true],
+  ])('a write the feed brings back before its reply is no conflict, %s', async (_, empty) => {
+    // An empty tree: the replica has no cursor when the write is sent.
+    const r = empty
+      ? await openReplica((await installation(w)).ufs, Tree.newId(), solo())
+      : (await setup()).r;
+    if (empty) await r.sync();
+    else {
+      await r.writeFile('/f.txt', text('one'));
+      await r.flush();
+    }
+    // Hold the commit's reply until the replica has caught up with the feed.
+    const s = r.fs.session;
+    const orig = s.call.bind(s);
+    let held: { names: string[]; versions: number; text: string } | undefined;
+    s.call = (async (path: string, enc: never, dec: never, req: unknown) => {
+      const out = await orig(path, enc, dec, req as never);
+      const ops = (req as { crdt_ops?: { op: string }[] }).crdt_ops;
+      if (path === '/v1/commit' && !held && ops?.some((o) => o.op === 'write')) {
+        await r.sync();
+        held = {
+          names: await r.readdir('/'),
+          versions: (await r.stat('/f.txt')).versions,
+          text: str(await r.readFile('/f.txt')),
+        };
+      }
+      return out;
+    }) as typeof s.call;
+    try {
+      await r.writeFile('/f.txt', text('two'));
+      await r.flush();
+    } finally {
+      s.call = orig;
+    }
+    const names = empty ? ['f.txt'] : ['.keep', 'f.txt'];
+    expect(held).toEqual({ names, versions: 1, text: 'two' });
+    expect(await r.readdir('/')).toEqual(names);
+    await r.close();
+  });
+
   it('two replicas write one file offline: a conflict copy, resolved by unlink', async () => {
     const { id, r, net, seen } = await setup();
     await r.writeFile('/f.txt', text('base'), { wait: true });

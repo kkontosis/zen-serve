@@ -20,7 +20,8 @@
     "build": "tsc -p ."
   },
   "dependencies": {
-    "@zen/client": "0.1.0"
+    "@zen/client": "0.1.0",
+    "@zen/fs": "0.1.0"
   },
   "optionalDependencies": {
     "@cocalc/fuse-native": "2.4.3"
