@@ -220,7 +220,21 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Docs:** `docs/DB.md` §19 "Indexes on CRDT tables".
     * **Tests:** `crdtindex.test.ts` (9): refusals, fast/private/sealed queries, merged counters from two installations, lag and re-check, resume after a stop, deletes and wrong types, backfills (also during writes with the indexer on), drops. The `unsupported` createIndex case left `crdt.test.ts`.
     * PR #22 merged, CI green (commit `96672cb`).
-  * **7c** (offline queue, read modes, property test): planned in detail (see Step 7, 7c). #22 is merged, so the plan commit restarts the branch from main and opens a new PR.
+  * **7c** (offline queue, read modes, property test): done, PR #23. **Step 7 is done.** As planned, with these details for step 8 on:
+    * **Server:** `POST /v1/crdt/versions` (`CrdtVersionsReq` / `CrdtVersions`, empty = no object), test `versions_track_object_changes`.
+    * **Client:** `Transaction.commitId` (fixed per transaction); `commitTransaction(tx, {attempts})`.
+    * **Files:**
+      * `crdtcache.ts`: `CrdtCache` (LRU of ObjStates, `markStale` with a generation so a fetch in flight stays stale), `crdtStates(db, objects, mode, rv, known)`, `crdtVersions`, `cacheStates`, `isNetwork`. `known(h)` lets a miss offline read as absent (rows only the queue writes; `remove`).
+      * `crdtq.ts`: `CrdtQueue` (`db.crdt`: `pending`, `online`, `flush`, `onSync`), `QueueEntry` / `QueueRow` / `QueueStore` / `memoryQueueStore`. Sender: `pack` (limits, the add-then-remove cut), `build` (a `db.begin()` transaction, runs of singles coalesced, `CrdtWrites.load`), resend with the same commit id, `restamp` on `stale_op`, `done` learns `set_dots`.
+      * `crdt.ts`: `Pending` `row`/`lww` carry an optional `hlc` (queue time); `stamp` keeps it, adds learned dots to `rem`, marks objects stale on commit and on error.
+      * `txn.ts`: `DbTransaction.crdtRead`, `queueAs`, `direct`, `queued`; `finish` queues a CRDT-only transaction (`crdtOnly()`), and flushes the queue before a direct one with CRDT operations; offline, a read-only transaction that used only catalog records skips its check. `tx.after` runs once queued.
+      * `query.ts`: `query().read(mode)`; `cacheScan` (path `cache`, paged by pk); `auto` falls back to it offline.
+      * `db.ts`: options `crdtCache`, `crdtCacheMs`, `crdtRead`, `crdtQueue` (boolean, default true), `crdtStore` (the `QueueStore`; renamed from the plan's `crdtQueue`), `crdtBatchMs`; `db.table(name, {wait})`; `db.transaction(fn, {queue, wait, read})`.
+    * **Decisions beyond the plan:** `DbOptions.crdtQueue: false` commits CRDT-only transactions directly (the 7a/7b tests use it with `crdtRead: 'server'`); a mixed transaction that flushes the queue may re-run once (its snapshot moved on).
+    * **Step 8 must:** give `QueueStore` a persistent implementation (and keep the built commit, so a restart resends the same `commit_id`); run the sender in the owner once the store is shared between tabs.
+    * **⚠️ Spec:** api.md §13.3 (`versions`), zendb.md §19.4 (cache, read modes), §19.7 (rewritten: entries, stamping, batches, sending, store, API), §16, the `offline` error.
+    * **Docs:** `docs/DB.md` §19 "Writes and the queue", "Read modes", the `offline` error; `docs/CLIENT.md` `commitId`.
+    * **Tests:** `crdtoffline.test.ts` (15: read modes, the queue, a lost response, a rebase past a 1 s horizon, mixed flushes, a dropped table, learned dots, the 3-installation property test with three seeds); `kv.test.ts` +1; `tests/crdt.rs` +1. 256 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

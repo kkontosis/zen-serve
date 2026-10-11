@@ -83,6 +83,9 @@ const migrations: DbOptions['migrations'] = {
 const open = (f: UnlockedFs, name: string, extra: DbOptions = {}) =>
   Db.open(f, name, {
     warn: () => {},
+    // Online: writes commit at once, reads ask the server.
+    crdtQueue: false,
+    crdtRead: 'server',
     locks: null,
     scheduler: false,
     schema: 1,

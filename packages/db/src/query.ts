@@ -4,7 +4,8 @@
 import { bytes } from '@zen/client';
 import type { IndexDef, IndexField, TableRecord } from './catalog.js';
 import { encode, same, type Value } from './cbor.js';
-import { crdtRange, mergeState, overlay, viewOf } from './crdt.js';
+import { crdtRange, emptyMerged, mergeState, overlay, viewOf } from './crdt.js';
+import { type CrdtRead, cacheStates, isNetwork } from './crdtcache.js';
 import { DbError } from './errors.js';
 import { privateScan, sealedScan } from './index/private.js';
 import { entryPk } from './index/unique.js';
@@ -256,11 +257,12 @@ async function fetchRows(
   tx: DbTransaction,
   t: TableRecord,
   pks: Value[],
+  mode?: CrdtRead,
 ): Promise<(Fields | undefined)[]> {
   tx.live();
   const tt = tx.table(t.name);
   const els = pks.map((pk) => encode(pk));
-  if (t.merge === 'crdt') return tt.crdtRows(t, els);
+  if (t.merge === 'crdt') return tt.crdtRows(t, els, mode);
   const got = await tx.raw.getEntries(els.map((el) => tx.keys.row(t.id, el)));
   const out: (Fields | undefined)[] = [];
   for (const [i, e] of got.entries()) {
@@ -281,6 +283,7 @@ export class Query<T extends Fields = Fields> {
   private order: { field: string; desc: boolean } | undefined;
   private max: number | undefined;
   private from: Position | undefined;
+  private mode: CrdtRead | undefined;
 
   constructor(
     readonly table: string,
@@ -304,6 +307,16 @@ export class Query<T extends Fields = Fields> {
     return this;
   }
 
+  /**
+   * How a query on a CRDT table reads (§19.4): `auto` and `server` ask the
+   * server (`auto` answers from the cache offline); `cache` answers from
+   * the cached rows and the queued ones, which may be incomplete.
+   */
+  read(mode: CrdtRead): this {
+    this.mode = mode;
+    return this;
+  }
+
   after(cursor: Cursor | undefined): this {
     this.from = cursor?.[CURSOR];
     return this;
@@ -322,6 +335,19 @@ export class Query<T extends Fields = Fields> {
   private async run(tx: DbTransaction): Promise<Page<T>> {
     tx.live();
     const t = await tx.tableRecord(this.table);
+    if (t.merge !== 'crdt') return this.runPaths(tx, t);
+    const mode = this.mode ?? tx.crdtRead;
+    if (mode === 'cache') return this.cacheScan(tx, t);
+    try {
+      return await this.runPaths(tx, t, mode);
+    } catch (e) {
+      const offline = isNetwork(e) || (e instanceof DbError && e.code === 'offline');
+      if (mode !== 'auto' || !offline) throw e;
+      return this.cacheScan(tx, t);
+    }
+  }
+
+  private async runPaths(tx: DbTransaction, t: TableRecord, mode?: CrdtRead): Promise<Page<T>> {
     const eq = new Map<string, Value>();
     for (const c of this.conds) if (c.op === '=' && !eq.has(c.field)) eq.set(c.field, c.value);
     const bound = (fields: string[]) => fields.every((f) => eq.has(f) && eq.get(f) !== null);
@@ -345,7 +371,7 @@ export class Query<T extends Fields = Fields> {
       }
     }
     if (lookup) {
-      const row = pk === undefined ? undefined : await tt.get(pk);
+      const row = pk === undefined ? undefined : await tt.get(pk, mode ? { read: mode } : {});
       return { rows: row && keep(row) ? [row as T] : [] };
     }
 
@@ -360,10 +386,10 @@ export class Query<T extends Fields = Fields> {
     if (range && (!fast || (this.order && range.ordered))) {
       path = `${range.ix.kind === 'private' ? 'p' : 's'}:${bytes.hex(range.ix.id)}`;
       ordered = range.ordered;
-      rows = await this.rangeRows(tx, t, range, path, keep, ordered);
+      rows = await this.rangeRows(tx, t, range, path, keep, ordered, mode);
     } else {
       path = fast ? `f:${bytes.hex(fast.id)}` : 'scan';
-      rows = await this.keyRows(tx, t, fast, eq, path, keep);
+      rows = await this.keyRows(tx, t, fast, eq, path, keep, mode);
     }
 
     if (!ordered) {
@@ -405,13 +431,15 @@ export class Query<T extends Fields = Fields> {
     const rows: { pk: Value; row: Fields }[] = [];
     for (let more = true; more && rows.length < want; ) {
       tx.live();
+      const gen = tx.db.crdtCache.start();
       const page = await crdtRange(tx.db, t, begin, batch, tx.raw.readVersion);
+      cacheStates(tx.db, page.objects, gen);
       more = page.more && page.objects.length > 0;
       for (const s of page.objects) {
         begin = bytes.keyAfter(s.object);
         const m = mergeState(tx.db, t, s);
         if (m.pk === undefined) continue;
-        const row = viewOf(t, overlay(m, m.pk, tx.crdtPending(t, encode(m.pk))));
+        const row = viewOf(t, this.overlays(tx, t, m, m.pk));
         if (row && keep(row)) rows.push({ pk: m.pk, row });
         if (rows.length >= want) break;
       }
@@ -429,6 +457,58 @@ export class Query<T extends Fields = Fields> {
     const out: Page<T> = { rows: rows.map((r) => r.row as T) };
     if (this.max !== undefined && rows.length >= this.max && rows.length) {
       out.cursor = { [CURSOR]: { path: 'crdt', pk: rows.at(-1)!.pk } };
+    }
+    return out;
+  }
+
+  /** A merged state with this device's queued operations, then the transaction's own. */
+  private overlays(
+    tx: DbTransaction,
+    t: TableRecord,
+    m: ReturnType<typeof mergeState>,
+    pk: Value,
+  ): ReturnType<typeof mergeState> {
+    const pkEl = encode(pk);
+    const q = overlay(m, pk, tx.db.crdtQueue.pendingOps(t.id, pkEl));
+    return overlay(q, pk, tx.crdtPending(t, pkEl));
+  }
+
+  /**
+   * A CRDT table read from the cache (§19.4): the cached rows and the rows
+   * only the queue holds, filtered, ordered and paged here by pk (or by
+   * `orderBy`, without a cursor). It may be incomplete.
+   */
+  private cacheScan(tx: DbTransaction, t: TableRecord): Page<T> {
+    tx.live();
+    const keep = (r: Fields) => this.conds.every((c) => matches(r, c));
+    const [begin, end] = tx.keys.rows(t.id);
+    const seen = new Set<string>();
+    let rows: { pk: Value; row: Fields }[] = [];
+    for (const s of tx.db.crdtCache.statesIn(begin, end)) {
+      const m = mergeState(tx.db, t, s);
+      if (m.pk === undefined) continue;
+      seen.add(bytes.hex(encode(m.pk)));
+      const row = viewOf(t, this.overlays(tx, t, m, m.pk));
+      if (row && keep(row)) rows.push({ pk: m.pk, row });
+    }
+    for (const [h, q] of tx.db.crdtQueue.rowsOf(t.id)) {
+      if (seen.has(h)) continue;
+      const row = viewOf(t, this.overlays(tx, t, emptyMerged(), q.pk));
+      if (row && keep(row)) rows.push({ pk: q.pk, row });
+    }
+    if (this.order) {
+      const { field, desc } = this.order;
+      rows.sort(
+        (a, b) => compareValues(a.row[field] ?? null, b.row[field] ?? null) * (desc ? -1 : 1),
+      );
+      return { rows: rows.slice(0, this.max).map((r) => r.row as T) };
+    }
+    rows.sort((a, b) => compareValues(a.pk, b.pk));
+    const from = this.position('cache');
+    if (from) rows = rows.filter((r) => compareValues(r.pk, from.pk!) > 0);
+    const out: Page<T> = { rows: rows.slice(0, this.max).map((r) => r.row as T) };
+    if (this.max !== undefined && rows.length > this.max && this.max > 0) {
+      out.cursor = { [CURSOR]: { path: 'cache', pk: rows[this.max - 1]!.pk } };
     }
     return out;
   }
@@ -453,6 +533,7 @@ export class Query<T extends Fields = Fields> {
     eq: Map<string, Value>,
     path: string,
     keep: (r: Fields) => boolean,
+    mode?: CrdtRead,
   ): Promise<{ pk: Value; row: Fields }[]> {
     const tt = tx.table(this.table);
     let begin: Uint8Array;
@@ -484,7 +565,7 @@ export class Query<T extends Fields = Fields> {
       if (last) begin = bytes.keyAfter(last.key);
       if (fast) {
         const pks = page.map((e) => entryPk(e.value));
-        const got = await fetchRows(tx, t, pks);
+        const got = await fetchRows(tx, t, pks, mode);
         for (let i = 0; i < pks.length && rows.length < want; i++) {
           const r = got[i];
           if (r && keep(r)) rows.push({ pk: pks[i]!, row: r });
@@ -510,6 +591,7 @@ export class Query<T extends Fields = Fields> {
     path: string,
     keep: (r: Fields) => boolean,
     ordered: boolean,
+    mode?: CrdtRead,
   ): Promise<{ pk: Value; row: Fields; key: Uint8Array }[]> {
     let { lo, hi } = plan;
     const from = this.position(path);
@@ -544,6 +626,7 @@ export class Query<T extends Fields = Fields> {
         tx,
         t,
         batch.map((b) => b.pk),
+        mode,
       );
       for (let i = 0; i < batch.length && rows.length < want; i++) {
         const r = got[i];

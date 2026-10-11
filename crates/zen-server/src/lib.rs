@@ -281,6 +281,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/fs/chunks/get", post(tree::chunks_get))
         .route("/v1/crdt/get", post(crdt::get))
         .route("/v1/crdt/range", post(crdt::range))
+        .route("/v1/crdt/versions", post(crdt::versions))
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/admin/origins/get", post(origin::admin_get))
         .route("/v1/admin/origins/set", post(origin::admin_set))

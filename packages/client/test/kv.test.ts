@@ -434,4 +434,16 @@ describe('retry filter, getEntries, commitTransaction', () => {
     expect(hooked).toBe(1);
     expect(s(await fs.kv.get(['ct']))).toBe('x');
   });
+
+  it('a transaction sent twice keeps its commit_id and applies once', async () => {
+    const t = fs.topic('ct-once');
+    const tx = new Transaction(fs, 'short');
+    t.appendIn(tx, u('once'));
+    expect(tx.build().commit_id).toEqual(tx.commitId);
+    await commitTransaction(tx);
+    await commitTransaction(tx, { attempts: 1 });
+    const evs = [];
+    for await (const e of t.read()) evs.push(e);
+    expect(evs.length).toBe(1);
+  });
 });

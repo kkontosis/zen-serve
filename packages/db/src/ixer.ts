@@ -48,7 +48,7 @@ export async function reindex(
   const row =
     opts.row !== undefined
       ? (opts.row ?? undefined)
-      : (await tx.table(t.name).crdtRows(t, [pkEl]))[0];
+      : (await tx.table(t.name).crdtRows(t, [pkEl], 'server'))[0];
 
   // `only` changes one entry; otherwise the maintained indexes are all
   // there is, so values of dropped indexes go.

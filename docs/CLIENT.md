@@ -93,6 +93,7 @@ await fs.transaction(async (tx) => {
 * `tx.getEntries(keys)` is `getAll` with each entry's key and version (undefined for the transaction's own writes), for caching. `tx.owns(key)` tells whether the transaction wrote, deleted or cleared a key.
 * `{retry: (e) => boolean}` chooses which errors re-run the function (default: `conflict` and `too_old`). zen-db's `auto` mode retries only `conflict` in its short phase.
 * `commitTransaction(tx)` commits a `new Transaction(fs, mode)` the caller built itself, and runs its `onCommit` hooks. It returns undefined when there is nothing to send. On a failure the caller decides; there is no retry. zen-db's `db.begin()` uses it.
+* A transaction's `commitId` is fixed when it is made: calling `commitTransaction(tx)` again after a lost response sends the same `commit_id`, so the commit applies at most once (api.md §6). `{attempts}` bounds its own replays on a network error (default 4). zen-db's CRDT queue relies on it.
 
 ## 6. Topics, consumers and leaders
 

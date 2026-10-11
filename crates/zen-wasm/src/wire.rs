@@ -102,6 +102,8 @@ wire_fns! {
     zen_proto::TreeChain => "TreeChain", encode_tree_chain, decode_tree_chain, "encodeTreeChain", "decodeTreeChain";
     zen_proto::CrdtGet => "CrdtGet", encode_crdt_get, decode_crdt_get, "encodeCrdtGet", "decodeCrdtGet";
     zen_proto::CrdtRange => "CrdtRange", encode_crdt_range, decode_crdt_range, "encodeCrdtRange", "decodeCrdtRange";
+    zen_proto::CrdtVersionsReq => "CrdtVersionsReq", encode_crdt_versions_req, decode_crdt_versions_req, "encodeCrdtVersionsReq", "decodeCrdtVersionsReq";
+    zen_proto::CrdtVersions => "CrdtVersions", encode_crdt_versions, decode_crdt_versions, "encodeCrdtVersions", "decodeCrdtVersions";
     zen_proto::ObjState => "ObjState", encode_obj_state, decode_obj_state, "encodeObjState", "decodeObjState";
     zen_proto::ObjStates => "ObjStates", encode_obj_states, decode_obj_states, "encodeObjStates", "decodeObjStates";
     zen_proto::FileGet => "FileGet", encode_file_get, decode_file_get, "encodeFileGet", "decodeFileGet";

@@ -482,6 +482,66 @@ async fn range_pages_over_objects() {
     assert_eq!(seen, (0..7).map(obj).collect::<Vec<_>>());
 }
 
+async fn versions(h: &Harness, d: &Dev, objects: &[Vec<u8>]) -> Result<CrdtVersions, ApiErr> {
+    h.call(
+        "/v1/crdt/versions",
+        Some(&d.tok),
+        &CrdtVersionsReq {
+            fs: 1,
+            objects: objects.iter().map(|o| ByteBuf::from(o.clone())).collect(),
+            read_version: None,
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn versions_track_object_changes() {
+    let (h, d) = devices(1, |_| {}).await;
+    let a = &d[0];
+    let t = zfs::hlc(now_ms(), 0);
+    let (o1, o2, none) = (obj(1), obj(2), obj(3));
+    send(
+        &h,
+        a,
+        vec![row(&o1, t, true, b"1"), row(&o2, t, true, b"2")],
+    )
+    .await
+    .unwrap();
+    let objs = vec![o1.clone(), none.clone(), o2.clone()];
+    let v = versions(&h, a, &objs).await.unwrap();
+    let states = get(&h, a, &objs).await;
+    assert_eq!(v.versions.len(), 3);
+    assert_eq!(v.versions[0].as_ref(), states[0].version.as_slice());
+    assert!(v.versions[1].is_empty());
+    assert_eq!(v.versions[2].as_ref(), states[1].version.as_slice());
+    assert_eq!(v.versions[0].len(), 10);
+    // A write changes its object's version only.
+    send(&h, a, vec![lww(&o1, &f(1), t + 1, Some(b"x"))])
+        .await
+        .unwrap();
+    let w = versions(&h, a, &objs).await.unwrap();
+    assert_ne!(w.versions[0], v.versions[0]);
+    assert_eq!(w.versions[2], v.versions[2]);
+    assert!(w.read_version >= v.read_version);
+    // Limits and rights.
+    let many: Vec<Vec<u8>> = (0..1001).map(|_| o1.clone()).collect();
+    assert_eq!(versions(&h, a, &many).await.unwrap_err().0, 413);
+    assert_eq!(versions(&h, a, &[vec![1; 15]]).await.unwrap_err().0, 400);
+    let anon: Result<CrdtVersions, ApiErr> = h
+        .call(
+            "/v1/crdt/versions",
+            None,
+            &CrdtVersionsReq {
+                fs: 1,
+                objects: vec![ByteBuf::from(o1.clone())],
+                read_version: None,
+            },
+        )
+        .await;
+    assert_eq!(anon.unwrap_err().0, 401);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sweeper_purges_dead_and_registerless_objects() {
     let (h, d) = devices(1, |c| {

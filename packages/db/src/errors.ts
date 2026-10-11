@@ -31,7 +31,9 @@ export type DbErrorCode =
   /** A request with no reply in time (§12.3). */
   | 'timeout'
   /** A feature the server doesn't offer, e.g. CRDT tables (§19). */
-  | 'unsupported';
+  | 'unsupported'
+  /** A CRDT read that needs the server, which can't be reached (§19.4). */
+  | 'offline';
 
 /** A zen-db error. */
 export class DbError extends Error {
