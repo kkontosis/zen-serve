@@ -220,6 +220,12 @@ export class Replica {
   private serialChain: Promise<unknown> = Promise.resolve();
   private recvChain: Promise<void> = Promise.resolve();
   private sender!: Sender;
+  /**
+   * The batch being sent: its written nodes, and the cursor when it started.
+   * Until its reply gives the dots, a server version of those nodes newer
+   * than the cursor may be the batch's own, so it isn't shown.
+   */
+  private inFlight: { id: string; nodes: Set<string>; floor: Uint8Array } | undefined;
   private infoP: Promise<Info> | undefined;
 
   private constructor(
@@ -280,6 +286,7 @@ export class Replica {
       done: (es, dots) => r.done(es, dots),
       failed: (es, e) => r.failed(es, e),
       reachable: (ok, e) => r.reachable(ok, e),
+      sending: (es, id) => r.sending(es, id),
     });
     r.owner = new Owner(locks, lockName, opts.owner !== false);
     r.owner.onOwner(() => {
@@ -494,8 +501,15 @@ export class Replica {
       return;
     }
     if (m.t === 'nodes' && m.ids) await this.reload(m.ids);
-    else if (m.t === 'queued') await this.loadQueue();
+    else if (m.t === 'sending' && m.keys && m.ids) {
+      this.inFlight = {
+        id: m.keys[0]!,
+        nodes: new Set(m.ids),
+        floor: m.floor ? bytes.fromHex(m.floor) : new Uint8Array(12),
+      };
+    } else if (m.t === 'queued') await this.loadQueue();
     else if (m.t === 'sent' && m.keys && m.dots) {
+      this.inFlight = undefined;
       // Committed: shown as before until the owner has caught up ('settled').
       for (const [k, d] of m.dots) {
         this.learned.set(k, bytes.fromHex(d));
@@ -512,6 +526,7 @@ export class Replica {
       for (const k of m.keys) this.sentDots.delete(k);
       await this.loadQueue();
     } else if (m.t === 'failed' && m.keys) {
+      this.inFlight = undefined;
       const err = new ZenError(0, m.code ?? 'failed', m.message ?? 'refused');
       for (const k of m.keys) this.settle(k, err);
       await this.loadQueue();
@@ -617,16 +632,38 @@ export class Replica {
    */
   async versionsOf(n: TreeNode): Promise<ShownVersion[]> {
     const k = bytes.hex(n.id);
-    const f = this.ov.files.get(k);
     const server = this.nodes.get(k);
-    if (!f) return server ? this.serverVersions(server) : [];
     let vs: FileVersion[] = [];
     try {
       if (server) vs = await this.serverVersions(server);
     } catch (e) {
-      if (!isCode(e, 'offline')) throw e;
+      if (!isCode(e, 'offline') || !this.ov.files.has(k)) throw e;
     }
-    return [...vs.filter((v) => !f.replaced.has(bytes.hex(v.dot))), f.local];
+    // The queue as it is now: it may have moved on during the read.
+    const f = this.ov.files.get(k);
+    if (!f) return vs;
+    const fl = this.inFlight?.nodes.has(k) ? this.inFlight.floor : undefined;
+    return [
+      ...vs.filter(
+        (v) =>
+          !f.replaced.has(bytes.hex(v.dot)) &&
+          !(fl && bytes.compare(v.dot.subarray(0, 10), fl.subarray(0, 10)) > 0),
+      ),
+      f.local,
+    ];
+  }
+
+  /** The sender's report: a batch is going out (the same commit again keeps its floor). */
+  private sending(entries: QueueEntry[], id: string): void {
+    if (this.inFlight?.id === id) return;
+    const nodes = new Set<string>();
+    for (const e of entries) {
+      for (const o of e.ops) if (o.op === 'write') nodes.add(bytes.hex(o.node));
+    }
+    // No cursor yet: no server version is known, so every one is newer.
+    const floor = this.cursor ?? new Uint8Array(12);
+    this.inFlight = { id, nodes, floor };
+    this.chan?.postMessage({ t: 'sending', keys: [id], ids: [...nodes], floor: bytes.hex(floor) });
   }
 
   /** A node's server versions, kept per change offset; fetched (and kept) on a miss. */
@@ -1051,6 +1088,8 @@ export class Replica {
     await this.rec.flush();
     this.queue = this.queue.filter((e) => !keys.has(e.key));
     this.settling.push(...entries);
+    // The overlay now knows the dots: the batch's versions are hidden by them.
+    this.inFlight = undefined;
     this.rebuild();
     this.chan?.postMessage({
       t: 'sent',
@@ -1083,6 +1122,7 @@ export class Replica {
   /** The sender's report: `entries` were refused; they are dropped. */
   private async failed(entries: QueueEntry[], e: unknown): Promise<void> {
     const keys = entries.map((x) => x.key);
+    this.inFlight = undefined;
     for (const k of keys) this.rec.delete('queue', bytes.fromHex(k));
     this.rec.delete('queue', INFLIGHT);
     await this.rec.flush();
@@ -1622,10 +1662,11 @@ export class Replica {
 
 /** Messages on the tab channel. */
 interface Msg {
-  t: 'nodes' | 'pins' | 'queued' | 'sent' | 'settled' | 'failed' | 'offline';
+  t: 'nodes' | 'pins' | 'queued' | 'sending' | 'sent' | 'settled' | 'failed' | 'offline';
   ids?: string[];
   keys?: string[];
   dots?: [string, string][];
   code?: string;
   message?: string;
+  floor?: string;
 }

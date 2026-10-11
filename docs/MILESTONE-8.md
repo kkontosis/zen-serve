@@ -7,7 +7,7 @@ A placeholder added during milestone 5 (after step 7e). Milestones 8–11 come a
   * **7f/7g (the layout, file keys, streams).** Step 8's replica stores and replays the format, so changing it after step 8 would mean designing the write path twice.
   * **Resumable state in step 8.**
 * **Plan for the rest:**
-  * Upload sessions that pin chunks and pages past `chunk_grace_secs`, so a resume works after more than 24 h.
+  * Upload sessions that pin chunks and pages past `chunk_grace_secs`, so a resume works after more than 24 h. Writes queued by the replica (step 8b) already survive this: their sealed chunks and pages are uploaded again from the local store right before the commit. Upload sessions remain for `Tree.upload` resumes.
   * Repacking pages after many edits in the middle of a file (a leader job).
   * Multi-GiB performance, measured in STATS.
   * The interplay with `zen-ublk` (M6).

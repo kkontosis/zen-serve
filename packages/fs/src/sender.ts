@@ -35,6 +35,8 @@ export interface SenderHost {
   failed(entries: QueueEntry[], e: unknown): Promise<void>;
   /** The server can (or can't) be reached. */
   reachable(ok: boolean, e?: unknown): void;
+  /** A batch (commit `id`) is about to be sent: it may apply before its reply comes. */
+  sending(entries: QueueEntry[], id: string): void;
 }
 
 const isNet = (e: unknown) =>
@@ -267,6 +269,7 @@ export class Sender {
       await rec.flush();
     }
     const id = bytes.hex(inf.commit.commit_id);
+    this.host.sending(entries, id);
     let r: Awaited<ReturnType<typeof sendCommit>>;
     try {
       if (!this.uploaded.has(id)) {
