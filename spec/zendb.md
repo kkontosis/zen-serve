@@ -13,7 +13,7 @@ It sends them as **one** `/v1/commit`, so everything applies or nothing does (ap
 
 The server is unchanged. Everything here is built from api.md §5–9 and §12. What the server lacks is listed in §18 and in TECH_DEBT.md.
 
-Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges (api.md §13).
+Part A (§2–9) is the database. Part B (§10–13) is the broker. §14–15 cover integrity and leakage for both. §16 sketches the class API; it is **informative**, and every other section is normative. §17 plans the test vectors, which milestone 5 generates with the code. Part D (§19) adds CRDT tables, whose rows the server merges (api.md §13). §20 adds Loro documents, which merge on the client over a topic.
 
 ## 1. Conventions
 
@@ -644,8 +644,9 @@ record = u8 version (1) ‖ u8 layers (bit 0 device, bit 1 fs) ‖ body
   | `crdt/<ns>` | the object | `{1?: ObjState (wire encoding), 2: checked (ms), 3: stale}` (§19.4) |
   | `nodes/<ns>` | the node id | the node's bytes (§5.4.3) |
   | `sealed/<ns>` | the index id | `{1: digest, 2: Blob}` (§5.7) |
+  | `loro/<ns>` | `d ‖ name`, `o ‖ lp(name) ‖ u64 BE ms ‖ 4 random bytes` | a Loro document's kept state `{1?: offset, 2: Loro snapshot}`, and its outbox: one local update not yet emitted per record (§20) |
 
-  Counter totals never are (§19.7). The header of each fs unlocked with a local store is kept in store `fs/<fs id>` (docs/CLIENT.md): it lets the fs unlock offline, and is no less trusted than one fetched online (signed headers come in milestone 6). Its store can't have the fs layer, which needs the keys it unlocks.
+  `loro/<ns>` is kept with `persist: false` too: its outbox holds unsent edits. Counter totals never are stored (§19.7). The header of each fs unlocked with a local store is kept in store `fs/<fs id>` (docs/CLIENT.md): it lets the fs unlock offline, and is no less trusted than one fetched online (signed headers come in milestone 6). Its store can't have the fs layer, which needs the keys it unlocks.
 * **The fs replica** (fs.md §11). A replica of tree `t` of fs `f` keeps its records in stores `zfs/<f>/<hex t>/<kind>`, per installation like the vault (`Db.wipe` leaves them):
 
   | Kind | Key | Record |
@@ -788,6 +789,7 @@ Every database has these tables, created with the DbRecord. They don't count as 
 | `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` (the `$sched` id of the pending timeout), `corr?: bytes` (the corr of the message in flight) | – |
 | `$inbox` | `[scope, id]` | `at: int`, `reply?: {type: text, body: any}` (the reply a dedup responder sends again) | – |
 | `$ixrows` | `[table_id, pk]` | `values: {text: [any]}` (the values last indexed, by index id in lowercase hex; an index the row is left out of has none) | – (§19.6) |
+| `$loro` | `[name]` | `offset: bytes(12)` (the last event the snapshot covers), `snapshot: bytes` (a Loro snapshot) | – (§20) |
 
 ## 12. Patterns
 
@@ -1329,4 +1331,57 @@ Added to §17:
 * a merged `ObjState` from a fixed set of operations, with its client-side view
 
 Property test: operations from three devices, applied in random orders, give the same merged state.
+
+---
+
+# Part E: Loro documents
+
+## 20. Loro documents
+
+A Loro document (a rich text, list, map or tree, DESIGN-3 §0) merges on the client. The server stores only sealed Loro updates and snapshots: it sees neither the content nor the structure of edits (DESIGN-4 §2.7).
+
+### 20.1 Names and messages
+
+* **Name.** A document has a text `name`, unique within its database.
+* **Topic.** Its updates are messages (§10) on the topic `("zen", "loro", ns, name)`, one topic per document.
+* **Message.** Type `zen.loro.update`, body the bytes of one Loro update (`export({mode: "update"})`, or several local updates merged). A body over `max_envelope_bytes` goes to parts (§10.3), with no `ttl`.
+* **Snapshot.** The `$loro` row of the document (§11.5) holds a Loro snapshot and the offset of the last event it covers. It is absent until the first compaction.
+
+### 20.2 Loading
+
+A client builds the document in this order:
+1. **Kept state** (`loro/<ns>`, key `d ‖ name`, §9.3), if any: the snapshot is imported, and the offset is where the log is read from. A document opens offline from it.
+2. **The `$loro` row:** if its offset is newer than the kept one (or nothing is kept), its snapshot is imported and its offset taken.
+3. **The tail:** every event after the offset, read in order (`/v1/log/read`), each imported; the offset moves to each event read.
+4. **Live:** an `on` subscription after the offset (§11.2). Events at or before the offset are skipped, so a reconnection never imports twice (doing so would be harmless anyway).
+5. **The outbox** (below) is imported too: its updates may be newer than the kept snapshot.
+
+Steps 2–4 need the server. When it can't be reached, the document is ready from steps 1 and 5, and the client tries again with backoff.
+
+Importing in any order gives the same document: Loro holds an update whose dependencies are missing until they arrive, and ignores one it already has.
+
+### 20.3 Local edits and the outbox
+
+* **The outbox.** Each local update (`subscribeLocalUpdates`) is stored as an outbox record (`o ‖ lp(name) ‖ u64 BE ms ‖ 4 random bytes`) before it is sent.
+* **Sending.** The updates are gathered for a short time (default 50 ms), merged into one update when they merge without missing dependencies (otherwise sent one by one), and emitted in one transaction. Their records are then deleted.
+* **Resends are safe.** A crash or a lost reply between the commit and the delete sends them again at the next try or open; receivers ignore what they already have.
+* **Tabs.** Every tab (and installation) sends its own outbox. A tab loading a document also takes over the outbox records it finds, so an edit a closed tab left unsent goes out; two tabs sending one record is harmless.
+* **No local store.** Without one, the outbox is in memory: unsent edits are lost when the document is closed (`flush()` first).
+
+### 20.4 Kept state
+
+The snapshot and the offset of the last imported event are written to `d ‖ name` behind the edits and imports (default 500 ms) and at close. A crash loses at most that interval of kept state; the tail read brings it back. Two tabs may write it in turn: either record is a valid starting point.
+
+### 20.5 Compaction
+
+* **Who.** The owner (§9.2) of each database where the document is open. Without Web Locks every instance owns, which is still safe.
+* **When.** After `N` events (default 100) or `M` bytes of update bodies (default 1 MiB) imported since the `$loro` row's offset, and on an explicit `compact()`.
+* **How.** One transaction reads the `$loro` row and, only if its offset is older than the client's, writes `{name, offset, snapshot}` at the client's offset. The offset only moves forward, so two compacting clients need no leader: one conflicts, re-runs and finds nothing to do.
+* **Why it is complete.** Every event up to the offset was imported, in order, before the snapshot was exported. A snapshot holding more (local edits not yet emitted) is harmless: they arrive again as events.
+* **Too large.** A snapshot that makes the commit too large (`too_large`, about `max_commit_bytes`) keeps the old row; the client warns once and stops compacting that document (TD-LORO-LARGE-SNAPSHOT).
+* **The log.** Events covered by a snapshot stay in the log until log retention exists (TD-LOG-RETENTION).
+
+### 20.6 Leakage
+
+Beyond §15, the server sees each document's topic, when and how often it is edited, from which devices, and the sizes of its updates and snapshots (the `$loro` row is not padded, §4.3). It sees neither the name, nor the content, nor what an edit did.
 
