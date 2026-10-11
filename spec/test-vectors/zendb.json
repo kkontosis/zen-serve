@@ -704,6 +704,25 @@
     "prefix": "9bda154a331198f3388800068ca8c90d041a76a1543468f6d9df50e13cfd977d460f39d0961edb4c517b6ecb346a8088"
   },
   "description": "zen-db vectors (spec/zendb.md §17, §19.9) for the fixture fs (keys.json) and the database ns \"app\". Hex is lowercase.",
+  "local": {
+    "description": "Local records (kind 8, zendb.md §9.3): the fs layer of the sealed local store, bound to the fs, the store name and the record key.",
+    "records": [
+      {
+        "key": "6531",
+        "plaintext": "a10165656e747279",
+        "rng_seed": "local-1",
+        "sealed": "0101080000000000a893ffc5e3077bf4aaf211d14b14562b6e5284db01aa02bd20696ea79a699f85489f51f6db9b608edbbf0db53ecf067c",
+        "store": "queue/app"
+      },
+      {
+        "key": "abababababababababababababababababababab",
+        "plaintext": "",
+        "rng_seed": "local-2",
+        "sealed": "01010800000000008d4972b6f764c6e88f7335399d803c8b33c6b565496de57b31b8ffacfdcf1a81e3992822e0f14ed9",
+        "store": "crdt/app"
+      }
+    ]
+  },
   "prolly": {
     "after": {
       "nodes": [

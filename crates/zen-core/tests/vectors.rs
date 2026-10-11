@@ -288,6 +288,21 @@ fn zendb_vectors_read_back() {
         // Bound to the object: another object fails.
         assert!(db::open_crdt_value(&fs, &object[16..], &field, &elem, &hx(&v["sealed"])).is_err());
     }
+    for v in z["local"]["records"].as_array().unwrap() {
+        let store = v["store"].as_str().unwrap();
+        let key = hx(&v["key"]);
+        let sealed = hx(&v["sealed"]);
+        assert_eq!(
+            db::open_local(&fs, store, &key, &sealed).unwrap(),
+            hx(&v["plaintext"])
+        );
+        // Bound to the store and the key.
+        assert!(db::open_local(&fs, "other", &key, &sealed).is_err());
+        assert!(db::open_local(&fs, store, b"other", &sealed).is_err());
+        // Not a CRDT value.
+        let zero = [0u8; 16];
+        assert!(db::open_crdt_value(&fs, &key, &zero, &zero, &sealed).is_err());
+    }
     // The tree after edits equals a fresh build of the edited entry set.
     let p = &z["prolly"];
     let ix = dbk.index(&hx(&p["index_id"]).try_into().unwrap());

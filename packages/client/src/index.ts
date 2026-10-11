@@ -25,6 +25,13 @@ export {
   type TxnOptions,
   transaction,
 } from './kv.js';
+export { indexedDbLocalStore } from './local/idb.js';
+export {
+  type SealedStore,
+  type SealedStoreOptions,
+  sealedStore,
+} from './local/sealed.js';
+export { type LocalStore, memoryLocalStore } from './local/store.js';
 export {
   type AppendOptions,
   Consumer,

@@ -8,6 +8,7 @@ import { decode, encode, isIntNumber, type Value } from './cbor.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
 import type { Fields } from './row.js';
+import type { LockManagerLike } from './tabs.js';
 import type { DbTransaction } from './txn.js';
 
 /** A CRDT field's type (§19.1). Fields not declared are `lww`. */
@@ -224,6 +225,8 @@ export interface RowOps {
 interface ActorState {
   totals: Map<string, bigint>;
   tail: Promise<void>;
+  /** Web Locks, when the installation's tabs share it (§19.7). */
+  locks?: LockManagerLike;
 }
 
 const actors = new WeakMap<TreeClock, ActorState>();
@@ -237,8 +240,33 @@ function actorState(clock: TreeClock): ActorState {
   return s;
 }
 
-/** Take the actor's lock; resolves with the function that releases it. */
-async function lock(s: ActorState): Promise<() => void> {
+/** Hold Web Lock `name`; resolves with the function that releases it. */
+export function webLock(locks: LockManagerLike, name: string): Promise<() => void> {
+  return new Promise((got, fail) => {
+    let granted = false;
+    locks
+      .request(name, { mode: 'exclusive' }, () => {
+        granted = true;
+        return new Promise<void>((release) => got(release));
+      })
+      .catch((e) => {
+        if (!granted) fail(e);
+      });
+  });
+}
+
+/**
+ * Take the installation's counter lock (§19.7); resolves with the function
+ * that releases it. Within a tab, a promise chain. With Web Locks, also
+ * `zen/actor/<actor hex>`, which the installation's other tabs take too:
+ * they share its actor, so their counter commits must not interleave. A
+ * tab can't tell whether another one held the lock since it last did, so
+ * it forgets its totals on taking it, and reads them from the server.
+ */
+export async function actorLock(db: Db): Promise<() => void> {
+  const clock = db.fs.session.clock;
+  const s = actorState(clock);
+  s.locks ??= db.locks;
   let release!: () => void;
   const mine = new Promise<void>((r) => {
     release = r;
@@ -246,13 +274,29 @@ async function lock(s: ActorState): Promise<() => void> {
   const prev = s.tail;
   s.tail = prev.then(() => mine);
   await prev;
+  let web: (() => void) | undefined;
+  if (s.locks) {
+    try {
+      web = await webLock(s.locks, `zen/actor/${bytes.hex(clock.actor)}`);
+    } catch (e) {
+      release();
+      throw e;
+    }
+    s.totals.clear();
+  }
   let done = false;
   return () => {
-    if (!done) {
-      done = true;
-      release();
-    }
+    if (done) return;
+    done = true;
+    web?.();
+    release();
   };
+}
+
+/** @internal Forget totals (they are read again from the server when needed). */
+export function forgetTotals(db: Db, keys: string[]): void {
+  const s = actorState(db.fs.session.clock);
+  for (const k of keys) s.totals.delete(k);
 }
 
 /**
@@ -389,7 +433,7 @@ export class CrdtWrites {
     const touched: string[] = [];
     const next = new Map<string, bigint>();
     if (ctrs.length) {
-      release = await lock(state);
+      release = await actorLock(db);
       try {
         await this.loadTotals(state, ctrs, clock.actor);
       } catch (e) {

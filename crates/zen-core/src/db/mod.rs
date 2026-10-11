@@ -234,3 +234,72 @@ pub fn open_crdt_value(
     }
     Ok(pt)
 }
+
+fn local_aad(fs_id: u32, store: &str, key: &[u8]) -> Aad {
+    let mut ctx = fs_id.to_be_bytes().to_vec();
+    lp(&mut ctx, store.as_bytes());
+    lp(&mut ctx, key);
+    Aad {
+        label: labels::AAD_LOCAL,
+        ctx,
+    }
+}
+
+/// Seal a local record (kind 8, §9.3): a record of store `store` at `key`
+/// on this device.
+pub fn seal_local(
+    fs: &FsKeys,
+    store: &str,
+    key: &[u8],
+    plaintext: &[u8],
+    rng: &mut dyn Rng,
+) -> Result<Vec<u8>> {
+    seal::seal(
+        Kind::Local,
+        fs.epoch,
+        &fs.kv_data_key(),
+        &local_aad(fs.fs_id, store, key),
+        plaintext,
+        rng,
+    )
+}
+
+/// Open a local record. `fs` must be at the record's epoch ([`seal::peek`]).
+pub fn open_local(fs: &FsKeys, store: &str, key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
+    let (epoch, pt) = seal::open(
+        Kind::Local,
+        &fs.kv_data_key(),
+        &local_aad(fs.fs_id, store, key),
+        sealed,
+    )?;
+    if epoch != fs.epoch {
+        return Err(Error::Decrypt);
+    }
+    Ok(pt)
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+    use crate::rng::DetRng;
+
+    #[test]
+    fn local_records_round_trip_and_stay_bound() {
+        let a = FsKeys::from_parts(7, 0, [1; 32], [2; 32]);
+        let b = FsKeys::from_parts(8, 0, [1; 32], [2; 32]);
+        let s = seal_local(&a, "queue/app", b"k1", b"hello", &mut DetRng::new("t")).unwrap();
+        assert_eq!(s[2], Kind::Local as u8);
+        assert_eq!(open_local(&a, "queue/app", b"k1", &s).unwrap(), b"hello");
+        // Moved to another fs, store or key.
+        assert!(open_local(&b, "queue/app", b"k1", &s).is_err());
+        assert!(open_local(&a, "queue/other", b"k1", &s).is_err());
+        assert!(open_local(&a, "queue/app", b"k2", &s).is_err());
+        // Tampered.
+        let mut t = s.clone();
+        *t.last_mut().unwrap() ^= 1;
+        assert!(open_local(&a, "queue/app", b"k1", &t).is_err());
+        // Another epoch's key.
+        let e1 = FsKeys::from_parts(7, 1, [1; 32], [2; 32]);
+        assert!(open_local(&e1, "queue/app", b"k1", &s).is_err());
+    }
+}

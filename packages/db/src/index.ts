@@ -33,6 +33,7 @@ export { CRDT_FEATURE, type CrdtFieldType } from './crdt.js';
 export type { CrdtRead } from './crdtcache.js';
 export {
   CrdtQueue,
+  type Inflight,
   memoryQueueStore,
   type QueueEntry,
   type QueueRow,
@@ -51,6 +52,7 @@ export {
 } from './db.js';
 export { DbError, type DbErrorCode } from './errors.js';
 export { TxFiles } from './files.js';
+export { localQueueStore } from './localq.js';
 export {
   type CreateIndexOptions,
   type CreateTableOptions,

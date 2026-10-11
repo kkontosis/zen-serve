@@ -371,8 +371,25 @@ db.crdt.onSync((e) => render(e.online, e.sent, e.failed));
 * **Retries.** A commit that may not have arrived (a network error) is sent again as is, with the same `commit_id`, so it applies once. A `conflict` rebuilds it; `stale_op` re-stamps it (above). Any other error drops the entries it held: their `wait`s reject and `onSync` reports `failed`.
 * **A dropped table**'s queued writes are dropped with a warning.
 * **Removes** take the copies seen when called; the queue adds the copies its own earlier adds got, so removing an element added offline works.
-* **The store** is in memory (`DbOptions.crdtStore` takes another `QueueStore`): the queue lasts as long as the process. A persistent, encrypted store comes with the local replica.
+* **The store** is in memory by default: the queue lasts as long as the process. `DbOptions.local` puts it on a sealed local store, so it survives restarts (below); `DbOptions.crdtStore` takes any other `QueueStore`.
 * **`tx.after`** of a queued transaction runs once queued.
+
+### A queue that survives restarts
+
+```ts
+import { indexedDbLocalStore, sealedStore } from '@zen/client';
+const local = sealedStore(indexedDbLocalStore('my-app'));      // docs/CLIENT.md §10
+const db = await Db.open(fs, 'app', { schema, migrations, local });
+// …at sign-out:
+db.close();
+await Db.wipe(local, 'app');                                  // unsent writes too
+```
+
+* **What is kept:** every queued entry, from before its write resolves until it is committed or fails, and the **commit in flight**. A restart sends that commit again as it was, with the same `commit_id`, before anything else: if the first send applied and only its reply was lost, it still applies once.
+* **Counter totals are never kept.** The server holds each installation's total; the class reads it when a send needs it. A total restored from a backup could otherwise roll a counter back.
+* **Tabs.** Tabs that share an IndexedDB store share the queue: each stores its writes and shows them in its reads, and only the owner tab sends, telling the others over a `BroadcastChannel` when their writes are committed. When the owner closes, the next tab sends what is left. Without Web Locks every instance sends, so don't share a store then.
+* **Counters across tabs.** A browser's tabs are one installation: they share its counter actor. With Web Locks, its counter commits take the Web Lock `zen/actor/<actor>` from stamping to the outcome, so two tabs incrementing one counter at once both count; each such commit reads the installation's totals from the server first.
+* **Layers.** The store's layers are the app's choice (device by default, fs too, or plaintext): docs/CLIENT.md §10. A record that doesn't open (another fs, another device key, tampered with) is dropped with a warning, which loses its write.
 
 ### Read modes
 

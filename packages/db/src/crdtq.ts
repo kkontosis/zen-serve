@@ -2,13 +2,15 @@
 // transactions and single calls are queued as entries, visible to reads at
 // once, and sent in batches: as few commits as the server's limits allow,
 // each sent again with the same `commit_id` until its outcome is known.
-import { bytes, commitTransaction, ZenError } from '@zen/client';
-import type { CommitResult } from '@zen/wasm';
+// With a store that tabs share, only the owner sends (§9.2, §19.7).
+import { bytes, commitTransaction, sendCommit, ZenError } from '@zen/client';
+import type { Commit, CommitResult, CrdtOp } from '@zen/wasm';
 import { encode, type Value } from './cbor.js';
-import type { Pending } from './crdt.js';
+import { actorLock, forgetTotals, type Pending } from './crdt.js';
 import { isNetwork } from './crdtcache.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
+import type { BroadcastChannelLike } from './proxy.js';
 import type { ManualTransaction } from './txn.js';
 
 /** The queued operations on one row. `row` and `lww` carry the `hlc` of the edit. */
@@ -34,18 +36,34 @@ export interface QueueEntry {
 }
 
 /**
+ * The commit in flight (§19.7): built once, sent until its outcome is
+ * known. Kept so a restart sends it again with the same `commit_id`.
+ */
+export interface Inflight {
+  commit: Commit;
+  /** The entries it carries. */
+  ids: string[];
+}
+
+/**
  * Where queued entries are kept. An entry is in the store before its
- * write resolves, and leaves it once committed or failed for good.
+ * write resolves, and leaves it once committed or failed for good. A
+ * store that keeps the commit in flight too (`putInflight`) lets a restart
+ * send it again as it was.
  */
 export interface QueueStore {
   load(): Promise<QueueEntry[]>;
   put(e: QueueEntry): Promise<void>;
   remove(ids: string[]): Promise<void>;
+  putInflight?(r: Inflight): Promise<void>;
+  loadInflight?(): Promise<Inflight | undefined>;
+  removeInflight?(): Promise<void>;
 }
 
 /** A store in memory: the queue lasts as long as the process. */
 export function memoryQueueStore(): QueueStore {
   const m = new Map<string, QueueEntry>();
+  let inflight: Inflight | undefined;
   return {
     load: async () => [...m.values()],
     put: async (e) => {
@@ -54,8 +72,26 @@ export function memoryQueueStore(): QueueStore {
     remove: async (ids) => {
       for (const id of ids) m.delete(id);
     },
+    putInflight: async (r) => {
+      inflight = r;
+    },
+    loadInflight: async () => inflight,
+    removeInflight: async () => {
+      inflight = undefined;
+    },
   };
 }
+
+/** A message between the tabs that share a queue's store. */
+type QueueMsg =
+  | { t: 'queued' }
+  | { t: 'flush' }
+  | {
+      t: 'sync';
+      online: boolean;
+      sent?: string[];
+      failed?: { ids: string[]; code: string; message: string };
+    };
 
 /** What `onSync` reports. */
 export interface SyncEvent {
@@ -142,12 +178,28 @@ export class CrdtQueue {
   private closed = false;
   private isOnline = true;
   private readonly offOnline: (() => void) | undefined;
+  /** Whether this instance sends: always, or (`shared`) while it is the owner. */
+  private sender: boolean;
+  /** The stored commit in flight, sent first (§19.7). */
+  private inflight: Inflight | undefined;
+  /** The counter lock, taken at load for the commit in flight before any other commit stamps. */
+  private held: Promise<() => void> | undefined;
+  private lastAt = 0;
 
+  /**
+   * `shared`: the store is shared with other tabs, which only queue into
+   * it; they hear about each other over `channel`, and only the owner
+   * sends (`start`).
+   */
   constructor(
     private readonly db: Db,
     private readonly store: QueueStore,
     private readonly batchMs: number,
+    shared = false,
+    private readonly channel?: BroadcastChannelLike,
   ) {
+    this.sender = !shared;
+    if (channel) channel.onmessage = (ev) => void this.onMessage(ev.data as QueueMsg);
     const g = globalThis as {
       addEventListener?: (t: string, f: () => void) => void;
       removeEventListener?: (t: string, f: () => void) => void;
@@ -159,10 +211,100 @@ export class CrdtQueue {
     }
   }
 
-  /** @internal Load the stored entries (at open) and start sending them. */
+  /** @internal Load the stored entries (at open) and, as a sender, start sending them. */
   async load(): Promise<void> {
     this.entries = (await this.store.load()).sort((a, b) => a.at - b.at);
-    if (this.entries.length) this.schedule();
+    this.lastAt = this.entries.at(-1)?.at ?? 0;
+    if (!this.sender) return;
+    this.inflight = await this.store.loadInflight?.();
+    if (this.inflight) this.held = actorLock(this.db);
+    if (this.entries.length || this.inflight) this.schedule();
+  }
+
+  /**
+   * @internal Become the sender of a shared store (the owner, §9.2): the
+   * store holds what the other tabs queued, and the commit the last owner
+   * had in flight.
+   */
+  async start(): Promise<void> {
+    if (this.sender || this.closed) return;
+    this.sender = true;
+    await this.reload(true);
+    this.inflight = await this.store.loadInflight?.();
+    if (this.inflight) this.held = actorLock(this.db);
+    if (this.entries.length || this.inflight) this.wake();
+  }
+
+  /**
+   * Take in the entries other tabs stored. `all`: also forget entries no
+   * longer stored (sent by an owner before this one).
+   */
+  private async reload(all: boolean): Promise<void> {
+    const stored = await this.store.load();
+    const ids = new Set(stored.map((e) => e.id));
+    const have = new Set(this.entries.map((e) => e.id));
+    if (all) {
+      const gone = this.entries.filter((e) => !ids.has(e.id)).map((e) => e.id);
+      if (gone.length) this.settled(gone);
+    }
+    const added = stored.filter((e) => !have.has(e.id));
+    if (!added.length) return;
+    this.entries = [...this.entries, ...added].sort((a, b) => a.at - b.at);
+  }
+
+  private async onMessage(m: QueueMsg): Promise<void> {
+    if (this.closed) return;
+    try {
+      if (m.t === 'queued' || m.t === 'flush') {
+        await this.reload(false);
+        if (this.sender) this.wake();
+        return;
+      }
+      if (m.t !== 'sync' || this.sender) return;
+      // From the owner: what it sent, what failed, whether it is online.
+      if (m.sent?.length) this.settled(m.sent);
+      // The owner's error, as a `ZenError` with its code.
+      const failed = m.failed && new ZenError(0, m.failed.code, m.failed.message);
+      if (m.failed?.ids.length) this.settled(m.failed.ids, failed);
+      if (m.online !== this.isOnline) {
+        this.isOnline = m.online;
+        if (!m.online) {
+          const off = new DbError(
+            'offline',
+            'the server cannot be reached; the writes stay queued',
+          );
+          for (const f of this.flushers.splice(0)) f.fail(off);
+        }
+      }
+      this.emit({
+        online: m.online,
+        ...(m.sent?.length ? { sent: m.sent.length } : {}),
+        ...(m.failed?.ids.length
+          ? { failed: { entries: m.failed.ids.length, error: failed } }
+          : {}),
+      });
+    } catch (e) {
+      this.db.warn(`zen-db: the queue store failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** Entries another tab settled: out of this view, their writes resolved (or rejected). */
+  private settled(ids: string[], error?: unknown): void {
+    const set = new Set(ids);
+    this.entries = this.entries.filter((e) => !set.has(e.id));
+    for (const id of ids) {
+      for (const w of this.waiters.get(id) ?? []) error ? w.fail(error) : w.ok();
+      this.waiters.delete(id);
+    }
+    if (!this.entries.length) for (const f of this.flushers.splice(0)) f.ok();
+  }
+
+  private post(m: QueueMsg): void {
+    try {
+      this.channel?.postMessage(m);
+    } catch {
+      // closed
+    }
   }
 
   /** Entries not yet committed. */
@@ -183,7 +325,8 @@ export class CrdtQueue {
     if (!this.entries.length) return Promise.resolve();
     if (this.closed) return Promise.reject(new DbError('closed', 'the database is closed'));
     const p = new Promise<void>((ok, fail) => this.flushers.push({ ok, fail }));
-    this.wake();
+    if (this.sender) this.wake();
+    else this.post({ t: 'flush' });
     return p;
   }
 
@@ -201,9 +344,13 @@ export class CrdtQueue {
     if (ops + SLACK_OPS > l.max_commit_ops || size > l.max_commit_bytes) {
       throw new DbError('too_large', `a CRDT write of ${ops} operations, about ${size} bytes`);
     }
+    // Queue order survives a restart: `at` never repeats within a tab.
+    e.at = Math.max(e.at, this.lastAt + 0.001);
+    this.lastAt = e.at;
     await this.store.put(e);
     this.entries.push(e);
-    this.schedule();
+    if (this.sender) this.schedule();
+    else this.post({ t: 'queued' });
   }
 
   /** @internal Resolves when the entry is committed; rejects if it fails for good. */
@@ -250,6 +397,9 @@ export class CrdtQueue {
   /** @internal Stop sending; the entries stay in the store. */
   close(): void {
     this.closed = true;
+    void this.held?.then((r) => r());
+    this.held = undefined;
+    this.channel?.close();
     this.offOnline?.();
     if (this.timer) clearTimeout(this.timer);
     this.wakeUp?.();
@@ -272,12 +422,12 @@ export class CrdtQueue {
   }
 
   private schedule(ms = this.batchMs): void {
-    if (this.closed || this.sending || this.timer) return;
+    if (this.closed || !this.sender || this.sending || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       this.sending = this.loop().finally(() => {
         this.sending = undefined;
-        if (this.entries.length && !this.closed) this.schedule();
+        if ((this.entries.length || this.inflight) && !this.closed) this.schedule();
       });
     }, ms);
   }
@@ -296,6 +446,7 @@ export class CrdtQueue {
     if (on === this.isOnline) return;
     this.isOnline = on;
     this.emit({ online: on });
+    this.post({ t: 'sync', online: on });
   }
 
   /** Offline: tell the flushers, then wait (a backoff, or a wake). */
@@ -320,7 +471,11 @@ export class CrdtQueue {
     let limit = Number.POSITIVE_INFINITY;
     let restamps = 0;
     let down = 0;
-    while (!this.closed && this.entries.length) {
+    if (this.inflight) {
+      down = await this.resend(this.inflight);
+      if (this.closed) return;
+    }
+    while (!this.closed && this.sender && this.entries.length) {
       const batch = this.pack(limit);
       let tx: ManualTransaction;
       try {
@@ -338,6 +493,13 @@ export class CrdtQueue {
         await this.fail(batch, e);
         continue;
       }
+      // Kept before the first send: a restart sends this very commit (§19.7).
+      const commit = tx.raw.build();
+      await this.store.putInflight?.({ commit, ids: batch.map((e) => e.id) }).catch((e) => {
+        this.db.warn(
+          `zen-db: the queue store failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      });
       // The same commit until its outcome is known (api.md §6).
       let err: unknown;
       let result: CommitResult | undefined;
@@ -363,19 +525,21 @@ export class CrdtQueue {
           break;
         }
       }
+      // Closed before the outcome: the stored commit is sent at the next start.
       if (this.closed && err) return;
+      tx.abort();
+      down = 0;
+      this.setOnline(true);
       if (!err) {
-        down = 0;
-        this.setOnline(true);
-        await this.done(batch, tx, result);
+        await this.done(batch, commit.crdt_ops ?? [], result);
         limit = Number.POSITIVE_INFINITY;
         restamps = 0;
         continue;
       }
-      down = 0;
-      this.setOnline(true);
+      // The server refused it: it never applied, so it is built again.
+      await this.dropInflight();
       const code = codeOf(err);
-      if (code === 'conflict') continue;
+      if (code === 'conflict' || code === 'too_old') continue;
       if ((code === 'stale_op' || code === 'clock_skew') && restamps++ < MAX_RESTAMPS) {
         await this.restamp(batch);
         continue;
@@ -386,6 +550,76 @@ export class CrdtQueue {
       }
       await this.fail(batch, err);
     }
+  }
+
+  private async dropInflight(): Promise<void> {
+    this.inflight = undefined;
+    await this.store.removeInflight?.().catch((e) => {
+      this.db.warn(`zen-db: the queue store failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+
+  /**
+   * Send the stored commit in flight (§19.7), as it was built, until its
+   * outcome is known: committed, its entries are done; refused, it never
+   * applied, and its entries are built again. The counter lock is held
+   * meanwhile: this commit's `seq`s must reach the server before any later
+   * one of this installation, or it would be ignored. Returns the offline
+   * count, for the backoff.
+   */
+  private async resend(r: Inflight): Promise<number> {
+    const db = this.db;
+    let down = 0;
+    const held = this.held ?? actorLock(db);
+    this.held = undefined;
+    const release = await held;
+    let result: CommitResult | undefined;
+    let err: unknown;
+    try {
+      for (let attempt = 1; ; attempt++) {
+        if (this.closed) return down;
+        try {
+          result = await sendCommit(db.fs.session, r.commit, 1);
+          break;
+        } catch (e) {
+          if (isNetwork(e)) {
+            await this.offline(down++);
+            continue;
+          }
+          if (codeOf(e) === 'commit_unknown') {
+            await new Promise((ok) =>
+              setTimeout(ok, Math.min(BACKOFF_MIN * 2 ** attempt, BACKOFF_MAX)),
+            );
+            continue;
+          }
+          err = e;
+          break;
+        }
+      }
+    } finally {
+      // Whatever happened, the states and totals are read again from the server.
+      const ops = r.commit.crdt_ops ?? [];
+      db.crdtCache.markStale(ops.flatMap((o) => ('object' in o ? [o.object] : [])));
+      forgetTotals(
+        db,
+        ops.flatMap((o) =>
+          o.op === 'ctr' ? [`${bytes.hex(o.object)}/${bytes.hex(o.field)}`] : [],
+        ),
+      );
+      release();
+    }
+    this.setOnline(true);
+    const ids = new Set(r.ids);
+    const batch = this.entries.filter((e) => ids.has(e.id));
+    if (err) {
+      db.warn(
+        `zen-db: the commit in flight was refused (${codeOf(err) || String(err)}); its writes are sent again`,
+      );
+      await this.dropInflight();
+      return 0;
+    }
+    await this.done(batch, r.commit.crdt_ops ?? [], result, r.ids);
+    return 0;
   }
 
   /**
@@ -459,7 +693,9 @@ export class CrdtQueue {
         coalesce(x.ops, r.ops);
       }
     }
-    const tx = db.begin();
+    // Long mode: catalog reads become `expect`s, so the commit carries no
+    // read version and stays valid however long it waits to be sent.
+    const tx = db.begin({ mode: 'long' });
     const alive = new Map<string, { row: QueueRow; alive: boolean }>();
     for (const rows of groups) {
       for (const r of rows) {
@@ -493,12 +729,12 @@ export class CrdtQueue {
   /** A batch committed: learn the dots of its `add`s, and resolve its writes. */
   private async done(
     batch: QueueEntry[],
-    tx: ManualTransaction,
+    ops: CrdtOp[],
     result: CommitResult | undefined,
+    ids = batch.map((e) => e.id),
   ): Promise<void> {
-    tx.abort();
     if (result) {
-      const adds = (tx.raw.build().crdt_ops ?? []).filter((o) => o.op === 'add');
+      const adds = ops.filter((o) => o.op === 'add');
       adds.forEach((o, i) => {
         const dot = result.set_dots?.[i];
         if (!dot || o.op !== 'add') return;
@@ -508,10 +744,11 @@ export class CrdtQueue {
       });
       while (this.learned.size > 4096) this.learned.delete(this.learned.keys().next().value!);
     }
-    await this.settle(batch);
-    for (const e of batch) for (const w of this.waiters.get(e.id) ?? []) w.ok();
-    for (const e of batch) this.waiters.delete(e.id);
+    await this.settle(ids);
+    for (const id of ids) for (const w of this.waiters.get(id) ?? []) w.ok();
+    for (const id of ids) this.waiters.delete(id);
     this.emit({ online: true, sent: batch.length });
+    this.post({ t: 'sync', online: true, sent: ids });
     if (!this.entries.length) for (const f of this.flushers.splice(0)) f.ok();
   }
 
@@ -520,19 +757,34 @@ export class CrdtQueue {
     this.db.warn(
       `zen-db: ${batch.length} queued CRDT writes failed: ${error instanceof Error ? error.message : String(error)}`,
     );
-    await this.settle(batch);
-    for (const e of batch) for (const w of this.waiters.get(e.id) ?? []) w.fail(error);
-    for (const e of batch) this.waiters.delete(e.id);
+    const ids = batch.map((e) => e.id);
+    await this.settle(ids);
+    for (const id of ids) for (const w of this.waiters.get(id) ?? []) w.fail(error);
+    for (const id of ids) this.waiters.delete(id);
     this.emit({ online: this.isOnline, failed: { entries: batch.length, error } });
+    this.post({
+      t: 'sync',
+      online: this.isOnline,
+      failed: {
+        ids,
+        code: codeOf(error) || 'failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
     if (!this.entries.length) for (const f of this.flushers.splice(0)) f.ok();
   }
 
-  private async settle(batch: QueueEntry[]): Promise<void> {
-    const ids = new Set(batch.map((e) => e.id));
-    this.entries = this.entries.filter((e) => !ids.has(e.id));
-    await this.store.remove([...ids]).catch((e) => {
+  /** Entries done with: out of the queue and the store, with the commit in flight. */
+  private async settle(ids: string[]): Promise<void> {
+    const set = new Set(ids);
+    this.entries = this.entries.filter((e) => !set.has(e.id));
+    this.inflight = undefined;
+    try {
+      await this.store.remove(ids);
+      await this.store.removeInflight?.();
+    } catch (e) {
       this.db.warn(`zen-db: the queue store failed: ${e instanceof Error ? e.message : String(e)}`);
-    });
+    }
   }
 
   /**

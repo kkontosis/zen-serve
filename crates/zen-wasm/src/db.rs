@@ -59,6 +59,19 @@ impl FsKeys {
     ) -> R<Vec<u8>> {
         zdb::open_crdt_value(&self.0, object, &id16(field)?, &id16(elem)?, sealed).map_err(core_err)
     }
+
+    /// Seal a local record (kind 8, zendb.md §9.3), bound to the store name
+    /// and the record key.
+    #[wasm_bindgen(js_name = sealLocal)]
+    pub fn seal_local(&self, store: &str, key: &[u8], plaintext: &[u8]) -> R<Vec<u8>> {
+        zdb::seal_local(&self.0, store, key, plaintext, &mut OsRng).map_err(core_err)
+    }
+
+    /// Open a local record. Its epoch must be this key's.
+    #[wasm_bindgen(js_name = openLocal)]
+    pub fn open_local(&self, store: &str, key: &[u8], sealed: &[u8]) -> R<Vec<u8>> {
+        zdb::open_local(&self.0, store, key, sealed).map_err(core_err)
+    }
 }
 
 #[wasm_bindgen]

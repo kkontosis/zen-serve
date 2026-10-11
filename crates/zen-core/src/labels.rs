@@ -78,6 +78,8 @@ pub const AAD_FS_MANIFEST: &str = "zen/v1/aad/fs-manifest";
 pub const AAD_FS_CHUNK: &str = "zen/v1/aad/fs-chunk";
 /// AAD domain: zen-db CRDT value (kind 7).
 pub const AAD_CRDT_VALUE: &str = "zen/v1/aad/crdt-value";
+/// AAD domain: a local record (kind 8).
+pub const AAD_LOCAL: &str = "zen/v1/aad/local";
 
 /// Signature domain prefix, prepended to every signed message.
 pub const SIG_DOMAIN: &str = "zen/v1/sig";
@@ -141,6 +143,7 @@ pub const ALL: &[&str] = &[
     AAD_FS_MANIFEST,
     AAD_FS_CHUNK,
     AAD_CRDT_VALUE,
+    AAD_LOCAL,
     SIG_DOMAIN,
     SIG_DEVICE_CERT,
     SIG_COMMIT,

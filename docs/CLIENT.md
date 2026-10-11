@@ -159,7 +159,29 @@ ZEN_PASSWORD=… ZEN_PASSPHRASE=… node packages/fuse/dist/cli.js https://zen.e
 * **Conflicts:** two devices writing the same file concurrently leave siblings. The newest is shown as the file and the others as read-only `name (conflict <device>-<n>).ext`; deleting the copy resolves the conflict in favour of the file.
 * **Limits** (`TD-FUSE-REPLICA`): no local replica (no offline use), no hard links, symlinks or xattrs, no `mmap` coherence across devices, and files up to about 175 MiB (`TD-FS-LARGE-FILES`).
 
-## 10. Security notes
+## 10. The local store
+
+What an app keeps on the device (zen-db's queue of CRDT writes; caches, the replica) goes into a **local store**, sealed (spec/zendb.md §9.3).
+
+```ts
+import { indexedDbLocalStore, memoryLocalStore, sealedStore } from '@zen/client';
+import { nodeDiskLocalStore } from '@zen/client/node';     // Node only: imports node:fs
+
+const local = sealedStore(indexedDbLocalStore('my-app'));   // device layer (the default)
+const both = sealedStore(nodeDiskLocalStore('/var/lib/my-app'), { fs });  // device + fs layers
+const clear = sealedStore(memoryLocalStore(), { device: false, plaintext: true });
+await local.put('notes', key, value);
+await local.get('notes', key);                              // undefined if absent or unreadable
+for await (const [k, v] of local.list('notes')) { … }
+```
+
+* **Backends** (`LocalStore`): `memoryLocalStore()` (per process), `indexedDbLocalStore(name)` (shared by an origin's tabs; one IndexedDB database, no version changes when stores are added), `nodeDiskLocalStore(dir)` (a file per record, written to a temporary file, synced, then renamed, so a crash leaves the old record or the new one). `@zen/client/node` keeps the Node one out of browser bundles.
+* **Layers.** The **device layer** (on by default) is AES-256-GCM under a non-extractable key the backend makes once and keeps: a `CryptoKey` in IndexedDB, `dir/device.key` (mode 0600) in Node, a fresh one per process in memory. `device: myKey` uses the app's key; `device: false` turns the layer off. The **fs layer** (`fs: unlockedFs`, off by default) seals each record under the fs keys too (a kind-8 sealed object), so it opens only for someone who can unlock the fs; with both, the device layer wraps it.
+* **Plaintext** is a choice the app states: neither layer requires `plaintext: true`. The records then sit on disk in the clear with no tamper check. It fits a disk the OS already encrypts, data that isn't sensitive, or a trusted host.
+* **What doesn't open reads as absent**, and is deleted with a warning: a tampered record, one copied to another key, store or fs, one sealed with other layers (a store's layers never mix), or every record once the device key is gone.
+* A `SealedStore` binds each record to its store name and key, so records can't be swapped between them.
+
+## 11. Security notes
 
 * **Secrets stay in WASM memory** behind handles (`FsKeys`, `SigningIdentity`, `DeviceSecret`, `PasswordKey`, OPAQUE state); `free()` and `UnlockedFs.close()` zeroize them. Values passed in from JS (passwords, recovery keys) are copied; JS strings can't be wiped.
 * **Argon2id parameters.** The floor is 64 MiB, t=1. Browsers should register with 256 MiB, t=3 (the default of `addPassphrase`); 1 GiB takes ~8 s in WASM (docs/STATS.md §5.2). The parameters the server returns are bounded on use (formats.md §6), so a hostile server can't make a client hang.
