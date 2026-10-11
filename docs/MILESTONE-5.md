@@ -263,7 +263,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `vectors.test.ts` +1 (local records).
       * `crdtpersist.test.ts` (10): a restart, a crash after a lost reply (the same `commit_id`, counted once), a crash before any send, three layer settings, another fs, `Db.wipe`, owner-only sending with handover, and two tabs of one installation incrementing at once. Both crash and counter tests were checked to fail without the change.
       * New dev dependency `fake-indexeddb` 6.2.5.
-  * **7e** (persisted caches, offline open): done, PR #25. **Step 7 is done.** As planned, with these details for step 8 on:
+  * **7e** (persisted caches, offline open): done, PR #25 (merged). **Step 7 is done.** Step 8 starts from main: restart the branch, plan it, open a new PR. As planned, with these details for step 8 on:
     * **Client:** `Fs.header({local})` / `Fs.unlock(how, {local})` keep the header in store `fs/<fs id>` (key `header`: `u32 len ‖ header ‖ version`) and fall back to it on `network`; a store with the fs layer is refused; `Fs.forget(local)`; `UnlockedFs.local` refreshes the kept copy in `editHeader`. `HeaderOptions` is exported.
     * **`@zen/db`:**
       * `localcache.ts`: `LocalCache` (write-behind per store: `put`, `delete`, `clear`, `get` with pending writes first, `list`, `flush`) and the record codecs (rows, CRDT entries, tables, sealed blobs).
@@ -278,6 +278,17 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** zendb.md §3.1 (opening offline), §7.7 (kept caches, `read: 'cache'`), §9.3 (the stores table, writes behind, checks on use, the fs header), §19.4.
     * **Docs:** `docs/CLIENT.md` §4 (unlocking offline), `docs/DB.md` §7 (kept caches, offline), TECH_DEBT: TD-DB-PERSISTENT-CACHE resolved.
     * **Tests:** `packages/client/test/unlock.test.ts` (5), `packages/db/test/dbpersist.test.ts` (9: a cold start offline, a due migration offline, nothing kept, a warm start (checked to fail without kept nodes and blobs), a stale kept row, CRDT `auto` after a restart, tampering, `persist: false`, wipe and forget). 300 vitest tests in all.
+  * **Replanned after 7e (merged, #25): four features added** (see "Added features: milestones 8–11"). They are placeholder milestones 8–11, one doc each. What is central moves forward into step 7, ahead of step 8:
+    * **7f:** the large-file layout on the Rust side (spec, zen-core, server, vectors).
+    * **7g:** the large-file layout in the client and zen-mount.
+    * **7h:** a credential vault on the sealed local store.
+    * Step 8 also takes on design constraints from the new milestones.
+    * **User decisions:**
+      * two-level pages (not a hash chain or a tree)
+      * per-file content keys folded into the same format change
+      * the vault as 7h
+    * The plan commit restarts the branch from main and opens a new PR (#26).
+  * **7f** planned in detail (see "7f: large files, the format and the server").
 
 ## Facts the work must respect (from the code survey)
 
@@ -1636,7 +1647,258 @@ Step 7 builds the class side.
 3. Log the 7a line, push, update the PR, confirm CI is green, stop for compaction.
 4. 7b: restart from main, commit the 7b plan (`docs: milestone 5 step 7b plan`), open a new PR. Build it on the user's go (the `spec:` commit, then the code commit), log, push, confirm CI is green, stop.
 5. 7c the same way: restart from main, commit the 7c plan (`docs: milestone 5 step 7c plan`), open a new PR; build on the user's go (`spec:` commit, then code), log, push, confirm CI is green, stop.
-6. 7d and 7e the same way, each from main with its plan commit (`docs: milestone 5 step 7d plan`, then 7e's). Step 7 is then done; step 8 (`@zen/fs`, on the sealed local store) is next.
+6. 7d and 7e the same way, each from main with its plan commit (`docs: milestone 5 step 7d plan`, then 7e's).
+7. 7f, 7g and 7h (added after 7e, see below) the same way: one PR each, each starting from main once the previous PR is merged. Step 7 is then done, and step 8 (`@zen/fs`, on the sealed local store and the paged layout) is next.
+
+### 7f: large files, the format and the server (detailed plan)
+
+**Context.** Today a file version is one value: a plaintext chunk list, which the server uses to count references for GC, followed by a sealed manifest (kind 5) that repeats the list. At 32 B per chunk within `max_value_bytes` (90,000), a version holds at most about 2,800 chunks of 64 KiB, roughly 175 MiB (TD-FS-LARGE-FILES).
+
+Every chunk is also sealed directly under the fs-data key of its epoch, so no single file can be handed to someone without handing over the whole fs.
+
+Step 8's replica will store and replay manifests and `write` ops, and milestones 9 and 10 need files past the cap. So the layout changes now.
+
+**User decisions:**
+* two-level pages
+* per-file content keys, in the same format change
+* 7f is the Rust side. The TS client keeps writing v1 until 7g.
+
+**After compaction, re-read:**
+* this section
+* `spec/formats.md` §2, §4, §11; `spec/fs.md` §4, §4.1, §6; `spec/keyspace.md` §3.6; `spec/api.md` §2, §6, §12; `spec/labels.md`
+* `crates/zen-core/src/{fs,keys,labels,vectors}.rs`
+* `crates/zen-server/src/tree.rs`:
+  * `encode_version`/`decode_version` (~201)
+  * `gc_candidate`/`release_chunk` (~276)
+  * `apply_write` (~600)
+  * `put_chunk` (~657)
+  * `apply` `Write` (~715)
+  * `sweep` (~1110)
+  * the purge release (~1596)
+  * `collect_chunks` (~1660)
+  * `file_get`/`chunks_get` (~1036)
+* `crates/zen-server/src/{commit.rs (validate ~78, ~145–190; apply ~380), keys.rs (~385–407), lib.rs (features ~68, routes)}`
+* `crates/zen-proto/src/lib.rs`: `Commit` (~1405), `ChunkPut` (~1993), `CrdtOp::Write` (~2058), `FileGet`/`Version`/`Versions`/`ChunksGet`/`Chunks` (~2700–2800)
+* `crates/zen-wasm/src/{crypto.rs (Manifest ~52/235/365, sealChunk ~401, writeOpBytes ~1030), wire.rs (~89, ~112)}`
+* `crates/zen-server/tests/fs.rs` (helpers, the property test)
+
+**Branch/PR.** #26 (the milestones 8–11 plan) must be merged first. Then restart from main, commit `docs: milestone 5 step 7f plan` (syncing `docs/MILESTONE-5.md`), and open a new PR that 7f joins.
+
+#### Formats (⚠️ `spec:` commit)
+1. **Page** (formats.md §11.6, new):
+   * The plaintext the server sees is `u32 n ‖ n × chunk_id(16)`, with `1 ≤ n` and `4 + 16n ≤ max_value_bytes`. That is up to 5,624 ids at the defaults, about 351 MiB at 64 KiB.
+   * Its id is 16 random bytes chosen by the client. A page is immutable.
+   * `page_digest = BLAKE3.derive_key("zen/v1/fs-page", page bytes)` (32 B), the same construction as the op chain.
+2. **Manifest v2** (formats.md §11.3; the plaintext of kind 5, with the same AAD as v1):
+   ```
+   u8 manifest_version = 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u32 key_epoch ‖ file_key(32) ‖ u8 form
+   form 1 (inline): n × chunk_id                          (u64 n above is the count)
+   form 2 (paged):  u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32))
+   ```
+   * **Paged:** `m = ceil(n / page_size)`. Every page holds `page_size` ids except the last. Chunk i is in page `i / page_size`, at slot `i % page_size`.
+   * **Readers check:**
+     * each page's digest against its bytes, when the page is fetched
+     * every page's count
+     * the inline list, or the page ids, equal the `write`'s `chunks` or `pages`
+   * **Cap:** 48 B per page. At the defaults the root holds about 1,870 pages, so about 10.5 M chunks, ≈ 640 GiB at 64 KiB (more with larger chunks).
+   * v1 stays valid to read. Clients write v2 from 7g on.
+3. **File key** (formats.md §2, §11.4):
+   * The chunk key is `KDF("zen/v1/fs-file", file_key, u32(fs))`.
+   * Kind 6 keeps its label and context (`u32(fs) ‖ chunk_id`). Its header `key_epoch` is the manifest's `key_epoch`: the epoch in which the file key was made. A reader opens it with the key derived from the manifest, not the fs epoch keys.
+   * A v1 manifest means its chunks are under the fs-data key, as now.
+   * **Rotation (fs.md §4, a client rule):** a writer whose fs is at an epoch newer than the node's `key_epoch` picks a fresh file key, and re-seals and re-uploads every chunk. Otherwise it keeps the node's key, so `previous` reuse works. A copy to another node may carry the key and reuse the chunks.
+4. **Op chain** (§11.5): the tag `write_paged = 0x04 ‖ u32(fs) ‖ tree ‖ node ‖ u32(r) ‖ r × dot ‖ u32(m) ‖ m × page_id ‖ lp(manifest)`. The inline `write` (0x03) is unchanged.
+5. **Labels** (labels.md, `labels.rs`):
+   * `zen/v1/fs-file` (KDF)
+   * `zen/v1/fs-page` (digest)
+   * `zen/v1/sig/app-bundle`, listed as reserved for milestone 11 (spec only)
+
+#### Wire and server semantics (⚠️ `spec:` commit: fs.md §4, §4.1, §6; keyspace.md §3.6; api.md §2, §6, §12)
+1. **Commit field `pages: [{fs, id, data}]`**, after `chunks`. Applied after the chunks and before the ops.
+   * `data` must parse: `n ≥ 1`, and its length is exactly `4 + 16n`.
+   * Every chunk in it must exist, or be uploaded in the same commit.
+   * Identical bytes under an existing id restart its grace. Different bytes are refused (400).
+   * **A first upload** stores the page and adds 1 to each listed chunk's `cr`, once per occurrence.
+   * Every upload makes the page a GC candidate (restarting the grace period).
+   * Validation:
+     * each page counts 1 toward `max_commit_ops`
+     * it adds `len + 16` bytes toward `max_commit_bytes`
+     * it is checked with `value_ok`
+     * it needs fs write
+2. **`write {node, replaces, chunks | pages, manifest}`:**
+   * `CrdtOp::Write` gains `pages: [bytes(16)]` (optional, serde default).
+   * Both lists non-empty → 400. Both empty is an empty file, as now.
+   * Every page must exist or be in the commit, else 400 `unknown page`.
+   * The size check is `value_ok(manifest + 16 × (chunks | pages))`. Bytes are `48 + manifest + 16·len + 12·replaces`.
+   * One write per node per commit, as now.
+3. **Stored version (`tf`):**
+   * inline: unchanged, `dev ‖ u32 n ‖ n × chunk ‖ manifest`
+   * paged: `dev ‖ u32 0xFFFFFFFF ‖ u32 m ‖ m × page_id ‖ manifest`
+   * `n` can never reach `0xFFFFFFFF` under the value cap, so existing data needs no migration.
+   * Applying a paged write adds 1 to `pr` per page. A replace or a purge subtracts 1 per page and makes the page a candidate. Quota counts `manifest + 16m`, as for chunks.
+4. **Keys** (keyspace.md §3.6; free prefixes, checked against `keys.rs`):
+   | Key | Value |
+   |---|---|
+   | `pack("pg", fs, page)` | the page bytes |
+   | `pack("pr", fs, page)` | `i64` LE, atomic add: the versions referencing the page |
+   | `pack("pz", fs, cvs, page)` | empty: page GC candidate |
+   | `pack("pc", fs, page)` | `cvs(12)` of the page's newest candidate |
+   * `cr` becomes "the number of versions **and pages** referencing the chunk".
+5. **GC (fs.md §6):** `collect_pages` mirrors `collect_chunks`.
+   * It takes candidates older than the grace period, 500 at a time, the newest only (via `pc`).
+   * If `pr ≤ 0`: delete `pg`, `pr` and `pc`, and release each listed chunk (`cr −1`, a chunk candidate). The chunks then wait one more grace period, which is simpler and only safer.
+   * Quota drops by the page bytes.
+   * `sweep` runs `collect_pages` before `collect_chunks`, in the same rounds per fs.
+6. **Reads:**
+   * `Version` gains `pages: [bytes(16)]` (optional). `/v1/fs/file/get` returns it for paged versions, with `chunks` empty.
+   * New `POST /v1/fs/pages/get {fs, ids: [bytes(16)] (≤ 64)}` → `{pages: [{id, data?}]}`, under fs read, like `chunks/get`.
+7. **`/v1/info` features:** `"fs_pages"`.
+
+#### Code
+* **zen-core `fs.rs`:**
+  * `Page {chunks}` with `encode` / `decode` (checking the limits passed in), and `page_digest`.
+  * `Manifest` becomes `enum Manifest { V1 {size, chunk_size, chunks}, V2 {size, chunk_size, n, key_epoch, file_key, body: Body} }` with `enum Body { Inline(Vec<Id>), Paged {page_size, pages: Vec<(Id, [u8;32])>} }`. `encode`/`decode` dispatch on the version byte, and `decode` checks `m = ceil(n/page_size)` and the inline count.
+  * `seal_manifest`/`open_manifest` work unchanged on the enum.
+  * `FileKey` (32 B, random via `Rng`), `file_chunk_key`.
+  * `seal_file_chunk(fs_id, file_key, key_epoch, chunk, data, rng)` / `open_file_chunk(...)`, which checks the header epoch.
+  * `write_paged_bytes`.
+  * `labels.rs`: `FS_FILE`, `FS_PAGE`, added to the label list (and its uniqueness test).
+* **zen-core `vectors.rs` `fs_vectors`:** new keys in `spec/test-vectors/fs.json`:
+  * `page` (plaintext, digest)
+  * `manifest_v2_inline` and `manifest_v2_paged` (plaintext, sealed, seeds)
+  * `file_chunk` (file key from `DetRng("fs-file")`, key_epoch, sealed)
+  * `write_paged` (op bytes)
+
+  Existing keys are unchanged.
+* **zen-proto:**
+  * `PagePut {fs, id, data}` and `Commit.pages`
+  * `CrdtOp::Write.pages`
+  * `Version.pages`
+  * `PagesGet {fs, ids}`, `PageData {id, data?}`, `Pages {pages}`
+  * each with the ts derives, like their chunk twins
+* **zen-server:**
+  * `keys.rs`: `page`, `page_refs`, `page_gc`, `page_gc_ptr`.
+  * `commit.rs`:
+    * validate: pages, ops and bytes, the one-of rule
+    * apply: `eng.put_page` after `put_chunk`
+  * `tree.rs`:
+    * `encode_version`/`decode_version` → `enum Content { Chunks(Vec<Id>), Pages(Vec<Id>) }`
+    * `release_content`, used by `apply_write` and the purge
+    * `put_page` (tracks `new_pages`, as `new_chunks`)
+    * `apply_write` paged
+    * `page_gc_candidate`, `collect_pages`, `sweep`
+    * `file_get`: `pages`
+    * `pages_get`
+  * `lib.rs`: the route and the feature.
+* **zen-wasm:**
+  * `crypto.rs`:
+    * `sealManifest` accepts the v1 shape `{size, chunkSize, chunks}`, or v2 `{version: 2, size, chunkSize, n, keyEpoch, fileKey, chunks? | pageSize + pages: [{id, digest}]}`
+    * `openManifest` returns the shape with `version`
+    * `newFileKey()`, `sealFileChunk`, `openFileChunk`
+    * `encodePage`, `decodePage`, `pageDigest`, `writePagedOpBytes`
+  * `wire.rs`: `PagePut`, `PagesGet`, `PageData`, `Pages`.
+  * The TS client compiles unchanged: v1 calls keep their shape. `tree.ts` refuses a v2 manifest with a clear error until 7g.
+* **Docs:**
+  * `docs/API.md`: the route and the commit field
+  * `docs/STATS.md` §1.3: the cap, as the format allows (the client in 7g)
+  * TECH_DEBT TD-FS-LARGE-FILES: "server side done in 7f"
+
+#### Tests
+* **zen-core units:**
+  * Page and Manifest v2 round trips, and refusals: a bad count, a short page, a form byte other than 1 or 2, `m` not equal to `ceil`
+  * v1 still decodes
+  * a file chunk opens only with its key, epoch and id. Under another file key, or with a changed header epoch, it fails.
+  * the digest is domain-separated
+* **`crates/zen-server/tests/fs.rs`, both backends:**
+  * **Paged round trip:** upload chunks plus 3 pages over 2 commits, then a paged write. `file_get` returns `pages`, and `pages_get` returns the bytes.
+  * **Refusals:**
+    * an unknown page in a write
+    * a page holding an unknown chunk
+    * a page over `max_value_bytes`, or malformed
+    * different bytes under an existing page id
+    * a write with both `chunks` and `pages`
+  * **Sharing:** version B reuses 2 of version A's pages plus a new last page, then replaces A. After the grace period (test `chunk_grace_secs`), only A's unshared last page and its unique chunks are gone; B reads fully.
+  * **GC order:** a replace, then sweeps. The page is deleted first, then its chunks one grace period later. A page uploaded but never referenced is collected, and its chunks after it.
+  * **Re-upload:** the same page id again restarts its grace and doesn't double `cr` (checked through deletion timing).
+  * **Purge:** trashing and purging a paged node releases its pages.
+  * **Quota:** page bytes are counted, and released after GC.
+  * **Op chain:** a paged write's chain value equals `chain_next` over `write_paged_bytes` (as the inline test does).
+  * **Property test:** the xorshift test gains paged writes and appends (a version reusing a prefix of pages). A reference model tracks expected live pages and chunks, checked after sweeps with grace 0.
+* **`packages/client/test/vectors.test.ts`:** the new fs.json keys through wasm.
+* The existing vitest suite stays green (v1 writes).
+
+#### Verification
+* **Disk:** `CARGO_INCREMENTAL=0`; check `df` first (about 6.9 GB at the last check).
+* **Rust:**
+  * `cargo fmt --check`
+  * `cargo clippy --all-targets -- -D warnings`, default and `--no-default-features`
+  * `cargo test -p zen-core -p zen-proto -p zen-server`
+  * `gen_vectors`: only the new fs.json keys change (`git diff spec/test-vectors`)
+  * `scripts/build-wasm.sh`
+* **JS:** `npx biome check`; tsc for client, fuse and db test; `npx vitest run`.
+* CI green on the PR (the fdb job covers the server tests on FoundationDB).
+
+#### Rhythm
+1. After #26 merges: restart from main, plan commit, new PR.
+2. On the user's go: the `spec:` commit, then the code commit.
+3. Log the 7f line, push, confirm CI is green, stop for compaction.
+4. 7g is next.
+
+### 7g: large files in the client and zen-mount (detailed plan)
+* **`tree.ts`:**
+  * **`upload(node, source)`** takes a `Uint8Array`, a `ReadableStream` or an `AsyncIterable<Uint8Array>`, with constant memory:
+    * chunks are sealed as they come and flushed in commits
+    * pages are uploaded as they fill
+    * the inline form is used when the file fits
+  * **File key:** a new node gets a fresh one. Otherwise the key comes from the current version's manifest, or a fresh one after a rotation.
+  * **`previous`** reuses unchanged chunks by hash, and also whole pages whose chunk ids are unchanged (appends).
+  * **`read(node, v, offset, length)`** goes through the pages. A page cache sits next to the chunk cache, and a page is checked against its digest when fetched.
+  * **`readStream(node, v, {offset, length})` → `ReadableStream`** decrypts chunk by chunk. M9's service worker and step 8 use it.
+  * `versions` reads v1 and v2 manifests.
+  * **Resumable uploads:** `Upload` gains a serializable state (the chunks and pages uploaded so far), so step 8 can keep it on the local store. A resume works within `chunk_grace_secs`; past that is M8.
+* **zen-mount:** it works unchanged on v2 files. Large writes are still buffered in memory until step 8 (documented).
+* **Docs:**
+  * `docs/CLIENT.md` §8 (pages, file keys, streams, resumable uploads) and §9 (the limits)
+  * `docs/STATS.md` (the new cap)
+  * TECH_DEBT: TD-FS-LARGE-FILES resolved, with the rest in M8
+  * TD-CRDT-ROWS-SERVER marked resolved (step 3; the survey found it stale)
+* **Tests (`tree.test.ts`)**, with lowered `max_value_bytes` and small chunks, so files of many pages stay cheap:
+  * a multi-page round trip
+  * a range read fetches only its page and its chunks (calls counted)
+  * an append re-uploads only the last page and the new chunks
+  * a streamed upload from a generator
+  * a page swapped on the server (a wrapped `session.call`) is detected
+  * an old v1 file still reads, and a v1 file rewritten becomes v2 with its chunks re-sealed
+  * two files' chunks don't open with each other's keys
+  * after `rotate`, the next write uses a fresh file key
+  * the `fs_v2` vectors (`vectors.test.ts`)
+  * zen-mount: a file of several pages read through the mount
+* **Verification:**
+  * `npx biome check`
+  * tsc for client, fuse and db test
+  * `npx vitest run` three times
+  * CI green
+
+### 7h: a credential vault on the local store (detailed plan)
+**Context.** A service worker (M9), a git helper (M10) or a restarted zen-mount must sign in and unlock with no page or prompt. Today the app holds the device identity and the session token itself. GAPS G15 asks for keys wrapped at rest under a non-extractable WebCrypto key, which the sealed store's device layer already provides.
+* **`packages/client/src/local/vault.ts`:** `credentialVault(sealed)`, on store `vault`:
+  * `saveDevice(device credentials)`, `saveSession(token)`
+  * `signIn(client)`: resume a stored token that is still valid, else `signInDevice` with the stored device, then store the new token
+  * `forget()`
+  * **Refused:**
+    * a store without the device layer, unless it is `plaintext: true` and the app passes `allowPlaintext`
+    * a store with the fs layer, which can't seal what unlocks the fs (as for the kept header)
+* **Unlocking:** the device keyslot (`unlock({device})`) then works from the vault, offline too, with the kept header of 7e.
+* **⚠️ Spec:** zendb.md §9.3 gains the `vault` store and what it holds.
+* **Docs:** `docs/CLIENT.md` §10; GAPS G15, partly done.
+* **Tests:**
+  * a round trip on memory, IndexedDB and Node disk
+  * a fresh "process" signs in and unlocks from the vault: online, and offline from the kept header
+  * an expired token falls back to the device
+  * a tampered record reads as absent
+  * the refusals
+  * `forget`
+* **Verification:** as for 7g.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
 * **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).
@@ -1655,6 +1917,100 @@ Step 7 builds the class side.
   * writes of changed chunks only
   * the existing mount tests stay green, plus offline and symlink tests
 * **TDs:** resolve TD-FUSE-REPLICA.
+* **Constraints from milestones 8–11** (added after 7e):
+  * **Layout:** the replica stores pages and sealed chunks as the server does (7f/7g), never plaintext. A resumable upload's state is kept on the local store.
+  * **Worker-safe core:** `@zen/fs` uses no DOM and no Node imports outside its Node store, so it runs in a service worker or a worker (M9). Reads include `createReadStream(path, {start, end})` → `ReadableStream`.
+  * **Content type:** a reserved xattr key in the sealed meta (spec'd in step 8's `spec:` commit), which M9 serves as `Content-Type`.
+  * **Vault:** `zen-mount` can sign in and unlock from the vault (7h), e.g. `--vault <dir>`.
+
+## Added features: milestones 8–11 (placeholders)
+
+Four features were added after 7e, each as a placeholder milestone at the end of the roadmap (DESIGN-3 §6), with one doc each: `docs/MILESTONE-8.md` to `MILESTONE-11.md`.
+
+Each doc has:
+* a few lines on the feature
+* a short plan
+* what was moved earlier, and why
+* the line: **"The rest is planned when the milestone starts."**
+
+The Q/A that proposed them is input, not the design.
+
+Order by dependency: 8 → 9 → 10 → 11. Milestone 6 (signed roots) comes before 11.
+
+### Milestone 8: large files (the rest)
+* **Feature:** files of hundreds of GiB that are streamed, resumable and appendable.
+* **Moved earlier:**
+  * **7f/7g (the layout, file keys, streams).** Step 8's replica stores and replays the format, so changing it after step 8 would mean designing the write path twice.
+  * **Resumable state in step 8.**
+* **Plan for the rest:**
+  * Upload sessions that pin chunks and pages past `chunk_grace_secs`, so a resume works after more than 24 h.
+  * Repacking pages after many edits in the middle of a file (a leader job).
+  * Multi-GiB performance, measured in STATS.
+  * The interplay with `zen-ublk` (M6).
+
+### Milestone 9: serving zen-fs over HTTP through a service worker (`@zen/sw`)
+* **Feature:** a worker maps URLs in its scope to fs nodes and answers each fetch with a decrypted, streamed `Response`, with `Range` → 206, MIME types and index pages. The HTML stays unchanged. It works offline from the replica. An encrypted website is then viewable by the members who unlocked it.
+* **Moved earlier:**
+  * **7g:** `readStream`.
+  * **7h:** the vault, so the worker re-unlocks after the browser kills it.
+  * **Step 8:** a worker-safe `@zen/fs` with stream reads, the content-type xattr, and sealed chunks at rest. This is so the worker never caches plaintext.
+* **Plan for the rest:**
+  * the `packages/sw` worker: URL → node, streams, Range, MIME, directories; lifecycle with `clients.claim` and updates
+  * **origin isolation**, so untrusted fs content never runs on the origin that holds keys:
+    * a separate content origin, with its own config in `zen-serve`
+    * `CSP: sandbox` and `nosniff` on every worker response
+  * `zen-serve static push` (DESIGN-3 §4.2, replicated fs 0), and `Range` in `statics.rs`
+  * the worker as the owner candidate of TD-DB-SHAREDWORKER
+  * Playwright tests: offline reads, seeking, the sandbox
+* **Note:** DESIGN-3 §0 made the worker "an optional cache only". M9 makes it a serving path. Whether the worker also verifies code is a question for M11.
+
+### Milestone 10: git over zen-serve (`git-remote-zen`)
+* **Feature:** `git clone zen://host/<fs>/<repo>` through a remote helper written on the client. The server stays blind.
+  * Packs (with their `.idx`) are immutable files.
+  * Refs live in a zen-db table.
+  * A push is one transaction: the pack's file op, a compare-and-set of the refs (non-fast-forward refused on the client unless `--force`), and an emit to `("git", repo, "pushes")` for CI workers.
+  * Fetch downloads only the packs it lacks.
+  * Read and write rights are the fs grants. Branch protection is cooperative only.
+* **Moved earlier:**
+  * **7f/7g:** packs over 175 MiB, and streaming uploads.
+  * **7h:** the helper signs in without a prompt.
+  * Already built: files plus rows in one commit (5c), emits (6a), and the scheduler for repacking (6b).
+* **Plan for the rest:**
+  * `packages/git` (a Node helper binary)
+  * the refs schema
+  * a pack manifest for large repos
+  * a gc/repack leader job
+  * an optional localhost smart-HTTP bridge (`insteadOf`)
+  * a dumb-HTTP public mirror through M9's static push
+  * tests with real `git`: clone, push, concurrent pushes, force
+
+### Milestone 11: an encrypted web-app platform (trust, sharing, lifecycle)
+* **Feature:** what zen-serve still lacks to qualify as an encrypted-storage web-app server:
+  * **Code-delivery trust:** signed app bundles, verified by a pinned bootstrap service worker (this reopens DESIGN-3 §0), plus SRI and reproducible builds, with a trust anchor the server doesn't control.
+  * **Sharing:** share links that carry a file key in the URL fragment plus a scoped read capability (TD-AUTH-TOKEN-SCOPES); folder shares; sharing with outsiders.
+  * **Lifecycle:**
+    * member removal: revoke, `rotate`, and fresh file keys on the next write
+    * account recovery
+    * Web Push with encrypted payloads
+    * log retention (TD-LOG-RETENTION)
+    * server timers (TD-BROKER-SERVER-TIMERS)
+  * **Metadata:** padding options for sizes and page counts.
+  * **Assurance:** a threat model of web delivery, audit readiness, and the wasm size (TD-CLIENT-WASM-OPT).
+* **Moved earlier:**
+  * **7f:** per-file content keys. Sharing one file then needs no format change. The `zen/v1/sig/app-bundle` label is reserved.
+  * **7h:** the vault.
+  * **Milestone 6:** signed roots, the rollback half of integrity. Its signing keys are reused for bundle signatures.
+  * **M9:** the worker that carries the bootstrap.
+* **Plan for the rest:** the five areas above, probably split into sub-milestones when planned.
+
+### The plan commit (after approval)
+1. Restart the branch from main.
+2. Sync `docs/MILESTONE-5.md` with this file.
+3. Add `docs/MILESTONE-8.md` to `MILESTONE-11.md` from the sections above.
+4. Add items 8–11 to DESIGN-3 §6.
+5. Point TD-FS-LARGE-FILES at 7f/7g.
+6. Commit `docs: milestones 8–11 placeholders, step 7f–7h plan`, push, open a new PR.
+7. 7f is built on the user's go.
 
 ## Step 9: `@zen/loro`, the Loro adapter (DESIGN-3 §0, §1)
 * Dependency: `loro-crdt`.
