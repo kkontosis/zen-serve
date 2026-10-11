@@ -206,3 +206,12 @@ Compared with the plain KV store, the server additionally sees, per tree:
 * **sizes:** the size of each sealed metadata value and chunk, which approximates name lengths and file sizes to 64 KiB granularity unless the client pads
 
 It does not see names, types, modes, times, sizes inside the manifest, or contents. Clients may add padding nodes, padding chunks or padded metadata to blur the counts.
+
+## 11. The local replica (client)
+
+A client may keep a **replica** of a tree on its local store (`@zen/fs`, docs/CLIENT.md; the stores in zendb.md §9.3). It is a cache of what the server holds, never a second source of truth:
+* **The node table is whole.** The replica keeps every node's state as the change feed delivers it (§5): the wire `NodeState`, with its meta still sealed (kind 4). It follows the feed from a stored cursor; on `resync` it runs a full sync and then drops the nodes the full sync didn't return. A full sync interrupted by a restart starts again.
+* **Content on demand.** Versions (the wire `Versions`, manifests sealed), sealed chunks and pages are fetched when read and kept, as the server stores them, in a cache bounded by size (least recently used first). **Pinned** nodes (a file, or a folder and everything under it) keep their current versions' content and are refreshed after each feed batch; their content is never evicted.
+* **Paths** walk from `ROOT` by display name (§8). A file with siblings (§4) shows its newest version under its name and each other one as a read-only **conflict copy** named `stem (conflict <first 8 hex digits of the writing device>-<n>).ext`, `n` counting from 2 in descending dot order (the newest version is the first).
+* **Offline**, reads use the kept node table and content; content that isn't kept fails with `offline`.
+* **One writer per store.** Where several tabs or processes share a store, one of them, the owner (a Web Lock, or a lock file on a Node disk store), follows the feed and writes the node table; the others read the store and reload the nodes the owner names on the tab channel. Kept content is immutable, so any of them may add it.
