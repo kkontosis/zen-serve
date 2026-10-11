@@ -14,6 +14,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/topic-name` | NK | `u32(fs_id)` | root of the topic naming chain |
 | `zen/v1/topic-data` | MK_e | `u32(fs_id) ‖ u32(epoch)` | root of the topic data chain |
 | `zen/v1/fs-data` | MK_e | `u32(fs_id) ‖ u32(epoch)` | AEAD key for filesystem meta, manifests and chunks (formats.md §11) |
+| `zen/v1/fs-file` | a file key (32 B, formats.md §11.3) | `u32(fs_id)` | AEAD key for the chunks of a version-2 file (formats.md §11.4) |
 | `zen/v1/name-chain` | chain key N_{i-1} | `lp(element)` | next naming-chain key N_i |
 | `zen/v1/topic-data-chain` | topic data key D_{i-1} | `lp(segment)` | next topic data key D_i |
 | `zen/v1/event-key` | topic naming key N_topic | empty | key for event key tokens |
@@ -38,6 +39,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/acl-chain` | `H(doc)` of a signed ACL, chaining ACL versions (formats.md §9.2) |
 | `zen/v1/range-hash` | hash of a KV range for `expect_ranges` (api.md §6) |
 | `zen/v1/tree-op-chain` | per-tree chain over filesystem operations (formats.md §11.5) |
+| `zen/v1/fs-page` | digest of a chunk-list page (formats.md §11.6) |
 | `zen/v1/passkey-id` | a passkey's credential-store id from its WebAuthn credential id (auth.md §4.1, formats.md §6) |
 | `zen/v1/opaque-keyslot` | the secret of an OPAQUE export-key keyslot from the 64-byte export key (formats.md §6, type 5) |
 | `zen/v1/db-parts-digest` | digest of a zen-db value split into parts: a large row or message body (zendb.md §4.2, §10.3) |
@@ -78,6 +80,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig/tree-checkpoint` | device | filesystem tree checkpoint over (state hash, count, chain) (fs.md §9, later milestone) |
 | `zen/v1/sig/password-session` | password-derived key | sign-in challenge (formats.md §7.5, §10) |
 | `zen/v1/sig/db-root` | device | zen-db signed root of the authenticated integrity tier (zendb.md §14, milestone 6) |
+| `zen/v1/sig/app-bundle` | release key | reserved: a signed app bundle checked by a bootstrap service worker (milestone 11) |
 
 Signing with a purpose not in this table is an error.
 

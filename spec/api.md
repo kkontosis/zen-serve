@@ -36,7 +36,7 @@ No authentication. Returns:
 { server: text, api: 1,
   suites: [1],                       // supported suite ids (spec/suites.md)
   formats: [1],
-  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows"
+  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows", "fs_pages"
   cross_origin_isolation: bool,      // DESIGN-3 §4.2
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
@@ -382,6 +382,7 @@ POST /v1/commit
   consume?: [{fs, group: bytes, partition?: u32, key_token: bytes(16)?,
               from: bytes(12), to: bytes(12), token: u64}],
   chunks?: [{fs, id: bytes(16), data: bytes}],              // filesystem chunks (fs.md §4.1)
+  pages?: [{fs, id: bytes(16), data: bytes}],               // chunk-list pages (fs.md §4.1, formats.md §11.6)
   crdt_ops?: [CrdtOp] }                                     // filesystem operations (fs.md §3, §4), CRDT rows (§13)
 → { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)], dots: [bytes(12)],
     set_dots: [bytes(12)] }                                  // one per `add`, in order (§13)
@@ -389,7 +390,7 @@ POST /v1/commit
 CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), hlc: u64, meta?: bytes}
        | {fs, tree: bytes(16), op: "meta",  node: bytes(16), hlc: u64, meta: bytes}
        | {fs, tree: bytes(16), op: "write", node: bytes(16), replaces?: [bytes(12)],
-                                            chunks?: [bytes(16)], manifest: bytes}
+                                            chunks?: [bytes(16)], pages?: [bytes(16)], manifest: bytes}
        | {fs, op: "row", object: bytes, hlc: u64, alive: bool, value: bytes}                 // CRDT rows (§13)
        | {fs, op: "lww", object: bytes, field: bytes(16), hlc: u64, value?: bytes}
        | {fs, op: "ctr", object: bytes, field: bytes(16), actor: bytes(16), seq: u64, value: bytes}
@@ -412,7 +413,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 6. **Consumes** (§8.3) are processed before appends, in order.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
-9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` (the stored version holds both, keyspace.md §3.6), which bounds a file at about `max_value_bytes / 32` chunks. Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
+9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` or `pages` (the stored version holds both, keyspace.md §3.6). That bounds an inline file at about `max_value_bytes / 32` chunks, and a paged one at about `max_value_bytes / 64` pages (fs.md §4). A `write` carries `chunks` or `pages`, never both (400). Chunks apply before pages, and pages before the operations, so a commit can upload a file's last chunks, its last page and its `write` together. Each page counts as one operation toward `max_commit_ops`, and its data plus 48 bytes per chunk it lists (the reference counts it adds) toward `max_commit_bytes`. A server without the feature `"fs_pages"` refuses `pages` (400). Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
 
 ## 7. Log
 
@@ -590,8 +591,9 @@ NodeState = { node: bytes(16),
 | `POST /v1/fs/tree/children {fs, tree, parent, after?: bytes(16), limit?, read_version?}` | `{read_version, nodes: [NodeState], more}`, in node-id order after `after` |
 | `POST /v1/fs/tree/changes {fs, tree, after?: bytes(12), limit?, wait_ms?}` | `{changes: [{offset: bytes(12), node, state?: NodeState}], cursor?: bytes(12), more}` |
 | `POST /v1/fs/tree/chain {fs, tree}` | `{ops: u64, chain: bytes(32)}` (formats.md §11.5) |
-| `POST /v1/fs/file/get {fs, tree, node, read_version?}` | `{read_version, versions: [{dot, device, chunks: [bytes(16)], manifest}]}` |
+| `POST /v1/fs/file/get {fs, tree, node, read_version?}` | `{read_version, versions: [{dot, device, chunks: [bytes(16)], pages?: [bytes(16)], manifest}]}`. A paged version has `pages` and empty `chunks`. |
 | `POST /v1/fs/chunks/get {fs, ids: [bytes(16)]}` | `{chunks: [{id, data?}]}`. `data` is absent for unknown ids. |
+| `POST /v1/fs/pages/get {fs, ids: [bytes(16)]}` | `{pages: [{id, data?}]}`, at most 64 ids. `data` is absent for unknown ids. |
 
 * **`changes`.**
   * It lists nodes changed after `after`, in change order; with no `after`, it lists every node.
