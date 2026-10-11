@@ -124,7 +124,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `expectCanonical` moved to `packages/db/test/helpers.ts`.
       * 161 vitest tests in all.
 * **Step 6** (broker): planned (see Step 6: sub-steps 6a, 6b and 6c, a PR each). PR #16 is merged, so the plan commit restarts the branch from main and opens a new PR, which 6a joins (PR #17).
-  * **6a** (messages, emit, `on`, consume, change events, ephemeral): done, PR #17. As planned, with these details for 6b and 6c:
+  * **6a** (messages, emit, `on`, consume, change events, ephemeral): done, PR #17 (merged; CI green). As planned, with these details for 6b and 6c:
     * **Files:**
       * `msg.ts`: Msg and BodyRef codecs, `eventId`, `Message`.
       * `broker.ts`:
@@ -158,6 +158,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `packages/db/test/broker.test.ts` (15), with its own copy of `FakeLocks`.
       * `vectors.test.ts` +3 (Msg, BodyRef, event and group ids).
       * 180 vitest tests in all.
+  * **6b** (scheduler, work queues, request/reply): planned (see 6b below); a new PR, since #17 is merged.
 
 ## Facts the work must respect (from the code survey)
 
@@ -735,52 +736,131 @@ Three sub-steps, **one PR each**, with the same rhythm as step 5.
 * **Ephemeral:** two sessions.
 * **Tables:** system tables exist after open (also on a database created before them); `$x` app tables are refused.
 
-### 6b: scheduler, work queues, request/reply
-1. **`sched.ts`, delayed messages (§12.4):**
-   * **`schedule(topic, type, body, {at | delayMs, key?})`** (tx or `Db`) inserts a `$sched` row `{at, kind: 'emit', topic, key?, msg}` (Msg with `deliver_at`) and returns the id. `cancel(id)` returns whether the row was still there.
-   * **`emit(…, {ttl})`:** a large body also schedules a `gc` row for its parts.
-   * **Scheduler:**
-     * `DbOptions.scheduler` (default true) runs it in the owner. `db.scheduler.start()/stop()`.
-     * Leader on topic `("zen", "db", ns, "sched")`, group `groupId("sched")`, through `topic.leader`.
-     * While leading, it loops: a short transaction reads `$sched.by_at` for `at ≤ now` (limit 100), appends or deletes the KV paths, deletes the rows, and commits.
-     * It sleeps until the next `at`, at most `pollMs` (default 1,000).
-     * `now` = `session.clock.now()` after `clock.sync`.
-     * Losing the lease stops the loop and campaigns again.
-2. **Work queues (§12.2):**
-   * `emit(…, {spread: true})` uses a fresh random key.
-   * `consume({retry: 'delay', backoff?})`: on a throw, a transaction acks and schedules a copy at `now + backoff(attempt)` with header `zen.attempt` + 1. After `maxAttempts`, the copy is a scheduled emit to `topic.child("zen.dlq")`.
-3. **Request/reply (§12.3):**
-   * **Inbox:** one inbox per `Db` instance (16 random bytes), with an `on` subscription from now and an ephemeral one, started on first `request`.
-   * **`request(topic, type, body, {timeoutMs, key?, corr?})`:**
-     * On `Db`, it emits `{corr, reply_to}` and waits for a reply with that `corr` (late replies are dropped, `timeout` → `DbError('timeout')`).
-     * `tx.request` returns a promise that starts waiting at commit; it rejects if the transaction fails.
-   * **`requestAll`** (scatter-gather): collects every reply until the timeout.
-   * **`serve({…consume opts, dedup?, reply?: 'event' | 'ephemeral'}, handler) → reply`:**
-     * a `consume` whose transaction also emits `{type: type + '.reply', corr, body}` to `reply_to`
-     * `ReplyError` → a `.error` reply that consumes the request
-     * `reply: 'ephemeral'` → `publishEphemeral` after commit
-   * **`dedup: true`** (`consume` and `serve`):
-     * `$inbox [scope = group, id = corr or msg.id]` is recorded in the transaction. An id already seen is acked without running the handler; `serve` replies again with the stored reply, kept in the row (amend `$inbox` with `reply?`, ⚠️ spec, `spec:` commit).
-     * Each row schedules a `gc` of itself at `dedupTtl` (default 7 days).
-   * **`on` handlers answering requests** (scatter-gather responders): `msg.reply(body)` emits to `reply_to`.
-4. **Spec (`spec:` commit if needed):** the `$inbox` `reply` field; the `zen.attempt` header; the class DLQ topic name.
+### 6b: scheduler, work queues, request/reply (detailed plan)
 
-**Tests 6b:**
+**Context.** 6a (PR #17, merged) gives messages, `emit`, `on`, consumer groups (owner only), change events and the system tables. 6b adds the §12 patterns that need more than one primitive:
+* the scheduler (delayed messages and `gc` jobs)
+* work-queue retries
+* request/reply
+
+They are all built from 6a's pieces and `$sched` / `$inbox` rows. No server changes.
+
+**After compaction, re-read:**
+* this section and the 6a log line
+* `spec/zendb.md` §10.3, §11.3, §11.5, §12.2–12.4, §12.6
+* `packages/db/src/{broker,msg,system,txn,db}.ts`
+* `packages/db/test/broker.test.ts` (setup, `until`, `events`, `FakeLocks`)
+* `packages/client/src/log.ts` (`Leader`), `clock.ts` (`now`, `sync`)
+
+**Branch/PR.** PR #17 is merged: restart the branch from main and open a new PR. The plan commit goes in first.
+
+#### Files
+1. **`broker.ts`, a refactor:** `appendMsg` splits into `sealMsg(tx, m, lean?) → payload` (body parts written in the transaction, as now) and the append. Schedules store payloads already sealed this way, so a large scheduled body already sits in parts.
+2. **`sched.ts`, delayed messages (§12.4):**
+   * **The `$sched` row:** `{id: bytes16, at: int, kind: 'emit' | 'gc', topic?: [bytes], key?: bytes, msg?: bytes, gc?: [[bytes]]}`.
+     * `msg` is the Msg's CBOR, `deliver_at` included.
+     * `key` is the event key's bytes (a string key as UTF-8).
+     * `gc` paths are element lists **under D** (decision, see Spec below), deleted as `keys.key(...elements)`.
+   * **`tx.schedule(topic, type, body, {at | delayMs, key?, id?, headers?}) → id`** and `db.schedule(…)`, which is its own transaction.
+     * `at` is in unix ms, by `session.clock.now()`.
+     * The row is inserted through `tx.table('$sched')`, so it goes through the private index.
+     * On commit, the local scheduler is woken if `at` comes before its next wake.
+   * **`tx.cancel(id)` / `db.cancel(id)` → boolean**: deletes the row, and returns whether it was still there.
+   * **`tx.gc(paths, {at | delayMs})`** (internal) inserts a `kind: 'gc'` row.
+   * **`emit(…, {ttlMs})`:** when the body went to parts, a `gc` row for those parts is added at `now + ttlMs` (§10.3).
+   * **`Scheduler`:**
+     * **Owner:** `db.scheduler`, started from `onOwner` when `DbOptions.scheduler !== false`. Options `DbOptions.schedulerOptions {pollMs = 1000, ttlMs = 10_000, batch = 100}`.
+     * **Leader:** `db.topic('zen', 'db', ns, 'sched').leader(groupId('sched'), {ttlMs, onLost})`, campaigning in the background.
+     * **Loop, while leading:**
+       1. Once at start (and every 10 minutes), `await clock.sync(client)`.
+       2. A short transaction: `tx.table('$sched').query().where('at', '<=', now).orderBy('at').limit(batch).page()`. For each row, `emit` appends the stored payload with its key (`topic.appendIn`, causation empty) and `gc` deletes the paths; then it deletes the row.
+       3. A `too_large` halves the batch.
+       4. Then it sleeps until `min(next at, now + pollMs)`. The next `at` comes from a one-row query; a local wake (schedule on this `Db`) cuts the sleep short.
+     * **Correctness** never depends on the lease (§12.4): two schedulers conflict on the index root and the rows, and one re-runs.
+     * **`stop({release = true})`:** `release: false` drops the lease without releasing it, which simulates a crash in tests.
+     * `db.close()` stops it.
+3. **Work queues (§12.2), in `broker.ts`:**
+   * **`EmitOptions.spread`:** a fresh random 16-byte key (with `key` given → `bad_value`).
+   * **`ConsumeOptions.retry: 'nack' | 'delay'`** (default `nack`) and **`backoff?: (attempt) => ms`** (default `min(1000 · 2^(attempt−1), 300_000)`).
+     * With `delay`, a handler throw runs a transaction: ack the delivery, then either schedule a copy, or dead-letter it.
+     * **The copy:** same Msg `id`, `body`, `corr` and `reply_to`, with header `zen.attempt` = attempt + 1. It is scheduled at `now + backoff(attempt)` with the same key.
+     * **The attempt** of a delivery is `headers['zen.attempt'] ?? 1`.
+     * **After `maxAttempts`** (default 5): an immediate `tx.emit` of the copy to `topic.child('zen.dlq')` (decision: immediate, not scheduled).
+     * Headers starting with `zen.` are refused in app `emit` (`bad_value`).
+4. **`reply.ts`, request/reply (§12.3):**
+   * **`ReplyError(message, data?)`** is exported. An error reply has type `<type>.error` and body `{message, data?}`. On the requester's side, `request` rejects with a `ReplyError` built from it.
+   * **The inbox:** `db.inbox`, created on first use.
+     * `instance` = 16 random bytes per `Db`; topic `('zen', 'inbox', instance)`.
+     * An `on` subscription from the beginning (`after` = 12 zero bytes). The topic is new and only this instance's, so there is no history to replay, and no race between subscribing and the first reply.
+     * Plus an `onEphemeral` subscription.
+     * `pending: Map<corr hex, Waiter>`. A reply whose `corr` is unknown is dropped (late or foreign).
+   * **`db.request(topic, type, body, {timeoutMs = 10_000, key?, corr?}) → Promise<Message>`:**
+     1. It awaits the inbox's start.
+     2. It emits `{type, id, corr (default random), reply_to: inbox path, body}`.
+     3. It waits for one reply. The timer starts after the commit; at the end, `DbError('timeout')`.
+     * A retry after a timeout passes the same `corr` (dedup).
+   * **`tx.request(…) → Promise<Message>`:**
+     * It emits in the transaction and registers the waiter in `onCommit`. The inbox starts at once, so its subscription runs before the reply can exist.
+     * If the attempt doesn't commit, its promise never settles: a re-run makes a new one. It must be awaited after the transaction, never inside it (documented).
+   * **`db.requestAll(…, {timeoutMs, max?}) → Promise<Message[]>`:** scatter-gather. It collects replies with the `corr` until the timeout, or until `max` replies, and resolves with what it has (no `timeout` error).
+   * **`db.serve(opts: ConsumeOptions & {dedup?, reply?: 'event' | 'ephemeral'}, handler(msg, tx) → body)`:**
+     * a `consume` whose transaction emits the reply to `reply_to` (`db.topic(...replyTo)`): `{type: type + '.reply', id, corr: msg.corr ?? msg.id, body}`
+     * `ReplyError` → a `.error` reply in the same transaction, with the request consumed (not nacked)
+     * any other throw → `nack` / `retry`, as for `consume`
+     * a request without `reply_to` → the handler runs, and no reply is sent
+     * **`reply: 'ephemeral'`:** the reply is published with `publishEphemeral` from `tx.after`
+   * **`db.reply(msg, body, {ephemeral?})` / `tx.reply(msg, body)`:** for plain `on` responders (scatter-gather) and manual consumers.
+5. **Dedup (§12.3, §12.6), `ConsumeOptions.dedup?: boolean` and `dedupTtlMs` (default 7 days):**
+   * **Row:** `$inbox [scope = group name, id]`, where `id` = `msg.corr ?? msg.id` for `serve` and `msg.id` for `consume`. Fields `{at, reply?}`.
+   * **In the handling transaction:**
+     * The row is read first. If present: skip the handler, ack, and (`serve`) send the stored reply again.
+     * Otherwise run the handler, then insert the row (with the reply for `serve`), and `tx.gc` its own row key at `now + dedupTtlMs`.
+6. **Spec (`spec:` commit, ⚠️ SPEC CHANGES):**
+   * §11.5: `$inbox` gains `reply?: any` (the reply a dedup responder sends again). `$sched` `gc` paths are element lists under `D`; `key` is the event key's bytes.
+   * §12.2: header `zen.attempt`; the class DLQ is an immediate emit to `<topic> ‖ "zen.dlq"`. App headers may not start with `zen.`.
+   * §12.3:
+     * the inbox subscribes from the start of its topic
+     * error replies have body `{message, data?}`
+     * `tx.request` settles only if its transaction commits
+     * `requestAll` resolves with what arrived by the timeout
+   * §12.4: `stop` and the wake-up on a local schedule are informative only. No change.
+7. **Docs:** none here (6c writes the broker part of DB.md). TECH_DEBT is unchanged.
+
+#### Tests (`packages/db/test/patterns.test.ts`, its own server)
+`world({limits: {claim_ttl_ms: 1000}})`. Scheduler options `{pollMs: 100, ttlMs: 1000}`, so failover takes about a second.
 * **Scheduler:**
-  * Due rows are emitted once and not early, by a fake clock offset or short delays.
-  * `cancel` before and after delivery.
-  * `gc` deletes the parts.
-  * Two schedulers (two `Db`s, both owners via `locks: null`) on the same rows give no duplicates: a deposed leader conflicts.
-  * Failover: stop the leader without release, and the other takes over after the lease TTL (a short `ttlMs` option).
-* **Queues:** `spread` across two consumers; `retry: 'delay'` backoff order and the DLQ topic.
+  * Rows at `now+300`, `now+600` and `now` are emitted in `at` order, each exactly once, and none before its `at` (compare the event's sealed HLC time, or the receive time, against `deliver_at`).
+  * `cancel` before delivery → true, and nothing is emitted. After delivery → false.
+  * A transaction that schedules, then throws, leaves no row.
+  * `emit(…, {ttlMs: 200})` with a large body: the parts are gone after the gc, and `openMessage` → `poisoned`.
+  * **Two schedulers racing** (two `Db`s with `locks: null`, both owners, and the lease bypassed by calling the internal `runOnce()` on both concurrently over 50 due rows): every row is emitted exactly once.
+  * **Failover:** A leads; `a.scheduler.stop({release: false})`; B takes the lease after the TTL and delivers rows scheduled meanwhile.
+* **Work queues:**
+  * `spread` messages on one `per_key` group with two `Db` consumers: both handle some, and all are handled once.
+  * `retry: 'delay'` with a fixed backoff of 100 ms and `maxAttempts: 3`:
+    * the handler sees attempts 1, 2, 3 (`zen.attempt`), then the message lands on `topic/zen.dlq` with the same `id`
+    * a handler that succeeds on attempt 2 stops the retries
+  * App headers or types starting with `zen.` are refused.
 * **Request/reply:**
-  * a round trip
-  * a timeout, and a late reply dropped
-  * `ReplyError`
-  * dedup: a repeated request with the same `corr` doesn't re-run the handler and gets the same reply
-  * ephemeral reply
-  * scatter-gather from two `on` responders
-  * a request inside a rolled-back transaction is never sent
+  * A round trip: `serve` does a row write plus the reply, and the requester gets the body.
+  * Timeout, then a late reply is dropped: the responder delays past the timeout, and a second request still works.
+  * `ReplyError` → the requester rejects with `ReplyError`, and the request is consumed (no redelivery).
+  * **Dedup:** a request repeated with the same `corr` (after a timeout) runs the handler once (row count) and gets the same reply twice. An `$inbox` row exists with its `gc` row in `$sched`.
+  * The ephemeral reply arrives.
+  * Scatter-gather: two `on` responders (two `Db`s) each `db.reply`, and `requestAll` returns 2.
+  * A request in a transaction that throws is never sent: the responder sees nothing, and the promise doesn't settle.
+* **Verification:**
+  * `npx biome check`
+  * tsc: client, fuse, db test
+  * `npx vitest run` three times
+  * CI green on the new PR before stopping
+
+#### Rhythm
+1. Restart from main.
+2. Commit the plan (`docs: milestone 5 step 6b plan`), push, open a new PR.
+3. Build 6b on the user's go.
+4. `spec:` commit, then the code commit.
+5. Log the 6b line, push, update the PR, confirm CI is green, stop for compaction.
 
 ### 6c: sagas, the tab proxy, the fault suite, docs
 1. **`saga.ts` (§12.5):**
