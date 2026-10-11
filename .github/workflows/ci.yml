@@ -83,9 +83,9 @@ jobs:
         if: failure()
         run: cat /tmp/zen-ci/init.log
 
-  # @zen/client and zen-mount (docs/MILESTONE-4.md): the WASM core, then the
-  # TypeScript packages tested against a spawned embedded zen-serve, in Node
-  # and in Chromium, and FUSE mounts.
+  # @zen/client, zen-mount and @zen/db (docs/MILESTONE-4.md, MILESTONE-5.md):
+  # the WASM core, then the TypeScript packages tested against a spawned
+  # embedded zen-serve, in Node and in Chromium, and FUSE mounts.
   client:
     runs-on: ubuntu-latest
     steps:
@@ -123,6 +123,7 @@ jobs:
           npx biome check
           npx tsc -p packages/client/tsconfig.test.json
           npx tsc -p packages/fuse/tsconfig.json --noEmit
+          npx tsc -p packages/db/tsconfig.test.json
       - name: Test (Node)
         run: npx vitest run
       - name: Test (Chromium)

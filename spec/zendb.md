@@ -183,7 +183,8 @@ The size of a row is bounded by the commit: `max_commit_bytes` (8 MB by default)
 
 A table with `pad: true` pads every Row with `5: pad` (zero bytes) so its encoded size is the smallest bucket that fits:
 * the buckets are 256 B, 1 KiB, 4 KiB, 16 KiB, then the multiples of 16 KiB
-* rows with parts are padded as a Row, and their last part with zero bytes to 16 KiB
+* rows with parts are padded as a Row, and their last part with zero bytes to a multiple of 16 KiB (at most the part size)
+* a padded Row whose bucket would not fit one value (`max_value_bytes` − 48 bytes of plaintext) is stored with parts, even when its fields alone would fit
 * the pad is the longest that keeps the Row within its bucket. Where CBOR's length heads make the bucket size itself unreachable (a pad of 24, 256 or 65,536 bytes needs a longer head), the Row ends one or two bytes short of it
 
 This hides row sizes within a bucket (DESIGN-3 §2.3).

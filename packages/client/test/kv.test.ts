@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { bytes, fullGrants, isCode, member, type UnlockedFs, zw } from '../src/index.js';
+import { bytes, fullGrants, isCode, member, type UnlockedFs, ZenError, zw } from '../src/index.js';
 import { testUser } from '../src/testing/index.js';
 import { type World, world } from './helpers.js';
 
@@ -142,6 +142,89 @@ describe('transactions', () => {
     // And fs 2 isn't hers at all.
     await expect(sc.fs(2).header()).rejects.toSatisfy((e) => isCode(e, 'forbidden'));
     void fullGrants;
+  });
+});
+
+describe('stored keys, limited ranges, getAll, clearRange', () => {
+  it('gets, sets and deletes by stored key; getAll reads several and records them', async () => {
+    const a = fs.kv.key(['sk', 'a']);
+    const b = fs.kv.key(['sk', 'b']);
+    let runs = 0;
+    await fs.transaction(async (tx) => {
+      runs++;
+      tx.set(a, u('A'));
+      expect(s(await tx.get(a))).toBe('A');
+      const [x, y] = await tx.getAll([a, ['sk', 'b']]);
+      expect(s(x)).toBe('A');
+      expect(s(y)).toBe(runs === 1 ? undefined : 'B');
+      if (runs === 1) await fs.kv.set(['sk', 'b'], u('B'));
+    });
+    // The concurrent write of b conflicted with the getAll: a second run.
+    expect(runs).toBe(2);
+    await fs.transaction(async (tx) => tx.delete(b));
+    expect(await fs.kv.get(['sk', 'b'])).toBeUndefined();
+  });
+
+  it('a limited range records only the part it read', async () => {
+    await fs.transaction(async (tx) => {
+      for (let i = 0; i < 8; i++) tx.set(['lr', `k${i}`], u(`v${i}`));
+    });
+    const sorted: Uint8Array[] = [];
+    for await (const e of fs.kv.range(['lr'])) sorted.push(e.key);
+    const [begin, end] = [fs.kv.key(['lr']), bytes.prefixEnd(fs.kv.key(['lr']))];
+    let runs = 0;
+    await fs.transaction(async (tx) => {
+      runs++;
+      const page = await tx.rangeStored(begin, end, { limit: 3 });
+      expect(page.map((e) => e.key)).toEqual(sorted.slice(0, 3));
+      // A write past the page does not conflict.
+      if (runs === 1) {
+        await fs.transaction(async (t2) => t2.set(sorted[6]!, u('changed')));
+      }
+      tx.set(['lr', 'seen'], u(String(page.length)));
+    });
+    expect(runs).toBe(1);
+    // One inside the page does.
+    runs = 0;
+    await fs.transaction(async (tx) => {
+      runs++;
+      await tx.rangeStored(begin, end, { limit: 3 });
+      if (runs === 1) {
+        await fs.transaction(async (t2) => t2.set(sorted[1]!, u('changed')));
+      }
+      tx.set(['lr', 'seen'], u('x'));
+    });
+    expect(runs).toBe(2);
+  });
+
+  it('clearRange deletes a stored-key range, and reads see it', async () => {
+    await fs.transaction(async (tx) => {
+      for (let i = 0; i < 4; i++) tx.set(['cr', `k${i}`], u(`v${i}`));
+    });
+    const keys: Uint8Array[] = [];
+    for await (const e of fs.kv.range(['cr'])) keys.push(e.key);
+    await fs.transaction(async (tx) => {
+      tx.clearRange(keys[1]!, keys[3]!);
+      expect(await tx.get(keys[1]!)).toBeUndefined();
+      expect(s(await tx.get(keys[3]!))).toBeDefined();
+    });
+    const left: Uint8Array[] = [];
+    for await (const e of fs.kv.range(['cr'])) left.push(e.key);
+    expect(left).toEqual([keys[0], keys[3]]);
+  });
+
+  it('a retryable error thrown by fn re-runs it', async () => {
+    let runs = 0;
+    const out = await fs.transaction(async () => {
+      if (++runs < 3) throw new ZenError(409, 'conflict', 'test');
+      return runs;
+    });
+    expect(out).toBe(3);
+    await expect(
+      fs.transaction(async () => {
+        throw new ZenError(400, 'bad_request', 'test');
+      }),
+    ).rejects.toThrow('bad_request');
   });
 });
 

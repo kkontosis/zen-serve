@@ -202,44 +202,79 @@ export class Transaction {
   }
 
   /** Read a value (sees this transaction's own writes). */
-  async get(path: Path): Promise<Uint8Array | undefined> {
-    const key = this.key(path);
-    const own = this.writes.get(hex(key));
-    if (own) return own.value ? this.fs.kv.open(key, own.value) : undefined;
-    const r = await this.fs.session.call('/v1/kv/get', zw.encodeKvGet, zw.decodeKvItems, {
-      fs: this.fs.id,
-      keys: [key],
-      ...this.rv(),
-    });
-    this.noteRv(r.read_version);
-    const it = r.items[0]!;
-    if (this.mode === 'short') {
-      this.conflicts.push({ fs: this.fs.id, begin: key, end: keyAfter(key) });
-    } else if (!this.expects.has(hex(key))) {
-      this.expects.set(hex(key), {
-        fs: this.fs.id,
-        key,
-        ...(it.version ? { version: it.version } : {}),
-      });
-    }
-    return it.value ? this.fs.kv.open(key, it.value) : undefined;
+  async get(path: Path | Uint8Array): Promise<Uint8Array | undefined> {
+    return (await this.getAll([path]))[0];
   }
 
   /**
-   * Read every entry under a prefix. In long mode the whole range is
-   * hashed into an `expect_ranges` check, so it must fit one response.
+   * Read several values in one request, each recorded like `get`: a read
+   * conflict in short mode, an `expect` in long mode.
    */
-  async range(prefix: Path): Promise<KvEntry[]> {
+  async getAll(paths: (Path | Uint8Array)[]): Promise<(Uint8Array | undefined)[]> {
+    const keys = paths.map((p) => this.key(p));
+    const out: (Uint8Array | undefined)[] = new Array(keys.length);
+    const need: number[] = [];
+    keys.forEach((k, i) => {
+      const own = this.own(k);
+      if (own) out[i] = own.value;
+      else need.push(i);
+    });
+    if (!need.length) return out;
+    const r = await this.fs.session.call('/v1/kv/get', zw.encodeKvGet, zw.decodeKvItems, {
+      fs: this.fs.id,
+      keys: need.map((i) => keys[i]!),
+      ...this.rv(),
+    });
+    this.noteRv(r.read_version);
+    need.forEach((i, j) => {
+      const key = keys[i]!;
+      const it = r.items[j]!;
+      if (this.mode === 'short') {
+        this.conflicts.push({ fs: this.fs.id, begin: key, end: keyAfter(key) });
+      } else if (!this.expects.has(hex(key))) {
+        this.expects.set(hex(key), {
+          fs: this.fs.id,
+          key,
+          ...(it.version ? { version: it.version } : {}),
+        });
+      }
+      out[i] = it.value ? this.fs.kv.open(key, it.value) : undefined;
+    });
+    return out;
+  }
+
+  /**
+   * Read every entry under a prefix (a path, or a stored-key prefix). In
+   * long mode the whole range is hashed into an `expect_ranges` check, so
+   * it must fit one response.
+   */
+  async range(prefix: Path | Uint8Array): Promise<KvEntry[]> {
     const begin = prefix.length ? this.key(prefix) : new Uint8Array(0);
-    const end = prefixEnd(begin);
+    return this.rangeStored(begin, prefixEnd(begin));
+  }
+
+  /**
+   * Read the stored-key range `[begin, end)`, recorded like `range`. With
+   * `limit`, at most that many entries are read, and only the part of the
+   * range up to the last one read is recorded: a paged scan conflicts with
+   * changes in the pages it read, not beyond.
+   */
+  async rangeStored(
+    begin: Uint8Array,
+    end: Uint8Array | undefined,
+    opts: { limit?: number } = {},
+  ): Promise<KvEntry[]> {
     const out: KvEntry[] = [];
     const hasher = this.mode === 'long' ? new zw.RangeHasher() : undefined;
+    let left = opts.limit ?? Number.POSITIVE_INFINITY;
     let lo = begin;
-    for (;;) {
+    let hi = end;
+    while (left > 0) {
       const r = await this.fs.session.call('/v1/kv/range', zw.encodeKvRange, zw.decodeKvItems, {
         fs: this.fs.id,
         begin: lo,
         ...(end ? { end } : {}),
+        ...(Number.isFinite(left) ? { limit: left } : {}),
         ...this.rv(),
       });
       this.noteRv(r.read_version);
@@ -247,12 +282,19 @@ export class Transaction {
         hasher?.update(it.key, it.version!);
         out.push({ key: it.key, value: this.fs.kv.open(it.key, it.value!), version: it.version! });
       }
+      left -= r.items.length;
       const last = r.items.at(-1);
-      if (!r.more || !last) break;
+      if (!last) break;
+      if (left <= 0) {
+        // The limit stopped the read: record the range up to the last item.
+        hi = keyAfter(last.key);
+        break;
+      }
+      if (!r.more) break;
       if (hasher) throw new ZenError(413, 'too_large', 'a long-mode range must fit one read');
       lo = keyAfter(last.key);
     }
-    const range: FsRange = { fs: this.fs.id, begin, ...(end ? { end } : {}) };
+    const range: FsRange = { fs: this.fs.id, begin, ...(hi ? { end: hi } : {}) };
     if (hasher) {
       this.expectRanges.push({ ...range, hash: hasher.finalize() });
       hasher.free();
@@ -260,15 +302,12 @@ export class Transaction {
       this.conflicts.push(range);
     }
     // Overlay this transaction's own writes and clears.
-    const inRange = (k: Uint8Array) => compare(k, begin) >= 0 && (!end || compare(k, end) < 0);
     const merged = new Map(out.map((e) => [hex(e.key), e]));
     for (const c of this.clears) {
-      for (const [h, e] of merged) {
-        if (compare(e.key, c.begin) >= 0 && (!c.end || compare(e.key, c.end) < 0)) merged.delete(h);
-      }
+      for (const [h, e] of merged) if (inRange(e.key, c.begin, c.end)) merged.delete(h);
     }
     for (const [h, w] of this.writes) {
-      if (!inRange(w.key)) continue;
+      if (!inRange(w.key, begin, hi)) continue;
       if (w.value) {
         merged.set(h, {
           key: w.key,
@@ -426,7 +465,7 @@ export class Transaction {
   }
 
   /** Write a value. */
-  set(path: Path, value: Uint8Array): void {
+  set(path: Path | Uint8Array, value: Uint8Array): void {
     const key = this.key(path);
     this.writes.set(hex(key), {
       fs: this.fs.id,
@@ -436,18 +475,20 @@ export class Transaction {
   }
 
   /** Delete a value. */
-  delete(path: Path): void {
+  delete(path: Path | Uint8Array): void {
     const key = this.key(path);
     this.writes.set(hex(key), { fs: this.fs.id, key });
   }
 
-  /** Delete everything under a path prefix (applied before the writes). */
-  clearPrefix(prefix: Path): void {
+  /** Delete everything under a path or stored-key prefix (applied before the writes). */
+  clearPrefix(prefix: Path | Uint8Array): void {
     const begin = this.key(prefix);
-    const end = prefixEnd(begin);
-    for (const [h, w] of this.writes) {
-      if (compare(w.key, begin) >= 0 && (!end || compare(w.key, end) < 0)) this.writes.delete(h);
-    }
+    this.clearRange(begin, prefixEnd(begin));
+  }
+
+  /** Delete the stored-key range `[begin, end)` (applied before the writes). */
+  clearRange(begin: Uint8Array, end: Uint8Array | undefined): void {
+    for (const [h, w] of this.writes) if (inRange(w.key, begin, end)) this.writes.delete(h);
     this.clears.push({ fs: this.fs.id, begin, ...(end ? { end } : {}) });
   }
 
@@ -484,6 +525,8 @@ export class Transaction {
   }
 }
 
+const backoff = (i: number) => sleep(Math.min(10 * 2 ** i, 1000) * (0.5 + Math.random()));
+
 /**
  * Run `fn` in a transaction and commit it, re-running it on `conflict` or
  * `too_old`, or when an `onError` hook asks for it. A transaction that only
@@ -497,7 +540,16 @@ export async function transaction<T>(
   const attempts = opts.attempts ?? 8;
   for (let i = 1; ; i++) {
     const tx = new Transaction(fs, opts.mode ?? 'short');
-    const out = await fn(tx);
+    let out: T;
+    try {
+      out = await fn(tx);
+    } catch (e) {
+      // A read that hit `too_old`, or a check of `fn`'s own that found a
+      // concurrent change, re-runs it like a failed commit.
+      if (i >= attempts || !(e instanceof ZenError && e.retryable)) throw e;
+      await backoff(i);
+      continue;
+    }
     if (tx.empty) return out;
     try {
       tx.result = await sendCommit(fs.session, tx.build());
@@ -507,7 +559,7 @@ export async function transaction<T>(
       let again = retryable;
       for (const h of tx.errorHooks) if (await h(e, i)) again = true;
       if (!again) throw e;
-      if (retryable) await sleep(Math.min(10 * 2 ** i, 1000) * (0.5 + Math.random()));
+      if (retryable) await backoff(i);
       continue;
     }
     for (const h of tx.commitHooks) h(tx.result);
