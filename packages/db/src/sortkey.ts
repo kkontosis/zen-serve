@@ -92,7 +92,7 @@ export function component(out: number[], v: Value | undefined, ty?: FieldType): 
   const mismatch = () => new DbError('bad_type', `a ${n.t} value in a ${ty} field`);
   switch (n.t) {
     case 'null':
-      out.push(0x00);
+      out.push(0x01);
       return;
     case 'bool':
       if (ty && ty !== 'bool') throw mismatch();

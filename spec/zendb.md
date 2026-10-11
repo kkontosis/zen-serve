@@ -216,7 +216,7 @@ Private indexes need order, so they use an order-preserving **sort key**. For ea
 
 | Value | Encoding |
 |---|---|
-| null | `0x00` |
+| null | `0x01` |
 | false / true | `0x10` / `0x11` |
 | int (i64 range) | `0x20 ‖ u64(x XOR 2^63)` |
 | int above 2^63−1 | `0x21 ‖ u64(x)` |
@@ -225,6 +225,7 @@ Private indexes need order, so they use an order-preserving **sort key**. For ea
 | bytes | `0x40 ‖ escape(bytes) ‖ 0x00` |
 
 * `escape` replaces each `0x00` with `0x00 0xFF`, so the encoding is prefix-free and byte order equals value order.
+* No encoding starts with `0x00` or `0xFF`, inverted or not. So after a text or bytes field's terminator (`0x00`, or `0xFF` inverted), the next field never starts with the escape's second byte, and a sort key of several fields still orders by its fields in turn. (This is why null is `0x01`: as `0x00`, a descending null after a text field read like an escaped zero, and `"a"` sorted after `"a\0"`.)
 * **By declared type.** A field is encoded by its declared `Type`, not by the CBOR form of its value: a `float` field encodes every number (an integer included, §1) as a float, and an `int` field every number as an int. A pk component is encoded by the type of its value (integers as int, other numbers as float).
 * Text compares by code point (binary UTF-8 order). There is no collation. An app wanting case-insensitive order stores and indexes a normalized copy of the field.
 * A pk field of a type outside this table (an array or a map) can't be used in a table that has a private index.
@@ -317,6 +318,8 @@ A private index with `decoys: k > 0` blurs which leaves a write touches (the loc
 
 * **Choosing them.** Pick a uniformly random level-0 entry by descending with the `count` fields. Its leaf gets a fresh random `salt`. Its id changes, and so do the ids of its ancestors up to the root, exactly as for a real change.
 * **Padding.** With decoys, every Node is padded with `4: pad` to the smallest size bucket that fits (1 KiB, 2 KiB, 4 KiB, then multiples of 4 KiB). Otherwise a changed entry count shows in the ciphertext size and tells a real leaf from a decoy.
+* **Every node is salted.** Every node a decoy index writes, by a real change or a decoy, carries a fresh random `salt`. Otherwise a leaf whose entries return to an earlier state would get its earlier id back, and the server would see an old key come back.
+* **Value size.** A padded node can reach 64 KiB (a node closes at 60,000 bytes with an entry of up to about 4.1 KB). So decoys need `max_value_bytes` of at least 65,584 (64 KiB plus the sealing overhead); the library refuses them (`bad_value`) on a server with less.
 * **Canonical tree.** The tree stays canonical in its entries and boundaries (§5.4.1), but node ids are no longer history-independent. Test vectors use unsalted nodes.
 * **Cost:** about `k × height` more node writes and deletes per commit.
 * **What it doesn't hide.**
@@ -363,6 +366,8 @@ A `sealed` index stores its entire entry list as one sealed blob, rewritten on e
   | `D ‖ ("s", index_id, u32(i))` | part `i` |
 
 * **Writing.** A transaction that changes the index reads the head (into its read set), applies its changes to the entry list and writes every part and the head. A change that would exceed `max_bytes` fails with `too_large`; the app then moves to `oblivious` or `private`.
+  * Parts beyond the new number of parts are deleted.
+  * An index that becomes empty keeps its head (`count: 0`) and one part, so it looks like any small index.
 * **Reading.** A reader reads the head, then all parts, and checks the digest.
   * The head's version validates a cached copy (§7.7), so an unchanged index costs one `get`.
   * Every query reads the whole index, so the server can't tell queries apart.

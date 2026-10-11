@@ -207,24 +207,32 @@ fn sort_key_vectors() -> Result<J> {
             cases.push(json!({"fields": [{"value": to_json(v), "type": name(*ty), "desc": desc}], "pk": [to_json(&int(7))], "key": h(&k)}));
         }
     }
-    let (a, b, pk1, pk2) = (t("todo"), int(3), t("card-9"), int(2));
-    let k = sortkey::sort_key(
-        &[
-            Field {
-                value: &a,
-                ty: Type::Text,
-                desc: false,
-            },
-            Field {
-                value: &b,
-                ty: Type::Int,
-                desc: true,
-            },
-        ],
-        &[&pk1, &pk2],
-    )?;
-    cases.push(json!({"fields": [{"value": to_json(&a), "type": "text", "desc": false}, {"value": to_json(&b), "type": "int", "desc": true}],
-                      "pk": [to_json(&pk1), to_json(&pk2)], "key": h(&k)}));
+    // Two fields: a text then a descending int, and the cases where a null
+    // follows a text field's terminator (zendb.md §5.1).
+    let (pk1, pk2) = (t("card-9"), int(2));
+    for (a, a_desc, b, b_desc) in [
+        (t("todo"), false, int(3), true),
+        (t("todo"), false, Value::Null, true),
+        (t("a\0"), true, Value::Null, false),
+    ] {
+        let k = sortkey::sort_key(
+            &[
+                Field {
+                    value: &a,
+                    ty: Type::Text,
+                    desc: a_desc,
+                },
+                Field {
+                    value: &b,
+                    ty: Type::Int,
+                    desc: b_desc,
+                },
+            ],
+            &[&pk1, &pk2],
+        )?;
+        cases.push(json!({"fields": [{"value": to_json(&a), "type": "text", "desc": a_desc}, {"value": to_json(&b), "type": "int", "desc": b_desc}],
+                          "pk": [to_json(&pk1), to_json(&pk2)], "key": h(&k)}));
+    }
     let refused = [
         (t("x"), Type::Int, "text in an int field"),
         (Value::Float(1.5), Type::Int, "fraction in an int field"),

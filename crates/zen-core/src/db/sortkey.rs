@@ -78,7 +78,7 @@ fn float(out: &mut Vec<u8>, f: f64) -> Result<()> {
 pub fn component(out: &mut Vec<u8>, v: &Value, ty: Option<Type>) -> Result<()> {
     let v = v.normalized_number().unwrap_or_else(|| v.clone());
     match (&v, ty) {
-        (Value::Null, _) => out.push(0x00),
+        (Value::Null, _) => out.push(0x01),
         (Value::Bool(b), None | Some(Type::Bool)) => out.push(if *b { 0x11 } else { 0x10 }),
         (Value::Int(i), None | Some(Type::Int)) => int(out, *i),
         (Value::Int(i), Some(Type::Float)) => float(out, *i as f64)?,
@@ -164,6 +164,34 @@ mod tests {
             assert!(k(Value::text(w[0]), Type::Text) < k(Value::text(w[1]), Type::Text));
         }
         assert!(k(Value::Null, Type::Int) < k(Value::Int(i64::MIN as i128), Type::Int));
+        // A text field ends in 0x00, a descending one in 0xFF: the next
+        // field must not start with the escape's second byte, or "a" would
+        // sort after "a\0" (a descending null starts with 0xFE, not 0xFF).
+        let two = |a: &str, b: Value, desc: [bool; 2]| {
+            let text = Value::text(a);
+            sort_key(
+                &[
+                    Field {
+                        value: &text,
+                        ty: Type::Text,
+                        desc: desc[0],
+                    },
+                    Field {
+                        value: &b,
+                        ty: Type::Int,
+                        desc: desc[1],
+                    },
+                ],
+                &[&Value::Int(1)],
+            )
+            .unwrap()
+        };
+        for b in [Value::Null, Value::Int(0), Value::Int(i64::MIN as i128)] {
+            assert!(two("a", b.clone(), [false, true]) < two("a\0", Value::Null, [false, true]));
+            assert!(two("a", b.clone(), [false, false]) < two("a\0", Value::Null, [false, false]));
+            assert!(two("a", b.clone(), [true, false]) > two("a\0", Value::Null, [true, false]));
+            assert!(two("a", b, [true, true]) > two("a\0", Value::Null, [true, true]));
+        }
         assert!(component(&mut Vec::new(), &Value::text("x"), Some(Type::Int)).is_err());
         assert!(component(&mut Vec::new(), &Value::Float(1.5), Some(Type::Int)).is_err());
     }
