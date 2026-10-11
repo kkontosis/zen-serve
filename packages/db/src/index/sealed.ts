@@ -149,12 +149,12 @@ export class SealedState {
 export async function readSealed(
   tx: IndexTx,
   index: Uint8Array,
-  cached: (digest: string) => Uint8Array[] | undefined,
+  cached: (digest: string) => Uint8Array[] | undefined | Promise<Uint8Array[] | undefined>,
 ): Promise<{ keys: Uint8Array[]; parts: number; digest?: Uint8Array }> {
   const b = await tx.raw.get(tx.keys.sealedHead(index));
   if (!b) return { keys: [], parts: 0 };
   const head = decodeHead(b);
-  const hit = cached(bytes.hex(head.digest));
+  const hit = await cached(bytes.hex(head.digest));
   if (hit) return { keys: [...hit], parts: head.parts, digest: head.digest };
   const got = await tx.raw.snapshotGet(
     Array.from({ length: head.parts }, (_, i) => tx.keys.sealedPart(index, i)),

@@ -18,7 +18,8 @@ import type { Inflight, QueueEntry, QueueRow, QueueStore } from './crdtq.js';
 import { DbError } from './errors.js';
 
 /** The stores of database `ns` in a local store (wiped together). */
-export const localStores = (ns: string) => [`queue/${ns}`];
+export const localStores = (ns: string) =>
+  ['queue', 'db', 'rows', 'crdt', 'nodes', 'sealed'].map((s) => `${s}/${ns}`);
 
 const INFLIGHT = bytes.utf8('inflight');
 const entryKey = (id: string) => bytes.utf8(`e${id}`);

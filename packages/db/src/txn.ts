@@ -386,7 +386,11 @@ export class DbTransaction implements IndexTx {
     let s = this.sealedStates.get(h);
     if (!s) {
       this.live();
-      const r = await readSealed(this, ix.id, (d) => this.db.cachedSealed(h, d));
+      const r = await readSealed(
+        this,
+        ix.id,
+        (d) => this.db.cachedSealed(h, d) ?? this.db.keptSealed(h, d),
+      );
       if (r.digest) this.db.cacheSealed(h, bytes.hex(r.digest), [...r.keys]);
       s = new SealedState(this, ix.id, ix.maxBytes ?? SEALED_MAX_BYTES, r.keys, r.parts);
       this.sealedStates.set(h, s);
@@ -483,8 +487,10 @@ export class DbTransaction implements IndexTx {
         now = await this.raw.snapshotGet(used.map((u) => u.key));
       } catch (e) {
         // Offline, a transaction that used only catalog records (CRDT reads)
-        // answers from them (§19.4).
+        // answers from them (§19.4); in `cache` mode, from its cached rows
+        // too, unchecked (§7.7).
         const catalog = this.catalogKeys();
+        if (isNetwork(e) && this.crdtRead === 'cache') return;
         if (isNetwork(e) && used.every((u) => catalog.has(bytes.hex(u.key)))) return;
         throw e;
       }
@@ -885,7 +891,15 @@ export class TableTx<T extends Fields = Fields> {
         return { fields: c.fields, parts: c.parts };
       }
     }
-    const [e] = await tx.raw.getEntries([key]);
+    let e: Awaited<ReturnType<typeof tx.raw.getEntries>>[number];
+    try {
+      [e] = await tx.raw.getEntries([key]);
+    } catch (err) {
+      if (isNetwork(err) && tx.crdtRead === 'cache') {
+        throw new DbError('offline', 'a row that is not cached, while offline');
+      }
+      throw err;
+    }
     if (!e) return undefined;
     const r = await this.decode(t, pkEl, e.value);
     tx.noteRow(key, e.version, r);

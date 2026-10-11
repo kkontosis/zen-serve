@@ -6,6 +6,7 @@ export { type ClockStore, memoryClockStore, SessionClock, TreeClock } from './cl
 export { isCode, ZenError } from './errors.js';
 export {
   Fs,
+  type HeaderOptions,
   openHeader,
   prfSlotSalts,
   SlotType,

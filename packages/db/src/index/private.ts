@@ -54,15 +54,23 @@ export class TxNodeStore implements NodeStore {
       else miss.push(i);
     });
     if (!miss.length) return out;
+    // Then the nodes the local store kept (§9.3), then the server.
+    const left: number[] = [];
+    for (const i of miss) {
+      const n = await db.keptNode(this.index, ids[i]!);
+      if (n) out[i] = n;
+      else left.push(i);
+    }
+    if (!left.length) return out;
     const got = await this.tx.raw.snapshotGet(
-      miss.map((i) => this.tx.keys.node(this.index, ids[i]!)),
+      left.map((i) => this.tx.keys.node(this.index, ids[i]!)),
     );
-    for (let j = 0; j < miss.length; j++) {
+    for (let j = 0; j < left.length; j++) {
       const e = got[j];
       if (!e) throw new ZenError(409, 'conflict', 'a private index changed while it was read');
       const n = decodeNode(e.value);
-      db.cacheNode(hex(ids[miss[j]!]!), n);
-      out[miss[j]!] = n;
+      db.cacheNode(hex(ids[left[j]!]!), n, e.value);
+      out[left[j]!] = n;
     }
     return out;
   }
@@ -101,7 +109,7 @@ export async function applyPrivate(
   if (r.root) raw.set(rk, encodeRoot(r.root));
   else raw.delete(rk);
   raw.onCommit(() => {
-    for (const w of r.put) tx.db.cacheNode(hex(w.id), w.node);
+    for (const w of r.put) tx.db.cacheNode(hex(w.id), w.node, w.bytes);
   });
 }
 

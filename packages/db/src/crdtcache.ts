@@ -20,13 +20,19 @@ export type CrdtRead = 'auto' | 'cache' | 'server';
 /** Objects per `/v1/crdt/versions` (api.md §13.3). */
 const VERSIONS_MAX = 1000;
 
-interface Entry {
+export interface Entry {
   /** The object's state; undefined when it has none. */
   state: ObjState | undefined;
   /** When the server last confirmed it (ms). */
   checked: number;
   /** A commit of this `Db` changed the object since: fetch it again when online. */
   stale: boolean;
+}
+
+/** Where entries are kept beyond memory (§9.3): told of every change. */
+export interface CacheSink {
+  put(h: string, e: Entry): void;
+  delete(h: string): void;
 }
 
 export const isNetwork = (e: unknown) => e instanceof ZenError && e.code === 'network';
@@ -39,6 +45,8 @@ export class CrdtCache {
   /** When each object was last marked stale (a counter), so a fetch in flight doesn't undo it. */
   private readonly marks = new Map<string, number>();
   private gen = 0;
+  /** @internal Keeps the entries on the local store. */
+  sink: CacheSink | undefined;
 
   constructor(
     private readonly size: number,
@@ -52,6 +60,21 @@ export class CrdtCache {
       this.m.set(h, e);
     }
     return e;
+  }
+
+  /** @internal An entry the local store kept (at open): never newer than one in memory. */
+  restore(h: string, e: Entry): void {
+    if (!this.size || this.m.has(h)) return;
+    this.m.set(h, e);
+    this.evict();
+  }
+
+  private evict(): void {
+    while (this.m.size > this.size) {
+      const h = this.m.keys().next().value!;
+      this.m.delete(h);
+      this.sink?.delete(h);
+    }
   }
 
   /** A cached entry. */
@@ -74,18 +97,23 @@ export class CrdtCache {
     const old = this.m.get(h);
     if (old?.state && state && !newer(state.version, old.state.version)) {
       old.checked = Date.now();
+      this.sink?.put(h, old);
       return;
     }
     const stale = (this.marks.get(h) ?? -1) > gen;
+    const e = { state, checked: Date.now(), stale };
     this.m.delete(h);
-    this.m.set(h, { state, checked: Date.now(), stale });
-    while (this.m.size > this.size) this.m.delete(this.m.keys().next().value!);
+    this.m.set(h, e);
+    this.sink?.put(h, e);
+    this.evict();
   }
 
   /** The server confirmed a cached state unchanged. */
   confirm(h: string): void {
     const e = this.m.get(h);
-    if (e) e.checked = Date.now();
+    if (!e) return;
+    e.checked = Date.now();
+    this.sink?.put(h, e);
   }
 
   /** A commit changed these objects: the next read fetches them again. */
@@ -94,7 +122,10 @@ export class CrdtCache {
     for (const o of objects) {
       const h = bytes.hex(o);
       const e = this.m.get(h);
-      if (e) e.stale = true;
+      if (e) {
+        e.stale = true;
+        this.sink?.put(h, e);
+      }
       this.marks.set(h, this.gen);
     }
     if (this.marks.size > 4 * Math.max(this.size, 1024)) this.marks.clear();
@@ -111,6 +142,7 @@ export class CrdtCache {
     return out;
   }
 
+  /** Forget what is in memory (the local store keeps its copy). */
   clear(): void {
     this.m.clear();
     this.marks.clear();

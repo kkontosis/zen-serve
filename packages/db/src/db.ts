@@ -8,8 +8,9 @@ import {
   type Transaction,
   type UnlockedFs,
   ZenError,
+  zw,
 } from '@zen/client';
-import type { CrdtKeys, IndexKeys, Limits } from '@zen/wasm';
+import type { CrdtKeys, IndexKeys, Info, Limits } from '@zen/wasm';
 import {
   bindingOf,
   type ChangeBody,
@@ -29,19 +30,32 @@ import {
   type StreamSource,
 } from './broker.js';
 import {
+  type DbRecord,
   decodeDbRecord,
   decodeTableRecord,
   encodeDbRecord,
   encodeTableRecord,
   type TableRecord,
 } from './catalog.js';
-import type { Value } from './cbor.js';
-import { CrdtCache, type CrdtRead } from './crdtcache.js';
+import { decode, type Value } from './cbor.js';
+import { CrdtCache, type CrdtRead, type Entry, isNetwork } from './crdtcache.js';
 import { CrdtQueue, memoryQueueStore, type QueueStore } from './crdtq.js';
 import { DbError } from './errors.js';
-import type { Node } from './index/node.js';
+import { decodeNode, type Node } from './index/node.js';
+import { decodeBlob, encodeBlob } from './index/sealed.js';
 import { startIndexers } from './ixer.js';
 import { Keys } from './keys.js';
+import {
+  decodeCachedRow,
+  decodeEntry,
+  decodeSealed,
+  decodeTable,
+  encodeCachedRow,
+  encodeEntry,
+  encodeSealed,
+  encodeTable,
+  LocalCache,
+} from './localcache.js';
 import { localQueueStore, localStores } from './localq.js';
 import { type MigrationFn, migrate } from './migrate.js';
 import { encodeMsg, type Msg } from './msg.js';
@@ -61,7 +75,7 @@ import {
   replyMsg,
   sendReply,
 } from './reply.js';
-import type { Fields } from './row.js';
+import { type Fields, partsDigest } from './row.js';
 import { Saga, type SagaOptions, type SagaStep } from './saga.js';
 import { type ScheduleOptions, Scheduler, type SchedulerOptions } from './sched.js';
 import { SYSTEM_TABLES, systemTable } from './system.js';
@@ -132,6 +146,12 @@ export interface DbOptions {
    * (IndexedDB) share the queue, and only the owner sends it.
    */
   local?: SealedStore;
+  /**
+   * `false`: keep the caches in memory even with `local` (the queue is
+   * still kept there). Default: with `local`, the caches persist too
+   * (§9.3), and the database opens offline from them.
+   */
+  persist?: boolean;
   /** How long the queue waits to gather writes into one commit (default 10 ms). */
   crdtBatchMs?: number;
 }
@@ -209,6 +229,38 @@ interface CatalogEntry {
   version: Uint8Array | undefined;
 }
 
+/** The records of store `db/<ns>` (§9.3). */
+const INFO_KEY = bytes.utf8('info');
+const DB_KEY = bytes.utf8('db');
+const tableKey = (name: string) => bytes.utf8(`t${name}`);
+
+/** What an offline open reads from the local store (§3.1). */
+interface Kept {
+  info: Info;
+  record: DbRecord;
+  tables: Map<string, CatalogEntry>;
+}
+
+/** The kept info, DbRecord and catalog of database `ns`, if all are there. */
+async function keptOf(local: SealedStore, ns: string): Promise<Kept | undefined> {
+  const store = `db/${ns}`;
+  try {
+    const i = await local.get(store, INFO_KEY);
+    const r = await local.get(store, DB_KEY);
+    if (!i || !r) return undefined;
+    const tables = new Map<string, CatalogEntry>();
+    for await (const [k, v] of local.list(store)) {
+      if (k[0] !== 0x74) continue; // "t"
+      const t = decodeTable(v);
+      const record = decodeTableRecord(t.record);
+      tables.set(record.name, { record, version: t.version });
+    }
+    return { info: zw.decodeInfo(i) as Info, record: decodeDbRecord(r), tables };
+  } catch {
+    return undefined;
+  }
+}
+
 /** A database `(fs, ns)`. */
 export class Db {
   private readonly catalog = new Map<string, CatalogEntry>();
@@ -220,6 +272,12 @@ export class Db {
   /** Rows by stored key (hex), least recently used first. */
   private readonly rows = new Map<string, CachedRow>();
   private owner: Owner | undefined;
+  /** The caches on the local store (§9.3), with `DbOptions.local`. */
+  private readonly persisted:
+    | { db: LocalCache; rows: LocalCache; crdt: LocalCache; nodes: LocalCache; sealed: LocalCache }
+    | undefined;
+  /** Whether this instance opened offline, from the state the local store kept (§3.1). */
+  offline = false;
   /** @internal Web Locks, when used (§9.2). */
   locks: LockManagerLike | undefined;
   private unQueue: (() => void) | undefined;
@@ -251,6 +309,22 @@ export class Db {
     private readonly opts: DbOptions,
   ) {
     this.crdtCache = new CrdtCache(opts.crdtCache ?? 1024, opts.crdtCacheMs ?? 5000);
+    if (opts.local && opts.persist !== false) {
+      const warn = (m: string) => this.warn(m);
+      const at = (s: string) => new LocalCache(opts.local!, `${s}/${ns}`, warn);
+      this.persisted = {
+        db: at('db'),
+        rows: at('rows'),
+        crdt: at('crdt'),
+        nodes: at('nodes'),
+        sealed: at('sealed'),
+      };
+      const crdt = this.persisted.crdt;
+      this.crdtCache.sink = {
+        put: (h, e) => crdt.put(bytes.fromHex(h), encodeEntry(e)),
+        delete: (h) => crdt.delete(bytes.fromHex(h)),
+      };
+    }
   }
 
   /**
@@ -267,7 +341,23 @@ export class Db {
    * stored schema too (`schema_newer`).
    */
   static async open(fs: UnlockedFs, ns: string, opts: DbOptions = {}): Promise<Db> {
-    const info = await fs.session.client.info();
+    // Offline: open from what the local store kept (§3.1), if anything.
+    const keptOr = async (e: unknown): Promise<Kept> => {
+      const k =
+        isNetwork(e) && opts.local && opts.persist !== false
+          ? await keptOf(opts.local, ns)
+          : undefined;
+      if (!k) throw e;
+      return k;
+    };
+    let info: Info;
+    let kept: Kept | undefined;
+    try {
+      info = await fs.session.client.info();
+    } catch (e) {
+      kept = await keptOr(e);
+      info = kept.info;
+    }
     const db = new Db(fs, ns, new Keys(fs.keys.db(ns)), info.limits, info.features, opts);
     const locks =
       opts.locks === undefined
@@ -290,7 +380,15 @@ export class Db {
       shared,
       shared ? channel?.(`${name}/queue`) : undefined,
     );
-    await db.init();
+    if (!kept) {
+      try {
+        db.keepOpen(info, await db.init());
+      } catch (e) {
+        kept = await keptOr(e);
+      }
+    }
+    if (kept) await db.openKept(kept);
+    await db.loadLocal();
     await db.crdtQueue.load();
     db.owner = new Owner(opts.owner === false ? undefined : locks, name, opts.owner !== false);
     if (shared) db.unQueue = db.onOwner(() => void db.crdtQueue.start());
@@ -310,7 +408,65 @@ export class Db {
     return db;
   }
 
-  private async init(): Promise<void> {
+  /** Open offline from the kept DbRecord and catalog: the schema must be the app's (§3.1). */
+  private async openKept(k: Kept): Promise<void> {
+    const target = this.opts.schema ?? 0;
+    const rec = k.record;
+    if (rec.format !== FORMAT) throw new DbError('format', `database format ${rec.format}`);
+    if (rec.integrity !== 'basic') throw new DbError('format', `integrity level ${rec.integrity}`);
+    if (rec.schema !== target) {
+      throw new DbError(
+        'offline',
+        `the database is at schema ${rec.schema}, the app at ${target}: opening needs the server`,
+      );
+    }
+    this.schema = target;
+    this.offline = true;
+    this.catalog.clear();
+    for (const [name, e] of k.tables) this.catalog.set(name, e);
+  }
+
+  /** Keep what an offline open needs (§3.1): the server's info, the DbRecord, the catalog. */
+  private keepOpen(info: Info, rec: DbRecord): void {
+    const p = this.persisted;
+    if (!p) return;
+    p.db.clear();
+    p.db.put(INFO_KEY, zw.encodeInfo(info));
+    p.db.put(DB_KEY, encodeDbRecord(rec));
+    for (const [name, e] of this.catalog) {
+      if (e.record) p.db.put(tableKey(name), encodeTable(encodeTableRecord(e.record), e.version));
+    }
+  }
+
+  /** Load the kept rows and CRDT states into their caches (§9.3). */
+  private async loadLocal(): Promise<void> {
+    const p = this.persisted;
+    if (!p) return;
+    const max = this.opts.rowCache ?? 1024;
+    const extra: Uint8Array[] = [];
+    for await (const [k, v] of p.rows.list()) {
+      try {
+        if (this.rows.size >= max) throw new Error('over the cache size');
+        this.rows.set(bytes.hex(k), decodeCachedRow(v));
+      } catch {
+        extra.push(k);
+      }
+    }
+    for (const k of extra) p.rows.delete(k);
+    const states: [string, Entry][] = [];
+    for await (const [k, v] of p.crdt.list()) {
+      try {
+        states.push([bytes.hex(k), decodeEntry(v)]);
+      } catch {
+        p.crdt.delete(k);
+      }
+    }
+    // The most recently checked last, so the LRU keeps them.
+    states.sort((a, b) => a[1].checked - b[1].checked);
+    for (const [h, e] of states) this.crdtCache.restore(h, e);
+  }
+
+  private async init(): Promise<DbRecord> {
     const target = this.opts.schema ?? 0;
     const key = this.keys.dbRecord();
     const rec = await this.transaction(async (tx) => {
@@ -344,6 +500,7 @@ export class Db {
     await migrate(this, target, this.opts.migrations ?? {});
     this.schema = target;
     await this.loadCatalog();
+    return { ...rec, schema: target };
   }
 
   /** Read every TableRecord into the catalog cache. */
@@ -354,6 +511,15 @@ export class Db {
       const t = decodeTableRecord(e.value);
       this.catalog.set(t.name, { record: t, version: e.version });
     }
+  }
+
+  /**
+   * Write what the caches have pending to the local store (§9.3). `close`
+   * does it too; this resolves once it is written.
+   */
+  async flushLocal(): Promise<void> {
+    const p = this.persisted;
+    if (p) await Promise.all(Object.values(p).map((c) => c.flush()));
   }
 
   /** The app's tables (from the catalog cache); the system tables (§11.5) are left out. */
@@ -747,7 +913,8 @@ export class Db {
    * Free the database keys and caches, stop its consumers and
    * subscriptions, and hand the owner role over.
    */
-  close(): void {
+  close(): Promise<void> {
+    const flushed = this.flushLocal();
     this.unQueue?.();
     this.crdtQueue?.close();
     this.crdtCache.clear();
@@ -771,6 +938,7 @@ export class Db {
     this.nodes.clear();
     this.sealed.clear();
     this.keys.db.free();
+    return flushed;
   }
 
   // ------------------------------------------------------------ row cache
@@ -794,18 +962,30 @@ export class Db {
     if (max <= 0) return;
     this.rows.delete(key);
     this.rows.set(key, { ...r, fields: structuredClone(r.fields) });
-    if (this.rows.size > max) this.rows.delete(this.rows.keys().next().value!);
+    const p = this.persisted?.rows;
+    if (p) {
+      try {
+        p.put(bytes.fromHex(key), encodeCachedRow(r));
+      } catch {
+        // a row CBOR can't hold stays in memory only
+      }
+    }
+    if (this.rows.size > max) this.dropRow(this.rows.keys().next().value!);
   }
 
   /** @internal */
   dropRow(key: string): void {
     this.rows.delete(key);
+    this.persisted?.rows.delete(bytes.fromHex(key));
   }
 
   /** @internal After a commit: its writes have new versions, so drop their cached copies. */
   rowsWritten(raw: Transaction): void {
-    if (raw.clears.length) this.rows.clear();
-    for (const h of raw.writes.keys()) this.rows.delete(h);
+    if (raw.clears.length) {
+      this.rows.clear();
+      this.persisted?.rows.clear();
+    }
+    for (const h of raw.writes.keys()) this.dropRow(h);
   }
 
   // ------------------------------------------------------------ index caches
@@ -843,9 +1023,30 @@ export class Db {
   }
 
   /** @internal */
-  cacheNode(id: string, n: Node): void {
+  cacheNode(id: string, n: Node, b?: Uint8Array): void {
     this.nodes.set(id, n);
-    if (this.nodes.size > NODE_CACHE) this.nodes.delete(this.nodes.keys().next().value!);
+    if (b) this.persisted?.nodes.put(bytes.fromHex(id), b);
+    if (this.nodes.size > NODE_CACHE) {
+      const old = this.nodes.keys().next().value!;
+      this.nodes.delete(old);
+      this.persisted?.nodes.delete(bytes.fromHex(old));
+    }
+  }
+
+  /** @internal A node the local store kept, checked against its id (§9.3). */
+  async keptNode(index: Uint8Array, id: Uint8Array): Promise<Node | undefined> {
+    const p = this.persisted?.nodes;
+    const b = p && (await p.get(id));
+    if (!b) return undefined;
+    try {
+      if (!bytes.equal(this.indexKeys(index).nodeId(b), id)) throw new Error('another node');
+      const n = decodeNode(b);
+      this.cacheNode(bytes.hex(id), n);
+      return n;
+    } catch {
+      p.delete(id);
+      return undefined;
+    }
   }
 
   /** @internal A sealed index's entries, if the cached blob has this digest. */
@@ -856,7 +1057,30 @@ export class Db {
 
   /** @internal */
   cacheSealed(index: string, digest: string, keys: Uint8Array[]): void {
+    if (this.sealed.get(index)?.digest === digest) return;
     this.sealed.set(index, { digest, keys });
+    this.persisted?.sealed.put(
+      bytes.fromHex(index),
+      encodeSealed(bytes.fromHex(digest), encodeBlob(keys)),
+    );
+  }
+
+  /** @internal A sealed blob the local store kept, if it has this digest (checked, §9.3). */
+  async keptSealed(index: string, digest: string): Promise<Uint8Array[] | undefined> {
+    const p = this.persisted?.sealed;
+    const b = p && (await p.get(bytes.fromHex(index)));
+    if (!b) return undefined;
+    try {
+      const k = decodeSealed(b);
+      if (bytes.hex(k.digest) !== digest) return undefined;
+      if (bytes.hex(partsDigest(k.blob)) !== digest) throw new Error('a blob of another digest');
+      const keys = decodeBlob(decode(k.blob));
+      this.sealed.set(index, { digest, keys });
+      return [...keys];
+    } catch {
+      p.delete(bytes.fromHex(index));
+      return undefined;
+    }
   }
 
   // ------------------------------------------------------------ catalog cache
@@ -869,11 +1093,16 @@ export class Db {
   /** @internal */
   catalogSet(name: string, record: TableRecord | undefined, version: Uint8Array | undefined) {
     this.catalog.set(name, { record, version });
+    const p = this.persisted?.db;
+    if (!p) return;
+    if (record) p.put(tableKey(name), encodeTable(encodeTableRecord(record), version));
+    else p.delete(tableKey(name));
   }
 
   /** @internal */
   catalogStale(name: string): void {
     this.catalog.delete(name);
+    this.persisted?.db.delete(tableKey(name));
   }
 
   /** @internal */
@@ -905,7 +1134,10 @@ export class Table<T extends Fields = Fields> {
 
   /** The row, or undefined; on a CRDT table, read as `read` says (§19.4). */
   get(pk: Value, opts: { read?: CrdtRead } = {}): Promise<T | undefined> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).get(pk, opts));
+    return this.db.transaction(
+      (tx) => tx.table<T>(this.name).get(pk, opts),
+      opts.read ? { read: opts.read } : {},
+    );
   }
 
   insert(row: T): Promise<void> {

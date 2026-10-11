@@ -66,6 +66,7 @@ const fs = await session.fs(1).unlock({ passphrase: 'open sesame' });
 * **Admins** create the header (`fs(1).init(keys => [slots…])`) and change it: `addPassphrase`, `addRecovery` (returns the key, to show once), `addDevice`, `addPasskey`, `addOpaque`, `removeSlot`. Changes are compare-and-set on the header version, retried on a concurrent change. Members can't write the header yet (`TD-FS-HEADER-SELF-SLOT`): they prepare a slot and an admin adds it.
 * **Rotation** (`fs.rotate(keys => [new slots])`) starts a new epoch, removes every old slot and adds the new ones. Data sealed under older epochs stays readable through the epoch chain. A handle unlocked by a slot of an older epoch reads, but refuses to seal (`stale_slot`).
 * `fs.close()` zeroizes the keys. Keys and secrets live in WASM memory behind handles; free handles you created yourself (`.free()`).
+* **Offline.** `unlock(how, {local})` keeps the header on a local store (§10) and unlocks from it when the server can't be reached. The store can't have the fs layer (it needs the keys being unlocked): an app that wants the fs layer for its data uses two `sealedStore`s over one backend. `fs(1).forget(local)` deletes the kept header at sign-out. Offline, sign in by resuming the session the app kept (`client.resume(token)`); a resumed session holds no unlock material, so pass it to `unlock` explicitly.
 
 ## 5. KV and transactions
 
