@@ -21,16 +21,24 @@ import { DbError } from './errors.js';
 import { Keys } from './keys.js';
 import { decodeMsg, encodeMsg, eventId, type Message, type Msg } from './msg.js';
 import { cutParts, type Fields, joinParts, partsDigest } from './row.js';
+import { scheduleMsg } from './sched.js';
 import type { DbTransaction } from './txn.js';
 
 /** Options of `emit`. */
 export interface EmitOptions {
   /** The event key: order within `per_key` and `partitioned` groups (§10.1). */
   key?: Uint8Array | string;
+  /**
+   * A fresh random key per message: a spread work queue on a `per_key`
+   * group (§12.2). Not with `key`.
+   */
+  spread?: boolean;
   /** The message id (default: random). Keep it across re-sends: it is the idempotency key. */
   id?: Uint8Array;
-  /** App metadata. */
+  /** App metadata. Names starting with `zen.` are reserved. */
   headers?: Record<string, string>;
+  /** A large body's parts are deleted this long after the commit (§10.3). Default: kept. */
+  ttlMs?: number;
 }
 
 /** Room an event's envelope needs beyond its payload (header, sender, hlc, AEAD). */
@@ -44,20 +52,44 @@ export function checkType(type: string): void {
   }
 }
 
+/** Refuse app headers in the reserved `zen.` namespace (§12.2). */
+export function checkHeaders(h: Record<string, string> | undefined): void {
+  for (const [k, v] of Object.entries(h ?? {})) {
+    if (k.startsWith('zen.')) {
+      throw new DbError('bad_value', `header names starting with "zen." are reserved (${k})`);
+    }
+    if (typeof v !== 'string') throw new DbError('bad_value', `header ${k} must be text`);
+  }
+}
+
+/** The event key of an emit: `key`, or a random one with `spread`. */
+export function emitKey(opts: EmitOptions): Uint8Array | string | undefined {
+  if (!opts.spread) return opts.key;
+  if (opts.key !== undefined) throw new DbError('bad_value', 'spread and key exclude each other');
+  return bytes.randomBytes(16);
+}
+
+/** A sealed message payload, and whether its body went to parts. */
+export interface Sealed {
+  payload: Uint8Array;
+  parts: number;
+}
+
 /**
- * @internal Append a Msg in a transaction (§11.1). A payload too large for
- * one envelope goes to body parts in the same commit (§10.3), or, with
+ * @internal Encode a Msg for an event. A payload too large for one
+ * envelope puts its body in parts in this transaction (§10.3), or, with
  * `lean`, is replaced by that smaller Msg (change events, §12.7).
+ * `causation` is the length of the causation the event will carry.
  */
-export function appendMsg(
+export function sealMsg(
   tx: DbTransaction,
-  topic: Topic,
   m: Msg,
-  key: Uint8Array | string | undefined,
   lean?: Msg,
-): void {
-  const room = tx.db.limits.max_envelope_bytes - ENVELOPE_OVERHEAD - (tx.causation?.length ?? 0);
+  causation = tx.causation?.length ?? 0,
+): Sealed {
+  const room = tx.db.limits.max_envelope_bytes - ENVELOPE_OVERHEAD - causation;
   let payload = encodeMsg(m);
+  let n = 0;
   if (payload.length > room) {
     if (lean) {
       payload = encodeMsg(lean);
@@ -65,21 +97,53 @@ export function appendMsg(
       const body = encode(m.body);
       const parts = cutParts(body, tx.partSize, false);
       for (const [i, p] of parts.entries()) tx.raw.set(tx.keys.msgPart(m.id, i), p);
+      n = parts.length;
       const { body: _, ...rest } = m;
       payload = encodeMsg({
         ...rest,
-        bodyRef: { ns: tx.db.ns, parts: parts.length, digest: partsDigest(body) },
+        bodyRef: { ns: tx.db.ns, parts: n, digest: partsDigest(body) },
       });
     }
     if (payload.length > room) {
       throw new DbError('too_large', `a message over max_envelope_bytes (${payload.length} bytes)`);
     }
   }
-  topic.appendIn(tx.raw, payload, {
+  return { payload, parts: n };
+}
+
+/** @internal Append a Msg in a transaction (§11.1), with the transaction's causation. */
+export function appendMsg(
+  tx: DbTransaction,
+  topic: Topic,
+  m: Msg,
+  key: Uint8Array | string | undefined,
+  lean?: Msg,
+): Sealed {
+  const s = sealMsg(tx, m, lean);
+  topic.appendIn(tx.raw, s.payload, {
     ...(key !== undefined ? { key } : {}),
     ...(tx.causation ? { causation: tx.causation } : {}),
   });
+  return s;
 }
+
+/** @internal The Msg of a received message (its body resolved), to send again. */
+export function msgOf(m: Message, headers?: Record<string, string>): Msg {
+  return {
+    type: m.type,
+    id: m.id,
+    ...(m.corr ? { corr: m.corr } : {}),
+    ...(m.replyTo ? { replyTo: m.replyTo } : {}),
+    ...(m.saga ? { saga: m.saga } : {}),
+    ...(m.step !== undefined ? { step: m.step } : {}),
+    headers: headers ?? m.headers,
+    body: m.body,
+  };
+}
+
+/** A topic path as bytes (how system rows and `reply_to` store it). */
+export const pathBytes = (t: Topic): Uint8Array[] =>
+  t.path.map((s) => (typeof s === 'string' ? bytes.utf8(s) : s));
 
 /** Turn an event into a Message, fetching a large body's parts. `poisoned` if it can't be read. */
 export async function openMessage<B = Value>(
@@ -347,9 +411,7 @@ export class OnSubscription {
   private async durable(batch: StreamEvent[]): Promise<void> {
     const items = await Promise.all(batch.map(async (e) => ({ e, msg: await this.open(e) })));
     const name = this.opts.cursor!;
-    const path = (isTopic(this.target) ? this.target : this.target.prefix).path.map((s) =>
-      typeof s === 'string' ? bytes.utf8(s) : s,
-    );
+    const path = pathBytes(isTopic(this.target) ? this.target : this.target.prefix);
     await this.db.transaction(async (tx) => {
       const cursors = tx.table('$cursors');
       const cur = await cursors.get([this.db.device, name]);
@@ -391,9 +453,62 @@ export interface ConsumeOptions {
   ttlMs?: number;
   /** Long-poll wait (default 25,000 ms; capped at a third of the lease). */
   waitMs?: number;
+  /**
+   * What a handler's throw does (§12.2): `nack` (default) redelivers at
+   * once, in order; `delay` consumes the message and schedules a copy
+   * after `backoff(attempt)`, with header `zen.attempt` counting attempts,
+   * and after `maxAttempts` emits it to `<topic>/zen.dlq`.
+   */
+  retry?: 'nack' | 'delay';
+  /** `retry: 'delay'`: ms before attempt `attempt + 1` (default `min(1000·2^(attempt−1), 300000)`). */
+  backoff?: (attempt: number) => number;
+  /**
+   * Skip messages handled before (§12.6): a `$inbox` row per message id
+   * (per `corr` for `serve`), kept `dedupTtlMs`.
+   */
+  dedup?: boolean;
+  /** How long dedup rows are kept (default 7 days). */
+  dedupTtlMs?: number;
   /** Errors: a handler's throw (nacked), an unreadable message (nacked), polling errors (retried). */
   onError?: (e: unknown, msg?: Message) => void;
 }
+
+/** The attempt a delivery is (`zen.attempt`, from 1). */
+export function attemptOf(m: Message): number {
+  const n = Number(m.headers['zen.attempt'] ?? 1);
+  return Number.isSafeInteger(n) && n >= 1 ? n : 1;
+}
+
+const defaultBackoff = (a: number) => Math.min(1000 * 2 ** (a - 1), 300_000);
+
+/**
+ * @internal With `retry: 'delay'`: schedule the next attempt of `m`, or,
+ * after `maxAttempts`, emit it to the class DLQ `<topic>/zen.dlq` (§12.2).
+ */
+async function retryLater(tx: DbTransaction, o: ConsumeOptions, m: Message): Promise<void> {
+  const a = attemptOf(m);
+  const max = o.maxAttempts ?? 5;
+  if (max > 0 && a >= max) {
+    appendMsg(
+      tx,
+      o.topic.child('zen.dlq'),
+      msgOf(m, { ...m.headers, 'zen.attempt': String(a) }),
+      undefined,
+    );
+    return;
+  }
+  // A consumer knows the event key's token only: the copy goes out with
+  // the group's key (`single_key`) or a fresh one.
+  const key = o.mode === 'single_key' ? o.key : bytes.randomBytes(16);
+  const at = Math.ceil(tx.db.fs.session.clock.now() + (o.backoff ?? defaultBackoff)(a));
+  await scheduleMsg(tx, o.topic, msgOf(m, { ...m.headers, 'zen.attempt': String(a + 1) }), key, at);
+}
+
+/**
+ * @internal How a consumer handles a handler's throw before `nack`: in a
+ * fresh transaction that also consumes the message, `true` if handled.
+ */
+export type FailHook = (msg: Delivered, e: unknown, tx: DbTransaction) => Promise<boolean>;
 
 /** A consumed message: `ack` it without writes, or bind it with `db.begin({consumes})`. */
 export interface Delivered<B = Value> extends Message<B> {
@@ -445,6 +560,7 @@ export class ConsumerHandle {
     private readonly opts: ConsumeOptions,
     private readonly handler: (msg: Delivered<never>, tx: DbTransaction) => unknown,
     private readonly manual: boolean,
+    private readonly onFail?: FailHook,
   ) {
     this.unOwner = db.onOwner(() => this.start());
   }
@@ -611,8 +727,35 @@ export class ConsumerHandle {
     } catch (e) {
       if (b.acked || dropped(e)) return;
       if (isCode(e, 'not_leader')) throw e;
+      if (!this.manual && (await this.failed(c, d, m, e))) return;
       this.report(e, m);
       await this.nack(c, d);
+    }
+  }
+
+  /**
+   * A handler threw: an error reply (`serve`) or a delayed retry, in a
+   * fresh transaction with the consume step. False: `nack` instead.
+   */
+  private async failed(c: Consumer, d: Delivery, m: Delivered, e: unknown): Promise<boolean> {
+    const delay = this.opts.retry === 'delay';
+    if (!delay && !this.onFail) return false;
+    try {
+      return await this.db.transaction(async (tx) => {
+        tx.causation = m.eventId;
+        if (!(this.onFail && (await this.onFail(m, e, tx)))) {
+          if (!delay) return false;
+          this.report(e, m);
+          await retryLater(tx, this.opts, m);
+        }
+        await c.ack(d, tx.raw);
+        return true;
+      }, this.opts.txn);
+    } catch (e2) {
+      if (dropped(e2)) return true;
+      if (isCode(e2, 'not_leader')) throw e2;
+      this.report(e2, m);
+      return false;
     }
   }
 }
@@ -622,6 +765,8 @@ export interface EphemeralMsg<B = Value> {
   type: string;
   id: Uint8Array;
   body: B;
+  /** The request a reply answers (§12.3). */
+  corr?: Uint8Array;
   topic: Topic;
   sender: Uint8Array;
   hlc: bigint;
@@ -635,6 +780,7 @@ export function openEphemeral<B>(topic: Topic, e: EphemeralEvent): EphemeralMsg<
       type: m.type,
       id: m.id,
       body: (m.body ?? null) as B,
+      ...(m.corr ? { corr: m.corr } : {}),
       topic,
       sender: e.sender,
       hlc: e.hlc,

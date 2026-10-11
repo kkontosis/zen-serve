@@ -158,7 +158,22 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `packages/db/test/broker.test.ts` (15), with its own copy of `FakeLocks`.
       * `vectors.test.ts` +3 (Msg, BodyRef, event and group ids).
       * 180 vitest tests in all.
-  * **6b** (scheduler, work queues, request/reply): planned (see 6b below); a new PR, since #17 is merged.
+  * **6b** (scheduler, work queues, request/reply): done, PR #18. As planned, with these details for 6c:
+    * **Files:**
+      * `broker.ts`: `appendMsg` is `sealMsg` (returns `{payload, parts}`) plus the append. New: `checkHeaders` (`zen.` header names refused), `emitKey` (`spread`), `msgOf` (a received message as a Msg to send again), `pathBytes`, `attemptOf`.
+      * `ConsumerHandle` takes an internal `FailHook`. On a handler throw, `failed()` runs a fresh transaction with the consume step: the hook (serve: `ReplyError` → error reply), else with `retry: 'delay'` `retryLater` (schedule the copy, or emit it to `topic.child('zen.dlq')` after `maxAttempts`). Otherwise `nack`. **6c's saga participants and orchestrator can reuse the hook.**
+      * `sched.ts`: `scheduleMsg(tx, topic, msg, key, at)`, `scheduleGc(tx, paths, at)`, `dueAt`, and `Scheduler` (`start`, `stop({release})`, `wake`, `runOnce`, `leading`). `db.scheduler` exists unless `DbOptions.scheduler === false`, and starts on `onOwner`. The leader is the group `groupId('sched')` on `('zen', 'db', ns, 'sched')`. A `gc` path is cleared with everything under it (`keys.range`).
+      * `reply.ts`: `ReplyError`, `Inbox` (`db.inbox`: `on` from 12 zero bytes plus `onEphemeral`, waiters by corr), `sendReply`/`replyMsg`, and dedup (`dedupSeen`, `dedupRecord`: an `$inbox` row plus a `gc` job for its row and parts keys).
+    * **API:**
+      * `tx/db.schedule`, `tx/db.cancel`, `tx.gc` (internal).
+      * `emit({spread, ttlMs})`. A ttl's `gc` row is inserted at `finish`.
+      * `tx.request`, `tx.requestAll`, `db.request`, `db.requestAll`, `tx.reply`, `db.reply(msg, body, {ephemeral})`.
+      * `db.serve(opts & {reply: 'event' | 'ephemeral'})`.
+      * `ConsumeOptions.retry`/`backoff`/`dedup`/`dedupTtlMs`. `EphemeralMsg` gained `corr`. `Reply = EphemeralMsg | Message`.
+    * **Fix (5c row cache):** a read in flight could cache a row after a commit had dropped it, and `insert` trusted that copy and threw `exists` before the commit could catch it as a conflict. `insert` now reads the row from the server (`read(t, pk, fresh)`). Regression test in `txn.test.ts`.
+    * **Test fixes:** `txn.test.ts`'s `itemsDb` sets `scheduler: false`, since its tests count reads. The decoy test in `indexes.test.ts` asserted more than 3 nodes, which a random index key misses about 0.3% of the time; it now asserts at least 3.
+    * **⚠️ Spec:** §11.5, §12.2 and §12.3, as planned (a separate `spec:` commit).
+    * **Tests:** `packages/db/test/patterns.test.ts` (17), 198 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

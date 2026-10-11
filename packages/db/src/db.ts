@@ -39,9 +39,24 @@ import { DbError } from './errors.js';
 import type { Node } from './index/node.js';
 import { Keys } from './keys.js';
 import { type MigrationFn, migrate } from './migrate.js';
-import { encodeMsg } from './msg.js';
+import { encodeMsg, type Msg } from './msg.js';
 import { type Page, Query } from './query.js';
+import {
+  DEDUP_TTL,
+  dedupRecord,
+  dedupSeen,
+  errorBody,
+  Inbox,
+  type Reply,
+  ReplyError,
+  type RequestAllOptions,
+  type RequestMsg,
+  type RequestOptions,
+  replyMsg,
+  sendReply,
+} from './reply.js';
 import type { Fields } from './row.js';
+import { type ScheduleOptions, Scheduler, type SchedulerOptions } from './sched.js';
 import { SYSTEM_TABLES, systemTable } from './system.js';
 import { type LockManagerLike, Owner } from './tabs.js';
 import { DbTransaction, ManualTransaction, type ReadRow, SwitchToLong } from './txn.js';
@@ -67,6 +82,16 @@ export interface DbOptions {
   locks?: LockManagerLike | null;
   /** `false`: never become the owner (default true). */
   owner?: boolean;
+  /** `false`: don't run the scheduler in the owner (§12.4; default true). */
+  scheduler?: boolean;
+  /** The scheduler's poll interval, lease and batch. */
+  schedulerOptions?: SchedulerOptions;
+}
+
+/** Options of `serve` (§12.3). */
+export interface ServeOptions extends ConsumeOptions {
+  /** `ephemeral`: reply with `epub` after the commit instead of an event. */
+  reply?: 'event' | 'ephemeral';
 }
 
 /** Transaction options (§7.1). */
@@ -132,6 +157,10 @@ export class Db {
   private stream: StreamSource | undefined;
   private readonly subs = new Set<OnSubscription | SourceSub>();
   private readonly consumers = new Set<ConsumerHandle>();
+  private box: Inbox | undefined;
+  /** The scheduler (§12.4), unless `DbOptions.scheduler` is false. It runs in the owner. */
+  scheduler: Scheduler | undefined;
+  private unSched: (() => void) | undefined;
   /** The stored schema version after opening. */
   schema = 0;
   /** Cache counters. */
@@ -164,6 +193,11 @@ export class Db {
       `zen/db/${fs.id}/${ns}`,
       opts.owner !== false,
     );
+    if (opts.scheduler !== false) {
+      const s = new Scheduler(db, opts.schedulerOptions);
+      db.scheduler = s;
+      db.unSched = db.onOwner(() => s.start());
+    }
     return db;
   }
 
@@ -397,7 +431,14 @@ export class Db {
     opts: ConsumeOptions,
     handler: (msg: Delivered<B>, tx: DbTransaction) => unknown,
   ): ConsumerHandle {
-    const h = new ConsumerHandle(this, opts, handler as never, false);
+    const run = opts.dedup
+      ? async (msg: Delivered<B>, tx: DbTransaction) => {
+          if (await dedupSeen(tx, opts.group, msg.id)) return;
+          await handler(msg, tx);
+          await dedupRecord(tx, opts.group, msg.id, opts.dedupTtlMs ?? DEDUP_TTL);
+        }
+      : handler;
+    const h = new ConsumerHandle(this, opts, run as never, false);
     this.consumers.add(h);
     return h;
   }
@@ -436,6 +477,109 @@ export class Db {
     return sub;
   }
 
+  /** Schedule a message (§12.4) in a transaction of its own. Returns its id. */
+  schedule(topic: Topic, type: string, body: Value, opts: ScheduleOptions): Promise<Uint8Array> {
+    const id = opts.id ?? bytes.randomBytes(16);
+    return this.transaction((tx) => tx.schedule(topic, type, body, { ...opts, id }));
+  }
+
+  /** Cancel a scheduled message. False if it was delivered (or never scheduled). */
+  cancel(id: Uint8Array): Promise<boolean> {
+    return this.transaction((tx) => tx.cancel(id));
+  }
+
+  /** @internal This instance's inbox (§12.3), created on first use. */
+  get inbox(): Inbox {
+    this.box ??= new Inbox(this);
+    return this.box;
+  }
+
+  /**
+   * Send a request and wait for its reply (§12.3): the reply message, or
+   * `timeout`; an error reply rejects with a `ReplyError`.
+   */
+  async request<B = Value>(
+    topic: Topic,
+    type: string,
+    body: Value,
+    opts: RequestOptions = {},
+  ): Promise<Reply<B>> {
+    await this.inbox.start();
+    const { p } = await this.transaction(async (tx) => ({
+      p: tx.request<B>(topic, type, body, opts),
+    }));
+    return p;
+  }
+
+  /** Scatter-gather (§12.3): the replies that arrive before the timeout (or the first `max`). */
+  async requestAll<B = Value>(
+    topic: Topic,
+    type: string,
+    body: Value,
+    opts: RequestAllOptions = {},
+  ): Promise<Reply<B>[]> {
+    await this.inbox.start();
+    const { p } = await this.transaction(async (tx) => ({
+      p: tx.requestAll<B>(topic, type, body, opts),
+    }));
+    return p;
+  }
+
+  /**
+   * A responder (§12.3): a consumer whose handler returns the reply body.
+   * The reply goes to the request's `reply_to` in the transaction that
+   * consumes it; a `ReplyError` sends an error reply and consumes the
+   * request; any other throw nacks (or retries, `retry: 'delay'`). With
+   * `dedup`, a repeated `corr` gets the stored reply without the handler.
+   */
+  serve<B = Value>(
+    opts: ServeOptions,
+    handler: (msg: Delivered<B>, tx: DbTransaction) => Value | Promise<Value>,
+  ): ConsumerHandle {
+    const eph = opts.reply === 'ephemeral';
+    const scope = opts.group;
+    const ttl = opts.dedupTtlMs ?? DEDUP_TTL;
+    const run = async (msg: Delivered<B>, tx: DbTransaction) => {
+      const key = msg.corr ?? msg.id;
+      if (opts.dedup) {
+        const seen = await dedupSeen(tx, scope, key);
+        if (seen) {
+          if (seen.reply) sendReply(tx, msg, seen.reply, eph);
+          return;
+        }
+      }
+      const r = { type: `${msg.type}.reply`, body: (await handler(msg, tx)) ?? null };
+      sendReply(tx, msg, r, eph);
+      if (opts.dedup) await dedupRecord(tx, scope, key, ttl, r);
+    };
+    const fail = async (msg: Delivered, e: unknown, tx: DbTransaction) => {
+      if (!(e instanceof ReplyError)) return false;
+      const r = { type: `${msg.type}.error`, body: errorBody(e) };
+      sendReply(tx, msg, r, eph);
+      if (opts.dedup) await dedupRecord(tx, scope, msg.corr ?? msg.id, ttl, r);
+      return true;
+    };
+    const h = new ConsumerHandle(this, opts, run as never, false, fail);
+    this.consumers.add(h);
+    return h;
+  }
+
+  /** Reply to a request outside a consumer (§12.3): an `on` responder, scatter-gather. */
+  async reply(req: RequestMsg, body: Value, opts: { ephemeral?: boolean } = {}): Promise<void> {
+    if (!req.replyTo) return;
+    const r = { type: `${req.type}.reply`, body };
+    if (opts.ephemeral) {
+      await this.publishMsg(this.topic(...req.replyTo), replyMsg(req, r));
+      return;
+    }
+    await this.transaction(async (tx) => sendReply(tx, req, r));
+  }
+
+  /** @internal Publish an encoded Msg ephemerally. */
+  async publishMsg(topic: Topic, m: Msg): Promise<void> {
+    await this.source.publish(topic, encodeMsg(m));
+  }
+
   /** @internal The stream subscriptions come from. */
   get source(): StreamSource {
     this.stream ??= new DirectSource(this.fs.session, (e) => this.warn(`stream: ${e.message}`));
@@ -452,6 +596,9 @@ export class Db {
    * subscriptions, and hand the owner role over.
    */
   close(): void {
+    this.unSched?.();
+    void this.scheduler?.stop();
+    this.box?.close();
     for (const c of this.consumers) void c.stop();
     this.consumers.clear();
     for (const s of this.subs) void s.close().catch(() => {});

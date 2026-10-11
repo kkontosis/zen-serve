@@ -2,6 +2,7 @@
 // (spec/zendb.md, docs/DB.md).
 
 export {
+  attemptOf,
   type ChangeBody,
   type ConsumeOptions,
   ConsumerHandle,
@@ -34,6 +35,7 @@ export {
   type DbStats,
   type DbTxnOptions,
   type ImportOptions,
+  type ServeOptions,
   Table,
 } from './db.js';
 export { DbError, type DbErrorCode } from './errors.js';
@@ -47,7 +49,14 @@ export {
 } from './migrate.js';
 export { type BodyRef, decodeMsg, encodeMsg, eventId, type Message, type Msg } from './msg.js';
 export { type Cursor, compareValues, type Op, type Page, Query } from './query.js';
+export {
+  type Reply,
+  ReplyError,
+  type RequestAllOptions,
+  type RequestOptions,
+} from './reply.js';
 export { decodeRow, encodeRow, type Fields, layoutRow, rowBucket } from './row.js';
+export { type ScheduleOptions, Scheduler, type SchedulerOptions, type When } from './sched.js';
 export { type FieldType, MAX_SORT_KEY, type SortField, sortKey } from './sortkey.js';
 export { SYSTEM_TABLES } from './system.js';
 export { type LockManagerLike, Owner } from './tabs.js';

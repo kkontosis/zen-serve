@@ -346,7 +346,8 @@ describe('private index trees (§5.4)', () => {
     await db.table<Task>('tasks').delete('t3');
     const left = rows.filter((r) => r.id !== 't3');
     const nodes = await db.transaction((tx) => tx.raw.rangeStored(...db.keys.range('n', ix.id)));
-    expect(nodes.length).toBeGreaterThan(3);
+    // A root over leaves (boundaries are random per index: one is about 0.3% likely).
+    expect(nodes.length).toBeGreaterThanOrEqual(3);
     for (const e of nodes) {
       expect(e.value.length).toBeLessThanOrEqual(nodeBucket(e.value.length));
       expect(e.value.length).toBeGreaterThanOrEqual(nodeBucket(e.value.length) - 2);

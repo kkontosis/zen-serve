@@ -44,6 +44,8 @@ function itemsDb(name: string, extra: DbOptions = {}): Promise<Db> {
   return Db.open(fs, name, {
     ...quiet,
     locks: null,
+    // These tests count reads: no scheduler polling in the background.
+    scheduler: false,
     schema: 1,
     migrations: {
       1: async (m) => {
@@ -214,6 +216,18 @@ describe('row cache (§7.7)', () => {
     });
     expect(runs).toBe(2);
     expect(await other.table('items').get('a')).toEqual({ id: 'a', v: 11 });
+  });
+
+  it('insert checks a cached row on the server: a stale copy is no `exists`', async () => {
+    const name = ns();
+    const db = await itemsDb(name);
+    const other = await itemsDb(name);
+    await db.table('items').put({ id: 'a', v: 1 });
+    await db.table('items').get('a'); // cached
+    await other.table('items').delete('a');
+    await db.table('items').insert({ id: 'a', v: 2 });
+    expect(await other.table('items').get('a')).toEqual({ id: 'a', v: 2 });
+    expect(await code(db.table('items').insert({ id: 'a' }))).toBe('exists');
   });
 
   it('a read-only transaction with a stale cached row re-runs and sees the new value', async () => {
