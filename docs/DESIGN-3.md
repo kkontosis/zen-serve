@@ -246,3 +246,7 @@ The server never sees names (namespaces, tables, columns, topics, paths), keys, 
 5. zen-db and the broker as specified in [`spec/zendb.md`](../spec/zendb.md), with the app examples of [`docs/EXAMPLES.md`](EXAMPLES.md); the server side of zen-db CRDT tables (server-merged `lww`, `counter` and `set` row fields, zendb.md §19, moved forward from 7); zen-fs client (local replica, POSIX-ish API over the CRDT filesystem), Loro adapter ([`docs/MILESTONE-5.md`](MILESTONE-5.md)).
 6. Authenticated-namespace Merkle tree, `zen-ublk`. (Ephemeral pub/sub shipped in milestone 2–3.)
 7. Later: `fips` suite, ORAM, more server CRDT types beyond zen-db rows (CRDT tables moved to 5).
+8. Large files, the rest: upload sessions, page repacking, multi-GiB performance ([`docs/MILESTONE-8.md`](MILESTONE-8.md)). The paged layout and per-file keys moved forward into milestone 5 (step 7f/7g).
+9. Serving zen-fs over HTTP through a service worker, `@zen/sw` ([`docs/MILESTONE-9.md`](MILESTONE-9.md)).
+10. git over zen-serve, `git-remote-zen` ([`docs/MILESTONE-10.md`](MILESTONE-10.md)).
+11. An encrypted web-app platform: code-delivery trust, sharing, lifecycle ([`docs/MILESTONE-11.md`](MILESTONE-11.md)).

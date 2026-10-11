@@ -147,6 +147,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** A file version's manifest and chunk list must fit one value: 32 B per chunk within `max_value_bytes` (90,000 by default), so a version holds at most ~2,800 chunks of 64 KiB, about **175 MiB** (docs/STATS.md §1.3). Raising `max_value_bytes` helps only up to FoundationDB's 100 KB value limit (~195 MiB).
 * **Why deferred:** The server-side CRDT filesystem (milestone 3.5) targets family-scale files; large media and disk images need a different version layout.
 * **What it would take:** Chunk lists split over several keys (e.g. `pack("tf", fs, tree, node, dot, i)` pages, or a tree of manifests), the write op carrying a list reference instead of the whole list, refcounting and GC over the pages, a matching formats.md change for the sealed manifest, and tests with multi-GiB synthetic files.
+* **Plan (milestone 5):** steps 7f/7g build two-level pages (immutable, server-visible chunk-id pages listed with their digests in a sealed v2 manifest, about 640 GiB at the defaults) and per-file content keys; the rest (upload sessions, repacking) is milestone 8 (docs/MILESTONE-8.md).
 
 ## TD-STORE-COMPACTION
 
