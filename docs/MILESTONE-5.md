@@ -358,7 +358,30 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **CI fix on #30:** `online` turned true only once a catch-up finished, so a node from the feed could show before it (the offline test, about 1 run in 2 on CI). Any feed batch now marks the replica online.
     * **Also on #30 (user request):** `crates/zen-server/tests/dump.rs` `a_started_server_counts_as_empty` failed once on FoundationDB with `read version too old` at the `is_empty` check right after an import (the version jump its other reads already retry). That check now retries the same way.
     * PR #30 merged.
-  * **8b** planned in detail (see "8b: local writes"); the plan commit restarts the branch from main and opens a new PR, which 8b joins.
+  * **8b** planned in detail (see "8b: local writes"); the plan commit restarts the branch from main and opens a new PR, which 8b joins (#31).
+  * **8b** (local writes): done, PR #31. As planned, with these details for 8c:
+    * **Client (`tree.ts`):**
+      * `UploadOptions.sink` and `Tree.seal(node, data, {sink})`.
+      * `KnownChunk {id, hash, size}` items in a `FileSource` (exported); they must be of `previous`, under the same key, at a block boundary (`bad_value` otherwise).
+      * `PendingOp` move/meta `hlc?`: `prepare` observes it and skips the clock sync when every op has one; `rebase` deletes it on the pending ops.
+      * `Tree.writeOpOf(u, replaces)`; `TreeOptions.info` and `Tree.info()` (the replica keeps `/v1/info` for offline sealing).
+      * `fileKeyFor` falls back to a fresh key when the versions can't be read (`network`).
+    * **`@zen/fs`:**
+      * `queue.ts`: entries (`QueueEntry {key, ops: QOp[], chunks, pages}`; a write's `after` names earlier entries whose dot it also replaces, patched in the store when they are sent; `index` rides on the op), the inflight record, a JSON codec with bytes and bigints.
+      * `overlay.ts`: `buildOverlay` (node copies, a kids index, files with `replaced` and a `LocalVersion`), `newestFirst`, `isLocal`.
+      * `sender.ts`: `Sender` (owner only): `pack`, upload from the store, the stored commit, rebase, split, fail.
+      * `handle.ts`: `FileHandle` (`read`, `write`, `truncate`, `stat`, `flush`, `close`) with dirty chunks and known chunks.
+      * `replica.ts`: `mkdir`, `writeFile({mode, contentType, create, wait})`, `symlink`, `rename`, `unlink` (a conflict copy: resolve), `rmdir`, `truncate`, `chmod`, `utimes`, `setxattr`, `removexattr`, `open(path, flags, {create, exclusive, mode})`, `onError`, `flush()` (the queue; the store flush is internal), `status().queued/sending`, `stat().contentType`, `CONTENT_TYPE`. Write calls run one at a time.
+      * **Settling:** a sent batch leaves the store at once (with the inflight record) but stays shown, with its dots, until the owner has caught up; `wait` resolves then. Other tabs get `sent` (dots), then `settled`.
+    * **Decisions beyond the plan:**
+      * After its own write settles, the owner fetches and keeps the node's versions, so a later write offline can replace them. **Writing offline over a file whose versions aren't kept fails with `offline`** (read, stat or pin it first).
+      * A write's `mtime` is updated with it (a meta op in the same entry).
+      * A handle's flush replaces the version it opened and the file's last local write (the last flush wins).
+      * Unlinking a conflict copy replaces just that copy's version (and the shown one, rewritten).
+    * **8c must know:** writes go through `FileHandle` (`flush` on `fsync`/`release`); `onChange` fires for queued writes too.
+    * **⚠️ Spec:** fs.md §11.1, formats.md §11.2 (`zen.` names), zendb.md §9.3 (`queue`, `index`, the kept `info`).
+    * **Docs:** `docs/CLIENT.md` §8 (writes), TECH_DEBT TD-FUSE-REPLICA progress.
+    * **Tests:** `packages/fs/test/writes.test.ts` (13: each operation online, offline with a restart, a lost reply with a crash, changed chunks only online and offline, handles, a conflict resolved by unlink, a move cycle, a refusal, a rebase past the horizon, tabs with handover, eviction); `large.test.ts` +2 (`seal` with a sink, known chunks), `tree.test.ts` +1 (a preset `hlc`, re-ticked by a rebase). The inflight resend and the eviction guard were each checked to fail when removed. 359 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

@@ -171,7 +171,34 @@ await r.close();
 * **Paths** use display names (`foo (2).txt` for a duplicate) and show a file's other sibling versions as read-only conflict copies, `notes (conflict ab12cd34-2).md`.
 * **Offline**, everything kept reads as before; content that isn't kept fails with `offline`, and `status().online` is false until the feed answers again.
 * **Several tabs** on one store (IndexedDB): the owner (a Web Lock) follows the feed and the others reload what it announces on the tab channel. In Node a disk store holds one replica (a lock file; one left by a dead process is taken over). `Replica.wipe(local, fs, tree)` deletes a replica.
-* Writes come in step 8b; until then write through the `Tree` and the replica follows.
+
+**Writes** work offline: each call is applied to what the replica shows at once, queued in the store, and sent later by the owner (spec/fs.md §11.1).
+
+```ts
+await r.mkdir('/docs');
+await r.writeFile('/docs/a.txt', bytes, { contentType: 'text/plain' });  // only changed chunks are sealed
+await r.symlink('docs/a.txt', '/link');
+await r.rename('/docs/a.txt', '/b.txt');          // replaces an existing file, or an empty directory
+await r.unlink('/b.txt'); await r.rmdir('/docs');
+await r.truncate('/big.bin', 1 << 20);
+await r.chmod(p, 0o600); await r.utimes(p, ms); await r.setxattr(p, 'user.k', v); await r.removexattr(p, 'user.k');
+await r.writeFile('/x', data, { wait: true });    // resolve once the server has it, not once queued
+
+const h = await r.open('/big.bin', 'r+');          // 'r', 'r+', 'w' (truncates), 'a'; {create, exclusive, mode}
+await h.write(patch, offset); await h.read(n, offset);
+await h.close();                                  // flush: one write, sealing only the chunks written
+await r.flush();                                  // resolves once every queued write is sent; offline: rejects
+r.onError((e, entries) => …);                     // writes the server refused (they are dropped)
+```
+
+* **A call returns once it is queued** (in the store, so it survives a restart), offline too; `{wait: true}` waits for the server. `status()` gives `queued` and `sending`.
+* **Changed chunks only.** A handle keeps the chunks it writes in memory; on flush the others are taken over from the version it opened by id (`KnownChunk`), with no plaintext read, and only pages whose ids changed are new. `writeFile` reuses unchanged chunks by hash. Both need the version's chunk index, built once with a streamed read and kept; offline it can be built from pinned content, else the whole file is sealed.
+* **Conflicts.** A write replaces the version shown (and this replica's earlier writes of the file), so a write made elsewhere meanwhile stays as a conflict copy, on every replica. Deleting the copy resolves it, keeping the version shown.
+* **Writing offline over a file whose versions aren't kept fails with `offline`**: read, stat or pin it first. Versions this replica wrote are kept.
+* **Sending.** Entries go in order, as few commits as the limits allow; a batch's commit is stored first and sent again with its `commit_id` after a crash. A refused entry (rights, a node purged meanwhile) is dropped and reported to `onError`; `stale_op` and `clock_skew` are rebased.
+* **Tabs.** Any tab writes; the owner sends, and the others hear when their writes are sent or refused.
+* The `zen.` xattr names are reserved (`zen.content_type` holds the media type, `stat().contentType`).
+* `Tree.seal(node, data, {sink})` (sealed chunks and pages go to the sink, nothing is sent) and `Tree.writeOpOf(upload, replaces)` are the client pieces under this; `PendingOp` move and meta ops may carry the `hlc` taken when queued (a rebase ticks a fresh one), and a `FileSource` may hold known chunks of the previous version.
 
 ## 9. zen-mount
 

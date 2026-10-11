@@ -119,11 +119,25 @@ export interface ChunkIndex {
   pages?: PageRef[];
 }
 
-/** A file's content: bytes, or a stream of byte arrays of any sizes. */
+/**
+ * A chunk of the `previous` version taken over as is, without its
+ * plaintext (its id, SHA-256 and size, from that version's index). It
+ * must start at a chunk boundary and be whole, unless it is the last.
+ */
+export interface KnownChunk {
+  id: Uint8Array;
+  hash: Uint8Array;
+  size: number;
+}
+
+/**
+ * A file's content: bytes, or a stream of byte arrays of any sizes, which
+ * may hold known chunks of the previous version.
+ */
 export type FileSource =
   | Uint8Array
-  | AsyncIterable<Uint8Array>
-  | Iterable<Uint8Array>
+  | AsyncIterable<Uint8Array | KnownChunk>
+  | Iterable<Uint8Array | KnownChunk>
   | ReadableStream<Uint8Array>;
 
 /** Options of `writeFile`. */
@@ -175,6 +189,11 @@ export interface UploadOptions extends Omit<WriteOptions, 'replaces'> {
    * are within `chunk_grace_secs`.
    */
   resume?: UploadState;
+  /**
+   * Hand each batch of sealed chunks and pages to `sink` instead of sending
+   * it (`Tree.seal`): the content can then be kept and sent later.
+   */
+  sink?: (chunks: ChunkPut[], pages: PagePut[]) => Promise<void>;
 }
 
 /** The result of `writeFile`. */
@@ -275,6 +294,8 @@ export interface TreeOptions {
   chunkCache?: ChunkCache;
   /** A cache of pages (their bytes, by page id), checked against their digests on use. */
   pageCache?: ChunkCache;
+  /** Where the server's `/v1/info` comes from (e.g. kept for offline use); default read once per client. */
+  info?: () => Promise<Info>;
 }
 
 /** Metadata given to `mkdir` / `create`. */
@@ -288,8 +309,9 @@ export interface CreateOptions {
 
 /** An operation before its timestamp is assigned (`Tree.send`). */
 export type PendingOp =
-  | { op: 'move'; node: Uint8Array; parent: Uint8Array; meta?: Uint8Array }
-  | { op: 'meta'; node: Uint8Array; meta: Uint8Array }
+  /** `hlc`: a timestamp taken earlier (queued offline); `prepare` ticks one otherwise. */
+  | { op: 'move'; node: Uint8Array; parent: Uint8Array; meta?: Uint8Array; hlc?: bigint }
+  | { op: 'meta'; node: Uint8Array; meta: Uint8Array; hlc?: bigint }
   | {
       op: 'write';
       node: Uint8Array;
@@ -330,7 +352,12 @@ export class Tree {
 
   /** The server limits (`/v1/info`, read once per client). */
   async limits(): Promise<Limits> {
-    return (await infoOf(this.fs.session.client)).limits;
+    return (await this.info()).limits;
+  }
+
+  /** `/v1/info`: `TreeOptions.info` when given, else read once per client. */
+  info(): Promise<Info> {
+    return this.opts.info ? this.opts.info() : infoOf(this.fs.session.client);
   }
 
   private get session(): Session {
@@ -735,7 +762,7 @@ export class Tree {
     const cs = m.chunkSize;
     const hashes: Uint8Array[] = [];
     const src = data ?? this.readStream(node, { version });
-    for await (const block of blocks(src, cs)) hashes.push(await sha256(block));
+    for await (const block of blocks(src, cs)) hashes.push(await sha256(block as Uint8Array));
     if (hashes.length !== version.chunkCount) {
       throw new ZenError(0, 'format', 'a version has the wrong number of chunks');
     }
@@ -807,6 +834,31 @@ export class Tree {
   }
 
   /**
+   * Seal a file's content without sending anything: every batch of sealed
+   * chunks and pages goes to `opts.sink` (to be uploaded later, before the
+   * write). `commits` counts the batches.
+   */
+  seal(
+    node: Uint8Array,
+    data: FileSource,
+    opts: UploadOptions & { sink: NonNullable<UploadOptions['sink']> },
+  ): Promise<Upload> {
+    return this.upload(node, data, opts);
+  }
+
+  /** The `write` operation of an upload, replacing exactly `replaces` (no read). */
+  writeOpOf(u: Upload, replaces: Uint8Array[]): Extract<PendingOp, { op: 'write' }> {
+    return {
+      op: 'write',
+      node: u.node,
+      replaces,
+      chunks: u.pages.length ? [] : u.index.chunks,
+      ...(u.pages.length ? { pages: u.pages } : {}),
+      manifest: u.sealedManifest,
+    };
+  }
+
+  /**
    * The `write` operation of an upload. `replaces` as in `writeFile`
    * (`'current'`, the default, reads the node's versions now).
    */
@@ -814,14 +866,10 @@ export class Tree {
     u: Upload,
     replaces: Uint8Array[] | 'current' = 'current',
   ): Promise<Extract<PendingOp, { op: 'write' }>> {
-    return {
-      op: 'write',
-      node: u.node,
-      replaces: replaces === 'current' ? (await this.versions(u.node)).map((v) => v.dot) : replaces,
-      chunks: u.pages.length ? [] : u.index.chunks,
-      ...(u.pages.length ? { pages: u.pages } : {}),
-      manifest: u.sealedManifest,
-    };
+    return this.writeOpOf(
+      u,
+      replaces === 'current' ? (await this.versions(u.node)).map((v) => v.dot) : replaces,
+    );
   }
 
   /**
@@ -840,8 +888,13 @@ export class Tree {
     if (previous) {
       if (previous.fileKey) base = { key: previous.fileKey, epoch: previous.keyEpoch! };
     } else {
-      const m = (await this.versions(node)).at(-1)?.manifest;
-      if (m?.version === 2 && m.fileKey) base = { key: m.fileKey, epoch: m.keyEpoch! };
+      try {
+        const m = (await this.versions(node)).at(-1)?.manifest;
+        if (m?.version === 2 && m.fileKey) base = { key: m.fileKey, epoch: m.keyEpoch! };
+      } catch (e) {
+        // Offline (e.g. a replica sealing a write to send later): a fresh key.
+        if (!isCode(e, 'network')) throw e;
+      }
     }
     const fresh = () => ({ key: zw.newFileKey(), epoch });
     if (!base) return fresh();
@@ -921,11 +974,14 @@ export class Tree {
     });
     const flush = async () => {
       if (!pending.length && !pendingPages.length) return;
-      await sendCommit(this.session, {
-        commit_id: randomBytes(16),
-        ...(pending.length ? { chunks: pending } : {}),
-        ...(pendingPages.length ? { pages: pendingPages } : {}),
-      });
+      if (opts.sink) await opts.sink(pending, pendingPages);
+      else {
+        await sendCommit(this.session, {
+          commit_id: randomBytes(16),
+          ...(pending.length ? { chunks: pending } : {}),
+          ...(pendingPages.length ? { pages: pendingPages } : {}),
+        });
+      }
       upload.commits++;
       pending = [];
       pendingPages = [];
@@ -961,13 +1017,24 @@ export class Tree {
     };
     const paged = () => ids.length > inlineMax;
 
+    const known = sameKey ? new Set(prev!.chunks.map(hex)) : undefined;
     for await (const block of blocks(data, chunkSize)) {
       if (size % chunkSize !== 0) {
-        throw new ZenError(
-          0,
-          'bad_value',
-          'resume: the upload already reached the end of the file',
-        );
+        throw new ZenError(0, 'bad_value', 'a short chunk before the end of the file');
+      }
+      if (!(block instanceof Uint8Array)) {
+        // A known chunk: taken over as is.
+        if (!known?.has(hex(block.id))) {
+          throw new ZenError(0, 'bad_value', 'a known chunk not of `previous` (or another key)');
+        }
+        if (block.size < 1 || block.size > chunkSize) {
+          throw new ZenError(0, 'bad_value', 'a known chunk of the wrong size');
+        }
+        ids.push(block.id);
+        hashes.push(block.hash);
+        size += block.size;
+        if (paged()) await cutPages(false);
+        continue;
       }
       const h = await sha256(block);
       // Each previous id is used once: a version shouldn't list a chunk twice.
@@ -999,7 +1066,7 @@ export class Tree {
 
     let manifest: ManifestV2;
     if (paged()) {
-      const info = await infoOf(this.session.client);
+      const info = await this.info();
       if (!info.features.includes('fs_pages')) {
         throw new ZenError(
           413,
@@ -1181,7 +1248,9 @@ export class Tree {
 
   /** Assign timestamps (reading the server clock once first). */
   async prepare(ops: PendingOp[]): Promise<Prepared> {
-    await this.clock.sync(this.session.client);
+    if (ops.some((o) => o.op !== 'write' && o.hlc === undefined)) {
+      await this.clock.sync(this.session.client);
+    }
     const hlcs: bigint[] = [];
     const wire: CrdtOp[] = ops.map((o) => {
       const base = { fs: this.fs.id, tree: this.id, node: o.node };
@@ -1195,7 +1264,9 @@ export class Tree {
           manifest: o.manifest,
         };
       }
-      const hlc = this.clock.tick();
+      let hlc = o.hlc;
+      if (hlc === undefined) hlc = this.clock.tick();
+      else this.clock.observe(hlc);
       hlcs.push(hlc);
       if (o.op === 'meta') return { op: 'meta', ...base, hlc, meta: o.meta };
       return { op: 'move', ...base, parent: o.parent, hlc, ...(o.meta ? { meta: o.meta } : {}) };
@@ -1216,6 +1287,10 @@ export class Tree {
   async rebase(p: Prepared, e: unknown, attempt: number): Promise<boolean> {
     if (attempt >= 3 || !(e instanceof ZenError) || !p.hlcs.length) return false;
     const client = this.session.client;
+    // Timestamps taken earlier are ticked afresh.
+    const fresh = () => {
+      for (const o of p.pending) if (o.op !== 'write') delete o.hlc;
+    };
     if (e.code === 'stale_op' && !e.message.includes('purged')) {
       await this.clock.sync(client, true);
       if (attempt === 1) {
@@ -1228,6 +1303,7 @@ export class Tree {
         const skew = Number((await this.limits()).crdt_max_skew_ms ?? 60_000n);
         this.clock.observe(zw.hlc(this.clock.now() + Math.floor(skew / 2), 0));
       }
+      fresh();
       return true;
     }
     if (e.code === 'clock_skew') {
@@ -1235,6 +1311,7 @@ export class Tree {
       const skew = Number((await this.limits()).crdt_max_skew_ms ?? 60_000n);
       if (zw.hlcMs(this.clock.last) > this.clock.now() + skew / 2)
         this.clock.reset(this.clock.now());
+      fresh();
       return true;
     }
     return false;
@@ -1441,8 +1518,11 @@ async function* streamParts(s: ReadableStream<Uint8Array>): AsyncGenerator<Uint8
   }
 }
 
-/** Split bytes or a stream of byte arrays into `size`-byte blocks (the last shorter). */
-async function* blocks(data: FileSource, size: number): AsyncGenerator<Uint8Array> {
+/**
+ * Split bytes or a stream of byte arrays into `size`-byte blocks (the last
+ * shorter). Known chunks pass through, at a block boundary.
+ */
+async function* blocks(data: FileSource, size: number): AsyncGenerator<Uint8Array | KnownChunk> {
   if (data instanceof Uint8Array) {
     for (let i = 0; i < data.length; i += size) yield data.subarray(i, i + size);
     return;
@@ -1450,10 +1530,17 @@ async function* blocks(data: FileSource, size: number): AsyncGenerator<Uint8Arra
   const parts =
     typeof (data as ReadableStream).getReader === 'function'
       ? streamParts(data as ReadableStream<Uint8Array>)
-      : (data as AsyncIterable<Uint8Array> | Iterable<Uint8Array>);
+      : (data as AsyncIterable<Uint8Array | KnownChunk> | Iterable<Uint8Array | KnownChunk>);
   let buf = new Uint8Array(size);
   let fill = 0;
   for await (const part of parts) {
+    if (!(part instanceof Uint8Array)) {
+      if (fill > 0) {
+        throw new ZenError(0, 'bad_value', 'a known chunk must start at a chunk boundary');
+      }
+      yield part;
+      continue;
+    }
     let p = 0;
     while (p < part.length) {
       const n = Math.min(size - fill, part.length - p);

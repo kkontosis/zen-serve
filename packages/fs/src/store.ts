@@ -3,8 +3,27 @@
 // behind (every 100 ms and at close); reads see pending writes first.
 import { bytes, type ChunkCache, type SealedStore } from '@zen/client';
 
-export type Kind = 'nodes' | 'sync' | 'versions' | 'chunks' | 'pages' | 'lru' | 'pins';
-export const KINDS: Kind[] = ['nodes', 'sync', 'versions', 'chunks', 'pages', 'lru', 'pins'];
+export type Kind =
+  | 'nodes'
+  | 'sync'
+  | 'versions'
+  | 'chunks'
+  | 'pages'
+  | 'lru'
+  | 'pins'
+  | 'queue'
+  | 'index';
+export const KINDS: Kind[] = [
+  'nodes',
+  'sync',
+  'versions',
+  'chunks',
+  'pages',
+  'lru',
+  'pins',
+  'queue',
+  'index',
+];
 
 const FLUSH_MS = 100;
 

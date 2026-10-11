@@ -336,6 +336,32 @@ describe('large files and limits', () => {
     expect(n.parent).toEqual(ROOT);
     expect(equal(n.state.move_device, w.session.deviceFp!)).toBe(true);
   });
+
+  it('uses a timestamp taken earlier; a rebase ticks it afresh', async () => {
+    const id = Tree.newId();
+    const ta = a.tree(id);
+    const x = await ta.mkdir(ROOT, 'x');
+    const y = await ta.mkdir(ROOT, 'y');
+    // Taken now, sent later (as a replica queues it offline).
+    const early = ta.clock.tick();
+    await ta.send([{ op: 'move', node: x, parent: y, hlc: early }]);
+    expect((await ta.getOne(x))!.state.move_hlc).toBe(early);
+
+    // b moves x three times after a takes its next timestamp: a's queued
+    // move is older than them, refused (crdt_max_redo = 2), then re-ticked.
+    const old = ta.clock.tick();
+    const tb = b.tree(id);
+    await tb.clock.sync(w.client, true);
+    tb.clock.observe(old);
+    for (let i = 0; i < 3; i++) await tb.move(x, i % 2 ? y : ROOT);
+    const ops = [{ op: 'move' as const, node: x, parent: ROOT, hlc: old }];
+    const codes = await errorsDuring(w.session, () => ta.send(ops));
+    expect(codes).toEqual(['stale_op']);
+    const n = (await ta.getOne(x))!;
+    expect(n.parent).toEqual(ROOT);
+    expect(n.state.move_hlc).toBeGreaterThan(old);
+    expect(ops[0]!.hlc).toBeUndefined();
+  });
 });
 
 describe('tree operations in transactions', () => {

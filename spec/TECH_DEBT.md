@@ -177,7 +177,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** `zen-mount` (packages/fuse) has no local replica: it lists directories from the server (cached until the change feed reports a change), reads file contents by chunk range, and writes a whole new version when a file is closed or synced. It is not POSIX-complete: no hard links, symlinks or xattrs; `mmap` isn't coherent across devices; there is no offline use and no persistent chunk cache (`--cache-dir` is reserved).
 * **Why deferred:** The local replica and the POSIX layer over it are the zen-fs client of milestone 5; milestone 4 needed a working mount on the operations API.
 * **What it would take:** The milestone-5 replica (node table and chunk store on disk, synced through the change feed), then `zen-mount` on top of it, with symlinks (the `symlink` node type exists), xattrs in the sealed meta, and writes of changed chunks only.
-* **Progress:** the replica is built (`@zen/fs`, milestone 5 step 8a: the node table, content on demand, pins, offline reads, the three stores); local writes come in 8b and `zen-mount` moves onto it in 8c.
+* **Progress:** the replica is built (`@zen/fs`, milestone 5 step 8a: the node table, content on demand, pins, offline reads, the three stores) and takes local writes (8b: queued offline, file handles writing changed chunks only, symlinks, xattrs); `zen-mount` moves onto it in 8c.
 
 ## TD-BROKER-SERVER-TIMERS
 

@@ -93,6 +93,7 @@ export {
   displayNames,
   type FileSource,
   type FileVersion,
+  type KnownChunk,
   type NodeStat,
   type OpRecord,
   opBytes,
