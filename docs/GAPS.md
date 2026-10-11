@@ -153,7 +153,7 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 
 | # | Gap | Proposal |
 |---|---|---|
-| G15 | **Browser key storage.** ML-DSA / X-Wing aren't in WebCrypto, so private keys sit in WASM memory and can be stolen by XSS. | Wrap them at rest with a non-extractable WebCrypto AES key. Strict CSP + Trusted Types headers on `/unencrypted` by default. Document the XSS risk. |
+| G15 | **Browser key storage.** ML-DSA / X-Wing aren't in WebCrypto, so private keys sit in WASM memory and can be stolen by XSS. | Wrap them at rest with a non-extractable WebCrypto AES key. Strict CSP + Trusted Types headers on `/unencrypted` by default. Document the XSS risk. **Partly done (milestone 5, step 7h):** the credential vault keeps device seeds and session tokens under the sealed store's non-extractable device key (docs/CLIENT.md §10); CSP and Trusted Types stay open. |
 | G16 | **Multiple tabs:** duplicate connections, caches and leases. | A SharedWorker (with a Web Locks fallback) owns the connection and cache per origin. **Decided (milestone 4.5):** one owner per database through a Web Lock, a SharedWorker where available, other tabs proxy over `BroadcastChannel` (spec/zendb.md §9). |
 | G17 | **Cross-origin apps** using a zen-serve instance. | Same-origin by default. An explicit CORS allowlist in config. |
 | G18 | **TLS for family self-hosting.** | Built-in ACME (Let's Encrypt) in zen-serve. TLS between FoundationDB nodes on by default when there's more than one node. |

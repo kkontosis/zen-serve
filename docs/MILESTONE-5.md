@@ -334,6 +334,14 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** formats.md §11.3 (`key_mode`), §11.4, §12 (header version 2, the policy, its leakage); fs.md §4.1, §4.2 (rewritten: the policy and the three rekey rules).
     * **Docs:** `docs/CLIENT.md` §8 (large files, streams, resumable uploads, file keys), §9; `docs/STATS.md` §1.3; TECH_DEBT: TD-FS-LARGE-FILES and TD-CRDT-ROWS-SERVER resolved.
     * **Tests:** `packages/client/test/large.test.ts` (13: three sources, range reads and the page cache, appends, the inline limit, swapped and missing pages, version 1, resume, no `fs_pages`, and the policy: default, on, the three rekey rules, a mixed history, offline unlock); two were checked to fail with page reuse or the rekey rule broken. `txn.test.ts` +1 (a paged upload with a row), `mount.test.ts` +1 (a 4-page file through the kernel), `fsvectors.test.ts` (key_mode 0), zen-core `header.rs` and `tests/fs.rs`. 316 vitest tests in all.
+  * **7h** planned in detail (see "7h: a credential vault on the local store"); PR #28 merged, so the plan commit restarts the branch from main and opens a new PR (#29).
+  * **7h** (the credential vault): done, PR #29. **Step 7 is done.** Step 8 starts from main: restart the branch, plan it, open a new PR. As planned, with these details for step 8:
+    * **Client:** `src/local/vault.ts` `credentialVault(sealed, {name, allowPlaintext})` → `CredentialVault` (`store`, `saveDevice`, `device`, `saveSession`, `signIn(client, {probe})`, `unlock(fs, {local})`, `forgetSession`, `forget`); exports `StoredDevice`, `VaultOptions`, `VaultSignInOptions`. Records are plain binary (`u8 1 ‖ …`), so the client needs no CBOR.
+    * **Decisions beyond the plan:** a stored session refused with 401 when there's no device is deleted before `not_found`; `signIn` resumes a session whose expiry is unknown (0), relying on the probe.
+    * **Step 8 (zen-mount `--vault`):** its `DeviceFile` (hex `identity_seed`, `device_seed`, `cert`) maps onto `saveDevice` with `identity: SigningIdentity.fromSeed(identity_seed)` (only the public bytes are kept).
+    * **⚠️ Spec:** zendb.md §9.3, the `vault/<name>` store and its two records.
+    * **Docs:** `docs/CLIENT.md` §10 "Credentials (the vault)"; GAPS G15 partly done.
+    * **Tests:** `packages/client/test/vault.test.ts` (14: three backends, resume with one call, offline with the kept header, offline with an expired or no session, an expiring session, a logged-out session, no device, the origin rule, refusals, a bad seed, tampering, unparsable records); the origin check and the 401 fallback were each checked to fail when removed. 330 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2075,25 +2083,59 @@ This resolves TD-FS-LARGE-FILES.
 4. 7h is next.
 
 ### 7h: a credential vault on the local store (detailed plan)
-**Context.** A service worker (M9), a git helper (M10) or a restarted zen-mount must sign in and unlock with no page or prompt. Today the app holds the device identity and the session token itself. GAPS G15 asks for keys wrapped at rest under a non-extractable WebCrypto key, which the sealed store's device layer already provides.
-* **`packages/client/src/local/vault.ts`:** `credentialVault(sealed)`, on store `vault`:
-  * `saveDevice(device credentials)`, `saveSession(token)`
-  * `signIn(client)`: resume a stored token that is still valid, else `signInDevice` with the stored device, then store the new token
-  * `forget()`
-  * **Refused:**
-    * a store without the device layer, unless it is `plaintext: true` and the app passes `allowPlaintext`
-    * a store with the fs layer, which can't seal what unlocks the fs (as for the kept header)
-* **Unlocking:** the device keyslot (`unlock({device})`) then works from the vault, offline too, with the kept header of 7e.
-* **⚠️ Spec:** zendb.md §9.3 gains the `vault` store and what it holds.
-* **Docs:** `docs/CLIENT.md` §10; GAPS G15, partly done.
-* **Tests:**
-  * a round trip on memory, IndexedDB and Node disk
-  * a fresh "process" signs in and unlocks from the vault: online, and offline from the kept header
-  * an expired token falls back to the device
-  * a tampered record reads as absent
-  * the refusals
-  * `forget`
-* **Verification:** as for 7g.
+
+**Context.** A service worker (M9), a git helper (M10) or a restarted zen-mount must sign in and unlock with no page or prompt. Today the app keeps the device seed and the session token itself (zen-mount reads them from a JSON file of hex seeds, `packages/fuse/src/cli.ts:127–170`). GAPS G15 asks for keys wrapped at rest under a non-extractable WebCrypto key, which the sealed store's device layer (7d) already provides. 7h puts the credentials in that store. It is TypeScript only: no Rust, no server, no vectors. Step 7 is then done.
+
+**Survey facts the design rests on:**
+* `DeviceSecret` is a wasm handle with no seed getter (`fromSeed(seed)` only), so the vault stores the 32-byte **seed**, the cert and the identity's **public** bytes, and rebuilds the device on use. `DeviceCredentials.identity` already accepts public bytes (`client.ts:31`).
+* `client.resume(token)` sends nothing. An expired or unknown token shows as 401 `unauthorized` on the first call. Expiry is known only from `session.info.expires_unix` (fresh sign-ins), so the vault stores it with the token. The session TTL is `limits.session_ttl_secs`.
+* `Fs.unlock({device}, {local})` already unlocks offline from the kept header (7e), and refuses a store with the fs layer.
+
+**Branch/PR.** #28 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7h plan`, syncing `docs/MILESTONE-5.md`), open a new PR that 7h joins.
+
+#### `packages/client/src/local/vault.ts`
+* **`credentialVault(sealed: SealedStore, {name = 'default', allowPlaintext = false}) → CredentialVault`**, on store `vault/<name>` (several identities can share one store).
+  * **Refused (`TypeError`):** a store with the fs layer (it can't seal what unlocks the fs, as for the kept header); a plaintext store (`layers === 0`) unless `allowPlaintext`. A store with only the device layer is the normal case.
+* **Records** (one per key, versioned plain binary; the client package has no CBOR):
+  * `device`: `u8 1 ‖ lp(identity public) ‖ seed(32) ‖ lp(cert)`
+  * `session`: `u8 1 ‖ lp(origin) ‖ lp(token) ‖ u64 expires_unix` (0 = unknown)
+  * A record that doesn't parse reads as absent (like one that doesn't open).
+* **Methods:**
+  * `saveDevice({identity: Uint8Array | SigningIdentity, deviceSeed, cert})` and `device() → DeviceCredentials | undefined` (a fresh `DeviceSecret`; the caller frees it).
+  * `saveSession(session)`: the token, `client.origin`, and `info.expires_unix` when known.
+  * **`signIn(client, {probe = true}) → Session`:**
+    1. A stored session for `client.origin` that hasn't expired (60 s margin) → `client.resume(token)`. With `probe`, one `/v1/grv` call: success → return it; 401 → step 2; `network` → return it (offline: the kept header and local caches work, and calls fail with `network` until the server is back).
+    2. Otherwise `signInDevice` with the stored device, save the new session, return it.
+    3. No device and no usable session → `ZenError(0, 'not_found', 'nothing in the vault')`. Device sign-in failing with `network` while an (expired) session is stored → return the resumed session, as in 1.
+    * A token stored for another origin is never sent.
+  * `unlock(fs: Fs, {local?}) → UnlockedFs`: `fs.unlock({device}, {local})` with the stored device (frees it after), so with the kept header it works offline too.
+  * `forgetSession()` (after a `logout`) and `forget()` (clears `vault/<name>`).
+* **Exports** (`index.ts`): `credentialVault`, `CredentialVault`, `StoredDevice`, `VaultOptions`.
+
+#### zen-mount
+Not changed here: `--vault <dir>` is step 8's (its constraints list). The vault's device record mirrors zen-mount's `DeviceFile` (seed, cert), so step 8 can import one.
+
+#### ⚠️ Spec (`spec:` commit)
+* zendb.md §9.3: after the kept-header paragraph, the `vault/<name>` store (per installation, not per database): its two records, the layer rules, binding the token to its origin, and that `Db.wipe` leaves it (sign-out clears it with `forget`).
+* No new labels or seal kinds: records are sealed by the store's layers as every local record is.
+
+#### Docs
+* `docs/CLIENT.md` §10: "Credentials" (the vault, `signIn`, offline, what it holds, sign-out).
+* `docs/GAPS.md` G15: device keys and session tokens wrapped at rest (7h); CSP / Trusted Types stay open.
+
+#### Tests (`packages/client/test/vault.test.ts`, its own server with `limits: {session_ttl_secs: 2}`)
+* **Backends** (`describe.each` of memory, Node disk, IndexedDB via `fake-indexeddb`, as `local.test.ts`): device and session round trip; `forget` empties the store; two names don't see each other.
+* **Fresh process:** a new `connect` + a new `sealedStore` over the same raw store → `signIn` resumes the stored token (one `/v1/grv`, no `/v1/auth/*` call), and `unlock(fs, {local})` opens the fs.
+* **Offline:** with `session.call` throwing `network`, `signIn` returns the resumed session and `unlock` opens from the kept header.
+* **Expiry:** after the TTL, `signIn` signs in with the device (counted `/v1/auth/session`) and stores the new token; a stored token the server no longer knows (after `logout`) → 401 → device.
+* **Origin:** a session stored for another origin is not sent.
+* **Refusals:** fs-layer store; plaintext without `allowPlaintext`; plaintext with it works.
+* **Tampering:** a flipped byte in the raw record → absent → `signIn` without a device gives `not_found`.
+
+#### Verification
+* `npx biome check`; tsc for client (test config), fuse, db (test); `npx vitest run` three times.
+* Rust unchanged (no build needed).
+* CI green on the PR, then log the 7h line in both plan copies (step 7 done), stop for compaction. Step 8 is next.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
 * **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).

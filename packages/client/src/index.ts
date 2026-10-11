@@ -34,6 +34,13 @@ export {
 } from './local/sealed.js';
 export { type LocalStore, memoryLocalStore } from './local/store.js';
 export {
+  type CredentialVault,
+  credentialVault,
+  type StoredDevice,
+  type VaultOptions,
+  type VaultSignInOptions,
+} from './local/vault.js';
+export {
   type AppendOptions,
   Consumer,
   type Delivery,

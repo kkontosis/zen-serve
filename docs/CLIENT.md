@@ -186,6 +186,25 @@ for await (const [k, v] of local.list('notes')) { … }
 * **What doesn't open reads as absent**, and is deleted with a warning: a tampered record, one copied to another key, store or fs, one sealed with other layers (a store's layers never mix), or every record once the device key is gone.
 * A `SealedStore` binds each record to its store name and key, so records can't be swapped between them.
 
+### Credentials (the vault)
+
+A worker, a helper or a restarted process can sign in and unlock with no prompt from a **credential vault** on a sealed store (spec/zendb.md §9.3):
+
+```ts
+import { credentialVault, indexedDbLocalStore, sealedStore } from '@zen/client';
+
+const local = sealedStore(indexedDbLocalStore('my-app'));
+const vault = credentialVault(local);                     // store vault/default
+await vault.saveDevice({ identity, deviceSeed, cert });   // once, after enrolling the device
+const session = await vault.signIn(client);               // a stored session, or a device sign-in
+const fs = await vault.unlock(session.fs(1), { local });  // the device keyslot; offline from the kept header
+await session.logout(); await vault.forget();             // sign-out
+```
+
+* **What it holds:** the device (its 32-byte seed, its cert and the identity's public bytes; the `DeviceSecret` is rebuilt from the seed) and the last session's token with its origin and expiry. `{name}` keeps several identities in one store.
+* **`signIn(client)`** resumes the stored session while it hasn't expired (60 s margin), checked with one `/v1/grv` call (`{probe: false}` skips it). A session the server refuses (401) falls back to a device sign-in, and the new session is stored. When the server can't be reached, the stored session is returned: the kept header and local caches work, and calls fail with `network` until it is back. A token is only ever sent to the origin it was issued for.
+* **The store** needs the device layer (G15: the seed and token sit at rest under a non-extractable key), or `plaintext: true` and `allowPlaintext`. It can't have the fs layer, which needs the keys it unlocks. `Db.wipe` leaves the vault; `forget()` (or `forgetSession()`) clears it.
+
 ## 11. Security notes
 
 * **Secrets stay in WASM memory** behind handles (`FsKeys`, `SigningIdentity`, `DeviceSecret`, `PasswordKey`, OPAQUE state); `free()` and `UnlockedFs.close()` zeroize them. Values passed in from JS (passwords, recovery keys) are copied; JS strings can't be wiped.
