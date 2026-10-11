@@ -147,6 +147,7 @@ ChangeDef   = { 1: topic: [bytes], 2: image: "keys" | "full" }
 * **Visibility by state.**
   * Writers maintain every index whose state is `building` or `active`.
   * Queries use only `active` indexes.
+* **CRDT tables** (`merge: "crdt"`, §19) are never padded, have no `unique` index (of any kind), and declare change events with `image: "keys"` only (§12.7). `createTable` refuses `pad: true`, and `crdt_fields` on a table that isn't a CRDT table; a pk field has no CRDT type.
 
 ## 4. Rows
 
@@ -583,6 +584,7 @@ A transaction can carry filesystem operations (spec/fs.md) next to its rows. The
 * **Clearing.** Its keys are cleared in pages, each one `clear_ranges` of at most `max_range_items` keys (api.md §6):
   * `("u"|"f"|"n"|"r", index_id)` for an index
   * `("t"|"o", table_id)` plus its indexes for a table
+* **CRDT tables** hold no KV rows: each page instead deletes the next live rows (a `row` operation with `alive: false` each, paged by `/v1/crdt/range`, the last object as the progress). The server purges them after the horizon (§19.5).
 * **Finishing.** The definition is removed in the last page's transaction.
 
 ## 9. Multiple tabs and processes (G16)
@@ -876,6 +878,7 @@ saga(name, steps: [{name, command: topic, compensate?: topic, timeoutMs?}], {gro
   * **Key:** the pk element, so `per_key` consumers see each row's changes in order.
   * **Row:** with `image: "full"` the new fields are included when they fit one envelope, and left out otherwise. The consumer reads the row.
 * **One event per row per transaction:** for a row written twice, the final state.
+* **CRDT tables (§19):** the merged row is known only to the server, so the body never carries `row`. `op` is `delete` when the transaction's last insert or delete of the row was a delete, `put` for any other write (an insert, a field, a counter, a set).
 * **Uses:**
   * live views (`table.on(handler)`, an `on` of the change topic)
   * cache freshness (§7.7)
@@ -1135,6 +1138,8 @@ Plaintexts:
 | `counter` entry | `{1: total: int}`: this installation's cumulative sum of increments and decrements |
 | `set` element | `{1: element}` |
 
+* **Undeclared fields.** A field not listed in `crdt_fields` is `lww`, and its plaintext carries its name, `{1: value, 2: name}`: field tokens can't be reversed, so a reader finds the name only there. Declared fields omit key 2. Counters and sets are always declared.
+
 ### 19.3 Operations
 
 New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
@@ -1163,6 +1168,15 @@ New `CrdtOp` variants in the commit's `crdt_ops` (api.md §6):
 * **Isolation (G11).**
   * In long mode the server retries its own conflicts, so CRDT operations never fail with `conflict`.
   * In short mode the state the server reads conflicts like any read.
+
+**The class side.**
+* **Calls.** `insert(row)` sends a `row` operation (`alive: true`) first, then one per field given: `lww` for `lww` fields, an increment by the value for counters, an `add` per element for sets. `patch(pk, fields)` sets `lww` fields (`undefined` unsets one), `incr(pk, field, n)` counts, `add`/`remove(pk, field, ...elements)` change sets, and `delete(pk)` sends `row` with `alive: false`. `put` and `update` read before writing, so CRDT tables refuse them (`bad_value`).
+* **Only `row` resurrects.** After a delete, `patch`, `incr` and `add` change fields of a hidden row; `insert` makes it visible again with them.
+* **Stamping.** Operations are kept in call order and stamped when the transaction builds its commit, so a re-run stamps afresh: `row` and `lww` get a fresh `hlc` from the session clock; a `ctr` gets `seq` = a fresh tick.
+* **Counter totals.** An installation's total of a counter is its committed total plus this attempt's increments (several in one transaction are one `ctr` operation). The committed total is read once from its own entry (`crdt/get`), then kept in memory and replaced when the commit lands. Commits with counters of one installation are sent one at a time, so their `seq`s reach the server in order; after a failed commit the totals it touched are read again, since whether it landed may be unknown.
+* **Removes.** `remove` reads the element's dots (`crdt/get`) and sends them: it removes the copies it saw. A transaction's own `add` of the element earlier in it is dropped instead.
+* **Reads in a transaction** see its own operations, applied to the merged state in order.
+* **Rebase.** On `stale_op` or `clock_skew` for a commit with `row` or `lww` operations, the class reads the server clock again (and restarts a clock that ran ahead), then re-runs the transaction, which stamps afresh; at most three times.
 
 ### 19.4 Reads
 
