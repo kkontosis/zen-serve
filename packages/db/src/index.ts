@@ -30,6 +30,15 @@ export type {
 export type { Value } from './cbor.js';
 export * as cbor from './cbor.js';
 export { CRDT_FEATURE, type CrdtFieldType } from './crdt.js';
+export type { CrdtRead } from './crdtcache.js';
+export {
+  CrdtQueue,
+  memoryQueueStore,
+  type QueueEntry,
+  type QueueRow,
+  type QueueStore,
+  type SyncEvent,
+} from './crdtq.js';
 export {
   Db,
   type DbOptions,
@@ -38,6 +47,7 @@ export {
   type ImportOptions,
   type ServeOptions,
   Table,
+  type TableOptions,
 } from './db.js';
 export { DbError, type DbErrorCode } from './errors.js';
 export { TxFiles } from './files.js';

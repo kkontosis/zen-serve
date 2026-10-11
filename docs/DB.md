@@ -188,6 +188,7 @@ In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lo
 | `poisoned` | a message that doesn't decode, or whose body parts are gone |
 | `timeout` | a request without a reply in time; no owner tab answering |
 | `unsupported` | a CRDT table on a server without `"crdt_rows"` |
+| `offline` | a CRDT read that needs the server while it can't be reached (§19) |
 
 ---
 
@@ -341,12 +342,51 @@ await cards.delete(id);
 | the row | `insert` makes it exist, `delete` hides it; only `insert` brings it back |
 
 * **`insert`** sets the fields given: `lww` fields, counters incremented by the value, set elements added. Fields not given keep their merged values.
-* **Reads** (`get`, `query`) merge the server's state on the client: declared counters read 0 and sets `[]` until written. Inside a transaction they see its own operations, and are **not** in its read set: a transaction that reads a CRDT row never conflicts on it.
+* **Reads** (`get`, `query`) merge the server's state on the client: declared counters read 0 and sets `[]` until written. They see this instance's queued writes and the transaction's own operations, and are **not** in its read set: a transaction that reads a CRDT row never conflicts on it.
 * **Queries** look up by pk, use an index (below), or scan the table (the predicates, `orderBy` and paging as for a scan).
-* **Timestamps** are stamped when the transaction commits, from the session clock. A commit refused with `stale_op` or `clock_skew` is re-run with fresh ones, after reading the server clock.
+* **Timestamps** of `insert`, `patch` and `delete` are the time of the edit, from the session clock. A commit refused with `stale_op` or `clock_skew` is sent again with fresh ones, after reading the server clock: an edit held offline past the server's horizon then wins over edits made since.
 * **Counters** need an installation id (the clock's `actor`): a persisted clock store must keep it with the HLC (docs/CLIENT.md). One installation's counter commits go one at a time.
 * **Change events** carry `{op, table, pk}`: `delete` when the transaction last deleted the row, `put` otherwise.
 * **Dropping** a CRDT table deletes its rows in pages, with their index entries; the server purges the rows after its horizon.
+
+### Writes and the queue
+
+CRDT writes work offline: they go through a queue (`db.crdt`) that sends them when the server can be reached.
+
+```ts
+await cards.patch(id, { title: 'x' });                       // resolves once queued
+await db.table<Card>('cards', { wait: true }).incr(id, 'votes'); // resolves once committed
+await db.transaction(async (tx) => {                          // one entry, sent whole
+  await tx.table<Card>('cards').patch(a, { status: 'done' });
+  await tx.table<Card>('cards').incr(b, 'votes', 1);
+}, { wait: true });
+db.crdt.pending;          // entries not yet committed
+db.crdt.online;           // whether the last attempt reached the server
+await db.crdt.flush();    // the queue is empty (rejects `offline` while offline)
+db.crdt.onSync((e) => render(e.online, e.sent, e.failed));
+```
+
+* **What is queued.** Each call on a CRDT `Table` is an entry; so is a transaction with CRDT operations only (and reads of its tables), which is sent whole, in one commit. A transaction with anything else (a transactional row, an emit, a consume) commits directly, after sending the queue first, so this instance's commits stay in order: offline it fails. `{queue: false}` on a transaction, or `DbOptions.crdtQueue: false`, commits CRDT-only transactions directly too.
+* **Batches.** Entries go out in order, in as few commits as the server's limits allow (`crdtBatchMs`, default 10 ms, gathers them). Single calls next to each other are coalesced: the last `patch` of a field wins, increments add up, an `add` then a `remove` of one element cancel out.
+* **Retries.** A commit that may not have arrived (a network error) is sent again as is, with the same `commit_id`, so it applies once. A `conflict` rebuilds it; `stale_op` re-stamps it (above). Any other error drops the entries it held: their `wait`s reject and `onSync` reports `failed`.
+* **A dropped table**'s queued writes are dropped with a warning.
+* **Removes** take the copies seen when called; the queue adds the copies its own earlier adds got, so removing an element added offline works.
+* **The store** is in memory (`DbOptions.crdtStore` takes another `QueueStore`): the queue lasts as long as the process. A persistent, encrypted store comes with the local replica.
+* **`tx.after`** of a queued transaction runs once queued.
+
+### Read modes
+
+CRDT reads keep the states they fetch in a cache (`DbOptions.crdtCache`, default 1,024 rows). How a read uses it is its mode: `DbOptions.crdtRead`, `db.transaction(fn, {read})`, `get(pk, {read})`, `query().read(mode)`.
+
+| Mode | Online | Offline |
+|---|---|---|
+| `auto` (default) | a state younger than `crdtCacheMs` (default 5 s) as cached; an older one checked by version (`/v1/crdt/versions`), and fetched again only if it changed | the cached state, however old |
+| `cache` | the cached state, however old; the server only for rows not cached | the cached state |
+| `server` | always the server | fails |
+
+* **Misses.** Offline, a row that isn't cached is `offline`, unless only the queue writes it: then it reads from its queued writes.
+* **Queries** in `auto` and `server` ask the server as usual; `auto` answers offline as `cache` does. A `cache` query answers from the cached rows and the rows only the queue holds, filtered, ordered and paged locally: it may miss rows never read.
+* **This instance's commits** mark their rows stale, so its next `auto` read fetches them; another installation's writes show once the entry is checked.
 
 ### Indexes on CRDT tables
 

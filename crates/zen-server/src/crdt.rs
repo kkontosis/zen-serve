@@ -18,7 +18,8 @@ use crate::txn::txn_loop;
 use axum::extract::State;
 use std::collections::{BTreeSet, HashMap};
 use zen_proto::{
-    ByteBuf, CrdtGet, CrdtOp, CrdtRange, CtrEntry, LwwReg, ObjState, ObjStates, RowReg, SetDot,
+    ByteBuf, CrdtGet, CrdtOp, CrdtRange, CrdtVersions, CrdtVersionsReq, CtrEntry, LwwReg, ObjState,
+    ObjStates, RowReg, SetDot,
 };
 use zen_store::tuple::{Elem, unpack_prefix};
 use zen_store::{STAMP_LEN, Txn, VERSIONS_PER_SEC, Version, key_after, stamp_of};
@@ -518,6 +519,34 @@ pub async fn get(
         read_version: t.read_version(),
         objects,
         more: false,
+    }))
+}
+
+/// `POST /v1/crdt/versions`: each object's version alone, for clients
+/// checking a cached state (empty = no such object).
+pub async fn versions(
+    State(st): State<Shared>,
+    caller: Caller,
+    Cbor(req): Cbor<CrdtVersionsReq>,
+) -> ApiResult<Cbor<CrdtVersions>> {
+    check_read(&st, &caller, req.fs)?;
+    if req.objects.len() > 1000 {
+        return Err(too_large("at most 1000 objects"));
+    }
+    for o in &req.objects {
+        check_object(&st, o)?;
+    }
+    let mut t = st.store.begin(req.read_version).await?;
+    let mut versions = Vec::with_capacity(req.objects.len());
+    for o in &req.objects {
+        let v = t
+            .snapshot_get(&keys::crdt_objects(req.fs).bytes(o).finish())
+            .await?;
+        versions.push(ByteBuf::from(v.unwrap_or_default()));
+    }
+    Ok(Cbor(CrdtVersions {
+        read_version: t.read_version(),
+        versions,
     }))
 }
 

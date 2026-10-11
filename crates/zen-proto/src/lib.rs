@@ -2252,6 +2252,38 @@ pub struct CrdtRange {
     pub read_version: Option<u64>,
 }
 
+/// `POST /v1/crdt/versions` request (api.md §13.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CrdtVersionsReq {
+    /// fs_id.
+    pub fs: u32,
+    /// Objects to check.
+    pub objects: Vec<ByteBuf>,
+    /// Snapshot to read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub read_version: Option<u64>,
+}
+
+/// `/v1/crdt/versions` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CrdtVersions {
+    /// The snapshot read.
+    pub read_version: u64,
+    /// Each object's version (10 bytes), in request order; empty = no such object.
+    pub versions: Vec<ByteBuf>,
+}
+
 /// A CRDT row's register.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(

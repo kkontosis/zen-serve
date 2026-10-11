@@ -35,6 +35,8 @@ import {
   type TableRecord,
 } from './catalog.js';
 import type { Value } from './cbor.js';
+import { CrdtCache, type CrdtRead } from './crdtcache.js';
+import { CrdtQueue, memoryQueueStore, type QueueStore } from './crdtq.js';
 import { DbError } from './errors.js';
 import type { Node } from './index/node.js';
 import { startIndexers } from './ixer.js';
@@ -62,7 +64,13 @@ import { Saga, type SagaOptions, type SagaStep } from './saga.js';
 import { type ScheduleOptions, Scheduler, type SchedulerOptions } from './sched.js';
 import { SYSTEM_TABLES, systemTable } from './system.js';
 import { type LockManagerLike, Owner } from './tabs.js';
-import { DbTransaction, ManualTransaction, type ReadRow, SwitchToLong } from './txn.js';
+import {
+  DbTransaction,
+  ManualTransaction,
+  type ReadRow,
+  SwitchToLong,
+  type TableTx,
+} from './txn.js';
 
 /** Options of `Db.open`. */
 export interface DbOptions {
@@ -100,6 +108,27 @@ export interface DbOptions {
    * default true). Their indexes then lag until an instance runs it.
    */
   indexer?: boolean;
+  /** CRDT object states kept for reads (§19.4). Default 1,024; 0 turns the cache off. */
+  crdtCache?: number;
+  /** How long a cached CRDT state is used unchecked, in `auto` reads (default 5,000 ms). */
+  crdtCacheMs?: number;
+  /** The default read mode of CRDT tables (§19.4; default `auto`). */
+  crdtRead?: CrdtRead;
+  /**
+   * `false`: CRDT-only transactions commit at once, like any other, instead
+   * of going through the queue (§19.7; default true).
+   */
+  crdtQueue?: boolean;
+  /** Where the queue of CRDT writes is kept (§19.7). Default: in memory. */
+  crdtStore?: QueueStore;
+  /** How long the queue waits to gather writes into one commit (default 10 ms). */
+  crdtBatchMs?: number;
+}
+
+/** Options of `db.table`. */
+export interface TableOptions {
+  /** CRDT writes resolve when committed, not when queued (§19.7). */
+  wait?: boolean;
 }
 
 /** Options of `serve` (§12.3). */
@@ -116,6 +145,18 @@ export interface DbTxnOptions {
   attempts?: number;
   /** `auto`: how long the short phase may run (default `DbOptions.autoSwitchMs`). */
   autoSwitchMs?: number;
+  /**
+   * A transaction of CRDT writes only is queued (§19.7) and resolves once
+   * queued; `false`: commit it at once, like any other (default
+   * `DbOptions.crdtQueue`).
+   */
+  queue?: boolean;
+  /** A queued transaction resolves when committed, not when queued. */
+  wait?: boolean;
+  /** The read mode of its CRDT reads (§19.4; default `DbOptions.crdtRead`). */
+  read?: CrdtRead;
+  /** @internal One call of a `Table`: a single entry of the queue. */
+  single?: boolean;
 }
 
 /** Options of `importRows`. */
@@ -180,6 +221,10 @@ export class Db {
   schema = 0;
   /** Cache counters. */
   readonly stats: DbStats = { rowHits: 0, rowMisses: 0 };
+  /** @internal CRDT states (§19.4). */
+  readonly crdtCache: CrdtCache;
+  /** @internal The queue of CRDT writes (§19.7). */
+  crdtQueue!: CrdtQueue;
 
   private constructor(
     readonly fs: UnlockedFs,
@@ -190,7 +235,17 @@ export class Db {
     /** The server's features (`/v1/info`). */
     readonly features: string[],
     private readonly opts: DbOptions,
-  ) {}
+  ) {
+    this.crdtCache = new CrdtCache(opts.crdtCache ?? 1024, opts.crdtCacheMs ?? 5000);
+  }
+
+  /**
+   * The queue of CRDT writes (§19.7): `pending` entries, `online`,
+   * `flush()` and `onSync(fn)`.
+   */
+  get crdt(): CrdtQueue {
+    return this.crdtQueue;
+  }
 
   /**
    * Open (or create) a database and bring it to `opts.schema` (§3.1):
@@ -200,7 +255,9 @@ export class Db {
   static async open(fs: UnlockedFs, ns: string, opts: DbOptions = {}): Promise<Db> {
     const info = await fs.session.client.info();
     const db = new Db(fs, ns, new Keys(fs.keys.db(ns)), info.limits, info.features, opts);
+    db.crdtQueue = new CrdtQueue(db, opts.crdtStore ?? memoryQueueStore(), opts.crdtBatchMs ?? 10);
     await db.init();
+    await db.crdtQueue.load();
     const locks =
       opts.locks === undefined
         ? (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks
@@ -286,8 +343,8 @@ export class Db {
   }
 
   /** A table handle. Its operations are transactions of their own. */
-  table<T extends Fields = Fields>(name: string): Table<T> {
-    return new Table<T>(this, name);
+  table<T extends Fields = Fields>(name: string, opts: TableOptions = {}): Table<T> {
+    return new Table<T>(this, name, opts);
   }
 
   /**
@@ -295,6 +352,28 @@ export class Db {
    * so it must have no side effects but through the transaction.
    */
   async transaction<R>(fn: (tx: DbTransaction) => Promise<R>, opts: DbTxnOptions = {}): Promise<R> {
+    let last: DbTransaction | undefined;
+    const read = opts.read ?? this.opts.crdtRead ?? 'auto';
+    const queue = opts.queue ?? this.opts.crdtQueue ?? true;
+    const queueAs = queue ? { single: !!opts.single } : undefined;
+    const out = await this.attempts((tx) => {
+      last = tx;
+      tx.crdtRead = read;
+      tx.queueAs = queueAs;
+      tx.direct = true;
+      return fn(tx);
+    }, opts);
+    // A CRDT-only transaction became a queue entry (§19.7): it completes when queued.
+    const q = last?.queued;
+    if (q) {
+      await this.crdtQueue.add(q);
+      last!.runAfters();
+      if (opts.wait) await this.crdtQueue.wait(q.id);
+    }
+    return out;
+  }
+
+  private async attempts<R>(fn: (tx: DbTransaction) => Promise<R>, opts: DbTxnOptions): Promise<R> {
     const mode = opts.mode ?? 'short';
     const attempts = opts.attempts ?? 8;
     if (mode !== 'auto') return this.run(fn, mode, attempts);
@@ -635,6 +714,8 @@ export class Db {
    * subscriptions, and hand the owner role over.
    */
   close(): void {
+    this.crdtQueue?.close();
+    this.crdtCache.clear();
     this.unSched?.();
     void this.scheduler?.stop();
     this.box?.close();
@@ -776,14 +857,24 @@ export class Table<T extends Fields = Fields> {
   constructor(
     readonly db: Db,
     readonly name: string,
+    private readonly opts: TableOptions = {},
   ) {}
 
-  get(pk: Value): Promise<T | undefined> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).get(pk));
+  /** A call's transaction: on a CRDT table, a single entry of the queue (§19.7). */
+  private one<R>(fn: (tt: TableTx<T>) => Promise<R>): Promise<R> {
+    return this.db.transaction((tx) => fn(tx.table<T>(this.name)), {
+      single: true,
+      ...(this.opts.wait ? { wait: true } : {}),
+    });
+  }
+
+  /** The row, or undefined; on a CRDT table, read as `read` says (§19.4). */
+  get(pk: Value, opts: { read?: CrdtRead } = {}): Promise<T | undefined> {
+    return this.db.transaction((tx) => tx.table<T>(this.name).get(pk, opts));
   }
 
   insert(row: T): Promise<void> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).insert(row));
+    return this.one((tt) => tt.insert(row));
   }
 
   put(row: T): Promise<void> {
@@ -795,27 +886,27 @@ export class Table<T extends Fields = Fields> {
   }
 
   delete(pk: Value): Promise<boolean> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).delete(pk));
+    return this.one((tt) => tt.delete(pk));
   }
 
   /** CRDT tables (§19.3): set `lww` fields; `undefined` unsets one. */
   patch(pk: Value, fields: Partial<T>): Promise<void> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).patch(pk, fields));
+    return this.one((tt) => tt.patch(pk, fields));
   }
 
   /** CRDT tables: add `n` (default 1) to a counter. */
   incr(pk: Value, field: string, n: number | bigint = 1): Promise<void> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).incr(pk, field, n));
+    return this.one((tt) => tt.incr(pk, field, n));
   }
 
   /** CRDT tables: add elements to a set. */
   add(pk: Value, field: string, ...elems: Value[]): Promise<void> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).add(pk, field, ...elems));
+    return this.one((tt) => tt.add(pk, field, ...elems));
   }
 
   /** CRDT tables: remove the copies of elements seen now (add-wins). */
   remove(pk: Value, field: string, ...elems: Value[]): Promise<void> {
-    return this.db.transaction((tx) => tx.table<T>(this.name).remove(pk, field, ...elems));
+    return this.one((tt) => tt.remove(pk, field, ...elems));
   }
 
   /** Subscribe to this table's change events (§12.7). */

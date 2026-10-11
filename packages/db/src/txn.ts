@@ -21,7 +21,6 @@ import { encodeTableRecord, type IndexDef, type TableRecord } from './catalog.js
 import { decode, encode, isPlainObject, type Value } from './cbor.js';
 import {
   CrdtWrites,
-  crdtGet,
   emptyMerged,
   fieldType,
   incrAmount,
@@ -29,6 +28,8 @@ import {
   overlay,
   viewOf,
 } from './crdt.js';
+import { type CrdtRead, crdtStates, isNetwork } from './crdtcache.js';
+import type { QueueEntry } from './crdtq.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
 import { TxFiles } from './files.js';
@@ -103,6 +104,15 @@ export class DbTransaction implements IndexTx {
    * appends carries it as `causation`. Set for consumer handlers.
    */
   causation: Uint8Array | undefined;
+  /** How CRDT reads find their state (§19.4), unless a read says otherwise. */
+  crdtRead: CrdtRead = 'auto';
+  /** @internal A CRDT-only transaction is queued (§19.7); `single`: one call. */
+  queueAs: { single: boolean } | undefined;
+  /** @internal Committed by `Db.transaction`: the queue is flushed before its CRDT writes. */
+  direct = false;
+  /** @internal The queue entry this transaction became. */
+  queued: QueueEntry | undefined;
+  private readonly afters: (() => void)[] = [];
 
   constructor(
     readonly db: Db,
@@ -264,13 +274,20 @@ export class DbTransaction implements IndexTx {
    * process dies first: use it for UI updates only.
    */
   after(fn: () => void): void {
-    this.raw.onCommit(() => {
+    const run = () => {
       try {
         fn();
       } catch (e) {
         this.db.warn(`after: ${e instanceof Error ? e.message : String(e)}`);
       }
-    });
+    };
+    this.afters.push(run);
+    this.raw.onCommit(run);
+  }
+
+  /** @internal A queued transaction completes when queued: its `after`s run then. */
+  runAfters(): void {
+    for (const f of this.afters.splice(0)) f();
   }
 
   /** @internal A row of a table with change events was written. */
@@ -440,6 +457,12 @@ export class DbTransaction implements IndexTx {
    */
   async finish(): Promise<void> {
     this.live();
+    if (this.queueAs && this.crdtW?.size && this.crdtOnly()) {
+      this.queued = this.queueEntry(this.queueAs.single);
+      return;
+    }
+    // This device's queued writes go first, so its commits stay in order (§19.7).
+    if (this.direct && this.crdtW?.size) await this.db.crdtQueue.flush();
     this.emitChanges();
     for (const g of this.gcs.splice(0)) await scheduleGc(this, g.paths, g.at);
     for (const p of this.ops.values()) {
@@ -455,7 +478,16 @@ export class DbTransaction implements IndexTx {
     if (this.raw.empty) {
       if (!this.cached.size) return;
       const used = [...this.cached.values()];
-      const now = await this.raw.snapshotGet(used.map((u) => u.key));
+      let now: Awaited<ReturnType<Transaction['snapshotGet']>>;
+      try {
+        now = await this.raw.snapshotGet(used.map((u) => u.key));
+      } catch (e) {
+        // Offline, a transaction that used only catalog records (CRDT reads)
+        // answers from them (§19.4).
+        const catalog = this.catalogKeys();
+        if (isNetwork(e) && used.every((u) => catalog.has(bytes.hex(u.key)))) return;
+        throw e;
+      }
       const stale = used.filter((u, i) => {
         const v = now[i]?.version;
         return !(v && u.version ? bytes.equal(v, u.version) : !v && !u.version);
@@ -470,6 +502,63 @@ export class DbTransaction implements IndexTx {
       this.crdtW?.release();
       throw e;
     }
+  }
+
+  private catalogKeys(): Set<string> {
+    return new Set([...this.tables.keys()].map((n) => bytes.hex(this.keys.tableRecord(n))));
+  }
+
+  /**
+   * Whether the commit would hold CRDT operations only (§19.7): no writes,
+   * appends, consume steps, file operations or reads in its read set but
+   * the catalog records of its tables.
+   */
+  private crdtOnly(): boolean {
+    const c = this.raw.build();
+    const catalog = this.catalogKeys();
+    return (
+      !c.writes?.length &&
+      !c.clear_ranges?.length &&
+      !c.append?.length &&
+      !c.consume?.length &&
+      !c.chunks?.length &&
+      !c.crdt_ops?.length &&
+      !c.read_conflicts?.length &&
+      !c.expect_ranges?.length &&
+      (c.expect ?? []).every((x) => catalog.has(bytes.hex(x.key))) &&
+      !this.gcs.length &&
+      !this.changedOther() &&
+      ![...this.ops.values()].some((p) => p.ops.size) &&
+      ![...this.sealedStates.values()].some((st) => st.dirty) &&
+      !this.fileWrites.size
+    );
+  }
+
+  /** Whether a table other than a CRDT one has a change event pending. */
+  private changedOther(): boolean {
+    return [...this.changed.values()].some((c) => c.t.merge !== 'crdt');
+  }
+
+  /**
+   * The queue entry of this transaction (§19.7): its rows and operations,
+   * `row` and `lww` stamped now, with the time of the edit.
+   */
+  private queueEntry(single: boolean): QueueEntry {
+    const clock = this.db.fs.session.clock;
+    return {
+      id: bytes.hex(bytes.randomBytes(16)),
+      single,
+      at: Date.now(),
+      rows: this.crdtW!.rowOps().map((r) => ({
+        table: r.t.name,
+        tableId: r.t.id,
+        pk: r.pk,
+        pkEl: r.pkEl,
+        ops: r.ops.map((o) =>
+          o.op === 'row' || o.op === 'lww' ? { ...o, hlc: o.hlc ?? clock.tick() } : { ...o },
+        ),
+      })),
+    };
   }
 
   /** Fail early with `too_large` if the commit would break the server's limits (§7.5). */
@@ -562,9 +651,11 @@ export class TableTx<T extends Fields = Fields> {
    * The row with this primary key, or undefined. A CRDT row is read merged,
    * outside the read set (§19.4), with this transaction's own operations.
    */
-  async get(pk: Value): Promise<T | undefined> {
+  async get(pk: Value, opts: { read?: CrdtRead } = {}): Promise<T | undefined> {
     const t = await this.tx.tableRecord(this.name);
-    if (t.merge === 'crdt') return (await this.crdtRows(t, [encode(pk)]))[0] as T | undefined;
+    if (t.merge === 'crdt') {
+      return (await this.crdtRows(t, [encode(pk)], opts.read))[0] as T | undefined;
+    }
     return (await this.read(t, encode(pk)))?.fields as T | undefined;
   }
 
@@ -682,7 +773,17 @@ export class TableTx<T extends Fields = Fields> {
     const pkEl = encode(pk);
     const keys = this.tx.db.crdtKeys(t.id);
     const tok = keys.field(field);
-    const [s] = await crdtGet(this.tx.db, [this.keys.row(t.id, pkEl)], this.tx.raw.readVersion);
+    // The dots seen now: offline, those of the cached state (none if it isn't
+    // cached); the queue's own adds get theirs when sent (§19.7).
+    const object = this.keys.row(t.id, pkEl);
+    const states = await crdtStates(
+      this.tx.db,
+      [object],
+      this.tx.crdtRead,
+      this.tx.raw.readVersion,
+      () => true,
+    );
+    const s = states.get(bytes.hex(object));
     for (const e of elems) {
       const elem = keys.elem(field, pkEl, encode(e));
       const dots = (s?.set ?? [])
@@ -694,19 +795,29 @@ export class TableTx<T extends Fields = Fields> {
   }
 
   /** @internal The merged rows of CRDT pk elements (undefined where none), with own writes. */
-  async crdtRows(t: TableRecord, pkEls: Uint8Array[]): Promise<(Fields | undefined)[]> {
+  async crdtRows(
+    t: TableRecord,
+    pkEls: Uint8Array[],
+    mode: CrdtRead = this.tx.crdtRead,
+  ): Promise<(Fields | undefined)[]> {
     this.tx.live();
+    const db = this.tx.db;
     const objects = pkEls.map((p) => this.keys.row(t.id, p));
-    const states = new Map(
-      (await crdtGet(this.tx.db, objects, this.tx.raw.readVersion)).map((s) => [
-        bytes.hex(s.object),
-        s,
-      ]),
+    const queued = new Map(pkEls.map((p, i) => [bytes.hex(objects[i]!), p]));
+    // Offline, a row the queue writes needs no state: it shows its queued writes.
+    const states = await crdtStates(
+      db,
+      objects,
+      mode,
+      this.tx.raw.readVersion,
+      (h) => db.crdtQueue.pendingOps(t.id, queued.get(h)!).length > 0,
     );
     return pkEls.map((pkEl, i) => {
       const s = states.get(bytes.hex(objects[i]!));
-      const m = s ? mergeState(this.tx.db, t, s) : emptyMerged();
-      return viewOf(t, overlay(m, decode(pkEl), this.tx.crdtPending(t, pkEl)));
+      const pk = decode(pkEl);
+      const m = s ? mergeState(db, t, s) : emptyMerged();
+      const q = overlay(m, pk, db.crdtQueue.pendingOps(t.id, pkEl));
+      return viewOf(t, overlay(q, pk, this.tx.crdtPending(t, pkEl)));
     });
   }
 

@@ -169,6 +169,11 @@ export class Transaction {
   readonly extra: Partial<Commit> = {};
   /** The commit's result, once committed (for appended offsets and dots). */
   result: CommitResult | undefined;
+  /**
+   * The `commit_id` of every `build()`: sending the same transaction again
+   * (after a lost response) applies it at most once (api.md §6).
+   */
+  readonly commitId: Uint8Array = randomBytes(16);
   private rv0: bigint | undefined;
   private readonly conflicts: FsRange[] = [];
   private readonly expects = new Map<string, Expect>();
@@ -522,7 +527,7 @@ export class Transaction {
 
   /** The commit body for this attempt. */
   build(): Commit {
-    const c: Commit = { commit_id: randomBytes(16), ...this.extra };
+    const c: Commit = { commit_id: this.commitId, ...this.extra };
     if (this.crdtOps.length) c.crdt_ops = [...(c.crdt_ops ?? []), ...this.crdtOps];
     if (this.chunks.length) c.chunks = [...(c.chunks ?? []), ...this.chunks];
     if (this.mode === 'short' && this.rv0 !== undefined) {
@@ -561,10 +566,15 @@ const retryable = (e: unknown) => e instanceof ZenError && e.retryable;
  * Commit a transaction: nothing to send gives undefined, otherwise the
  * result, after the `onCommit` hooks ran. On a failure the caller decides
  * what to do (`transaction` runs the `onError` hooks and maybe re-runs).
+ * Calling it again on the same transaction sends the same `commit_id`.
+ * `attempts` bounds the replays on a network error (default 4).
  */
-export async function commitTransaction(tx: Transaction): Promise<CommitResult | undefined> {
+export async function commitTransaction(
+  tx: Transaction,
+  opts: { attempts?: number } = {},
+): Promise<CommitResult | undefined> {
   if (tx.empty) return undefined;
-  tx.result = await sendCommit(tx.fs.session, tx.build());
+  tx.result = await sendCommit(tx.fs.session, tx.build(), opts.attempts);
   for (const h of tx.commitHooks) h(tx.result);
   return tx.result;
 }

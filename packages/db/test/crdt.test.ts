@@ -91,8 +91,19 @@ const migrations: DbOptions['migrations'] = {
   },
 };
 
+// Online behavior: writes commit at once and reads ask the server (the
+// queue and the cache are crdtoffline.test.ts's).
+const online = { crdtQueue: false, crdtRead: 'server' } as const;
 const open = (f: UnlockedFs, name: string, extra: DbOptions = {}) =>
-  Db.open(f, name, { ...quiet, locks: null, scheduler: false, schema: 1, migrations, ...extra });
+  Db.open(f, name, {
+    ...quiet,
+    ...online,
+    locks: null,
+    scheduler: false,
+    schema: 1,
+    migrations,
+    ...extra,
+  });
 
 /** One database seen from two installations. */
 async function pair() {

@@ -201,14 +201,14 @@ export async function crdtRange(
 
 /** An operation of a transaction, before it is stamped. */
 export type Pending =
-  | { op: 'row'; alive: boolean }
-  | { op: 'lww'; field: string; value: Value | undefined }
+  | { op: 'row'; alive: boolean; hlc?: bigint }
+  | { op: 'lww'; field: string; value: Value | undefined; hlc?: bigint }
   | { op: 'ctr'; field: string; delta: bigint }
   | { op: 'add'; field: string; elem: Value }
   | { op: 'rem'; field: string; elem: Value; dots: Uint8Array[] };
 
 /** The pending operations on one row. */
-interface RowOps {
+export interface RowOps {
   t: TableRecord;
   pk: Value;
   pkEl: Uint8Array;
@@ -283,6 +283,30 @@ export class CrdtWrites {
   /** The pending operations on a row (to overlay on reads). */
   pending(t: TableRecord, pkEl: Uint8Array): Pending[] {
     return this.rows.get(`${bytes.hex(t.id)}/${bytes.hex(pkEl)}`)?.ops ?? [];
+  }
+
+  /** The rows written, with their operations (to queue them, §19.7). */
+  rowOps(): RowOps[] {
+    return [...this.rows.values()];
+  }
+
+  /**
+   * @internal Operations from the queue (§19.7), in order: counter deltas
+   * of a field add up into one operation, as one commit takes one per
+   * field; `row` and `lww` keep their `hlc`.
+   */
+  load(t: TableRecord, pk: Value, pkEl: Uint8Array, ops: Pending[]): void {
+    const r = this.row(t, pk, pkEl);
+    for (const o of ops) {
+      if (o.op === 'ctr') {
+        const c = r.ops.find((x) => x.op === 'ctr' && x.field === o.field);
+        if (c && c.op === 'ctr') {
+          c.delta += o.delta;
+          continue;
+        }
+      }
+      r.ops.push({ ...o });
+    }
   }
 
   /** Insert (`alive`) or delete a row. */
@@ -387,7 +411,7 @@ export class CrdtWrites {
         for (const o of r.ops) {
           const object = r.object;
           if (o.op === 'row') {
-            const hlc = clock.tick();
+            const hlc = o.hlc ?? clock.tick();
             hlcs.push(hlc);
             const value = seal(object, ZERO16, ZERO16, plaintext(r.pk));
             ops.push({ op: 'row', fs, object, hlc, alive: o.alive, value });
@@ -395,7 +419,7 @@ export class CrdtWrites {
           }
           const field = keys.field(o.field);
           if (o.op === 'lww') {
-            const hlc = clock.tick();
+            const hlc = o.hlc ?? clock.tick();
             hlcs.push(hlc);
             // An undeclared field carries its name: tokens can't be reversed (§19.2).
             const name = o.field in names ? undefined : o.field;
@@ -431,20 +455,29 @@ export class CrdtWrites {
               const value = seal(object, field, elem, plaintext(o.elem));
               ops.push({ op: 'add', fs, object, field, elem, value });
             } else {
-              ops.push({ op: 'rem', fs, object, field, elem, dots: o.dots });
+              // Also the dots of this queue's adds of it, committed since it was observed.
+              const dots = new Map(o.dots.map((d) => [bytes.hex(d), d]));
+              for (const d of db.crdtQueue.learnedDots(object, field, elem)) {
+                dots.set(bytes.hex(d), d);
+              }
+              ops.push({ op: 'rem', fs, object, field, elem, dots: [...dots.values()] });
             }
           }
         }
       }
       raw.addCrdtOps(ops);
+      const objects = rows.map((r) => r.object);
       raw.onCommit(() => {
+        db.crdtCache.markStale(objects);
         for (const h of hlcs) clock.accept(h);
         for (const [k, v] of next) state.totals.set(k, v);
         this.undo = undefined;
         done();
       });
       raw.onError(async (e, attempt) => {
-        // Whether it landed is unknown after some failures: read the totals again.
+        // Whether it landed is unknown after some failures: read the totals
+        // and the states again.
+        db.crdtCache.markStale(objects);
         this.release();
         return hlcs.length ? rebase(session, clock, e, attempt) : false;
       });
