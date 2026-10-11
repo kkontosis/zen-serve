@@ -92,7 +92,7 @@ export function component(out: number[], v: Value | undefined, ty?: FieldType): 
   const mismatch = () => new DbError('bad_type', `a ${n.t} value in a ${ty} field`);
   switch (n.t) {
     case 'null':
-      out.push(0x00);
+      out.push(0x01);
       return;
     case 'bool':
       if (ty && ty !== 'bool') throw mismatch();
@@ -147,4 +147,111 @@ export function sortKey(fields: SortField[], pk: Value[]): Uint8Array {
   }
   if (out.length > MAX_SORT_KEY) throw new DbError('too_large', 'a sort key over 4,096 bytes');
   return Uint8Array.from(out);
+}
+
+/** The encoding of one field's value as a range bound: by `type`, inverted when `desc`. */
+export function encodeComponent(v: Value, type: FieldType, desc: boolean): Uint8Array {
+  const out: number[] = [];
+  component(out, v, type);
+  if (desc) for (let i = 0; i < out.length; i++) out[i] = out[i]! ^ 0xff;
+  return Uint8Array.from(out);
+}
+
+/**
+ * The bytes every text or bytes value starting with `v` begins with: the
+ * tag and the escaped bytes, without the terminator. Inverted when `desc`.
+ */
+export function encodePrefix(v: string | Uint8Array, desc: boolean): Uint8Array {
+  const out: number[] = [];
+  escaped(out, typeof v === 'string' ? 0x30 : 0x40, typeof v === 'string' ? te.encode(v) : v);
+  out.pop(); // the terminator
+  if (desc) for (let i = 0; i < out.length; i++) out[i] = out[i]! ^ 0xff;
+  return Uint8Array.from(out);
+}
+
+const td = new TextDecoder('utf-8', { fatal: true });
+const corrupt = () => new DbError('corrupt', 'a malformed sort key');
+
+// Reads components of a sort key; `mask` un-inverts a descending field.
+class Reader {
+  i = 0;
+  constructor(readonly b: Uint8Array) {}
+
+  byte(mask: number): number {
+    if (this.i >= this.b.length) throw corrupt();
+    return this.b[this.i++]! ^ mask;
+  }
+
+  u64(mask: number): bigint {
+    let x = 0n;
+    for (let k = 0; k < 8; k++) x = (x << 8n) | BigInt(this.byte(mask));
+    return x;
+  }
+
+  escaped(mask: number): Uint8Array {
+    const out: number[] = [];
+    for (;;) {
+      const x = this.byte(mask);
+      if (x !== 0) {
+        out.push(x);
+        continue;
+      }
+      if (this.i < this.b.length && (this.b[this.i]! ^ mask) === 0xff) {
+        this.i++;
+        out.push(0);
+        continue;
+      }
+      return Uint8Array.from(out);
+    }
+  }
+
+  component(mask: number): Value {
+    const tag = this.byte(mask);
+    switch (tag) {
+      case 0x01:
+        return null;
+      case 0x10:
+        return false;
+      case 0x11:
+        return true;
+      case 0x20: {
+        const i = BigInt.asIntN(64, this.u64(mask) ^ (1n << 63n));
+        return i >= -(2n ** 53n) && i <= 2n ** 53n ? Number(i) : i;
+      }
+      case 0x21:
+        return this.u64(mask);
+      case 0x28: {
+        const x = this.u64(mask);
+        const bits = x >> 63n === 1n ? x ^ (1n << 63n) : BigInt.asUintN(64, ~x);
+        const d = new DataView(new ArrayBuffer(8));
+        d.setBigUint64(0, bits);
+        return d.getFloat64(0);
+      }
+      case 0x30:
+        try {
+          return td.decode(this.escaped(mask));
+        } catch {
+          throw corrupt();
+        }
+      case 0x40:
+        return this.escaped(mask);
+      default:
+        throw corrupt();
+    }
+  }
+}
+
+/**
+ * Split a sort key into its fields' values (by their directions) and the
+ * pk components (§5.1).
+ */
+export function decodeSortKey(
+  fields: { desc: boolean }[],
+  key: Uint8Array,
+): { values: Value[]; pk: Value[] } {
+  const r = new Reader(key);
+  const values = fields.map((f) => r.component(f.desc ? 0xff : 0));
+  const pk: Value[] = [];
+  while (r.i < key.length) pk.push(r.component(0));
+  return { values, pk };
 }

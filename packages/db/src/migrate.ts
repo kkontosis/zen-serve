@@ -51,7 +51,14 @@ export interface CreateIndexOptions {
 }
 
 /** Index kinds this version builds. */
-const SUPPORTED: IndexKind[] = ['none', 'fast'];
+const SUPPORTED: IndexKind[] = ['none', 'fast', 'private', 'sealed'];
+
+/**
+ * The largest node a decoy index pads to: a node closes at 60,000 bytes
+ * with an entry of up to about 4.1 KB, salted and padded to its 4 KiB
+ * bucket (§5.4.6). It must fit one value.
+ */
+const DECOY_NODE_MAX = 65_536;
 
 interface Progress {
   op: number;
@@ -154,6 +161,7 @@ export class Migrator {
       throw new DbError('bad_value', 'an index of kind "none" must be unique');
     }
     if (!opts.fields.length) throw new DbError('bad_value', 'an index needs fields');
+    checkIndexOptions(kind, opts, this.db.limits.max_value_bytes);
     return this.run(async (tx) => {
       const t = await tx.tableRecord(table);
       const ix = t.indexes.find((i) => i.name === name);
@@ -282,6 +290,32 @@ export class Migrator {
       });
       if (finished) return;
     }
+  }
+}
+
+const isInt = (x: unknown, min: number) =>
+  typeof x === 'number' && Number.isInteger(x) && x >= min && x < 2 ** 32;
+
+/** Refuse index options that don't fit the kind or the server (§3.2). */
+function checkIndexOptions(kind: IndexKind, o: CreateIndexOptions, maxValueBytes: number): void {
+  const bad = (why: string) => new DbError('bad_value', why);
+  const tree = kind === 'private';
+  if (o.fanout !== undefined && (!tree || !isInt(o.fanout, 2))) {
+    throw bad('fanout is an integer ≥ 2, for private indexes');
+  }
+  if (o.shards !== undefined && (!tree || !isInt(o.shards, 1))) {
+    throw bad('shards is an integer ≥ 1, for private indexes');
+  }
+  if (o.decoys !== undefined && (!tree || !isInt(o.decoys, 0))) {
+    throw bad('decoys is an integer ≥ 0, for private indexes');
+  }
+  if (o.maxBytes !== undefined && (kind !== 'sealed' || !isInt(o.maxBytes, 1))) {
+    throw bad('maxBytes is a positive integer, for sealed indexes');
+  }
+  if (o.decoys && maxValueBytes - 48 < DECOY_NODE_MAX) {
+    throw bad(
+      `decoys need values of ${DECOY_NODE_MAX + 48} bytes; the server takes ${maxValueBytes}`,
+    );
   }
 }
 

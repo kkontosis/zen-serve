@@ -3,9 +3,13 @@ import { readFileSync } from 'node:fs';
 import { bytes, initWasm, zw } from '@zen/client';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { decode, encode, type Value } from '../src/cbor.js';
+import { encodeRoot } from '../src/index/node.js';
+import { type Change, rewrite, treeKeys } from '../src/index/prolly.js';
+import { blobParts, encodeBlob, encodeHead } from '../src/index/sealed.js';
 import { Keys, u64 } from '../src/keys.js';
 import { cutParts, encodeRow, joinParts, partsDigest, rowBucket } from '../src/row.js';
-import { type FieldType, sortKey } from '../src/sortkey.js';
+import { decodeSortKey, type FieldType, sortKey } from '../src/sortkey.js';
+import { MemStore } from './memstore.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: vector JSON
 type J = any;
@@ -82,6 +86,17 @@ describe('sort keys (§5.1)', () => {
     }
   });
 
+  it('decode back to their values and pk', () => {
+    for (const c of V.sort_keys.cases) {
+      const fs = fields(c.fields);
+      const got = decodeSortKey(fs, unhex(c.key));
+      const want = (v: Value, ty?: FieldType) =>
+        ty === 'float' && typeof v === 'bigint' ? Number(v) : v;
+      expect(got.values).toEqual(fs.map((f) => want(f.value ?? null, f.type)));
+      expect(got.pk).toEqual(c.pk.map(val));
+    }
+  });
+
   it('refuses the `refused` cases', () => {
     for (const c of V.sort_keys.refused) {
       expect(() => sortKey(fields(c.fields), c.pk.map(val)), c.why).toThrow();
@@ -154,5 +169,82 @@ describe('database keys (§2)', () => {
     }
     k.db.free();
     fsKeys.free();
+  });
+});
+
+describe('private index (§5.4)', () => {
+  const P = () => V.prolly;
+  const ik = () =>
+    zw.FsKeys.fromBundle(unhex(K.fs_epoch0.bundle)).db(V.database.ns).index(unhex(P().index_id));
+
+  it('boundaries and shards', () => {
+    const k = ik();
+    for (const b of P().boundaries) {
+      expect(k.isBoundary(b.level, unhex(b.key), b.fanout)).toBe(b.boundary);
+    }
+    const flags = k.boundaries(
+      0,
+      P()
+        .boundaries.filter((b: J) => b.level === 0)
+        .map((b: J) => unhex(b.key)),
+      4,
+    );
+    expect([...flags].map((x) => x === 1)).toEqual(
+      P()
+        .boundaries.filter((b: J) => b.level === 0)
+        .map((b: J) => b.boundary),
+    );
+    for (const s of P().shards) expect(k.shard(unhex(s.pk_element), s.shards)).toBe(s.shard);
+  });
+
+  it('a build from empty, then a change, give the vector trees', async () => {
+    const tk = treeKeys(ik(), 4);
+    const store = new MemStore();
+    const entries: Uint8Array[] = P().entries.map(unhex);
+    const ids = (t: J) => new Set<string>(t.nodes.map((n: J) => n.id));
+    const r1 = await rewrite(
+      tk,
+      store,
+      undefined,
+      entries.map((key) => ({ key, add: true })),
+    );
+    store.apply(r1);
+    expect(hex(encodeRoot(r1.root!))).toBe(P().tree.root.record);
+    expect(new Map([...store.m].map(([id, b]) => [id, hex(b)]))).toEqual(
+      new Map(P().tree.nodes.map((n: J) => [n.id, n.node])),
+    );
+    const changes: Change[] = [
+      ...P().deleted.map((i: number) => ({ key: entries[i]!, add: false })),
+      ...P().inserted.map((h: string) => ({ key: unhex(h), add: true })),
+    ];
+    const r2 = await rewrite(tk, store, r1.root, changes);
+    expect(hex(encodeRoot(r2.root!))).toBe(P().after.root.record);
+    const before = ids(P().tree);
+    const after = ids(P().after);
+    expect(new Set(r2.put.map((w) => hex(w.id)))).toEqual(
+      new Set([...after].filter((x) => !before.has(x))),
+    );
+    expect(new Set(r2.del.map(hex))).toEqual(new Set([...before].filter((x) => !after.has(x))));
+    store.apply(r2);
+    expect(new Map([...store.m].map(([id, b]) => [id, hex(b)]))).toEqual(
+      new Map(P().after.nodes.map((n: J) => [n.id, n.node])),
+    );
+  });
+});
+
+describe('sealed index (§5.7)', () => {
+  it('blob, parts, head and keys', () => {
+    const S = V.sealed_index;
+    const entries: Uint8Array[] = V.prolly.entries.slice(0, 12).map(unhex);
+    const blob = encodeBlob(entries);
+    expect(hex(blob)).toBe(S.blob);
+    expect(blobParts(blob, S.part_size).map(hex)).toEqual(S.parts);
+    const head = encodeHead({ parts: S.parts.length, digest: partsDigest(blob), count: 12 });
+    expect(hex(head)).toBe(S.head);
+    const fsKeys = zw.FsKeys.fromBundle(unhex(K.fs_epoch0.bundle));
+    const k = new Keys(fsKeys.db(V.database.ns));
+    const id = unhex(V.prolly.index_id);
+    expect(hex(k.sealedHead(id))).toBe(S.head_key);
+    expect(hex(k.sealedPart(id, 1))).toBe(S.part_key_1);
   });
 });

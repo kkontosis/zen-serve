@@ -1,12 +1,14 @@
 // Queries (spec/zendb.md §6): one access path, the other predicates on the
-// client. This file has pk, unique and fast equality and the table scan;
-// private and sealed ranges come with those indexes.
+// client. Paths: pk, unique and fast equality, a private or sealed range,
+// the table scan.
 import { bytes } from '@zen/client';
-import type { IndexDef, TableRecord } from './catalog.js';
+import type { IndexDef, IndexField, TableRecord } from './catalog.js';
 import { encode, same, type Value } from './cbor.js';
 import { DbError } from './errors.js';
+import { privateScan, sealedScan } from './index/private.js';
 import { entryPk } from './index/unique.js';
 import { decodeRow, type Fields } from './row.js';
+import { decodeSortKey, encodeComponent, encodePrefix, fitsType } from './sortkey.js';
 import type { DbTransaction } from './txn.js';
 
 /** A predicate operator. */
@@ -25,7 +27,14 @@ const CURSOR = Symbol('zen-db cursor');
  * never send it to a server or put it in a URL (§6.2).
  */
 export interface Cursor {
-  readonly [CURSOR]: { path: string; pk: Value };
+  readonly [CURSOR]: Position;
+}
+
+/** A scan's or an index's position: the last pk, or the last sort key. */
+interface Position {
+  path: string;
+  pk?: Value;
+  key?: Uint8Array;
 }
 
 /** One page of results. */
@@ -106,12 +115,141 @@ const usable = (t: TableRecord) => t.indexes.filter((i) => i.state === 'active')
 export const hasUniqueEntries = (i: IndexDef) =>
   i.unique && (i.kind === 'none' || i.kind === 'fast' || i.kind === 'private');
 
+/** A range on a private or sealed index (§6.1 step 4). */
+interface RangePlan {
+  ix: IndexDef;
+  lo: Uint8Array;
+  hi: Uint8Array | undefined;
+  /** No entry can match. */
+  empty: boolean;
+  /** Scan descending sort keys. */
+  reverse: boolean;
+  /** The scan gives the `orderBy` (or there is none). */
+  ordered: boolean;
+  /** Conditions the bounds enforce exactly. */
+  covered: Set<Cond>;
+}
+
+const RANGE_OPS = new Set<Op>(['<', '<=', '>', '>=']);
+const FLIP: Record<string, Op> = { '<': '>', '<=': '>=', '>': '<', '>=': '<=' };
+
+const usableEq = (c: Cond, [f, type]: IndexField) =>
+  c.field === f && c.op === '=' && c.value !== null && fitsType(c.value, type);
+
+function usableRange(c: Cond, [f, type]: IndexField): boolean {
+  if (c.field !== f || c.value === null) return false;
+  if (RANGE_OPS.has(c.op)) return fitsType(c.value, type);
+  return (
+    c.op === 'prefix' &&
+    ((type === 'text' && typeof c.value === 'string') ||
+      (type === 'bytes' && c.value instanceof Uint8Array))
+  );
+}
+
+function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
+}
+
+/** Lexicographic `a > b`. */
+function greater(a: number[], b: number[]): boolean {
+  const i = a.findIndex((x, j) => x !== b[j]);
+  return i >= 0 && a[i]! > b[i]!;
+}
+
+/**
+ * Pick a private or sealed index whose leading fields are bound by `=`
+ * and whose next field carries a range or the `orderBy` (or that every
+ * `=` binds), and compute its sort-key bounds. Prefers an index giving the
+ * order, then more bound fields, a range, and private over sealed.
+ */
+function planRange(
+  t: TableRecord,
+  conds: Cond[],
+  order: { field: string; desc: boolean } | undefined,
+): RangePlan | undefined {
+  let best:
+    | { ix: IndexDef; eqs: Cond[]; ranges: Cond[]; ordered: boolean; score: number[] }
+    | undefined;
+  for (const ix of usable(t)) {
+    if (ix.kind !== 'private' && ix.kind !== 'sealed') continue;
+    const eqs: Cond[] = [];
+    for (const f of ix.fields) {
+      const c = conds.find((c) => usableEq(c, f));
+      if (!c) break;
+      eqs.push(c);
+    }
+    const next = ix.fields[eqs.length];
+    const ranges = next ? conds.filter((c) => usableRange(c, next)) : [];
+    const ordersNext = !!order && next?.[0] === order.field;
+    if (!next || ranges.length || ordersNext) {
+      const ordered =
+        !order || ordersNext || ix.fields.slice(0, eqs.length).some(([f]) => f === order.field);
+      const score = [
+        ordered ? 1 : 0,
+        eqs.length,
+        ranges.length ? 1 : 0,
+        ix.kind === 'private' ? 1 : 0,
+      ];
+      if (!best || greater(score, best.score)) best = { ix, eqs, ranges, ordered, score };
+    }
+  }
+  if (!best) return undefined;
+  const { ix, eqs, ranges, ordered } = best;
+
+  let p: Uint8Array = new Uint8Array(0);
+  eqs.forEach((c, i) => {
+    const [, type, desc] = ix.fields[i]!;
+    p = concat(p, encodeComponent(c.value, type, desc));
+  });
+  let lo: Uint8Array = p;
+  let hi = p.length ? bytes.prefixEnd(p) : undefined;
+  let empty = false;
+  const atLeast = (x: Uint8Array | undefined) => {
+    if (!x) empty = true;
+    else if (bytes.compare(x, lo) > 0) lo = x;
+  };
+  const below = (x: Uint8Array | undefined) => {
+    if (x && (!hi || bytes.compare(x, hi) < 0)) hi = x;
+  };
+  const next = ix.fields[eqs.length];
+  for (const c of ranges) {
+    const [, type, desc] = next!;
+    if (c.op === 'prefix') {
+      const e = concat(p, encodePrefix(c.value as string | Uint8Array, desc));
+      atLeast(e);
+      below(bytes.prefixEnd(e));
+      continue;
+    }
+    const e = concat(p, encodeComponent(c.value, type, desc));
+    switch (desc ? FLIP[c.op] : c.op) {
+      case '>=':
+        atLeast(e);
+        break;
+      case '>':
+        atLeast(bytes.prefixEnd(e));
+        break;
+      case '<':
+        below(e);
+        break;
+      case '<=':
+        below(bytes.prefixEnd(e));
+        break;
+    }
+  }
+  const reverse = !!order && next?.[0] === order.field && order.desc !== next[2];
+  // `<`/`<=` on an ascending field also take nulls, which the row filter keeps too.
+  return { ix, lo, hi, empty, reverse, ordered, covered: new Set([...eqs, ...ranges]) };
+}
+
 /** A query builder. Run it with `page()` or `all()`. */
 export class Query<T extends Fields = Fields> {
   private readonly conds: Cond[] = [];
   private order: { field: string; desc: boolean } | undefined;
   private max: number | undefined;
-  private from: { path: string; pk: Value } | undefined;
+  private from: Position | undefined;
 
   constructor(
     readonly table: string,
@@ -179,29 +317,79 @@ export class Query<T extends Fields = Fields> {
       return { rows: row && keep(row) ? [row as T] : [] };
     }
 
-    // 3. fast equality, 5. table scan: candidates in stored-key order.
+    // 4. a private or sealed range, when it gives the order asked for;
+    // 3. fast equality; 4. a range otherwise; 5. a table scan.
+    const range = planRange(t, this.conds, this.order);
     const fast = usable(t).find((i) => i.kind === 'fast' && bound(i.fields.map(([f]) => f)));
+    let rows: { pk: Value; row: Fields; key?: Uint8Array }[];
     let path: string;
+    let ordered = !this.order;
+    if (range && (!fast || (this.order && range.ordered))) {
+      path = `${range.ix.kind === 'private' ? 'p' : 's'}:${bytes.hex(range.ix.id)}`;
+      ordered = range.ordered;
+      rows = await this.rangeRows(tx, t, range, path, keep, ordered);
+    } else {
+      path = fast ? `f:${bytes.hex(fast.id)}` : 'scan';
+      rows = await this.keyRows(tx, t, fast, eq, path, keep);
+    }
+
+    if (!ordered) {
+      const { field, desc } = this.order!;
+      if (this.max !== undefined && rows.length > this.max) {
+        throw new DbError('needs_index', `orderBy ${field} needs an index for a limited result`);
+      }
+      rows.sort(
+        (a, b) => compareValues(a.row[field] ?? null, b.row[field] ?? null) * (desc ? -1 : 1),
+      );
+      return { rows: rows.map((r) => r.row as T) };
+    }
+    const out: Page<T> = { rows: rows.map((r) => r.row as T) };
+    if (this.max !== undefined && rows.length >= this.max && rows.length) {
+      const last = rows.at(-1)!;
+      out.cursor = { [CURSOR]: last.key ? { path, key: last.key } : { path, pk: last.pk } };
+    }
+    return out;
+  }
+
+  /** Rows wanted from a path: the limit, or every row when they are sorted afterwards. */
+  private want(ordered: boolean): number {
+    return ordered ? (this.max ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+  }
+
+  private position(path: string): Position | undefined {
+    if (this.from && this.from.path !== path) {
+      throw new DbError('bad_value', 'a cursor of another query');
+    }
+    return this.from;
+  }
+
+  /** Fast equality or a scan: candidates in stored-key order. */
+  private async keyRows(
+    tx: DbTransaction,
+    t: TableRecord,
+    fast: IndexDef | undefined,
+    eq: Map<string, Value>,
+    path: string,
+    keep: (r: Fields) => boolean,
+  ): Promise<{ pk: Value; row: Fields }[]> {
+    const tt = tx.table(this.table);
     let begin: Uint8Array;
     let end: Uint8Array | undefined;
     let value: Uint8Array | undefined;
     if (fast) {
-      path = `f:${bytes.hex(fast.id)}`;
       value = encode(fast.fields.map(([f]) => eq.get(f)!));
       [begin, end] = tx.keys.fastValue(fast.id, value);
     } else {
-      path = 'scan';
       this.warn(`zen-db: query on ${this.table} scans the whole table (no index fits)`);
       [begin, end] = tx.keys.rows(t.id);
     }
-    if (this.from) {
-      if (this.from.path !== path) throw new DbError('bad_value', 'a cursor of another query');
-      const pkEl = encode(this.from.pk);
+    const from = this.position(path);
+    if (from) {
+      const pkEl = encode(from.pk!);
       begin = bytes.keyAfter(fast ? tx.keys.fast(fast.id, value!, pkEl) : tx.keys.row(t.id, pkEl));
     }
 
-    const ordered = this.order !== undefined;
-    const want = ordered ? Number.POSITIVE_INFINITY : (this.max ?? Number.POSITIVE_INFINITY);
+    const want = this.want(this.order === undefined);
     const plain = this.conds.length === 0 || (fast && this.conds.every((c) => c.op === '='));
     const batch = Number.isFinite(want) ? Math.max(plain ? want : want * 2, 16) : undefined;
     const rows: { pk: Value; row: Fields }[] = [];
@@ -229,21 +417,57 @@ export class Query<T extends Fields = Fields> {
         }
       }
     }
+    return rows;
+  }
 
-    if (this.order) {
-      const { field, desc } = this.order;
-      if (this.max !== undefined && rows.length > this.max) {
-        throw new DbError('needs_index', `orderBy ${field} needs an index for a limited result`);
+  /** A private or sealed range: entries in sort-key order, then their rows (§6.1 step 4). */
+  private async rangeRows(
+    tx: DbTransaction,
+    t: TableRecord,
+    plan: RangePlan,
+    path: string,
+    keep: (r: Fields) => boolean,
+    ordered: boolean,
+  ): Promise<{ pk: Value; row: Fields; key: Uint8Array }[]> {
+    let { lo, hi } = plan;
+    const from = this.position(path);
+    if (from) {
+      const k = from.key!;
+      if (plan.reverse) hi = !hi || bytes.compare(k, hi) < 0 ? k : hi;
+      else {
+        const after = bytes.keyAfter(k);
+        if (bytes.compare(after, lo) > 0) lo = after;
       }
-      rows.sort(
-        (a, b) => compareValues(a.row[field] ?? null, b.row[field] ?? null) * (desc ? -1 : 1),
-      );
-      return { rows: rows.map((r) => r.row as T) };
     }
-    const out: Page<T> = { rows: rows.map((r) => r.row as T) };
-    if (this.max !== undefined && rows.length >= this.max && rows.length) {
-      out.cursor = { [CURSOR]: { path, pk: rows.at(-1)!.pk } };
+    const rows: { pk: Value; row: Fields; key: Uint8Array }[] = [];
+    if (plan.empty || (hi && bytes.compare(lo, hi) >= 0)) return rows;
+    const ix = plan.ix;
+    const keys = (ix.kind === 'private' ? privateScan : sealedScan)(tx, ix, lo, hi, plan.reverse);
+    const dirs = ix.fields.map(([, , desc]) => ({ desc }));
+    const tt = tx.table(this.table);
+    const want = this.want(ordered);
+    const exact = this.conds.every((c) => plan.covered.has(c));
+    for (;;) {
+      const left = want - rows.length;
+      if (left <= 0) break;
+      const n = Number.isFinite(left) ? Math.min(Math.max(exact ? left : left * 2, 16), 256) : 256;
+      const batch: { key: Uint8Array; pk: Value }[] = [];
+      while (batch.length < n) {
+        const r = await keys.next();
+        if (r.done) break;
+        const parts = decodeSortKey(dirs, r.value).pk;
+        batch.push({ key: r.value, pk: parts.length === 1 ? parts[0]! : parts });
+      }
+      if (!batch.length) break;
+      const got = await tx.raw.getAll(batch.map((b) => tx.keys.row(t.id, encode(b.pk))));
+      for (let i = 0; i < batch.length && rows.length < want; i++) {
+        const b = got[i];
+        if (!b) continue; // long mode: the row went after the index was read
+        const r = await tt.decode(t, encode(batch[i]!.pk), b);
+        if (keep(r.fields)) rows.push({ ...batch[i]!, row: r.fields });
+      }
+      if (batch.length < n) break;
     }
-    return out;
+    return rows;
   }
 }

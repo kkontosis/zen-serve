@@ -8,6 +8,8 @@ import type { Keys } from '../keys.js';
 export interface IndexTx {
   raw: Transaction;
   keys: Keys;
+  /** Size of the parts of large rows and sealed indexes: `max_value_bytes − 1024`. */
+  partSize: number;
 }
 
 /**
@@ -23,4 +25,9 @@ export interface IndexChange {
   pkElement: Uint8Array;
   old: Uint8Array | undefined;
   new: Uint8Array | undefined;
+  /** The indexed values themselves (§5.1), for sort keys; absent with no row. */
+  oldValues: Value[] | undefined;
+  newValues: Value[] | undefined;
+  /** The pk components, for sort keys. */
+  pkParts: Value[];
 }
