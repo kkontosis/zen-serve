@@ -184,8 +184,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** §9.2 (the proxy protocol), §11.5 (`$sagas.corr`, `timeout`), §12.3 (an inbox per `Db`), §12.5 (rewritten: messages, the stale rule by `corr`, transitions, stuck through the class DLQ).
     * **Docs:** `docs/DB.md` sections 8 and 10–18 (the broker); TD-DB-TAB-PROXY resolved.
     * **Tests:** `saga.test.ts` (7), `proxy.test.ts` (4, `FakeBus` + `FakeLocks`), `faults.test.ts` (6; commits are intercepted by wrapping `session.call`). 215 vitest tests in all.
-* **Step 7** (CRDT tables): planned (see Step 7: sub-steps 7a and 7b, a PR each). PR #19 is merged, so the plan commit restarts the branch from main and opens a new PR (#20), which 7a joins.
-  * **7a** (CRDT tables online): done, PR #20. As planned, with these details for 7b:
+* **Step 7** (CRDT tables): planned (see Step 7: sub-steps 7a and 7b, a PR each). PR #19 is merged, so the plan commit restarts the branch from main and opens a new PR (#20, merged with the plan only: 7a was pushed after GitHub had registered its head).
+  * **7a** (CRDT tables online): done, PR #21. As planned, with these details for 7b:
     * **Files:**
       * `crdt.ts`:
         * `mergeState(db, t, ObjState) → Merged`, `overlay(merged, pk, pending)`, `viewOf(t, merged)`. **7b's local view of queued operations reuses `overlay`.**
