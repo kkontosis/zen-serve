@@ -96,7 +96,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `prolly.test.ts` (9, in memory against `IndexKeys.build`): random batches at fanout 2/4/64, the entry and byte caps, scans, decoys.
       * `indexes.test.ts` (18, server).
       * 140 vitest tests in all.
-  * **5c** (transaction modes, cache coherence, files, bulk import, owner): done, PR (see below). As planned, with these details for step 6:
+  * **5c** (transaction modes, cache coherence, files, bulk import, owner): done, PR #16 (merged; CI green). As planned, with these details for step 6:
     * **Client:**
       * `TxnOptions.retry` chooses which errors re-run `fn`.
       * `Transaction.getEntries` (with versions; none for own writes) and `owns(key)` are new.
@@ -123,7 +123,41 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `kv.test.ts` +3.
       * `expectCanonical` moved to `packages/db/test/helpers.ts`.
       * 161 vitest tests in all.
-* **Step 6** (broker): next.
+* **Step 6** (broker): planned (see Step 6: sub-steps 6a, 6b and 6c, a PR each). PR #16 is merged, so the plan commit restarts the branch from main and opens a new PR, which 6a joins (PR #17).
+  * **6a** (messages, emit, `on`, consume, change events, ephemeral): done, PR #17. As planned, with these details for 6b and 6c:
+    * **Files:**
+      * `msg.ts`: Msg and BodyRef codecs, `eventId`, `Message`.
+      * `broker.ts`:
+        * `appendMsg(tx, topic, msg, key, lean?)` writes large bodies to parts at `keys.msgPart`. With `lean`, the change events' row is dropped instead.
+        * `openMessage`.
+        * `StreamSource` / `DirectSource`. **6c puts the proxy behind this interface.**
+        * `OnSubscription`.
+        * `ConsumerHandle`:
+          * owner-gated via `db.onOwner`
+          * group id from `TopicKeys.groupId`
+          * leased modes loop on `deliveries()`, `partitioned` with one loop per partition
+          * `per_key` uses `next({limit: maxInflight})`
+          * `not_leader` → forget the lease, wait ttl/3, campaign again
+          * `cursor_moved` / `claim_lost` → drop the delivery; anything else → `nack`
+          * a `group` getter (DLQ)
+      * `system.ts`: the system tables. `init()` creates missing ones in the DbRecord transaction (one `getAll`). `createTable`, `renameTable` and `dropTable` refuse `$` names.
+    * **API:**
+      * `db.topic(...path)`, cached and closed by `close()`.
+      * `db.emit` (its own transaction) and `tx.emit`, which return the message id. `zen.` types are refused for apps.
+      * `tx.after(fn)`.
+      * `tx.causation` (set by consumers; every emit carries it).
+      * `db.on(target, handler, {after, cursor, batch, txn, onError})`. The `$cursors` row is `{device, name, topic, offset}`; a durable handler that throws stops the subscription (`active` false).
+      * `db.consume(opts, (msg, tx))`, and `db.consumeManual(opts, (msg))`, which acks with `msg.ack()` or `db.begin({consumes: msg})`.
+      * `db.publishEphemeral` / `db.onEphemeral`.
+      * `table.on(handler)` (change events).
+      * `db.device`. `db.tableNames()` leaves out the system tables.
+      * New error codes `poisoned` and `timeout`.
+    * **Change events:** `DbTransaction.noteChange` is recorded in `TableTx.write` and emitted in `finish()`: one per row, final state. A row inserted then deleted emits nothing.
+    * **Client fix:** `Transaction.snapshotGet` and `getEntries` returned sparse arrays, so `some((e) => !e)` missed absent entries (missing row parts too). They are dense now, with a test in `kv.test.ts`.
+    * **Tests:**
+      * `packages/db/test/broker.test.ts` (15), with its own copy of `FakeLocks`.
+      * `vectors.test.ts` +3 (Msg, BodyRef, event and group ids).
+      * 180 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
@@ -584,6 +618,219 @@ Log the 5b line in `docs/MILESTONE-5.md` (and here), commit (spec separately if 
 Log the 5c line in `docs/MILESTONE-5.md` (and here), commit, push, update or open the PR, then stop for compaction. Step 6 (the broker) is next.
 
 ## Step 6: `@zen/db` part B, the broker (zendb.md §10–13)
+
+Three sub-steps, **one PR each**, with the same rhythm as step 5.
+
+**Context.** Part A of zendb.md (step 5, PRs #14–#16) is in place. Part B makes `Db` a message broker over the M4 client's topics, groups and stream. No server changes are needed. Every broker write rides in the same `/v1/commit` as the rows.
+
+**User decisions:**
+* split into 6a (primitives), 6b (patterns), 6c (sagas, tab proxy, fault suite)
+* **tab proxy:** consumers, `serve`, the scheduler and saga orchestrators run only in the owner. Transactions stay local in every tab. **`on` subscriptions (and ephemeral and inbox ones) are proxied:** only the owner holds a stream, and it forwards events to the other tabs over a `BroadcastChannel` (6c).
+
+**After compaction, re-read:**
+* this section
+* `spec/zendb.md` §2.3, §9.2, §10–13, §16
+* `packages/client/src/{log,stream,kv,clock}.ts`
+* `packages/db/src/{db,txn,catalog,migrate,keys,row,tabs}.ts`
+* `packages/db/test/{txn,db}.test.ts` (setup, `FakeLocks`, `barrier`)
+* `packages/client/test/{log,stream}.test.ts` (second device, `take`)
+
+**What exists (survey):**
+* **Topics** (`log.ts`):
+  * `fs.topic(...path)` → `Topic`.
+  * `append(payload, {key, causation})` and `appendIn(tx, payload, opts)`.
+  * `read({after, key, limit})`.
+  * `TopicEvent {offset, keyToken?, sender, hlc, causation, payload}`. It carries only the key token, never the key.
+* **Groups:**
+  * `topic.group(name: bytes | string, GroupOptions)` sends the name as raw bytes. `TopicKeys.groupId(name)` (wasm) has no caller yet.
+  * `Consumer.deliveries({signal, ttlMs})` (leases renewed; it ends with a 412 `not_leader`), `next`, `ack(d, tx)` (pushes onto `tx.extra.consume`), `nack(d)` (outside a transaction), `dlq`.
+  * `Delivery` adds `from`, `token`, `attempts`, `partition?` and `error?` (undecryptable).
+* **Leaders:** `topic.leader(name, {ttlMs, onLost})` with `campaign(signal)`, `renew` and `stop`.
+* **Stream:**
+  * `session.stream()`, then `subscribe(Topic | {fs, prefix, topics}, {after, onEvent, onError})`. Without `after` it starts at the read version.
+  * Reconnects resume after the last offset received.
+  * Also `publish(topic, data)` and `subscribeEphemeral`.
+* **Errors:** 412 `cursor_moved`, `claim_lost` and `not_leader` arrive as `ZenError`.
+* **Time:** `session.clock.now()` is corrected toward the server after `clock.sync(client)`.
+* **Vectors:** `zendb.json` `broker` holds `msg`, `body_ref`, `event_id` and `group_ids`, none of them tested yet.
+* **db package:**
+  * `ChangeDef {topic, image}` is stored in the TableRecord, but nothing emits change events yet.
+  * No system tables exist, and apps may still name tables `$…`.
+  * `TableTx.write(t, pk, pkEl, old, row)` (txn.ts) is the single place where every row is written.
+  * `checkLimits` already counts `append` and `consume`.
+
+### 6a: messages, emit, `on`, consume, change events, ephemeral
+
+**Files** (`packages/db/src/`):
+1. **`msg.ts`:**
+   * Msg codec (§10.1): integer keys 1–10. `type` is required, and `zen.` prefixes are refused for apps (`bad_value`) except the class's own types. `id` is 16 random bytes.
+   * `BodyRef` codec.
+   * `eventId(topic, offset)` = `topic.id ‖ offset` (§10.2).
+   * `Message<B>`: `{type, id, body, corr?, replyTo?, deliverAt?, saga?, step?, headers, topic, offset, keyToken?, sender, hlc, causation, eventId}`.
+   * `openMsg(db, event)`:
+     * decodes the Msg
+     * resolves a `body_ref` by `snapshotGet` of the parts and `joinParts` (digest check)
+     * a payload that doesn't decode, or missing parts, → `DbError('poisoned')`, a new code
+2. **`keys.ts`:** `msgPart(id, i)` = `D ‖ ("m", id, u32(i))`. Check it against the `database` vectors if they list it.
+3. **`broker.ts`:**
+   * `db.topic(...path)`, cached per `Db` and closed by `close()`.
+   * **`emit(topic, type, body, {key?, id?, headers?})`** on `DbTransaction` and on `Db`. On `Db` it is its own transaction.
+     * It encodes the Msg. If the estimated envelope is over `max_envelope_bytes` (from `/v1/info` limits), the body goes to parts at `msgPart` in the same commit, and the Msg carries a `body_ref` (§10.3).
+     * `appendIn(tx.raw, …, {key, causation: tx.causation})`.
+     * A `ttl` (part deletion) comes with the scheduler in 6b.
+   * **`on(target, handler, opts)`**, where `target` is a `Topic`, or `{prefix: Topic, topics?: Topic[]}`, and `opts` is `{after?, cursor?, batch?}`. It returns a `Subscription` with `close()`.
+     * **Plain:** a stream subscription that decodes Msgs and calls `handler(msg)`. A poisoned message goes to `opts.onError` and is skipped.
+     * **`cursor: name` (§11.2):** `handler(msg, tx)`.
+       * The `$cursors` row `[device fp, name]` gives the start offset (read before subscribing).
+       * Each batch (default 1) runs in one `db.transaction`. It reads the cursor row, skips events at or before it, runs the handler and writes the new offset.
+       * A handler that throws stops the subscription and reports to `onError`. The cursor isn't advanced, so a restart retries.
+     * It runs over a `StreamSource` interface: `subscribe(target, after, onEvent)` and `publish`/`subscribeEphemeral`. 6a's source is a direct `session.stream()`, opened lazily per `Db`. 6c adds the proxy behind the same interface.
+   * **`consume(opts, handler)` (§11.3)** returns a `ConsumerHandle {stop(), running}`.
+     * **Options:** `{group, topic, mode, partitions?, key?, maxInflight?, maxAttempts?, onPoison?, start?, txMode?}`.
+     * **Group:** the server name is `topic.keysAt(epoch).groupId(group)`, checked against the vectors (§11.3). Creation through `topic.group(idBytes, def)`; `group_exists` passes through.
+     * **Owner gating:** the loop starts on `db.onOwner` and stops on `close()` or `stop()`. Without locks the instance owns at once, as now.
+     * **Loop per delivery:**
+       * Run `db.transaction(tx => { handler(msg, tx); consumer.ack(d, tx.raw) })` with `tx.causation = eventId`.
+       * `conflict` and `too_old` retry inside `transaction()`.
+       * A handler throw, or a poisoned or undecryptable delivery, → `nack` (DLQ after `maxAttempts`, or `block`).
+       * `cursor_moved` / `claim_lost` → drop the delivery.
+       * `not_leader` → restart `deliveries()` (re-lease).
+       * Network errors → back off and continue.
+     * Leased modes use `deliveries()`. `per_key` uses `next()` with `maxInflight` handlers in parallel.
+   * **`msg.ack()`** sends a commit holding only the consume step.
+   * **`db.begin({mode, consumes: msg})`:** `ManualTransaction` gets the delivery. `commit()` adds the consume step, and its emits get the causation.
+   * **`tx.after(fn)`** runs `fn` from `raw.onCommit`, at most once per transaction; errors are only logged.
+   * **Ephemeral (§11.4):** `db.publishEphemeral(topic, type, body)` and `db.onEphemeral(topic, handler)` carry a Msg (type, id, body) through the stream source.
+4. **System tables (§11.5):**
+   * `$cursors`, `$sched` (with a private index `by_at` on `at int`), `$sagas`, `$inbox` and `$ixrows`, as TableRecords.
+   * They are created in `init()` when missing: with the DbRecord for new databases, and idempotently for 5a–5c databases.
+   * `createTable` and `renameTable` refuse app names starting with `$` (`bad_value`).
+   * Migrations and schema numbers ignore them.
+5. **Change events (§12.7):**
+   * `DbTransaction.changes`: a `Map<tableId‖pkEl, {t, pk, first old, last new}>`, recorded in `TableTx.write` for tables with `changes`.
+   * In `finish()`, before `checkLimits`, append one `zen.change` Msg per row whose state changed. Body `{op: 'put' | 'delete', table, pk, row?}`; key = pk element; topic from the `ChangeDef`.
+     * `image: 'full'` includes the row when the envelope fits, and leaves it out otherwise.
+     * A row inserted then deleted in one transaction emits nothing.
+   * `table.on(handler, opts)` is an `on` of the change topic.
+6. **Errors:** new codes `poisoned`, and `timeout` (used from 6b).
+
+**Tests 6a** (`packages/db/test/broker.test.ts`, its own server, `world({limits: {claim_ttl_ms, …}})`):
+* **Vectors:** `msg` and `body_ref` encode byte-exactly; `event_id`; `group_ids` via `groupId`.
+* **emit:**
+  * Inside a transaction the message exists only if the transaction commits (a thrown `fn` leaves the topic empty).
+  * A conflict re-run emits exactly once.
+  * Outside a transaction it is its own commit.
+  * A large body uses parts and round-trips; deleted parts → `poisoned`.
+* **on:**
+  * Plain: from now, and with `after` (history, then live).
+  * `cursor`: effects exactly once across a simulated crash. Close mid-batch, reopen another `Db` with the same device: no duplicate rows, nothing missed. Also `batch: 3`.
+  * Prefix with `topics`.
+* **consume:**
+  * `sequential`: handler effects plus emits with causation = the consumed event id.
+  * A throw → nack → DLQ after `maxAttempts`.
+  * Two `Db`s on one `per_key` group share the keys, with no duplicates.
+  * A non-owner (`FakeLocks`) doesn't consume until the owner closes.
+  * `begin({consumes})` and `msg.ack()`.
+* **Change events:** put, update and delete produce one event per row per transaction, with key order per row; `image: 'full'`; `table.on`.
+* **Ephemeral:** two sessions.
+* **Tables:** system tables exist after open (also on a database created before them); `$x` app tables are refused.
+
+### 6b: scheduler, work queues, request/reply
+1. **`sched.ts`, delayed messages (§12.4):**
+   * **`schedule(topic, type, body, {at | delayMs, key?})`** (tx or `Db`) inserts a `$sched` row `{at, kind: 'emit', topic, key?, msg}` (Msg with `deliver_at`) and returns the id. `cancel(id)` returns whether the row was still there.
+   * **`emit(…, {ttl})`:** a large body also schedules a `gc` row for its parts.
+   * **Scheduler:**
+     * `DbOptions.scheduler` (default true) runs it in the owner. `db.scheduler.start()/stop()`.
+     * Leader on topic `("zen", "db", ns, "sched")`, group `groupId("sched")`, through `topic.leader`.
+     * While leading, it loops: a short transaction reads `$sched.by_at` for `at ≤ now` (limit 100), appends or deletes the KV paths, deletes the rows, and commits.
+     * It sleeps until the next `at`, at most `pollMs` (default 1,000).
+     * `now` = `session.clock.now()` after `clock.sync`.
+     * Losing the lease stops the loop and campaigns again.
+2. **Work queues (§12.2):**
+   * `emit(…, {spread: true})` uses a fresh random key.
+   * `consume({retry: 'delay', backoff?})`: on a throw, a transaction acks and schedules a copy at `now + backoff(attempt)` with header `zen.attempt` + 1. After `maxAttempts`, the copy is a scheduled emit to `topic.child("zen.dlq")`.
+3. **Request/reply (§12.3):**
+   * **Inbox:** one inbox per `Db` instance (16 random bytes), with an `on` subscription from now and an ephemeral one, started on first `request`.
+   * **`request(topic, type, body, {timeoutMs, key?, corr?})`:**
+     * On `Db`, it emits `{corr, reply_to}` and waits for a reply with that `corr` (late replies are dropped, `timeout` → `DbError('timeout')`).
+     * `tx.request` returns a promise that starts waiting at commit; it rejects if the transaction fails.
+   * **`requestAll`** (scatter-gather): collects every reply until the timeout.
+   * **`serve({…consume opts, dedup?, reply?: 'event' | 'ephemeral'}, handler) → reply`:**
+     * a `consume` whose transaction also emits `{type: type + '.reply', corr, body}` to `reply_to`
+     * `ReplyError` → a `.error` reply that consumes the request
+     * `reply: 'ephemeral'` → `publishEphemeral` after commit
+   * **`dedup: true`** (`consume` and `serve`):
+     * `$inbox [scope = group, id = corr or msg.id]` is recorded in the transaction. An id already seen is acked without running the handler; `serve` replies again with the stored reply, kept in the row (amend `$inbox` with `reply?`, ⚠️ spec, `spec:` commit).
+     * Each row schedules a `gc` of itself at `dedupTtl` (default 7 days).
+   * **`on` handlers answering requests** (scatter-gather responders): `msg.reply(body)` emits to `reply_to`.
+4. **Spec (`spec:` commit if needed):** the `$inbox` `reply` field; the `zen.attempt` header; the class DLQ topic name.
+
+**Tests 6b:**
+* **Scheduler:**
+  * Due rows are emitted once and not early, by a fake clock offset or short delays.
+  * `cancel` before and after delivery.
+  * `gc` deletes the parts.
+  * Two schedulers (two `Db`s, both owners via `locks: null`) on the same rows give no duplicates: a deposed leader conflicts.
+  * Failover: stop the leader without release, and the other takes over after the lease TTL (a short `ttlMs` option).
+* **Queues:** `spread` across two consumers; `retry: 'delay'` backoff order and the DLQ topic.
+* **Request/reply:**
+  * a round trip
+  * a timeout, and a late reply dropped
+  * `ReplyError`
+  * dedup: a repeated request with the same `corr` doesn't re-run the handler and gets the same reply
+  * ephemeral reply
+  * scatter-gather from two `on` responders
+  * a request inside a rolled-back transaction is never sent
+
+### 6c: sagas, the tab proxy, the fault suite, docs
+1. **`saga.ts` (§12.5):**
+   * `db.saga(name, steps)` → `Saga {start(data, tx?), get(id)}`.
+   * The orchestrator consumes `("zen", "saga", ns, name)` with `per_key` keyed by saga id, runs only in the owner, and applies the transition table of §12.5.
+   * `$sagas` row, step commands with `reply_to`, timeouts as scheduled messages cancelled on `ok`, compensations in reverse, `stuck` when a compensation dead-letters (orchestrator watches the class DLQ of compensate topics).
+   * Participants are `serve` handlers that return `{ok}` or throw `ReplyError` (fail).
+2. **`proxy.ts`, the tab proxy (TD-DB-TAB-PROXY):**
+   * **Injection:** `DbOptions.channel?: (name) => BroadcastChannelLike | null`, default `globalThis.BroadcastChannel`. Channel name `zen/db/<fs>/<ns>`.
+   * **Protocol** (structured-clone messages tagged with a random tab id):
+     * `sub {sid, target: topic paths / prefix path, after}`
+     * `unsub`
+     * `ev {sid, topic id, offset, keyToken, envelope}`: sealed events. The receiving tab opens them with its own `Topic`, so no plaintext crosses the channel.
+     * `err`
+     * `esub` / `eev` / `epub` for ephemeral
+     * `owner` (announce)
+     * `hello` (a new tab asks for the owner)
+   * **The owner** holds the only stream, subscribes for every remote sub, forwards events, and drops a tab's subs on `unsub` or when the tab says `bye` (pagehide).
+   * **A non-owner** `StreamSource`:
+     * Resolves a plain `on` without `after` to the read version itself (`/v1/grv` → `offsetAfterVersion`, exported from the client if needed), so the start doesn't depend on the owner.
+     * Keeps the last offset per sub, and on an `owner` announce re-sends every sub with `after = last`. So a handover loses and repeats nothing.
+   * **Without `BroadcastChannel`,** or as owner, the source is the direct stream.
+   * **Updates:** TD-DB-TAB-PROXY resolved. TD-DB-SHAREDWORKER stays open.
+3. **Fault suite (`packages/db/test/faults.test.ts`, §13.2):**
+   * a handler process "killed" mid-transaction (abort the consumer loop with the transaction uncommitted): another holder gets the event after the lease or claim expires
+   * a deposed leader commits late → `not_leader`, none of its writes, emits or schedules land
+   * two consumers racing → `cursor_moved` drops one
+   * a dropped stream (`reconnect()`) → `on` misses and repeats nothing
+   * a replayed `commit_id` (send the same built commit twice) → one effect
+   * scheduler failover mid-batch
+   * an owner tab closing: proxied subscriptions continue on the new owner without gaps; consumers move
+   * a responder that never answers → timeout, then a retry with the same `corr` and dedup
+4. **Docs:**
+   * `docs/DB.md` gains the broker part: messages, emit, on, consume, patterns, sagas, tabs, guarantees.
+   * `docs/EXAMPLES.md` needs no change.
+   * TECH_DEBT updates as above.
+
+**Tests 6c:** sagas (happy path; a fail at step 2 compensates step 1 in reverse; a timeout; a stale reply acked; `stuck`); the proxy with a fake `BroadcastChannel` bus and `FakeLocks` (the non-owner receives events and inbox replies, only one stream is opened (counted), and a handover has no gap or duplicate); the fault suite.
+
+**Verification (each sub-step):**
+* `npx biome check`
+* tsc: client, fuse, db test
+* `npx vitest run`, three times
+* CI green on the PR before stopping
+
+**Rhythm.**
+1. **Now:** restart the branch from main and copy this plan into `docs/MILESTONE-5.md`. Commit (`docs: milestone 5 step 6 plan`), push with `--force-with-lease`, and open a new PR.
+2. **Each sub-step:** log, commit, push, update the PR or open a new one, and confirm CI is green. Then stop for compaction.
+
+### Original outline
 * **Base:** `msg.ts` (Msg encoding, BodyRef, causation), `emit`, `on` (plain, `after`, `cursor`), `consume` (group id, the loop table of §11.3, `ack`, `begin({consumes})`), the system tables, ephemeral messages.
 * **Patterns:**
   * work queues: spread mode; `retry: "delay"`

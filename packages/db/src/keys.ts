@@ -50,4 +50,5 @@ export class Keys {
   root = (index: Uint8Array, shard: number) => this.key('r', index, u32(shard));
   sealedHead = (index: Uint8Array) => this.key('s', index);
   sealedPart = (index: Uint8Array, i: number) => this.key('s', index, u32(i));
+  msgPart = (id: Uint8Array, i: number) => this.key('m', id, u32(i));
 }
