@@ -334,7 +334,14 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** formats.md §11.3 (`key_mode`), §11.4, §12 (header version 2, the policy, its leakage); fs.md §4.1, §4.2 (rewritten: the policy and the three rekey rules).
     * **Docs:** `docs/CLIENT.md` §8 (large files, streams, resumable uploads, file keys), §9; `docs/STATS.md` §1.3; TECH_DEBT: TD-FS-LARGE-FILES and TD-CRDT-ROWS-SERVER resolved.
     * **Tests:** `packages/client/test/large.test.ts` (13: three sources, range reads and the page cache, appends, the inline limit, swapped and missing pages, version 1, resume, no `fs_pages`, and the policy: default, on, the three rekey rules, a mixed history, offline unlock); two were checked to fail with page reuse or the rekey rule broken. `txn.test.ts` +1 (a paged upload with a row), `mount.test.ts` +1 (a 4-page file through the kernel), `fsvectors.test.ts` (key_mode 0), zen-core `header.rs` and `tests/fs.rs`. 316 vitest tests in all.
-  * **7h** planned in detail (see "7h: a credential vault on the local store"); PR #28 merged, so the plan commit restarts the branch from main and opens a new PR.
+  * **7h** planned in detail (see "7h: a credential vault on the local store"); PR #28 merged, so the plan commit restarts the branch from main and opens a new PR (#29).
+  * **7h** (the credential vault): done, PR #29. **Step 7 is done.** Step 8 starts from main: restart the branch, plan it, open a new PR. As planned, with these details for step 8:
+    * **Client:** `src/local/vault.ts` `credentialVault(sealed, {name, allowPlaintext})` → `CredentialVault` (`store`, `saveDevice`, `device`, `saveSession`, `signIn(client, {probe})`, `unlock(fs, {local})`, `forgetSession`, `forget`); exports `StoredDevice`, `VaultOptions`, `VaultSignInOptions`. Records are plain binary (`u8 1 ‖ …`), so the client needs no CBOR.
+    * **Decisions beyond the plan:** a stored session refused with 401 when there's no device is deleted before `not_found`; `signIn` resumes a session whose expiry is unknown (0), relying on the probe.
+    * **Step 8 (zen-mount `--vault`):** its `DeviceFile` (hex `identity_seed`, `device_seed`, `cert`) maps onto `saveDevice` with `identity: SigningIdentity.fromSeed(identity_seed)` (only the public bytes are kept).
+    * **⚠️ Spec:** zendb.md §9.3, the `vault/<name>` store and its two records.
+    * **Docs:** `docs/CLIENT.md` §10 "Credentials (the vault)"; GAPS G15 partly done.
+    * **Tests:** `packages/client/test/vault.test.ts` (14: three backends, resume with one call, offline with the kept header, offline with an expired or no session, an expiring session, a logged-out session, no device, the origin rule, refusals, a bad seed, tampering, unparsable records); the origin check and the 401 fallback were each checked to fail when removed. 330 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
