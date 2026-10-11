@@ -355,6 +355,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** fs.md §11 (the replica), zendb.md §9.3 (the `zfs/…` stores).
     * **Docs:** `docs/CLIENT.md` §8 "The local replica"; TECH_DEBT TD-FUSE-REPLICA progress.
     * **Tests:** `packages/fs/test/replica.test.ts` (13: sync and the loop, restart from the cursor offline, a resync dropping a planted node, duplicate names and conflict copies, symlinks and xattrs, ranged reads of a paged file with counted calls, eviction with a pin, a pinned folder's new file, offline reopen and catch-up, the three stores (sealed, wipe), two tabs with handover, the Node lock and a stale one). Eviction keeping pins and the full-sync sweep were each checked to fail when removed. 343 vitest tests in all.
+    * **CI fix on #30:** `online` turned true only once a catch-up finished, so a node from the feed could show before it (the offline test, about 1 run in 2 on CI). Any feed batch now marks the replica online.
 
 ## Facts the work must respect (from the code survey)
 

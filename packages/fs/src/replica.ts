@@ -238,6 +238,7 @@ export class Replica {
 
   /** Apply feed changes (newer offsets win, so overlapping polls are harmless). */
   private apply(changes: TreeChange[]): Uint8Array[] {
+    this.online = true; // the feed answered
     const changed: Uint8Array[] = [];
     for (const c of changes) {
       const key = bytes.hex(c.node);
