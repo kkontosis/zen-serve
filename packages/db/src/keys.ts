@@ -46,4 +46,8 @@ export class Keys {
   unique = (index: Uint8Array, value: Uint8Array) => this.key('u', index, value);
   fast = (index: Uint8Array, value: Uint8Array, pk: Uint8Array) => this.key('f', index, value, pk);
   fastValue = (index: Uint8Array, value: Uint8Array) => this.range('f', index, value);
+  node = (index: Uint8Array, id: Uint8Array) => this.key('n', index, id);
+  root = (index: Uint8Array, shard: number) => this.key('r', index, u32(shard));
+  sealedHead = (index: Uint8Array) => this.key('s', index);
+  sealedPart = (index: Uint8Array, i: number) => this.key('s', index, u32(i));
 }

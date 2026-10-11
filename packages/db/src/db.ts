@@ -1,10 +1,11 @@
 // The `Db` class (spec/zendb.md §2–3, §16): opening a database, the
 // catalog cache, tables and transactions.
-import type { UnlockedFs } from '@zen/client';
-import type { Limits } from '@zen/wasm';
+import { bytes, type UnlockedFs } from '@zen/client';
+import type { IndexKeys, Limits } from '@zen/wasm';
 import { decodeDbRecord, decodeTableRecord, encodeDbRecord, type TableRecord } from './catalog.js';
 import type { Value } from './cbor.js';
 import { DbError } from './errors.js';
+import type { Node } from './index/node.js';
 import { Keys } from './keys.js';
 import { type MigrationFn, migrate } from './migrate.js';
 import { type Page, Query } from './query.js';
@@ -34,6 +35,9 @@ export interface DbTxnOptions {
 /** The format this code reads and writes (§3.1). */
 const FORMAT = 1;
 
+/** Decoded private-index nodes kept per `Db` (they never change, §5.4.3). */
+const NODE_CACHE = 4096;
+
 interface CatalogEntry {
   record: TableRecord | undefined;
   version: Uint8Array | undefined;
@@ -42,6 +46,10 @@ interface CatalogEntry {
 /** A database `(fs, ns)`. */
 export class Db {
   private readonly catalog = new Map<string, CatalogEntry>();
+  private readonly nodes = new Map<string, Node>();
+  private readonly ixKeys = new Map<string, IndexKeys>();
+  /** Sealed indexes by index id: the entries of the blob with this digest. */
+  private readonly sealed = new Map<string, { digest: string; keys: Uint8Array[] }>();
   /** The stored schema version after opening. */
   schema = 0;
 
@@ -139,7 +147,49 @@ export class Db {
 
   /** Free the database keys. */
   close(): void {
+    for (const k of this.ixKeys.values()) k.free();
+    this.ixKeys.clear();
     this.keys.db.free();
+  }
+
+  // ------------------------------------------------------------ index caches
+
+  /** @internal The keys of a private index. */
+  indexKeys(id: Uint8Array): IndexKeys {
+    const h = bytes.hex(id);
+    let k = this.ixKeys.get(h);
+    if (!k) {
+      k = this.keys.db.index(id);
+      this.ixKeys.set(h, k);
+    }
+    return k;
+  }
+
+  /** @internal A cached node, by id. */
+  cachedNode(id: string): Node | undefined {
+    const n = this.nodes.get(id);
+    if (n) {
+      this.nodes.delete(id);
+      this.nodes.set(id, n);
+    }
+    return n;
+  }
+
+  /** @internal */
+  cacheNode(id: string, n: Node): void {
+    this.nodes.set(id, n);
+    if (this.nodes.size > NODE_CACHE) this.nodes.delete(this.nodes.keys().next().value!);
+  }
+
+  /** @internal A sealed index's entries, if the cached blob has this digest. */
+  cachedSealed(index: string, digest: string): Uint8Array[] | undefined {
+    const c = this.sealed.get(index);
+    return c?.digest === digest ? c.keys : undefined;
+  }
+
+  /** @internal */
+  cacheSealed(index: string, digest: string, keys: Uint8Array[]): void {
+    this.sealed.set(index, { digest, keys });
   }
 
   // ------------------------------------------------------------ catalog cache
