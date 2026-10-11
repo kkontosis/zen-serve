@@ -400,7 +400,10 @@ describe('migrations (§8)', () => {
     // The index stays building, and writers already maintain it.
     const t = await db1.transaction((tx) => tx.tableRecord('u'));
     expect(t.indexes[0]!.state).toBe('building');
-    expect(await code(db1.table('u').put({ id: 'd9', v: 'v2' }))).toBe('unique_violation');
+    // (Checked with values of their own: which old rows the backfill reached
+    // depends on the random stored-key order.)
+    await db1.table('u').put({ id: 'd9', v: 'vx' });
+    expect(await code(db1.table('u').put({ id: 'd10', v: 'vx' }))).toBe('unique_violation');
     await db1.table('u').delete('d5');
     const db2 = await Db.open(fs, name, v2);
     const t2 = await db2.transaction((tx) => tx.tableRecord('u'));
