@@ -14,12 +14,14 @@ export {
   UnlockedFs,
 } from './fs.js';
 export {
+  commitTransaction,
   Kv,
   type KvEntry,
   type Path,
   type RangeOptions,
   sendCommit,
   Transaction,
+  type TxEntry,
   type TxnOptions,
   transaction,
 } from './kv.js';

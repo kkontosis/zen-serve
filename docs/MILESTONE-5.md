@@ -96,7 +96,34 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `prolly.test.ts` (9, in memory against `IndexKeys.build`): random batches at fanout 2/4/64, the entry and byte caps, scans, decoys.
       * `indexes.test.ts` (18, server).
       * 140 vitest tests in all.
-  * **5c**: next (transaction modes, cache coherence, files, bulk import, tabs). The node cache is per `Db`, memory only, and so is the sealed cache. 5c's row cache (§7.7) can follow the same pattern. Planned in detail under "5c … (detailed plan)". User decisions: tabs get owner election only (the BroadcastChannel proxy moves to step 6); a row cache is built (a small LRU). After compaction and "go", build it from there.
+  * **5c** (transaction modes, cache coherence, files, bulk import, owner): done, PR (see below). As planned, with these details for step 6:
+    * **Client:**
+      * `TxnOptions.retry` chooses which errors re-run `fn`.
+      * `Transaction.getEntries` (with versions; none for own writes) and `owns(key)` are new.
+      * `commitTransaction(tx)` is exported.
+      * `transaction()` now runs the `onError` hooks on the last attempt too, so caches drop stale entries.
+    * **`Db.transaction`:**
+      * `auto` runs short with `retry` = conflict only. `DbTransaction.live()` (called at every read, query page and `finish`) throws `SwitchToLong` past the deadline. `SwitchToLong` or `too_old` → one long run with the remaining attempts.
+      * In long mode, a `ZenError too_large` thrown inside `fn` becomes `DbError('too_large', '… split the work')`.
+    * **`db.begin()`** → `ManualTransaction`. It overrides `live()` to throw `closed`, and runs the raw error hooks on a failed commit.
+    * **Row cache:**
+      * `Db.rows` is an LRU (`rowCache`, default 1,024). Copies are cloned in and out. `db.stats.rowHits/rowMisses`.
+      * `TableTx.read`: a hit is `useCached` → `expectKey` + `DbTransaction.cached`. A miss is `getEntries` + `noteRow`. Query paths fill the cache too.
+      * `onCommit` drops written keys (all rows if the commit clears a range). `conflict` drops every cached record used. A read-only `finish` checks catalog records and rows in one `snapshotGet`.
+    * **Files:** `files.ts` `TxFiles` (`tx.fs(tree).write(upload, {replaces})`, `.ops(batch | PendingOp[])`) over `Tree.writeIn`. Duplicate node writes are refused via `DbTransaction.fileWrites`.
+    * **`db.importRows`**, as planned.
+    * **Owner:**
+      * `tabs.ts` `Owner` with `LockManagerLike`. `DbOptions.locks` defaults to `navigator.locks`; `null` means none. `owner: false` never campaigns.
+      * `db.isOwner`, `db.onOwner(fn)` (fires at once if already owner), `db.ownerChange`.
+      * The lock name is `zen/db/<fs id>/<ns>` (the fs id is a number).
+      * **Step 6 hangs consumers, the scheduler and the stream off `onOwner`.**
+    * **Docs:** new `docs/DB.md` (database part; step 6 adds the broker), `docs/CLIENT.md` §5, TECH_DEBT: TD-DB-PERSISTENT-CACHE, TD-DB-TAB-PROXY, TD-DB-OBLIVIOUS-INDEX, TD-DB-SHAREDWORKER.
+    * **Tests:**
+      * `packages/db/test/txn.test.ts` (18), with fake Web Locks.
+      * `kv.test.ts` +3.
+      * `expectCanonical` moved to `packages/db/test/helpers.ts`.
+      * 161 vitest tests in all.
+* **Step 6** (broker): next.
 
 ## Facts the work must respect (from the code survey)
 
