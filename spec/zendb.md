@@ -108,6 +108,7 @@ DbRecord = { 1: format = 1,
   * an older `schema` → migrate (§8)
   * no DbRecord → create one at schema 0, then migrate
 * An `integrity` other than `"basic"` is refused until milestone 6.
+* **Opening offline.** With a local store (§9.3), every open keeps the server's info (`/v1/info`: limits and features), the DbRecord (at the schema it opened with) and the catalog. When the server can't be reached at open, the database opens from them if the format and integrity pass and the kept `schema` **equals** the app's; migrations wait for the next online open, so a due one makes the open fail with `offline`. Nothing kept: the network error stands. The instance reports it opened offline (`db.offline`).
 
 ### 3.2 TableRecord and IndexDef
 
@@ -547,6 +548,8 @@ A transaction can carry filesystem operations (spec/fs.md) next to its rows. The
 
 * **Catalog records and rows** may be cached with their version. A transaction that uses a cached record puts its version into the read set (short: a conflict range on the key; long: an `expect`). A stale cache therefore causes a retry, never a wrong commit.
 * **Private-index nodes** never go stale (§5.4.3).
+* **Kept across restarts** (§9.3) these caches change nothing: a kept row or catalog record is used by its version as above, so a copy that went stale while the app was closed costs one retry.
+* **Offline reads (`read: "cache"`).** By default a read-only transaction that used cached rows checks them at the end, so offline it fails. With the read mode `cache` (the mode of §19.4, per transaction or `get`), a read-only transaction that can't reach the server for that check answers from its cached rows unchecked: the answer may be stale. A row that isn't cached is then `offline`. Writes, and queries on transactional tables (their roots and entries need the server), always need the server.
 * **Freshness outside transactions.** A table with a change topic (§12.7) can keep its cache fresh by subscribing to it. Without one, cached rows are fresh only as of when they were read.
 
 ## 8. Migrations (G6)
@@ -631,7 +634,19 @@ record = u8 version (1) ‖ u8 layers (bit 0 device, bit 1 fs) ‖ body
 * **Neither layer** is an app's choice too, but it must say so (`plaintext: true`), so it is never an accident: the records sit on disk in the clear, with no tamper check. It fits a disk the OS already encrypts, data that isn't sensitive, or a trusted host.
 * **A record that doesn't open** (tampered with, moved to another store, key or fs, sealed with other layers, or after the device key is lost) reads as absent and is deleted, with a warning. A store's layers never mix: records of another setting read as absent.
 * **Wipe.** `Db.wipe(local, ns)` deletes every store of a database (at sign-out), its unsent writes too.
-* **What is stored:** the queue of CRDT writes and its commit in flight (§19.7), in store `queue/<ns>`. Counter totals never are (§19.7).
+* **What is stored,** per database, unless `persist: false` (then only the queue):
+
+  | Store | Key | Record |
+  |---|---|---|
+  | `queue/<ns>` | `e ‖ id`, `inflight` | queued entries and the commit in flight (§19.7) |
+  | `db/<ns>` | `info`, `db`, `t ‖ name` | `/v1/info` (wire encoding), the DbRecord, `{1: TableRecord, 2?: version}` (§3.1) |
+  | `rows/<ns>` | the row's stored key | `{1: version, 2: fields, 3: parts}` (§7.7) |
+  | `crdt/<ns>` | the object | `{1?: ObjState (wire encoding), 2: checked (ms), 3: stale}` (§19.4) |
+  | `nodes/<ns>` | the node id | the node's bytes (§5.4.3) |
+  | `sealed/<ns>` | the index id | `{1: digest, 2: Blob}` (§5.7) |
+
+  Counter totals never are (§19.7). The header of each fs unlocked with a local store is kept in store `fs/<fs id>` (docs/CLIENT.md): it lets the fs unlock offline, and is no less trusted than one fetched online (signed headers come in milestone 6). Its store can't have the fs layer, which needs the keys it unlocks.
+* **Writes behind.** Cache records are gathered and written every 100 ms and at close; a write lost to a crash only leaves the cache colder. Rows and CRDT states are loaded at open, up to their cache sizes (the rest is deleted); nodes and blobs are read on a miss. Every record is checked when used: rows and catalog records by their version (§7.7), CRDT states by theirs (§19.4), nodes against their id, blobs against the digest in the head.
 
 ---
 
@@ -1215,7 +1230,7 @@ ObjState = { object: bytes,
   * sets as the elements with at least one dot
   * the row visible if its register is `alive`
 * **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
-* **The cache.** The class keeps the ObjStates it reads (`get`, `range`) in a cache per database: in memory, least recently used out (default 1,024 objects). A commit of this instance with CRDT operations marks their objects stale. A state fetched while a commit marked its object stale stays stale.
+* **The cache.** The class keeps the ObjStates it reads (`get`, `range`) in a cache per database: in memory, least recently used out (default 1,024 objects), and on the local store with their `checked` times (§9.3), so `cache` and `auto` reads (and offline ones) work after a restart. A commit of this instance with CRDT operations marks their objects stale. A state fetched while a commit marked its object stale stays stale.
 * **Read modes.** A read takes one of three modes (default `auto`; per database, transaction, `get` or query):
 
   | Mode | Fresh entry (younger than `crdtCacheMs`, default 5 s) | Older entry | Not cached, or stale | Offline |
