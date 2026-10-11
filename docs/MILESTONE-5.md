@@ -174,7 +174,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Test fixes:** `txn.test.ts`'s `itemsDb` sets `scheduler: false`, since its tests count reads. The decoy test in `indexes.test.ts` asserted more than 3 nodes, which a random index key misses about 0.3% of the time; it now asserts at least 3.
     * **⚠️ Spec:** §11.5, §12.2 and §12.3, as planned (a separate `spec:` commit).
     * **Tests:** `packages/db/test/patterns.test.ts` (17), 198 vitest tests in all. PR #18 merged, CI green (commit `a91c258`).
-  * **6c** (sagas, tab proxy, fault suite, docs): done, PR #19. **Step 6 is done.** As planned, with these details for step 7 on:
+  * **6c** (sagas, tab proxy, fault suite, docs): done, PR #19 (merged; CI green). **Step 6 is done.** As planned, with these details for step 7 on:
     * **Files:**
       * `saga.ts`: `Saga` (`db.saga(name, steps, {group, ttlMs, onError})` → `start(data, tx?)`, `get`, `stop`, `topic`), `SAGA_TIMEOUT`. The orchestrator is a `per_key` consumer of `('zen', 'saga', ns, name)` plus a `sequential` group `<group>.<name>.dlq` on each compensate topic's class DLQ. A timeout's `data.error` is `{message: 'timeout', step}`.
       * `proxy.ts`: `TabSource` (a `StreamSource`; `streaming` tells whether the tab holds a stream), `ProxyHost` (owner side), `BroadcastChannelLike`, `ChannelFactory`. Used when both `locks` and a channel exist (`DbOptions.channel`, default `BroadcastChannel`; `null` turns it off). The host filters an exact-topic subscription by topic id (it subscribes to the id as a prefix).
@@ -184,6 +184,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** §9.2 (the proxy protocol), §11.5 (`$sagas.corr`, `timeout`), §12.3 (an inbox per `Db`), §12.5 (rewritten: messages, the stale rule by `corr`, transitions, stuck through the class DLQ).
     * **Docs:** `docs/DB.md` sections 8 and 10–18 (the broker); TD-DB-TAB-PROXY resolved.
     * **Tests:** `saga.test.ts` (7), `proxy.test.ts` (4, `FakeBus` + `FakeLocks`), `faults.test.ts` (6; commits are intercepted by wrapping `session.call`). 215 vitest tests in all.
+* **Step 7** (CRDT tables): planned (see Step 7: sub-steps 7a and 7b, a PR each). PR #19 is merged, so the plan commit restarts the branch from main and opens a new PR, which 7a joins.
 
 ## Facts the work must respect (from the code survey)
 
@@ -1027,12 +1028,158 @@ Step 7 (CRDT tables) is next.
   * `commit_id` replays, scheduler failover, an owner tab closing (simulated owners)
 
 ## Step 7: `@zen/db` part D, CRDT tables (zendb.md §19)
-* `crdt.ts`: `patch`, `incr`, `add`, `remove`, `delete`, the merged view through `/v1/crdt/*`
-* change-event appends, the `$index` indexer group and `$ixrows`
-* the offline queue: memory, or the persisted store of step 8, with rebase on `stale_op`
-* `"crdt_rows"` feature detection
 
-**Tests:** offline edits merging, counters across devices, add-wins sets, indexer lag and re-check, an indexer restart.
+**Original outline:** `crdt.ts` (`patch`, `incr`, `add`, `remove`, `delete`, the merged view through `/v1/crdt/*`), change-event appends, the `$index` indexer and `$ixrows`, the offline queue with rebase on `stale_op`, `"crdt_rows"` detection. Tests: offline edits merging, counters across devices, add-wins sets, indexer lag and re-check, an indexer restart.
+
+**Context.** Steps 5–6 (PRs #14–#19, all merged) give `@zen/db` its transactional tables and the broker. The server merges CRDT rows since step 3 (`crates/zen-server/src/crdt.rs`, api.md §13), and the client already has what the wire needs:
+* `Transaction.addCrdtOps`, `CommitResult.set_dots`
+* `wasm`: `DbKeys.crdt(tableId)` → `CrdtKeys {field, elem}`, `FsKeys.sealCrdtValue` / `openCrdtValue`, the `CrdtOp` / `ObjState` / `CrdtGet` / `CrdtRange` wire types
+* `TreeClock.tick()` and `actor`, `Tree.rebase` (the pattern for `stale_op` / `clock_skew`)
+* `TableRecord.merge` / `crdtFields` (catalog keys 8 and 9), not yet written by `createTable`
+
+Step 7 builds the class side.
+
+**User decisions:**
+* **Split:** 7a (CRDT tables online) and 7b (indexer, offline queue, batching, property test), a PR each.
+* **Queue unit, by what the call is:**
+  * a CRDT-only transaction is queued as **one atomic entry**
+  * a single call (`table.patch`, `incr`, …) is a **single-operation entry**
+  * the queue **batches** entries into as few commits as the limits allow
+* **Resolving:** CRDT writes outside a mixed transaction resolve **once queued** by default; `{wait: true}` waits for the commit.
+* **Store:** memory now, behind a `QueueStore` interface that step 8 implements (disk, IndexedDB, sealed at rest).
+
+**After compaction, re-read:**
+* this section and the 6a–6c log lines
+* `spec/zendb.md` §3.2, §12.7, §16, §19
+* `spec/api.md` §13
+* `packages/db/src/{txn,db,query,migrate,catalog,keys,broker,system}.ts`
+* `packages/client/src/{kv,tree,clock}.ts` (`addCrdtOps`, `rebase`, `tick`, `actor`)
+* `crates/zen-wasm/src/db.rs`
+* the `crdt` section of `spec/test-vectors/zendb.json`
+* `packages/db/test/{db,broker}.test.ts` (setup)
+
+**Branch/PR.** #19 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7 plan`), and open a new PR that 7a joins.
+
+### 7a: CRDT tables online
+
+#### Files
+1. **`migrate.ts`:** `createTable(name, {pk, merge: 'crdt', fields?: {name: 'lww' | 'counter' | 'set'}, changes?})`.
+   * It checks the server's `/v1/info` features for `"crdt_rows"`, and fails with `DbError('unsupported')` (a new code) otherwise.
+   * pk fields can't be typed fields; `pad` is refused.
+   * `createIndex` on a CRDT table: `unique` is refused (`bad_value`). Every other kind waits for 7b (`unsupported` until then).
+2. **`crdt.ts` (new): the codec and the merged view.**
+   * **Tokens and objects:** `CrdtKeys` are cached per table in `Db` and freed by `close()`.
+     * object = `keys.row(table.id, pkEl)`
+     * field = `crdt.field(name)`
+     * elem = `crdt.elem(name, pkEl, CBOR(element))`
+   * **Plaintexts:** as in §19.2, sealed with `fs.keys.sealCrdtValue(object, field, elem, CBOR)`. **⚠️ Spec addition:** an `lww` field not declared in `fields` carries its name, `{1: value, 2: name}`, since tokens can't be reversed. Declared fields keep `{1: value}`, so the vectors are unchanged.
+   * **`mergeState(table, ObjState) → row | undefined`:**
+     * open every value
+     * the row register `alive` → the pk fields
+     * `lww` fields by name, a field without a value is absent
+     * counters as the sum of their entries
+     * sets as the elements with at least one dot, sorted by their CBOR bytes
+     * absent if there is no register or `alive` is false
+     * A value that doesn't open → `corrupt`.
+   * **`readCrdt(db, objects, rv?)`** batches `/v1/crdt/get` in 1,000s. **`scanCrdt(db, table, {after, limit})`** pages `/v1/crdt/range` over `keys.rows(table.id)`, continuing at `last ‖ 0x00`.
+3. **`CrdtTableTx` in `txn.ts` (`tx.table(name)` dispatches on `merge`):**
+   * **Writes:**
+     * `insert(row)`: a `row` op (`alive: true`, `{1: pk}`), then the fields as below
+     * `patch(pk, fields)`: an `lww` op per field (`undefined` unsets it); counter and set fields are refused here (`bad_value`)
+     * `incr(pk, field, n)`
+     * `add(pk, field, ...elems)` / `remove(pk, field, ...elems)`
+     * `delete(pk)`: a `row` op, `alive: false`
+   * **Reads:**
+     * `get(pk)`: the merged row, read with `crdt/get` at the transaction's read version. It is not in the read set (§19.4).
+     * `query()`: a scan over `scanCrdt` with predicates applied client-side, and the scan rules for `orderBy` and `limit` (`needs_index`). Index paths come in 7b.
+   * **Refused** (`bad_value`): `put` and `update`, which are read-modify-write.
+   * **Stamping.** Ops are stamped when the transaction finishes:
+     * `row` / `lww`: `clock.tick()` as the `hlc`
+     * `ctr`: `seq` = `clock.tick()`, and `value` = this installation's total
+   * **Counter totals.** The `Db` keeps the base per `(object, field)`, read once from this actor's entry with `crdt/get`. The total is base + this attempt's increments, and `onCommit` stores the new base, so a re-run never double-counts.
+   * **`remove`** reads the element's current dots (`crdt/get`) and sends `rem` with them: add-wins.
+   * **Ops on one row** are kept in call order. An `insert` with fields puts its `row` op first.
+   * **Rebase.** An `onError` hook (like `Tree.writeIn`): on `stale_op` or `clock_skew`, `clock.sync(force)`, then re-run the transaction, which restamps. At most 3 times.
+   * **Limits:** the ops count in `checkLimits` (`max_commit_ops`, `max_commit_bytes`, `max_value_bytes`).
+4. **Change events (§12.7):**
+   * A CRDT table with `changes` appends one `zen.change` per touched row per transaction: `{op: 'put' | 'delete', table, pk}`, keyed by the pk element.
+   * There is no `row` image: the merged state is known only to the server. `image: 'full'` is refused for CRDT tables.
+   * They reuse `noteChange` / `emitChanges` with an `op`-only record.
+5. **`Table` (outside a transaction):** `patch`, `incr`, `add`, `remove`, `delete` and `insert` are a transaction each. In 7a they always wait for the commit (the queue and `{wait}` come in 7b). `get` and `query` read.
+6. **Spec (⚠️ `spec:` commit):**
+   * §3.2: `merge: "crdt"` tables refuse `pad`, `unique` and `image: "full"`.
+   * §12.7: CRDT change events carry no row.
+   * §19.2: the `lww` name rule.
+   * §19.3 (class side):
+     * stamping at commit build
+     * counter totals per actor from the base plus increments
+     * `remove` sends the observed dots
+     * `insert` vs `patch`: only `row` ops resurrect
+   * §16: the example's `incr` / `add` signatures as built.
+   * Error code `unsupported`.
+7. **Docs:** a `docs/DB.md` section on CRDT tables (what is given up, the field types, reads, change events). The offline part is added in 7b.
+
+#### Tests 7a (`packages/db/test/crdt.test.ts`, its own server)
+* **Vectors:**
+  * field and element tokens from the `crdt` section
+  * opening each sealed value (row, lww, counter, set)
+  * `mergeState` of a hand-built ObjState equals the expected view
+* **Rows:**
+  * insert → get, and patch
+  * `delete` hides the row; a later `patch` doesn't resurrect it, but `insert` does
+* **Concurrency (two `Db`s with separate sessions and clocks):**
+  * different fields both survive; one field: the later `hlc` wins
+  * counters: two installations' `incr`s sum; a conflict re-run doesn't double-count
+  * sets: a concurrent `add` survives a `remove` that didn't observe it (add-wins); a `remove` of observed dots removes
+* **Transactions:**
+  * a transaction with a transactional row, a CRDT op and an emit is atomic: a throw leaves none of them
+  * CRDT reads don't conflict: a concurrent CRDT write doesn't re-run a transaction that read the row
+* **Rebase:** a skewed clock (as in `tree.test.ts`) → `stale_op` / `clock_skew` → rebased and committed.
+* **Change events:** one per touched row per transaction, keyed by pk, `table.on` sees them.
+* **Errors:**
+  * `unsupported` against an info without `"crdt_rows"` (a wrapped `client.info`)
+  * `unique` and `put` refused
+* **Scan query:** paging with cursors, predicates, `needs_index`.
+
+### 7b: the indexer, the offline queue, batching (outline; detailed after 7a)
+* **The indexer (§19.6):**
+  * a `per_key` group `"$index"` on each indexed CRDT table's change topic, run in the owner
+  * each event is one short transaction: merged row, `$ixrows` entry, `changeIndex` old → new for every index, `$ixrows` written, consume step
+* **Indexes on CRDT tables:**
+  * `createIndex` (kinds fast, private and sealed) requires `changes`
+  * the backfill scans `crdt/range` and writes `$ixrows`
+  * queries use the index path, then re-check every predicate on the merged rows fetched with `crdt/get`
+* **The queue (`crdtq.ts`, §19.7):**
+  * **Entries:**
+    * atomic: a CRDT-only transaction (no transactional reads or writes, no consume; its emits and change events included)
+    * single-op: a `Table` call
+    * Mixed transactions never queue. They wait for the queue to drain first, so counter `seq`s stay in order. Offline they fail as now.
+  * **Stamping:**
+    * `row` / `lww` `hlc`s are stamped when queued: the offline edit's time.
+    * `ctr` `seq` and total are assigned when sent, so they stay in send order.
+    * `rem` dots: dots observed when queued, plus the `set_dots` of this queue's earlier `add`s of the element, filled in when those commit.
+  * **Batching:**
+    * consecutive entries are packed into one long-mode commit up to `max_commit_ops` and `max_commit_bytes` (an atomic entry is never split)
+    * entries arriving within `batchMs` (default 0: the same tick) join one send
+  * **Coalescing** (single-op entries only):
+    * a later `lww` on the same object and field drops the earlier one
+    * `incr`s on one counter sum
+  * **Idempotency:** a built commit is kept with its `commit_id` until it succeeds, and re-sent unchanged after a network error. On `stale_op` or `clock_skew` it is restamped and rebuilt with a new id.
+  * **Resolving:** writes resolve once queued (`{wait: true}`: on commit). `db.crdt.pending`, `flushed()`, and `onSync(fn)` events.
+  * **Offline detection:** a network error keeps the entry and retries with backoff (100 ms up to 30 s), and on `online` events where they exist.
+  * **`QueueStore`:** `{load(): Entry[], append(e), remove(ids)}`, memory by default; step 8 adds persisted stores.
+  * **Local view:** `get` and `query` overlay the queued ops on the merged state (pending `lww` and `row` by `hlc`, `incr` deltas, adds and removes), so a tab sees its own offline edits.
+* **Tests:**
+  * the indexer: lag then re-check, a restart resumes, stale entries are filtered out
+  * offline: a fake fetch that drops requests, edits on two devices merging after reconnect, `stale_op` rebase past the horizon
+  * batching and coalescing counts, atomic entries kept whole
+  * the 3-device property test of §19.9: random ops in random orders give the same merged state
+
+### Rhythm
+1. Restart from main, log the step 7 plan line, commit, push, open a new PR.
+2. Build 7a on the user's go: the `spec:` commit, then the code commit.
+3. Log the 7a line, push, update the PR, confirm CI is green, stop for compaction.
+4. Plan 7b in detail, then build it the same way.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
 * **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).
