@@ -235,6 +235,9 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** api.md §13.3 (`versions`), zendb.md §19.4 (cache, read modes), §19.7 (rewritten: entries, stamping, batches, sending, store, API), §16, the `offline` error.
     * **Docs:** `docs/DB.md` §19 "Writes and the queue", "Read modes", the `offline` error; `docs/CLIENT.md` `commitId`.
     * **Tests:** `crdtoffline.test.ts` (15: read modes, the queue, a lost response, a rebase past a 1 s horizon, mixed flushes, a dropped table, learned dots, the 3-installation property test with three seeds); `kv.test.ts` +1; `tests/crdt.rs` +1. 256 vitest tests in all.
+    * PR #23 merged.
+  * **Replanned after 7c (merged, #23):** step 7 gains 7d (a sealed local store, the persisted queue) and 7e (persisted caches, offline open), a PR each. See Step 7, 7d and 7e.
+  * **7d** (sealed local store, persisted queue): planned in detail (see Step 7, 7d). #23 is merged, so the plan commit restarts the branch from main and opens a new PR.
 
 ## Facts the work must respect (from the code survey)
 
@@ -1395,12 +1398,122 @@ Step 7 builds the class side.
   * CI green on the PR before stopping
 * **Disk:** `CARGO_INCREMENTAL=0`; check disk before the Rust build (6.9 GB free).
 
+### 7d: the sealed local store and the persisted queue (detailed plan)
+
+**Context.** 7c (PR #23) gives CRDT tables an offline queue and read modes, but everything lives in memory: a restart loses queued writes, and a commit whose outcome was unknown is rebuilt with a new `commit_id`, so it may apply twice. zendb.md §9.3 says a persistent cache is "encrypted at rest" and that milestone 5 decides; TD-DB-PERSISTENT-CACHE is open. 7d builds the **sealed local store**, shared with step 8's replica, and puts the **queue** on it. 7e then persists the caches and opens offline.
+
+**User decisions (after 7c):**
+* **Scope:** persist the queue (7d), then the caches (7e): CRDT states, rows and catalog, index nodes and sealed blobs. The store is shared groundwork that step 8's replica reuses for nodes and chunks.
+* **Layers, both optional:**
+  * **device** (default **on**): AES-GCM under a device-local key
+  * **fs** (default **off**): sealed under the fs keys, inside the device layer
+* **Offline open (7e):** `unlock` and `Db.open` work offline from stored state.
+* **Split:** 7d + 7e, a PR each.
+
+**After compaction, re-read:**
+* this section and the 7c log line
+* `spec/zendb.md` §9.2, §9.3, §19.7; `spec/formats.md` §4
+* `packages/db/src/{crdtq,crdt,db,tabs,proxy}.ts`
+* `packages/client/src/{kv,clock,index}.ts`, `packages/client/package.json`
+* `crates/zen-core/src/db/mod.rs` (`seal_crdt_value`), `crates/zen-wasm/src/db.rs`, `crates/zen-core/src/db_vectors.rs` (`crdt_vectors`)
+* `packages/db/test/crdtoffline.test.ts` (`net`, `pair`)
+
+**Branch/PR.** #23 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7d plan`), and open a new PR that 7d joins.
+
+#### Seal kind 8, local records (⚠️ formats.md §4, Rust)
+* **The kind:** label `zen/v1/aad/local`, context `u32(fs) ‖ lp(store) ‖ lp(record key)`, under the KV AEAD key of `key_epoch`, like kind 7. A record moved to another store, key or fs fails authentication.
+* **zen-core:** `seal_local(fs_keys, store, key, pt, rng)` and `open_local`, next to `seal_crdt_value`. A `local` section in `spec/test-vectors/zendb.json` (`db_vectors.rs`), from a fixed RNG.
+* **zen-wasm:** `FsKeys.sealLocal(store, key, pt)` and `openLocal(store, key, sealed)`.
+* `gen_vectors` leaves the other sections unchanged.
+
+#### `@zen/client`: the local store (`packages/client/src/local/`)
+1. **`LocalStore`**, the raw backend: `get(store, key)`, `put(store, key, value)`, `delete(store, keys)`, `list(store)` (an async iterator of `[key, value]`), `clear(store?)`, `close()`. `store` is a short name (`queue`, `crdt`, …); keys and values are bytes.
+   * **`memoryLocalStore()`**
+   * **`indexedDbLocalStore(name)`**: one object store per store name, created on demand (a version bump); a key is the hex of its bytes.
+   * **`nodeDiskLocalStore(dir)`**: in the subpath export `@zen/client/node` (new in `package.json`), so browser bundles never import `node:fs`. One directory per store, one file per key (hex name). Writes go to a temporary file, are fsynced, then renamed, so a crash never leaves half a record.
+2. **`SealedStore`** (`sealedStore(raw, {fs?, device?})`): the same API over plaintext, which seals on `put` and opens on `get` / `list`.
+   * **Record:** `u8 version (1) ‖ u8 layers (bit 0 device, bit 1 fs) ‖ body`.
+   * **fs layer** (`fs: UnlockedFs`, default off): `fs.keys.sealLocal(store, key, plaintext)`.
+   * **device layer** (default on): AES-256-GCM through WebCrypto, a random 12-byte nonce, AAD = `zen/v1/device ‖ 0x00 ‖ lp(store) ‖ lp(key)`. It wraps the fs layer when both are on.
+   * **The device key:**
+     * a non-extractable `CryptoKey`
+     * `deviceKey(raw)` makes one and keeps it: in IndexedDB the CryptoKey itself (structured clone); in Node a random 32-byte key in `dir/device.key`, mode 0600, imported non-extractable; in memory, fresh per process
+     * or the app passes its own (`device: CryptoKey`), or `device: false` turns the layer off
+   * **Failures:** a record that doesn't open (tampered, moved, another key) is treated as absent and deleted, with a warning. A store with neither layer is refused unless `plaintext: true` is passed (tests).
+3. **Exports:** `LocalStore`, `SealedStore`, `sealedStore`, `memoryLocalStore`, `indexedDbLocalStore`; `nodeDiskLocalStore` from `@zen/client/node`.
+
+#### `@zen/db`: the queue on the store
+1. **`localQueueStore(sealed, ns)`** implements `QueueStore` over store `queue/<ns>`. Entries are CBOR: `Value`s, bytes and bigints round-trip (`cbor.ts`); `Pending` ops encode as integer-keyed maps.
+2. **Keeping the built commit.**
+   * Before the first send of a batch, the queue stores an **inflight** record: the encoded Commit (`zw.encodeCommit`), with its `commit_id` and its entry ids.
+   * `done` and `fail` remove it together with the entries; a rebuild (`conflict`, restamp, split) replaces it.
+   * **At load:** an inflight record is resent first, as is, with the same `commit_id`, until its outcome is known: success settles its entries, a final error fails them, network keeps waiting. Its entries are not packed again until then.
+   * Counter totals are not stored. After a restart they are read again from the server (`loadTotals`), so a resent counter commit then does not double-count.
+   * `QueueStore` gains optional `putInflight(r)`, `loadInflight()` and `removeInflight()`; the memory store implements them too.
+3. **Owner-only sender.** With a store shared between tabs (IndexedDB), only the owner sends (`db.onOwner`), as consumers do.
+   * Every tab writes its entries to the store and overlays the queue it has loaded.
+   * A tab that queues an entry posts `queued` on the tab channel (§9.2, `proxy.ts`), and the owner reloads the store.
+   * `flush()` in a non-owner waits until its own entries leave the store: a `sent` broadcast from the owner, or polling `pending` from the store.
+   * Without locks (`locks: null`) every instance sends, as now.
+4. **Options:** `DbOptions.local?: SealedStore`. When given, the queue uses `localQueueStore(local, ns)` unless `crdtStore` overrides it; 7e's caches use the same store.
+5. **Wipe:** `Db.wipe(local, ns)` clears every store of a database (sign-out).
+
+#### Spec (⚠️ `spec:` commit)
+* **formats.md §4:** kind 8, local records.
+* **zendb.md §9.3** rewritten, local state:
+  * the store and the record format
+  * the two layers and their defaults, and the device key
+  * failures are treated as absent
+  * wipe
+  * what is stored (7d: the queue; 7e: the caches)
+* **zendb.md §19.7:** the persisted queue, the inflight record and the resend at load, the owner-only sender.
+* **zendb.md §17:** the `local` vectors.
+
+#### Docs
+* `docs/CLIENT.md`: the local store, the layers, `@zen/client/node`.
+* `docs/DB.md` §19: "A queue that survives restarts".
+* `spec/TECH_DEBT.md`: TD-DB-PERSISTENT-CACHE stays open until 7e.
+
+#### Tests
+* **Rust:** seal and open round-trip; a moved record (another store, key or fs) fails; the vectors.
+* **`packages/client/test/local.test.ts`:**
+  * every backend: memory, Node disk in a temporary directory, IndexedDB through `fake-indexeddb` (a new dev dependency); put, get, list, delete, clear
+  * every layer combination round-trips
+  * a flipped byte, or a record copied to another key or store, reads as absent
+  * the Node device key file has mode 0600, and a second open reuses it
+  * a store without its device key reads nothing
+  * `vectors.test.ts` gains the `local` section
+* **`packages/db/test/crdtpersist.test.ts`** (its own server; `net` from crdtoffline):
+  * **Survives a restart:** queue writes offline, `close()`, reopen on the same disk store: entries are back, show in reads, and are sent once online.
+  * **A crash after a lost response:** the commit applied, the reply was lost, then a close and reopen. The resend has the same `commit_id` (captured) and the counter total is right (applied once).
+  * **A crash before any send:** a restart sends the entries normally.
+  * **Two tabs on one IndexedDB store** (`FakeLocks`, `FakeBus`): only the owner sends (commits counted per session); the other tab's writes arrive; closing the owner hands sending to the other tab.
+  * **Layers:** fs layer on, device layer off, both: the queue round-trips. A record sealed for another fs is dropped with a warning.
+  * **`Db.wipe`** leaves the store empty.
+* **Verification:**
+  * Rust: `cargo fmt --check`, clippy (default and `--no-default-features`), `cargo test -p zen-core`, `gen_vectors` (only the `local` section changes), `scripts/build-wasm.sh`
+  * JS: `npx biome check`; tsc for client (test config), fuse and db test; `npx vitest run` three times
+  * CI green on the PR before stopping
+* **Disk:** `CARGO_INCREMENTAL=0`; check disk first.
+
+### 7e: persisted caches and offline open (outline; detailed after 7d)
+* **Caches on the sealed store**, write-through with versions, loaded at open and bounded by the same LRU sizes (eviction deletes):
+  * CRDT ObjStates, with `checked` times: `cache` and `auto` reads after a restart
+  * rows and TableRecords: their versions keep §7.7's `expect`s coherent, so a stale copy only causes a retry
+  * private-index nodes (immutable, by id) and sealed blobs (by index and digest), read lazily on a miss
+* **Offline open:**
+  * the fs header (already sealed) is stored at `unlock`, and `unlock` falls back to it offline
+  * `Db.open` stores `/v1/info` limits and features, the DbRecord and the catalog; offline it opens from them when the stored schema equals the app's, and migrations wait for the server
+  * the app keeps its own session token
+* **Tests:** a cold start offline reads CRDT rows (both read modes) and cached rows; a stale persisted row re-runs its transaction; no node fetches on a warm start; wipe. TD-DB-PERSISTENT-CACHE resolved.
+
 ### Rhythm
 1. Restart from main, log the step 7 plan line, commit, push, open a new PR.
 2. Build 7a on the user's go: the `spec:` commit, then the code commit.
 3. Log the 7a line, push, update the PR, confirm CI is green, stop for compaction.
 4. 7b: restart from main, commit the 7b plan (`docs: milestone 5 step 7b plan`), open a new PR. Build it on the user's go (the `spec:` commit, then the code commit), log, push, confirm CI is green, stop.
-5. 7c the same way: restart from main, commit the 7c plan (`docs: milestone 5 step 7c plan`), open a new PR; build on the user's go (`spec:` commit, then code), log, push, confirm CI is green, stop. Step 7 is then done; step 8 (`@zen/fs`) is next.
+5. 7c the same way: restart from main, commit the 7c plan (`docs: milestone 5 step 7c plan`), open a new PR; build on the user's go (`spec:` commit, then code), log, push, confirm CI is green, stop.
+6. 7d and 7e the same way, each from main with its plan commit (`docs: milestone 5 step 7d plan`, then 7e's). Step 7 is then done; step 8 (`@zen/fs`, on the sealed local store) is next.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
 * **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).
