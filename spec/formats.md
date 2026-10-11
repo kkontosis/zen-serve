@@ -304,7 +304,9 @@ u8 meta_version = 1 ‖ u8 type ‖ lp(name) ‖ u32 mode ‖ u64 mtime_ms ‖ l
 * `name`: UTF-8 without `/` or NUL, 1–255 bytes.
 * `mode`: POSIX permission bits.
 * `mtime_ms`: unix milliseconds.
-* `xattrs`: CBOR map (may be empty, length 0).
+* `xattrs`: CBOR map (may be empty, length 0), from text names to byte strings.
+  * Names starting with `zen.` are reserved for zen-serve; others are the app's (zen-mount shows them in the `user.` namespace).
+  * `zen.content_type`: the node's media type (`text/html`, …), UTF-8 text, as served over HTTP (milestone 9).
 
 ### 11.3 Manifest (plaintext of a kind-5 object)
 

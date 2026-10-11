@@ -215,3 +215,15 @@ A client may keep a **replica** of a tree on its local store (`@zen/fs`, docs/CL
 * **Paths** walk from `ROOT` by display name (§8). A file with siblings (§4) shows its newest version under its name and each other one as a read-only **conflict copy** named `stem (conflict <first 8 hex digits of the writing device>-<n>).ext`, `n` counting from 2 in descending dot order (the newest version is the first).
 * **Offline**, reads use the kept node table and content; content that isn't kept fails with `offline`.
 * **One writer per store.** Where several tabs or processes share a store, one of them, the owner (a Web Lock, or a lock file on a Node disk store), follows the feed and writes the node table; the others read the store and reload the nodes the owner names on the tab channel. Kept content is immutable, so any of them may add it.
+
+### 11.1 Local writes
+
+A replica accepts writes (mkdir, file writes, symlinks, renames, deletes, mode, mtime, xattrs) without the server, and sends them later:
+* **The queue.** Each call is one **entry**: its operations, in order, with `move`/`meta` timestamps taken when the call is made, so an edit made offline keeps its place among the others. Entries are kept in the store (zendb.md §9.3) before the call returns, and survive a restart.
+* **What the replica shows** is the node table with the queue applied in order: moves and meta changes rewrite the nodes they touch, and a write gives its file a **local version** (sealed content kept in the store) that hides the versions it replaces. A queued entry stays shown until it is sent and the replica has caught up with the server's state.
+* **Writes replace the version shown** (and the file's earlier local writes, whose dots are filled in once they are known), not every version: a write made elsewhere meanwhile stays as a sibling, and both show (a conflict copy, §11). Deleting a conflict copy writes the shown version again, replacing that copy's version.
+* **Content.** A write is sealed when it is made, chunks and pages as on the server, and kept in the store; only chunks whose bytes changed are sealed (the others keep their ids, §4.1). Kept content of queued writes is never evicted. Before each commit its content is uploaded (again, after a restart: uploads of identical bytes are idempotent), so a write queued longer than `chunk_grace_secs` still finds it.
+* **Sending.** One sender, the owner (§11), sends entries in order, packed into commits within the limits, at most one write per node per commit. A batch's commit is stored before it is first sent and sent again, as is (the same `commit_id`, api.md §6), until its outcome is known, across restarts.
+  * `stale_op` / `clock_skew`: the batch is rebased (§3.4) and its timestamps taken afresh.
+  * `too_large`: the batch is split.
+  * Another refusal drops the batch's entries, and the server's state shows again. A move the server skips (a cycle, §3.2) is not a refusal: the next catch-up shows where the node is.
