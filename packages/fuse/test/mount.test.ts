@@ -238,7 +238,7 @@ def err(f):
     except OSError as e:
         return str(e.errno)
 print(err(lambda: os.getxattr(p, 'user.missing')))
-print(err(lambda: os.setxattr(p, 'security.zen', b'x')))
+print(err(lambda: os.getxattr(p, 'security.zen')))
 print(err(lambda: os.setxattr(p, 'user.k', b'x', os.XATTR_CREATE)))
 print(err(lambda: os.setxattr(p, 'user.new', b'x', os.XATTR_REPLACE)))`,
         f,
@@ -248,7 +248,7 @@ print(err(lambda: os.setxattr(p, 'user.new', b'x', os.XATTR_REPLACE)))`,
       'v1',
       'user.k,user.zen.content_type',
       '61', // ENODATA
-      '95', // EOPNOTSUPP
+      '95', // EOPNOTSUPP (a read: writing security.* needs a capability the kernel checks first)
       '17', // EEXIST
       '61',
     ]);
