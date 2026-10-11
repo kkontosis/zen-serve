@@ -288,7 +288,37 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * per-file content keys folded into the same format change
       * the vault as 7h
     * The plan commit restarts the branch from main and opens a new PR (#26).
-  * **7f** planned in detail (see "7f: large files, the format and the server").
+  * **7f** planned in detail (see "7f: large files, the format and the server"); PR #26 (the plan) merged.
+  * **7f** (paged versions and file keys, the Rust side): done, PR #27. As planned, with these details for 7g:
+    * **zen-core `fs.rs`:**
+      * `Manifest` (v1) is unchanged. Version 2 is a separate `ManifestV2 {size, chunk_size, n, key_epoch, file_key, body: Body::Inline | Body::Paged {page_size, pages: [(id, digest)]}}`, plus `AnyManifest::{V1, V2}`, `seal_any_manifest` and `open_any_manifest`. This replaces the planned `Manifest` enum, so callers of v1 didn't change.
+      * `encode_page`, `decode_page`, `page_digest`, `page_capacity(max_value_bytes)` (5,624 at the defaults), `new_file_key`, `file_chunk_key`, `seal_file_chunk`/`open_file_chunk(fs_id, file_key, key_epoch, chunk, …)`, `write_paged_bytes`.
+      * Labels: `FS_FILE`, `FS_PAGE`, `SIG_APP_BUNDLE` (also an accepted signature purpose, like `SIG_DB_ROOT`).
+    * **wasm:**
+      * `sealManifest`/`openManifest` stay v1.
+      * New: `sealManifestV2(tree, node, ManifestV2)`, `openAnyManifest` → `AnyManifest` (`version` 1 or 2; v2 has `chunks`, or `pageSize` + `pages: [{id, digest}]`), `newFileKey`, `sealFileChunk`/`openFileChunk(fs, fileKey, keyEpoch, chunkId, …)`, `encodePage`, `decodePage`, `pageDigest`, `pageCapacity`, `writePagedOpBytes`.
+      * Wire: `PagePut`, `PagesGet`, `PageData`, `Pages`; `Commit.pages`; `CrdtOp.write.pages`; `Version.pages`.
+      * 2,135,245 bytes.
+    * **Server:**
+      * `tree.rs`: `Content::{Chunks, Pages}`, with the paged version marked by `u32 0xFFFFFFFF`. `put_page` (the first upload adds `cr` per chunk; a re-upload only restarts the grace period), `release_content`, `page_gc_candidate`, `collect_pages` (runs before `collect_chunks`; at most about 20,000 chunk releases per transaction), `pages_get`.
+      * `commit.rs`: a page counts as one op, plus `data + 48 B per chunk`. A write carrying both chunks and pages gets 400. Pages apply after chunks and before ops.
+      * Keys `pg`/`pr`/`pz`/`pc`; the feature `"fs_pages"`; the route `/v1/fs/pages/get`.
+    * **Client:** `tree.ts` `versions` throws `unsupported` on a paged version until 7g; `packages/client/test/fsvectors.test.ts` (new).
+    * **⚠️ Spec:**
+      * formats.md §2, §4, §11.3 (v2), §11.4 (file keys), §11.5 (`write_paged` 0x04), §11.6 (pages)
+      * fs.md §4, §4.1, §4.2 (new: file keys), §6
+      * keyspace.md §3.6
+      * api.md §2, §6 (`pages`, its costs), §12
+      * labels.md
+    * **Docs:** `docs/STATS.md` §1.3; TECH_DEBT TD-FS-LARGE-FILES progress (resolved in 7g).
+    * **Tests:**
+      * `crates/zen-core/tests/fs.rs` (6)
+      * the `fs.json` v2 keys, in `tests/vectors.rs`
+      * `crates/zen-server/tests/fs.rs` +4: a round trip with refusals and the chain; shared pages, GC order, re-upload and quota; purge; a reference-model GC property test over three seeds. Three of them were checked to fail when page collection doesn't release chunks.
+      * vitest: 301 tests
+    * **CI fixes on #27:**
+      * **FoundationDB:** with a grace of 0, the GC tests assumed a single sweep sees the latest commits. On FoundationDB, commit versions can trail the clock the grace is measured with. The tests now use `sweep_until`, which sweeps to the expected state and checks after every sweep that no page outlives a chunk it lists. Two mutations (no chunk release; pages not counting their chunks) were each checked to fail.
+      * **A 7d bug** (`crdtpersist` "two tabs … increment": 14, not 16, in about 1 run in 6). Two tabs share one counter actor but each has its own clock, so a tab's `seq` could be no newer than the other tab's last one, and the server ignored it as a re-send. `loadTotals` now observes the `seq` of the entries it reads (after the lock, which already forces the read). zendb.md §19.7 and DB.md were updated.
 
 ## Facts the work must respect (from the code survey)
 

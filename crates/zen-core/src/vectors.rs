@@ -300,6 +300,68 @@ fn fs_vectors() -> Result<Value> {
         chain = fs::chain_next(&chain, op, &device);
         chains.push(json!({"op": h(op), "chain": h(&chain)}));
     }
+    // Version 2 (formats.md §11.3–11.6): a file key, an inline and a paged
+    // manifest, a page, a chunk under the file key, a paged write.
+    let file_key = fs::new_file_key(&mut DetRng::new("fs-file"))?;
+    let page_ids = [[0x55; 16], [0x56; 16]];
+    let pages = [
+        fs::encode_page(&chunk_ids[..1]),
+        fs::encode_page(&chunk_ids[1..]),
+    ];
+    let inline_v2 = fs::AnyManifest::V2(fs::ManifestV2 {
+        size: 70_000,
+        chunk_size: 65_536,
+        n: 2,
+        key_epoch: 0,
+        file_key,
+        body: fs::Body::Inline(chunk_ids.to_vec()),
+    });
+    let paged_v2 = fs::AnyManifest::V2(fs::ManifestV2 {
+        size: 70_000,
+        chunk_size: 65_536,
+        n: 2,
+        key_epoch: 0,
+        file_key,
+        body: fs::Body::Paged {
+            page_size: 1,
+            pages: page_ids
+                .iter()
+                .zip(&pages)
+                .map(|(id, p)| (*id, fs::page_digest(p)))
+                .collect(),
+        },
+    });
+    let sealed_inline_v2 = fs::seal_any_manifest(
+        &fsk,
+        &tree,
+        &node,
+        &inline_v2,
+        &mut DetRng::new("fs-manifest-v2-inline"),
+    )?;
+    let sealed_paged_v2 = fs::seal_any_manifest(
+        &fsk,
+        &tree,
+        &node,
+        &paged_v2,
+        &mut DetRng::new("fs-manifest-v2-paged"),
+    )?;
+    let sealed_file_chunk = fs::seal_file_chunk(
+        fsk.fs_id,
+        &file_key,
+        0,
+        &chunk_ids[0],
+        &chunk0,
+        &mut DetRng::new("fs-file-chunk"),
+    )?;
+    let paged_op = fs::write_paged_bytes(
+        fsk.fs_id,
+        &tree,
+        &node,
+        &[[0x66; 12]],
+        &page_ids,
+        &sealed_paged_v2,
+    );
+    let paged_chain = fs::chain_next(&chain, &paged_op, &device);
     Ok(json!({
         "description": "CRDT filesystem objects (formats.md §11) for the fixture fs at epoch 0.",
         "fs_data_key": h(fsk.fs_data_key().as_ref()),
@@ -309,6 +371,16 @@ fn fs_vectors() -> Result<Value> {
         "manifest": {"rng_seed": "fs-manifest", "plaintext": h(&manifest.encode()), "sealed": h(&sealed_manifest)},
         "chunk": {"rng_seed": "fs-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_chunk)},
         "op_chain": {"replaces": [h(&[0x66; 12])], "steps": chains},
+        "file_key": {"rng_seed": "fs-file", "key": h(&file_key), "key_epoch": 0,
+                     "chunk_key": h(fs::file_chunk_key(fsk.fs_id, &file_key).as_ref())},
+        "pages": page_ids.iter().zip(&pages).map(|(id, p)| json!({
+            "id": h(id), "page": h(p), "digest": h(&fs::page_digest(p)),
+        })).collect::<Vec<_>>(),
+        "manifest_v2_inline": {"rng_seed": "fs-manifest-v2-inline", "plaintext": h(&inline_v2.encode()), "sealed": h(&sealed_inline_v2)},
+        "manifest_v2_paged": {"rng_seed": "fs-manifest-v2-paged", "plaintext": h(&paged_v2.encode()), "sealed": h(&sealed_paged_v2)},
+        "file_chunk": {"rng_seed": "fs-file-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_file_chunk)},
+        "write_paged": {"op": h(&paged_op), "chain": h(&paged_chain),
+                        "description": "a paged write after the op_chain steps"},
     }))
 }
 

@@ -382,6 +382,13 @@ export class Tree {
       node,
     });
     return r.versions.map((v) => {
+      if (v.pages?.length) {
+        throw new ZenError(
+          0,
+          'unsupported',
+          'a paged file version: this client reads inline ones only',
+        );
+      }
       const manifest = this.fs.keysFor(v.manifest).openManifest(this.id, node, v.manifest);
       const same =
         manifest.chunks.length === v.chunks.length &&

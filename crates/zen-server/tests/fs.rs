@@ -83,6 +83,24 @@ fn write(node: [u8; 16], replaces: &[Vec<u8>], chunks: &[[u8; 16]], manifest: &[
         node: node.to_vec(),
         replaces: replaces.iter().map(|d| ByteBuf::from(d.clone())).collect(),
         chunks: chunks.iter().map(|c| ByteBuf::from(c.to_vec())).collect(),
+        pages: vec![],
+        manifest: manifest.to_vec(),
+    }
+}
+
+fn write_paged(
+    node: [u8; 16],
+    replaces: &[Vec<u8>],
+    pages: &[[u8; 16]],
+    manifest: &[u8],
+) -> CrdtOp {
+    CrdtOp::Write {
+        fs: 1,
+        tree: TREE.to_vec(),
+        node: node.to_vec(),
+        replaces: replaces.iter().map(|d| ByteBuf::from(d.clone())).collect(),
+        chunks: vec![],
+        pages: pages.iter().map(|c| ByteBuf::from(c.to_vec())).collect(),
         manifest: manifest.to_vec(),
     }
 }
@@ -1283,4 +1301,477 @@ async fn sweeper_visits_only_indexed_trees() {
         .await
         .unwrap();
     assert!(has(entry.clone()).await);
+}
+
+// ------------------------------------------------------------ paged versions
+
+fn chunk_put(c: [u8; 16]) -> ChunkPut {
+    ChunkPut {
+        fs: 1,
+        id: c.to_vec(),
+        data: vec![c[0]; 40],
+    }
+}
+
+fn page_put(p: [u8; 16], chunks: &[[u8; 16]]) -> PagePut {
+    PagePut {
+        fs: 1,
+        id: p.to_vec(),
+        data: zfs::encode_page(chunks),
+    }
+}
+
+async fn upload(
+    h: &Harness,
+    d: &Dev,
+    chunks: Vec<ChunkPut>,
+    pages: Vec<PagePut>,
+    ops: Vec<CrdtOp>,
+) -> Result<CommitResult, ApiErr> {
+    let c = Commit {
+        commit_id: rcid(),
+        chunks,
+        pages,
+        crdt_ops: ops,
+        ..Default::default()
+    };
+    h.call("/v1/commit", Some(&d.tok), &c).await
+}
+
+async fn page_data(h: &Harness, d: &Dev, p: [u8; 16]) -> Option<Vec<u8>> {
+    let r: Pages = h
+        .call(
+            "/v1/fs/pages/get",
+            Some(&d.tok),
+            &PagesGet {
+                fs: 1,
+                ids: vec![ByteBuf::from(p.to_vec())],
+            },
+        )
+        .await
+        .unwrap();
+    r.pages.into_iter().next().unwrap().data
+}
+
+async fn file(h: &Harness, d: &Dev, node: [u8; 16]) -> Versions {
+    h.call(
+        "/v1/fs/file/get",
+        Some(&d.tok),
+        &FileGet {
+            fs: 1,
+            tree: TREE.to_vec(),
+            node: node.to_vec(),
+            read_version: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn quota_bytes(h: &Harness) -> i64 {
+    let mut t = h.server.state.store.begin(None).await.unwrap();
+    t.get(&zen_server::keys::quota(1, "bytes"))
+        .await
+        .unwrap()
+        .map_or(0, |v| i64::from_le_bytes(v.try_into().unwrap()))
+}
+
+fn ids(v: &[ByteBuf]) -> Vec<[u8; 16]> {
+    v.iter().map(|b| b[..].try_into().unwrap()).collect()
+}
+
+/// A paged version round-trips through `file/get` and `pages/get`, its op
+/// is chained as `write_paged`, and malformed uploads and writes are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn paged_versions_round_trip_and_refusals() {
+    let (h, a, _) = two_devices(|c| c.limits.sweep_interval_secs = 3600).await;
+    let (p1, p2, p3) = (id(0xB1), id(0xB2), id(0xB3));
+    let c: Vec<[u8; 16]> = (0xC1..=0xC5).map(id).collect();
+    upload(
+        &h,
+        &a,
+        c[..4].iter().map(|&c| chunk_put(c)).collect(),
+        vec![page_put(p1, &c[..2]), page_put(p2, &c[2..4])],
+        vec![],
+    )
+    .await
+    .unwrap();
+    // The last chunk, its page and the write in one commit.
+    let t = zfs::hlc(now_ms(), 0);
+    upload(
+        &h,
+        &a,
+        vec![chunk_put(c[4])],
+        vec![page_put(p3, &c[4..])],
+        vec![
+            mv(id(1), ROOT, t, Some(b"big")),
+            write_paged(id(1), &[], &[p1, p2, p3], b"manifest"),
+        ],
+    )
+    .await
+    .unwrap();
+    let v = file(&h, &a, id(1)).await;
+    assert_eq!(v.versions.len(), 1);
+    assert!(v.versions[0].chunks.is_empty());
+    assert_eq!(ids(&v.versions[0].pages), [p1, p2, p3]);
+    assert_eq!(v.versions[0].manifest, b"manifest");
+    assert_eq!(
+        page_data(&h, &a, p2).await,
+        Some(zfs::encode_page(&c[2..4]))
+    );
+    assert_eq!(page_data(&h, &a, id(0xBF)).await, None);
+    // The op chain holds the paged write as `write_paged` (formats.md §11.5).
+    let chain: TreeChain = h
+        .call(
+            "/v1/fs/tree/chain",
+            Some(&a.tok),
+            &TreeRef {
+                fs: 1,
+                tree: TREE.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut want = zfs::chain_next(
+        &[0; 32],
+        &zfs::move_bytes(1, &TREE, &id(1), &ROOT, t, b"big"),
+        &a.fp,
+    );
+    want = zfs::chain_next(
+        &want,
+        &zfs::write_paged_bytes(1, &TREE, &id(1), &[], &[p1, p2, p3], b"manifest"),
+        &a.fp,
+    );
+    assert_eq!(chain.chain, want.to_vec());
+
+    let err = |r: Result<CommitResult, ApiErr>| {
+        let e = r.unwrap_err();
+        (e.0, e.1.message)
+    };
+    // A write naming an unknown page.
+    let (status, msg) = err(upload(
+        &h,
+        &a,
+        vec![],
+        vec![],
+        vec![write_paged(id(1), &[], &[id(0xBE)], b"m")],
+    )
+    .await);
+    assert_eq!((status, msg.as_str()), (400, "unknown page"));
+    // A page listing an unknown chunk.
+    let (status, msg) = err(upload(
+        &h,
+        &a,
+        vec![],
+        vec![page_put(id(0xB4), &[id(0xCE)])],
+        vec![],
+    )
+    .await);
+    assert_eq!((status, msg.as_str()), (400, "unknown chunk in page"));
+    // Malformed, or other bytes under an existing id.
+    let bad = PagePut {
+        fs: 1,
+        id: id(0xB5).to_vec(),
+        data: vec![0, 0, 0, 2, 1],
+    };
+    assert_eq!(err(upload(&h, &a, vec![], vec![bad], vec![]).await).0, 400);
+    let (status, msg) = err(upload(&h, &a, vec![], vec![page_put(p1, &c[..1])], vec![]).await);
+    assert_eq!(
+        (status, msg.as_str()),
+        (400, "page id already holds another page")
+    );
+    // Identical bytes again are fine.
+    upload(&h, &a, vec![], vec![page_put(p1, &c[..2])], vec![])
+        .await
+        .unwrap();
+    // A page over max_value_bytes (validated before any chunk is looked up).
+    let many: Vec<[u8; 16]> = (0..5_625u32).map(|_| id(0xC1)).collect();
+    assert_eq!(
+        err(upload(&h, &a, vec![], vec![page_put(id(0xB6), &many)], vec![]).await).0,
+        413
+    );
+    // A write with both chunks and pages.
+    let both = CrdtOp::Write {
+        fs: 1,
+        tree: TREE.to_vec(),
+        node: id(1).to_vec(),
+        replaces: vec![],
+        chunks: vec![ByteBuf::from(c[0].to_vec())],
+        pages: vec![ByteBuf::from(p1.to_vec())],
+        manifest: b"m".to_vec(),
+    };
+    assert_eq!(err(upload(&h, &a, vec![], vec![], vec![both]).await).0, 400);
+    // `/v1/info` advertises the feature.
+    let info: Info = h.get("/v1/info").await;
+    assert!(info.features.iter().any(|f| f == "fs_pages"));
+}
+
+/// Sweep until exactly `want_pages` of `pages` and `want_chunks` of
+/// `chunks` exist, checking after every sweep that no page outlives a chunk
+/// it lists (pages are collected first). With a grace of 0 this can still
+/// take a few sweeps: on FoundationDB, commit versions can trail the clock
+/// the grace is measured with.
+async fn sweep_until(
+    h: &Harness,
+    a: &Dev,
+    pages: &[([u8; 16], Vec<[u8; 16]>)],
+    chunks: &[[u8; 16]],
+    want_pages: &[[u8; 16]],
+    want_chunks: &[[u8; 16]],
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        zen_server::sweep_once(&h.server.state).await.unwrap();
+        let mut done = true;
+        for (p, list) in pages {
+            let present = page_data(h, a, *p).await.is_some();
+            if present {
+                for c in list {
+                    assert!(
+                        chunk_exists(h, a, *c).await,
+                        "page {p:02x?} outlived chunk {c:02x?}"
+                    );
+                }
+            }
+            done &= present == want_pages.contains(p);
+        }
+        for c in chunks {
+            done &= chunk_exists(h, a, *c).await == want_chunks.contains(c);
+        }
+        if done {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "swept to pages {want_pages:02x?}, chunks {want_chunks:02x?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Pages shared between versions keep their chunks; replaced pages are
+/// collected first and their chunks one grace period later; a re-upload
+/// doesn't count a page's chunks twice; quota follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_pages_and_gc_order() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 0;
+        c.limits.sweep_interval_secs = 3600; // swept by hand below
+    })
+    .await;
+    let n = id(1);
+    ops(&h, &a, vec![mv(n, ROOT, zfs::hlc(now_ms(), 0), Some(b"f"))])
+        .await
+        .unwrap();
+    let q0 = quota_bytes(&h).await;
+    let c: Vec<[u8; 16]> = (0xC1..=0xC6).map(id).collect();
+    let (a1, a2, b2, u) = (id(0xA1), id(0xA2), id(0xB2), id(0xEE));
+    // Version A: [c1 c2][c3].
+    let r = upload(
+        &h,
+        &a,
+        c.iter().map(|&c| chunk_put(c)).collect(),
+        vec![page_put(a1, &c[..2]), page_put(a2, &c[2..3])],
+        vec![write_paged(n, &[], &[a1, a2], b"vA")],
+    )
+    .await
+    .unwrap();
+    let da = r.dots[0].to_vec();
+    // Version B appends: [c1 c2][c3 c4], reusing a1 and replacing A. A page
+    // nothing ever references, and c6, referenced by nothing at all.
+    let r = upload(
+        &h,
+        &a,
+        vec![],
+        vec![page_put(b2, &c[2..4]), page_put(u, &c[4..5])],
+        vec![write_paged(n, &[da], &[a1, b2], b"vB")],
+    )
+    .await
+    .unwrap();
+    let db = r.dots[0].to_vec();
+    let pages = [
+        (a1, c[..2].to_vec()),
+        (a2, c[2..3].to_vec()),
+        (b2, c[2..4].to_vec()),
+        (u, c[4..5].to_vec()),
+    ];
+    // a2 and u go, with c5 (only u listed it) and c6 (nothing did); a1
+    // (shared) and b2 stay, and B reads fully.
+    sweep_until(&h, &a, &pages, &c, &[a1, b2], &c[..4]).await;
+    // Re-uploading a1 restarts its grace without counting its chunks again:
+    // once B is replaced, every page and chunk goes.
+    upload(&h, &a, vec![], vec![page_put(a1, &c[..2])], vec![])
+        .await
+        .unwrap();
+    upload(&h, &a, vec![], vec![], vec![write(n, &[db], &[], b"vC")])
+        .await
+        .unwrap();
+    sweep_until(&h, &a, &pages, &c, &[], &[]).await;
+    assert_eq!(quota_bytes(&h).await, q0 + b"vC".len() as i64);
+}
+
+/// Purging a node releases the pages of its versions, then their chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_releases_pages() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.crdt_horizon_secs = 2;
+        c.limits.crdt_max_skew_ms = 500;
+        c.limits.chunk_grace_secs = 0;
+        c.limits.sweep_interval_secs = 3600;
+    })
+    .await;
+    let t = zfs::hlc(now_ms(), 0);
+    let (p, c) = (id(0xA1), id(0xC1));
+    upload(
+        &h,
+        &a,
+        vec![chunk_put(c)],
+        vec![page_put(p, &[c])],
+        vec![
+            mv(id(1), ROOT, t, Some(b"f")),
+            write_paged(id(1), &[], &[p], b"m"),
+        ],
+    )
+    .await
+    .unwrap();
+    ops(&h, &a, vec![mv(id(1), TRASH, t + 1, None)])
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        zen_server::sweep_once(&h.server.state).await.unwrap();
+        if page_data(&h, &a, p).await.is_none() && !chunk_exists(&h, &a, c).await {
+            break;
+        }
+        assert!(Instant::now() < deadline, "page and chunk collected");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A live version in the reference model: its dot, whether it is paged,
+/// and its chunk or page ids.
+type LiveVersion = (Vec<u8>, bool, Vec<[u8; 16]>);
+
+/// Random uploads and inline, paged and sibling writes: after the sweeps,
+/// exactly the pages of live versions and the chunks of live inline
+/// versions and live pages remain (three seeds).
+#[tokio::test(flavor = "multi_thread")]
+async fn paged_gc_matches_reference() {
+    use std::collections::{BTreeSet, HashMap};
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 0;
+        c.limits.sweep_interval_secs = 3600;
+    })
+    .await;
+    for seed in [1u64, 2, 3] {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let tagged = |tag: u8, i: usize| {
+            let mut b = [tag; 16];
+            b[0] = seed as u8;
+            b[1..3].copy_from_slice(&(i as u16).to_be_bytes());
+            b
+        };
+        let nodes: Vec<[u8; 16]> = (0..3).map(|i| tagged(0x10, i)).collect();
+        let t = zfs::hlc(now_ms(), 0);
+        ops(
+            &h,
+            &a,
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| mv(n, ROOT, t + i as u64, None))
+                .collect(),
+        )
+        .await
+        .unwrap();
+        let (mut chunks, mut pages) = (Vec::new(), Vec::<([u8; 16], Vec<[u8; 16]>)>::new());
+        // Live versions per node: dot → (inline chunks, pages).
+        let mut live: HashMap<[u8; 16], Vec<LiveVersion>> = HashMap::new();
+        for _ in 0..60 {
+            match rnd(5) {
+                0 => {
+                    let c = tagged(0xC0, chunks.len());
+                    upload(&h, &a, vec![chunk_put(c)], vec![], vec![])
+                        .await
+                        .unwrap();
+                    chunks.push(c);
+                }
+                1 if !chunks.is_empty() => {
+                    let list: Vec<[u8; 16]> = (0..1 + rnd(3))
+                        .map(|_| chunks[rnd(chunks.len() as u64) as usize])
+                        .collect();
+                    let p = tagged(0xA0, pages.len());
+                    upload(&h, &a, vec![], vec![page_put(p, &list)], vec![])
+                        .await
+                        .unwrap();
+                    pages.push((p, list));
+                }
+                k @ (2..=4) => {
+                    let n = nodes[rnd(3) as usize];
+                    let vs = live.entry(n).or_default();
+                    // 2: replace every version; 3, 4: also add a sibling.
+                    let replaces: Vec<Vec<u8>> = if k == 2 {
+                        vs.iter().map(|v| v.0.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let paged = rnd(2) == 0 && !pages.is_empty();
+                    let list: Vec<[u8; 16]> = if paged {
+                        (0..1 + rnd(3))
+                            .map(|_| pages[rnd(pages.len() as u64) as usize].0)
+                            .collect()
+                    } else if chunks.is_empty() {
+                        Vec::new()
+                    } else {
+                        (0..rnd(3))
+                            .map(|_| chunks[rnd(chunks.len() as u64) as usize])
+                            .collect()
+                    };
+                    let op = if paged {
+                        write_paged(n, &replaces, &list, b"m")
+                    } else {
+                        write(n, &replaces, &list, b"m")
+                    };
+                    let r = ops(&h, &a, vec![op]).await.unwrap();
+                    if k == 2 {
+                        vs.clear();
+                    }
+                    vs.push((r.dots[0].to_vec(), paged, list));
+                }
+                _ => {}
+            }
+        }
+        let mut want_pages = BTreeSet::new();
+        let mut want_chunks = BTreeSet::new();
+        for vs in live.values() {
+            for (_, paged, list) in vs {
+                for &x in list {
+                    if *paged {
+                        want_pages.insert(x);
+                    } else {
+                        want_chunks.insert(x);
+                    }
+                }
+            }
+        }
+        for (p, list) in &pages {
+            if want_pages.contains(p) {
+                want_chunks.extend(list.iter().copied());
+            }
+        }
+        let want_pages: Vec<[u8; 16]> = want_pages.into_iter().collect();
+        let want_chunks: Vec<[u8; 16]> = want_chunks.into_iter().collect();
+        sweep_until(&h, &a, &pages, &chunks, &want_pages, &want_chunks).await;
+        // Every live version still reads back as written.
+        for (n, vs) in &live {
+            let got = file(&h, &a, *n).await;
+            assert_eq!(got.versions.len(), vs.len(), "seed {seed}");
+        }
+    }
 }

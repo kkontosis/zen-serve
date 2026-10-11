@@ -67,6 +67,7 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
         return Err(bad_request("commit_id must be 16 bytes"));
     }
     let ops = req.chunks.len()
+        + req.pages.len()
         + req.crdt_ops.len()
         + req.read_conflicts.len()
         + req.expect.len()
@@ -147,6 +148,12 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
         value_ok(c.data.len())?;
         bytes += c.data.len() + c.id.len();
     }
+    for p in &req.pages {
+        fs_ok(p.fs, R_WRITE)?;
+        value_ok(p.data.len())?;
+        // The page's data, plus a reference-count add per chunk it lists.
+        bytes += p.data.len() + p.id.len() + 48 * (p.data.len() / 16);
+    }
     let mut written = HashSet::new();
     for op in &req.crdt_ops {
         fs_ok(op.fs(), R_WRITE)?;
@@ -171,15 +178,20 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
                 node,
                 replaces,
                 chunks,
+                pages,
                 manifest,
             } => {
-                value_ok(manifest.len() + 16 * chunks.len())?;
+                if !chunks.is_empty() && !pages.is_empty() {
+                    return Err(bad_request("a write carries chunks or pages, not both"));
+                }
+                let n = chunks.len() + pages.len();
+                value_ok(manifest.len() + 16 * n)?;
                 // A second write to one node in a commit could not read
                 // the first one's pending (versionstamped) version.
                 if !written.insert((*fs, tree.clone(), node.clone())) {
                     return Err(bad_request("one write per node per commit"));
                 }
-                bytes += 48 + manifest.len() + 16 * chunks.len() + 12 * replaces.len();
+                bytes += 48 + manifest.len() + 16 * n + 12 * replaces.len();
             }
             _ => bytes += 64 + crate::crdt::validate(st, op)?,
         }
@@ -379,6 +391,9 @@ pub async fn execute(
         let mut eng = crate::tree::Engine::new(st, caller.device);
         for c in &req.chunks {
             eng.put_chunk(&mut t, c).await?;
+        }
+        for p in &req.pages {
+            eng.put_page(&mut t, p).await?;
         }
         let mut rows = crate::crdt::RowEngine::new(st, caller.device);
         for op in &req.crdt_ops {

@@ -164,6 +164,37 @@ fn fs_vectors_open_from_files() {
     }
     let hlc = v["hlc"]["hlc"].as_u64().unwrap();
     assert_eq!(fs::hlc_ms(hlc), v["hlc"]["unix_ms"].as_u64().unwrap());
+    // Version 2: pages, manifests, a chunk under the file key, a paged write.
+    let fk: [u8; 32] = hx(&v["file_key"]["key"]).try_into().unwrap();
+    assert_eq!(
+        fs::file_chunk_key(fsk.fs_id, &fk).to_vec(),
+        hx(&v["file_key"]["chunk_key"])
+    );
+    let mut page_ids = Vec::new();
+    for p in v["pages"].as_array().unwrap() {
+        let page = hx(&p["page"]);
+        assert_eq!(fs::page_digest(&page).to_vec(), hx(&p["digest"]));
+        fs::decode_page(&page).unwrap();
+        page_ids.push(<[u8; 16]>::try_from(hx(&p["id"])).unwrap());
+    }
+    for name in ["manifest_v2_inline", "manifest_v2_paged"] {
+        let m = fs::open_any_manifest(&fsk, &tree, &node, &hx(&v[name]["sealed"])).unwrap();
+        assert_eq!(m.encode(), hx(&v[name]["plaintext"]));
+        let fs::AnyManifest::V2(m) = m else {
+            panic!("version 2")
+        };
+        assert_eq!(m.file_key, fk);
+    }
+    assert_eq!(
+        fs::open_file_chunk(fsk.fs_id, &fk, 0, &cid, &hx(&v["file_chunk"]["sealed"])).unwrap(),
+        hx(&v["file_chunk"]["plaintext"])
+    );
+    let paged = hx(&v["write_paged"]["op"]);
+    assert_eq!(paged[0], 4);
+    assert_eq!(
+        fs::chain_next(&chain, &paged, &device).to_vec(),
+        hx(&v["write_paged"]["chain"])
+    );
 }
 
 #[test]

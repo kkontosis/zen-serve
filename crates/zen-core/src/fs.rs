@@ -3,6 +3,7 @@
 //! canonical operation encoding behind the per-tree op chain.
 
 use crate::encoding::{Reader, lp};
+use crate::kdf::{Key32, kdf};
 use crate::keys::FsKeys;
 use crate::labels;
 use crate::rng::Rng;
@@ -180,6 +181,204 @@ impl Manifest {
     }
 }
 
+/// The body of a version-2 manifest: the chunk list inline, or its pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Body {
+    /// Chunk ids in file order (form 1).
+    Inline(Vec<Id>),
+    /// Pages of `page_size` chunk ids each, the last possibly shorter, with
+    /// their digests (form 2).
+    Paged {
+        /// Chunk ids per page.
+        page_size: u32,
+        /// `(page_id, page_digest)` in file order.
+        pages: Vec<(Id, [u8; 32])>,
+    },
+}
+
+/// Plaintext of a version-2 manifest (formats.md §11.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestV2 {
+    /// File size in bytes.
+    pub size: u64,
+    /// Plaintext bytes per chunk (all but the last).
+    pub chunk_size: u32,
+    /// Number of chunks.
+    pub n: u64,
+    /// The epoch the file key was made in; the chunks' header epoch.
+    pub key_epoch: u32,
+    /// The file key (formats.md §11.4).
+    pub file_key: [u8; 32],
+    /// The chunk list or its pages.
+    pub body: Body,
+}
+
+impl ManifestV2 {
+    /// `0x02 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u32 key_epoch ‖ file_key ‖ u8 form ‖ body`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(58 + 48 * self.n.min(1 << 16) as usize);
+        out.push(2);
+        out.extend_from_slice(&self.size.to_be_bytes());
+        out.extend_from_slice(&self.chunk_size.to_be_bytes());
+        out.extend_from_slice(&self.n.to_be_bytes());
+        out.extend_from_slice(&self.key_epoch.to_be_bytes());
+        out.extend_from_slice(&self.file_key);
+        match &self.body {
+            Body::Inline(chunks) => {
+                out.push(1);
+                for c in chunks {
+                    out.extend_from_slice(c);
+                }
+            }
+            Body::Paged { page_size, pages } => {
+                out.push(2);
+                out.extend_from_slice(&page_size.to_be_bytes());
+                out.extend_from_slice(&(pages.len() as u32).to_be_bytes());
+                for (id, digest) in pages {
+                    out.extend_from_slice(id);
+                    out.extend_from_slice(digest);
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode, checking the form and the page count against `n`.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != 2 {
+            return Err(Error::Format);
+        }
+        let size = r.u64()?;
+        let chunk_size = r.u32()?;
+        let n = r.u64()?;
+        let key_epoch = r.u32()?;
+        let file_key = r.array()?;
+        let body = match r.u8()? {
+            1 => {
+                // Each id is 16 bytes, so `n` can't exceed what is left.
+                if n > (bytes.len() / ID_LEN) as u64 {
+                    return Err(Error::Format);
+                }
+                let mut chunks = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    chunks.push(r.array()?);
+                }
+                Body::Inline(chunks)
+            }
+            2 => {
+                let page_size = r.u32()?;
+                let m = r.u32()? as u64;
+                let want = if n == 0 {
+                    0
+                } else if page_size == 0 {
+                    return Err(Error::Format);
+                } else {
+                    n.div_ceil(page_size as u64)
+                };
+                if m != want || m > (bytes.len() / 48) as u64 {
+                    return Err(Error::Format);
+                }
+                let mut pages = Vec::with_capacity(m as usize);
+                for _ in 0..m {
+                    pages.push((r.array()?, r.array()?));
+                }
+                Body::Paged { page_size, pages }
+            }
+            _ => return Err(Error::Format),
+        };
+        r.finish()?;
+        Ok(ManifestV2 {
+            size,
+            chunk_size,
+            n,
+            key_epoch,
+            file_key,
+            body,
+        })
+    }
+
+    /// The number of chunk ids page `i` holds: `page_size`, the last fewer.
+    pub fn page_len(&self, i: usize) -> Option<u32> {
+        let Body::Paged { page_size, pages } = &self.body else {
+            return None;
+        };
+        if i >= pages.len() {
+            return None;
+        }
+        let before = i as u64 * *page_size as u64;
+        Some((self.n - before).min(*page_size as u64) as u32)
+    }
+}
+
+/// A manifest of either version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnyManifest {
+    /// Version 1: chunks under the fs keys.
+    V1(Manifest),
+    /// Version 2: chunks under a file key, inline or paged.
+    V2(ManifestV2),
+}
+
+impl AnyManifest {
+    /// Encode.
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            AnyManifest::V1(m) => m.encode(),
+            AnyManifest::V2(m) => m.encode(),
+        }
+    }
+
+    /// Decode by the version byte.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        match bytes.first() {
+            Some(1) => Ok(AnyManifest::V1(Manifest::decode(bytes)?)),
+            Some(2) => Ok(AnyManifest::V2(ManifestV2::decode(bytes)?)),
+            _ => Err(Error::Format),
+        }
+    }
+}
+
+// ------------------------------------------------------------------ pages
+
+/// Most chunk ids a page can hold within `max_value_bytes`.
+pub fn page_capacity(max_value_bytes: u32) -> u32 {
+    (max_value_bytes.saturating_sub(4) / ID_LEN as u32).max(1)
+}
+
+/// A page of a paged version's chunk list (formats.md §11.6): `u32 n ‖ n × chunk_id`.
+pub fn encode_page(chunks: &[Id]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + ID_LEN * chunks.len());
+    out.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+    for c in chunks {
+        out.extend_from_slice(c);
+    }
+    out
+}
+
+/// Decode a page; at least one id, and nothing after the last.
+pub fn decode_page(bytes: &[u8]) -> Result<Vec<Id>> {
+    if bytes.len() < 4 {
+        return Err(Error::Format);
+    }
+    let n = u32::from_be_bytes(bytes[..4].try_into().expect("4")) as usize;
+    if n == 0 || bytes.len() != 4 + ID_LEN * n {
+        return Err(Error::Format);
+    }
+    Ok(bytes[4..]
+        .chunks(ID_LEN)
+        .map(|c| c.try_into().expect("16"))
+        .collect())
+}
+
+/// `page_digest = BLAKE3.derive_key("zen/v1/fs-page", page)`.
+pub fn page_digest(page: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(labels::FS_PAGE)
+        .update(page)
+        .finalize()
+        .as_bytes()
+}
+
 // ------------------------------------------------------------------ sealing
 
 fn node_ctx(label: &'static str, fs_id: u32, tree: &Id, node: &Id) -> Aad {
@@ -275,6 +474,83 @@ pub fn open_chunk(fs: &FsKeys, chunk: &Id, sealed: &[u8]) -> Result<Vec<u8>> {
     open_at(fs, Kind::FsChunk, &chunk_ctx(fs.fs_id, chunk), sealed)
 }
 
+/// Seal a manifest of either version (kind 5), bound to its fs, tree and node.
+pub fn seal_any_manifest(
+    fs: &FsKeys,
+    tree: &Id,
+    node: &Id,
+    manifest: &AnyManifest,
+    rng: &mut dyn Rng,
+) -> Result<Vec<u8>> {
+    let aad = node_ctx(labels::AAD_FS_MANIFEST, fs.fs_id, tree, node);
+    seal::seal(
+        Kind::FsManifest,
+        fs.epoch,
+        &fs.fs_data_key(),
+        &aad,
+        &manifest.encode(),
+        rng,
+    )
+}
+
+/// Open a manifest of either version.
+pub fn open_any_manifest(fs: &FsKeys, tree: &Id, node: &Id, sealed: &[u8]) -> Result<AnyManifest> {
+    let aad = node_ctx(labels::AAD_FS_MANIFEST, fs.fs_id, tree, node);
+    AnyManifest::decode(&open_at(fs, Kind::FsManifest, &aad, sealed)?)
+}
+
+/// A fresh file key.
+pub fn new_file_key(rng: &mut dyn Rng) -> Result<[u8; 32]> {
+    let mut k = [0u8; 32];
+    rng.fill(&mut k)?;
+    Ok(k)
+}
+
+/// The chunk key of a version-2 file: `KDF("zen/v1/fs-file", file_key, u32(fs))`.
+pub fn file_chunk_key(fs_id: u32, file_key: &[u8; 32]) -> Key32 {
+    kdf(labels::FS_FILE, file_key, &fs_id.to_be_bytes())
+}
+
+/// Seal a chunk of a version-2 file (kind 6) under its file key; the
+/// header's epoch is the manifest's `key_epoch`.
+pub fn seal_file_chunk(
+    fs_id: u32,
+    file_key: &[u8; 32],
+    key_epoch: u32,
+    chunk: &Id,
+    data: &[u8],
+    rng: &mut dyn Rng,
+) -> Result<Vec<u8>> {
+    seal::seal(
+        Kind::FsChunk,
+        key_epoch,
+        &file_chunk_key(fs_id, file_key),
+        &chunk_ctx(fs_id, chunk),
+        data,
+        rng,
+    )
+}
+
+/// Open a chunk of a version-2 file; its header epoch must be `key_epoch`.
+pub fn open_file_chunk(
+    fs_id: u32,
+    file_key: &[u8; 32],
+    key_epoch: u32,
+    chunk: &Id,
+    sealed: &[u8],
+) -> Result<Vec<u8>> {
+    let (epoch, pt) = seal::open(
+        Kind::FsChunk,
+        &file_chunk_key(fs_id, file_key),
+        &chunk_ctx(fs_id, chunk),
+        sealed,
+    )?;
+    if epoch != key_epoch {
+        return Err(Error::Decrypt);
+    }
+    Ok(pt)
+}
+
 // ------------------------------------------------------------------ op chain
 
 fn op_head(tag: u8, fs_id: u32, tree: &Id, node: &Id) -> Vec<u8> {
@@ -321,6 +597,28 @@ pub fn write_bytes(
     b.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
     for c in chunks {
         b.extend_from_slice(c);
+    }
+    lp(&mut b, manifest);
+    b
+}
+
+/// Canonical bytes of a `write` with `pages` (`write_paged`).
+pub fn write_paged_bytes(
+    fs_id: u32,
+    tree: &Id,
+    node: &Id,
+    replaces: &[[u8; DOT_LEN]],
+    pages: &[Id],
+    manifest: &[u8],
+) -> Vec<u8> {
+    let mut b = op_head(4, fs_id, tree, node);
+    b.extend_from_slice(&(replaces.len() as u32).to_be_bytes());
+    for d in replaces {
+        b.extend_from_slice(d);
+    }
+    b.extend_from_slice(&(pages.len() as u32).to_be_bytes());
+    for p in pages {
+        b.extend_from_slice(p);
     }
     lp(&mut b, manifest);
     b

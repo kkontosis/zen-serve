@@ -22,6 +22,7 @@ NK    (32 B, random, long-lived)          MK_e  (32 B, random per epoch)
 * **Naming keys are never rotated by a revocation.** So stored keys, topic ids, ACL prefixes, cursors and subscriptions survive epoch changes. `key_epoch` appears in sealed objects only, **never** inside a token.
 * **Revocation** (`rotate`): pick a fresh `MK_{e+1}`, keep NK, and write an **epoch-chain record**: a sealed object (§4) of kind 3 with `key_epoch = e+1`, plaintext `MK_e` (32 B), key = the chain key of epoch e+1, and AAD context `u32(fs)`. A holder of epoch e+1 can therefore walk back to every earlier epoch.
 * **Key bundle** (keyslot payload, 72 B): `u32(fs_id) ‖ u32(epoch) ‖ NK ‖ MK_e`.
+* **File keys** (§11.3, §11.4): a file's chunks under a version-2 manifest are sealed under `KDF("zen/v1/fs-file", file_key, u32(fs))`, where `file_key` is 32 random bytes kept in the file's sealed manifest. It is outside the epoch tree, so one file can be handed over without the fs keys (milestone 11).
 
 ## 3. Tokens
 
@@ -85,7 +86,7 @@ Total = 48 + plaintext length.
 | 3 epoch chain | `zen/v1/aad/epoch-chain` | `u32(fs)` | chain key of `key_epoch` |
 | 4 fs node meta | `zen/v1/aad/fs-meta` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
 | 5 fs manifest | `zen/v1/aad/fs-manifest` | `u32(fs) ‖ tree(16) ‖ node(16)` | filesystem AEAD key of `key_epoch` |
-| 6 fs chunk | `zen/v1/aad/fs-chunk` | `u32(fs) ‖ chunk_id(16)` | filesystem AEAD key of `key_epoch` |
+| 6 fs chunk | `zen/v1/aad/fs-chunk` | `u32(fs) ‖ chunk_id(16)` | filesystem AEAD key of `key_epoch` (a version-1 manifest), or the file's chunk key (a version-2 manifest, §11.4) |
 | 7 CRDT value | `zen/v1/aad/crdt-value` | `u32(fs) ‖ lp(object) ‖ field(16) ‖ elem(16)` (zendb.md §19.2) | KV AEAD key of `key_epoch` |
 | 8 local record | `zen/v1/aad/local` | `u32(fs) ‖ lp(store) ‖ lp(record_key)` (zendb.md §9.3) | KV AEAD key of `key_epoch` |
 
@@ -307,16 +308,38 @@ u8 meta_version = 1 ‖ u8 type ‖ lp(name) ‖ u32 mode ‖ u64 mtime_ms ‖ l
 
 ### 11.3 Manifest (plaintext of a kind-5 object)
 
+Version 1, read but no longer written by clients from milestone 5 (step 7g) on:
+
 ```
 u8 manifest_version = 1 ‖ u64 size ‖ u32 chunk_size ‖ u32 n ‖ n × chunk_id(16)
 ```
 
 * `size` is the exact file size in bytes. Every chunk holds `chunk_size` plaintext bytes except the last.
 * The chunk list must equal the `chunks` of the `write` that carries the manifest (fs.md §4).
+* Its chunks are sealed under the filesystem AEAD key of their `key_epoch`.
+
+Version 2:
+
+```
+u8 manifest_version = 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u32 key_epoch ‖ file_key(32) ‖ u8 form ‖ body
+form 1, inline:  body = n × chunk_id(16)
+form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32))
+```
+
+* `n` is the number of chunks; `size` and `chunk_size` are as in version 1.
+* `file_key` and `key_epoch`: the file's chunk key (§11.4) and the epoch the file key was made in.
+* **Inline:** the chunk list must equal the `chunks` of the `write` that carries the manifest.
+* **Paged:** the chunk list is split into pages (§11.6) of `page_size ≥ 1` ids each, every page full but the last, so `m = ceil(n / page_size)` (and `m = 0` when `n = 0`). Chunk `i` is in page `i / page_size` at slot `i % page_size`. The page ids must equal the `pages` of the `write`, in order. A reader checks each page against its `page_digest` and its expected count when it fetches it, so a page that was swapped, reordered or truncated is detected.
+* A decoder refuses any other `form`, a paged `m` other than `ceil(n / page_size)`, `page_size = 0` with `n > 0`, and trailing bytes.
+* At the defaults (`max_value_bytes` 90,000) a paged version holds about 1,870 pages of 5,624 chunks, about 640 GiB at 64 KiB per chunk.
 
 ### 11.4 Chunk (kind 6)
 
 The plaintext is the chunk's bytes. A chunk is bound to its fs and id, so the server can't substitute one chunk for another.
+
+* **Under a version-1 manifest** it is sealed under the filesystem AEAD key of `key_epoch`.
+* **Under a version-2 manifest** it is sealed under the file's chunk key `KDF("zen/v1/fs-file", file_key, u32(fs))` (§2), and its header's `key_epoch` is the manifest's `key_epoch`. A reader opens it with the key the manifest gives, and checks the header epoch against the manifest's.
+* **One file key per node**, kept across the node's versions so a new version reuses unchanged chunks. A writer whose fs is at a newer epoch than the node's `key_epoch` picks a fresh file key and re-seals every chunk (fs.md §4.2). A copy to another node may keep the key and reuse the chunks.
 
 ### 11.5 Operation encoding and op chain
 
@@ -327,10 +350,14 @@ move   = 0x01 ‖ u32(fs) ‖ tree ‖ node ‖ parent ‖ u64(hlc) ‖ lp(meta 
 meta   = 0x02 ‖ u32(fs) ‖ tree ‖ node ‖ u64(hlc) ‖ lp(meta)
 write  = 0x03 ‖ u32(fs) ‖ tree ‖ node ‖ u32(r) ‖ r × dot(12)
               ‖ u32(n) ‖ n × chunk_id ‖ lp(manifest)
+write_paged
+       = 0x04 ‖ u32(fs) ‖ tree ‖ node ‖ u32(r) ‖ r × dot(12)
+              ‖ u32(m) ‖ m × page_id ‖ lp(manifest)
 ```
 
 * `meta` and `manifest` are the sealed objects, byte for byte.
-* In `write`, the `r` dots are `replaces`. The new version's own dot is not part of the chain: it is only known once the commit commits.
+* In `write` and `write_paged`, the `r` dots are `replaces`. The new version's own dot is not part of the chain: it is only known once the commit commits.
+* A `write` with `pages` (fs.md §4) is encoded as `write_paged`; every other `write`, an empty one included, as `write`.
 
 The chain starts at 32 zero bytes. Each operation accepted by the server extends it, in arrival order:
 
@@ -338,6 +365,18 @@ The chain starts at 32 zero bytes. Each operation accepted by the server extends
 chain_n = BLAKE3.derive_key("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op_bytes) ‖ device_fp(32))
 ```
 
+
+### 11.6 Page
+
+A page holds part of a paged version's chunk list (§11.3). It is stored and read by the server in the clear, like the inline `chunks` of a `write`:
+
+```
+page = u32 n ‖ n × chunk_id(16)          1 ≤ n, 4 + 16n ≤ max_value_bytes
+page_digest = BLAKE3.derive_key("zen/v1/fs-page", page)
+```
+
+* A page id is 16 random bytes chosen by the client. A page is immutable: an id never holds other bytes (fs.md §4.1).
+* At the defaults a page holds up to 5,624 chunk ids, about 351 MiB at 64 KiB per chunk.
 
 ## 12. fs header
 

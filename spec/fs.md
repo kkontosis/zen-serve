@@ -101,18 +101,22 @@ meta {node, hlc, meta}
 ## 4. Content
 
 ```
-write {node, replaces: [dot], chunks: [chunk_id], manifest}
+write {node, replaces: [dot], chunks: [chunk_id] | pages: [page_id], manifest}
 ```
 
 * A node's content is a **multi-value register** of **versions**:
-  * Each version is `{dot, device, chunks, manifest}`.
+  * Each version is `{dot, device, chunks | pages, manifest}`.
   * `dot` is a 12-byte id assigned by the server: `versionstamp ‖ u16(i)`, where `i` is the write's position among the commit's writes. Dots are returned in the commit result.
 * `replaces` lists the dots of the versions the writer had seen. The server removes those that still exist, then adds the new version.
 * **Concurrent writes** each replace only what their author saw, so both survive as **siblings**. A client shows them as conflict copies. A later write that lists both resolves the conflict.
-* `chunks` lists the version's chunk ids in file order. The server sees them (so it can garbage-collect chunks), but not their order's meaning or the file size.
-* `manifest` is the sealed manifest (formats.md §11.3): the file size, chunk size, and the same chunk list, authenticated. Clients check that it matches `chunks`.
-* `write` with no chunks writes an empty file. The server doesn't distinguish files from directories, so the client decides whether a directory has content.
-* Every chunk must exist when the write commits: uploaded earlier, or in the same commit.
+* A version lists its chunks in one of two forms:
+  * **inline:** `chunks`, the chunk ids in file order
+  * **paged:** `pages`, the ids of the pages (§4.1) that hold the chunk ids, in file order. A large file uses it: the inline list must fit one value with the manifest.
+
+  The server sees the ids (so it can garbage-collect chunks and pages), but not their order's meaning or the file size. A `write` with both `chunks` and `pages` is refused (400).
+* `manifest` is the sealed manifest (formats.md §11.3): the file size, chunk size, the file key, and the same chunk list or page list, authenticated. Clients check that it matches `chunks` or `pages`, and check each page against its digest.
+* `write` with neither writes an empty file. The server doesn't distinguish files from directories, so the client decides whether a directory has content.
+* Every chunk, or every page, must exist when the write commits: uploaded earlier, or in the same commit.
 * `node` must exist.
 
 ### 4.1 Chunks
@@ -120,8 +124,19 @@ write {node, replaces: [dot], chunks: [chunk_id], manifest}
 * A chunk is an immutable sealed blob (formats.md §11.4), at most `max_value_bytes`. Clients use 64 KiB of plaintext.
 * Chunk ids are random 16-byte ids chosen by the client. They belong to the fs, not to a tree.
 * Chunks are uploaded through the commit field `chunks` (api.md §6). Large files are uploaded over several commits, then referenced by one `write`.
+* **Pages** (formats.md §11.6) are uploaded through the commit field `pages`, each `{fs, id, data}`. Every chunk a page lists must exist when the page is uploaded: uploaded earlier, or in the same commit (the commit's chunks apply before its pages). A page is immutable: re-uploading identical bytes stores nothing new but restarts its grace period, and different bytes under an existing id are refused (400). The first upload of a page counts one reference to each chunk it lists (once per occurrence), so a page shared by many versions holds its chunks once.
+* The server counts references to every page (one per paged version listing it, once per occurrence). A page no version references, and that hasn't been uploaded or released for `limits.chunk_grace_secs`, is deleted, which releases its chunk references (§6). Its grace is measured like a chunk's, from its newest upload or release (keyspace.md §3.6, `pc`).
 * Re-uploading an identical chunk stores nothing new but restarts its grace period (below). Uploading different bytes under an existing id is refused (400).
 * The server counts references to every chunk. A chunk that no version references, and hasn't been uploaded or referenced for `limits.chunk_grace_secs` (default 24 h), is deleted (§6). The grace period covers chunks uploaded in one commit and referenced by a later one. It is measured from the chunk's **newest** upload or release (keyspace.md §3.6, `cp`), so an earlier one that has aged past the grace period doesn't delete a chunk that was uploaded or released again since.
+
+### 4.2 File keys
+
+A version-2 manifest (formats.md §11.3) carries the file's 32-byte key, under which its chunks are sealed (formats.md §11.4). This is a client rule; the server never sees the key.
+
+* A new node gets a fresh random file key.
+* A new version of a node keeps the node's file key, so unchanged chunks are reused, **unless** the fs is now at a newer epoch than the key's `key_epoch` (after a `rotate`). The writer then picks a fresh key and re-seals and re-uploads every chunk, so a revoked member who saw the old key can't read new content even with the chunks.
+* A version-1 file rewritten by a client that writes version 2 gets a fresh file key, and its chunks are re-sealed.
+* Concurrent writers of one node may pick different file keys. Each version carries its own, so siblings stay readable.
 
 ## 5. Change feed and sync
 
@@ -150,6 +165,7 @@ The sweeper (every node runs it) keeps the tree bounded. It visits only trees wi
   The rule above holds for the whole subtree, including the part a round doesn't reach. Before removing part of a subtree, the round reads the tree's move log from the horizon on (it keeps every recent move), and walks up from each node whose current move is that recent. If one is inside the subtree, nothing of the subtree is removed. This check is bounded at 5,000 log entries and 2,000 node reads per round. While a tree has more recent moves than that, subtrees too large for one round wait. Smaller ones are still purged, because their round sees every node.
 
   A purge can still contradict an operation that is inside the horizon but has not arrived yet: an offline device that moved a file out of a directory before the directory was trashed, and syncs after the purge. Its operation is refused with `stale_op` rather than applied to a node whose content is gone; the client shows the file as deleted.
+* **Pages:** unreferenced pages are deleted after the grace period (§4.1), and their chunk references are released. The sweeper collects pages before chunks; a chunk released by a page waits one more grace period.
 * **Chunks:** unreferenced chunks are deleted after the grace period (§4.1).
 * **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Logged moves of a purged node itself (a skipped move can name one) are passed over by undo and redo. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.
 
