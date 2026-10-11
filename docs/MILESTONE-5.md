@@ -287,7 +287,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * two-level pages (not a hash chain or a tree)
       * per-file content keys folded into the same format change
       * the vault as 7h
-    * The plan commit restarts the branch from main and opens a new PR.
+    * The plan commit restarts the branch from main and opens a new PR (#26).
+  * **7f** planned in detail (see "7f: large files, the format and the server").
 
 ## Facts the work must respect (from the code survey)
 
@@ -1651,85 +1652,197 @@ Step 7 builds the class side.
 
 ### 7f: large files, the format and the server (detailed plan)
 
-**Context.** Today a file version is one value: a plaintext chunk list, which the server uses to count references for GC, followed by a sealed manifest (kind 5) that repeats the list. With `max_value_bytes` at 90,000, that is 32 B per chunk, so a version holds at most about 2,800 chunks of 64 KiB, roughly 175 MiB (TD-FS-LARGE-FILES).
+**Context.** Today a file version is one value: a plaintext chunk list, which the server uses to count references for GC, followed by a sealed manifest (kind 5) that repeats the list. At 32 B per chunk within `max_value_bytes` (90,000), a version holds at most about 2,800 chunks of 64 KiB, roughly 175 MiB (TD-FS-LARGE-FILES).
 
-Every chunk is sealed directly under the fs-data key of its epoch (kind 6), so no single file can be handed to someone without handing over the whole fs.
+Every chunk is also sealed directly under the fs-data key of its epoch, so no single file can be handed to someone without handing over the whole fs.
 
-Step 8's replica will store and replay manifests and `write` ops, and git packs (M10) and media (M9) go past the cap. So the layout changes now, before the replica is built on it.
+Step 8's replica will store and replay manifests and `write` ops, and milestones 9 and 10 need files past the cap. So the layout changes now.
 
 **User decisions:**
-* **Two-level pages.** Chunk ids live in immutable, server-visible pages. The sealed root manifest lists each page with its digest.
-* **Per-file content keys**, in the same format change.
+* two-level pages
+* per-file content keys, in the same format change
+* 7f is the Rust side. The TS client keeps writing v1 until 7g.
 
-#### Design (⚠️ spec: formats.md §2, §4, §11.3–11.5; fs.md §4, §4.1, §6; keyspace.md §3.6; api.md; labels.md)
-1. **Page:**
-   * Its plaintext is `u32 n ‖ n × chunk_id`, with `4 + 16n ≤ max_value_bytes`. That is up to about 5,600 ids, around 350 MiB at 64 KiB.
-   * Its id is 16 random bytes. A page is immutable.
-   * Pages are uploaded through a new commit field, `pages: [{id, chunks}]`. Every chunk in it must exist or be uploaded in the same commit, and different bytes under an existing id are refused, as for chunks.
-   * The server keeps the page, plus a reference count per page. Uploading a page adds 1 to each of its chunks' `cr`.
-   * A page nothing references becomes a GC candidate with the same grace mechanism as chunks (`chunk_grace_secs`). Collecting it deletes the page and releases its chunks.
-   * New key prefixes go in keyspace.md §3.6, checked against `keys.rs` for clashes, as `co` was.
-2. **Write and version:**
-   * `write {node, replaces, chunks | pages, manifest}` carries exactly one of the two lists.
-     * The inline form `chunks` stays, so small files keep one value.
-     * The paged form `pages` lists page ids in file order.
-   * The version value (`tf`) gains a form byte. A paged version adds 1 to each page's reference count, and releasing it subtracts 1. A page that reaches 0 starts its grace period, and the chunks are released once the page is collected. So a page shared by many versions holds each of its chunks once.
-   * The op chain encoding (§11.5) gains a tag for the paged write.
-   * The size check is `manifest + 16 × (chunks | pages) ≤ max_value_bytes`.
-   * `/v1/info` gains the feature `"fs_pages"`.
-3. **Manifest v2** (kind 5, `manifest_version = 2`):
-   * `size` (u64), `chunk_size`, `n` (u64)
-   * `file_key` (32 B)
-   * the form:
-     * inline: the chunk ids, as v1
-     * paged: `page_size` (the ids per page; every page is full but the last), then each page as `page_id ‖ SHA-256(page plaintext)`
-   * The digests bind order and content, so a page that is swapped, reordered or missing is detected. Chunk i is in page `i / page_size` at slot `i % page_size`, so a range read costs one page fetch.
-   * The cap is about 1,870 pages × 5,600 chunks × 64 KiB ≈ 640 GiB at the defaults. Larger chunks raise it.
-   * v1 manifests stay readable. New writes are v2.
-4. **File keys:**
-   * Each node has a random 32-byte file key, kept across its versions so that `previous` reuses unchanged chunks.
-   * The chunk AEAD key is `KDF("zen/v1/fs-file", file_key, u32(fs))`. The kind-6 context is unchanged (`u32(fs) ‖ chunk_id`), so a copy that carries the key can reuse the chunks.
-   * A write picks a fresh file key when the node's current key was sealed in an older epoch than the fs's current one (after a `rotate`). Revocation then still covers new content, at the cost of re-uploading that node's chunks once.
-   * The file key never reaches the server in the clear: it lives only inside the sealed manifest.
-   * **Sharing one file later (M11)** is handing over its file key plus the manifest's page and chunk references.
-5. **Routes:** `/v1/fs/file/get` returns `pages` for paged versions. The new `/v1/fs/pages/get {fs, pages (≤ 64)}` returns the page bytes, under the fs read right.
-6. **Labels:** `zen/v1/fs-file`. M11's `zen/v1/sig/app-bundle` is reserved (only its name; no format yet).
+**After compaction, re-read:**
+* this section
+* `spec/formats.md` §2, §4, §11; `spec/fs.md` §4, §4.1, §6; `spec/keyspace.md` §3.6; `spec/api.md` §2, §6, §12; `spec/labels.md`
+* `crates/zen-core/src/{fs,keys,labels,vectors}.rs`
+* `crates/zen-server/src/tree.rs`:
+  * `encode_version`/`decode_version` (~201)
+  * `gc_candidate`/`release_chunk` (~276)
+  * `apply_write` (~600)
+  * `put_chunk` (~657)
+  * `apply` `Write` (~715)
+  * `sweep` (~1110)
+  * the purge release (~1596)
+  * `collect_chunks` (~1660)
+  * `file_get`/`chunks_get` (~1036)
+* `crates/zen-server/src/{commit.rs (validate ~78, ~145–190; apply ~380), keys.rs (~385–407), lib.rs (features ~68, routes)}`
+* `crates/zen-proto/src/lib.rs`: `Commit` (~1405), `ChunkPut` (~1993), `CrdtOp::Write` (~2058), `FileGet`/`Version`/`Versions`/`ChunksGet`/`Chunks` (~2700–2800)
+* `crates/zen-wasm/src/{crypto.rs (Manifest ~52/235/365, sealChunk ~401, writeOpBytes ~1030), wire.rs (~89, ~112)}`
+* `crates/zen-server/tests/fs.rs` (helpers, the property test)
+
+**Branch/PR.** #26 (the milestones 8–11 plan) must be merged first. Then restart from main, commit `docs: milestone 5 step 7f plan` (syncing `docs/MILESTONE-5.md`), and open a new PR that 7f joins.
+
+#### Formats (⚠️ `spec:` commit)
+1. **Page** (formats.md §11.6, new):
+   * The plaintext the server sees is `u32 n ‖ n × chunk_id(16)`, with `1 ≤ n` and `4 + 16n ≤ max_value_bytes`. That is up to 5,624 ids at the defaults, about 351 MiB at 64 KiB.
+   * Its id is 16 random bytes chosen by the client. A page is immutable.
+   * `page_digest = BLAKE3.derive_key("zen/v1/fs-page", page bytes)` (32 B), the same construction as the op chain.
+2. **Manifest v2** (formats.md §11.3; the plaintext of kind 5, with the same AAD as v1):
+   ```
+   u8 manifest_version = 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u32 key_epoch ‖ file_key(32) ‖ u8 form
+   form 1 (inline): n × chunk_id                          (u64 n above is the count)
+   form 2 (paged):  u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32))
+   ```
+   * **Paged:** `m = ceil(n / page_size)`. Every page holds `page_size` ids except the last. Chunk i is in page `i / page_size`, at slot `i % page_size`.
+   * **Readers check:**
+     * each page's digest against its bytes, when the page is fetched
+     * every page's count
+     * the inline list, or the page ids, equal the `write`'s `chunks` or `pages`
+   * **Cap:** 48 B per page. At the defaults the root holds about 1,870 pages, so about 10.5 M chunks, ≈ 640 GiB at 64 KiB (more with larger chunks).
+   * v1 stays valid to read. Clients write v2 from 7g on.
+3. **File key** (formats.md §2, §11.4):
+   * The chunk key is `KDF("zen/v1/fs-file", file_key, u32(fs))`.
+   * Kind 6 keeps its label and context (`u32(fs) ‖ chunk_id`). Its header `key_epoch` is the manifest's `key_epoch`: the epoch in which the file key was made. A reader opens it with the key derived from the manifest, not the fs epoch keys.
+   * A v1 manifest means its chunks are under the fs-data key, as now.
+   * **Rotation (fs.md §4, a client rule):** a writer whose fs is at an epoch newer than the node's `key_epoch` picks a fresh file key, and re-seals and re-uploads every chunk. Otherwise it keeps the node's key, so `previous` reuse works. A copy to another node may carry the key and reuse the chunks.
+4. **Op chain** (§11.5): the tag `write_paged = 0x04 ‖ u32(fs) ‖ tree ‖ node ‖ u32(r) ‖ r × dot ‖ u32(m) ‖ m × page_id ‖ lp(manifest)`. The inline `write` (0x03) is unchanged.
+5. **Labels** (labels.md, `labels.rs`):
+   * `zen/v1/fs-file` (KDF)
+   * `zen/v1/fs-page` (digest)
+   * `zen/v1/sig/app-bundle`, listed as reserved for milestone 11 (spec only)
+
+#### Wire and server semantics (⚠️ `spec:` commit: fs.md §4, §4.1, §6; keyspace.md §3.6; api.md §2, §6, §12)
+1. **Commit field `pages: [{fs, id, data}]`**, after `chunks`. Applied after the chunks and before the ops.
+   * `data` must parse: `n ≥ 1`, and its length is exactly `4 + 16n`.
+   * Every chunk in it must exist, or be uploaded in the same commit.
+   * Identical bytes under an existing id restart its grace. Different bytes are refused (400).
+   * **A first upload** stores the page and adds 1 to each listed chunk's `cr`, once per occurrence.
+   * Every upload makes the page a GC candidate (restarting the grace period).
+   * Validation:
+     * each page counts 1 toward `max_commit_ops`
+     * it adds `len + 16` bytes toward `max_commit_bytes`
+     * it is checked with `value_ok`
+     * it needs fs write
+2. **`write {node, replaces, chunks | pages, manifest}`:**
+   * `CrdtOp::Write` gains `pages: [bytes(16)]` (optional, serde default).
+   * Both lists non-empty → 400. Both empty is an empty file, as now.
+   * Every page must exist or be in the commit, else 400 `unknown page`.
+   * The size check is `value_ok(manifest + 16 × (chunks | pages))`. Bytes are `48 + manifest + 16·len + 12·replaces`.
+   * One write per node per commit, as now.
+3. **Stored version (`tf`):**
+   * inline: unchanged, `dev ‖ u32 n ‖ n × chunk ‖ manifest`
+   * paged: `dev ‖ u32 0xFFFFFFFF ‖ u32 m ‖ m × page_id ‖ manifest`
+   * `n` can never reach `0xFFFFFFFF` under the value cap, so existing data needs no migration.
+   * Applying a paged write adds 1 to `pr` per page. A replace or a purge subtracts 1 per page and makes the page a candidate. Quota counts `manifest + 16m`, as for chunks.
+4. **Keys** (keyspace.md §3.6; free prefixes, checked against `keys.rs`):
+   | Key | Value |
+   |---|---|
+   | `pack("pg", fs, page)` | the page bytes |
+   | `pack("pr", fs, page)` | `i64` LE, atomic add: the versions referencing the page |
+   | `pack("pz", fs, cvs, page)` | empty: page GC candidate |
+   | `pack("pc", fs, page)` | `cvs(12)` of the page's newest candidate |
+   * `cr` becomes "the number of versions **and pages** referencing the chunk".
+5. **GC (fs.md §6):** `collect_pages` mirrors `collect_chunks`.
+   * It takes candidates older than the grace period, 500 at a time, the newest only (via `pc`).
+   * If `pr ≤ 0`: delete `pg`, `pr` and `pc`, and release each listed chunk (`cr −1`, a chunk candidate). The chunks then wait one more grace period, which is simpler and only safer.
+   * Quota drops by the page bytes.
+   * `sweep` runs `collect_pages` before `collect_chunks`, in the same rounds per fs.
+6. **Reads:**
+   * `Version` gains `pages: [bytes(16)]` (optional). `/v1/fs/file/get` returns it for paged versions, with `chunks` empty.
+   * New `POST /v1/fs/pages/get {fs, ids: [bytes(16)] (≤ 64)}` → `{pages: [{id, data?}]}`, under fs read, like `chunks/get`.
+7. **`/v1/info` features:** `"fs_pages"`.
 
 #### Code
-* **zen-core:**
-  * the page codec
-  * the Manifest v2 codec (v1 still decoded)
-  * the file-key derivation, with chunk seal and open under it
-  * `write_bytes` for the paged form
-* **zen-proto:** the `pages` commit field, the write variant, `PagesGet` / `Pages`.
-* **zen-server:**
-  * `commit.rs` validate: page sizes, the one-of rule, byte totals
-  * `tree.rs`: `put_page`, `apply_write` paged, page refcounts, the release on replace and purge, `collect` extended to pages, `file_get`, `pages_get`
-  * the route
-  * the feature
-* **zen-wasm:** bindings for the codecs and the key derivation, and the wire types.
-* **Vectors:**
-  * A new `fs_v2` section in `spec/test-vectors`: a page, inline and paged manifests, a chunk under a file key, and the op chain bytes of a paged write.
-  * `gen_vectors` leaves every other section unchanged.
+* **zen-core `fs.rs`:**
+  * `Page {chunks}` with `encode` / `decode` (checking the limits passed in), and `page_digest`.
+  * `Manifest` becomes `enum Manifest { V1 {size, chunk_size, chunks}, V2 {size, chunk_size, n, key_epoch, file_key, body: Body} }` with `enum Body { Inline(Vec<Id>), Paged {page_size, pages: Vec<(Id, [u8;32])>} }`. `encode`/`decode` dispatch on the version byte, and `decode` checks `m = ceil(n/page_size)` and the inline count.
+  * `seal_manifest`/`open_manifest` work unchanged on the enum.
+  * `FileKey` (32 B, random via `Rng`), `file_chunk_key`.
+  * `seal_file_chunk(fs_id, file_key, key_epoch, chunk, data, rng)` / `open_file_chunk(...)`, which checks the header epoch.
+  * `write_paged_bytes`.
+  * `labels.rs`: `FS_FILE`, `FS_PAGE`, added to the label list (and its uniqueness test).
+* **zen-core `vectors.rs` `fs_vectors`:** new keys in `spec/test-vectors/fs.json`:
+  * `page` (plaintext, digest)
+  * `manifest_v2_inline` and `manifest_v2_paged` (plaintext, sealed, seeds)
+  * `file_chunk` (file key from `DetRng("fs-file")`, key_epoch, sealed)
+  * `write_paged` (op bytes)
 
-#### Tests (`crates/zen-server/tests/fs.rs`, both backends)
-* Paged writes round-trip, through `file_get` plus `pages_get`.
-* An unknown page, or a page holding an unknown chunk, is refused. So is a page over the limit, or a write carrying both forms.
-* **Sharing pages:** an append version reuses the old version's pages. Replacing the old version keeps the shared pages and their chunks.
-* **GC:** after a replace and the grace period, the pages are deleted first, then their chunks, and nothing referenced is lost.
-* Quota counts pages.
-* The xorshift property test gains paged writes and appends.
-* zen-core unit tests: the codecs, file-key seal and open, v1 decoding.
+  Existing keys are unchanged.
+* **zen-proto:**
+  * `PagePut {fs, id, data}` and `Commit.pages`
+  * `CrdtOp::Write.pages`
+  * `Version.pages`
+  * `PagesGet {fs, ids}`, `PageData {id, data?}`, `Pages {pages}`
+  * each with the ts derives, like their chunk twins
+* **zen-server:**
+  * `keys.rs`: `page`, `page_refs`, `page_gc`, `page_gc_ptr`.
+  * `commit.rs`:
+    * validate: pages, ops and bytes, the one-of rule
+    * apply: `eng.put_page` after `put_chunk`
+  * `tree.rs`:
+    * `encode_version`/`decode_version` → `enum Content { Chunks(Vec<Id>), Pages(Vec<Id>) }`
+    * `release_content`, used by `apply_write` and the purge
+    * `put_page` (tracks `new_pages`, as `new_chunks`)
+    * `apply_write` paged
+    * `page_gc_candidate`, `collect_pages`, `sweep`
+    * `file_get`: `pages`
+    * `pages_get`
+  * `lib.rs`: the route and the feature.
+* **zen-wasm:**
+  * `crypto.rs`:
+    * `sealManifest` accepts the v1 shape `{size, chunkSize, chunks}`, or v2 `{version: 2, size, chunkSize, n, keyEpoch, fileKey, chunks? | pageSize + pages: [{id, digest}]}`
+    * `openManifest` returns the shape with `version`
+    * `newFileKey()`, `sealFileChunk`, `openFileChunk`
+    * `encodePage`, `decodePage`, `pageDigest`, `writePagedOpBytes`
+  * `wire.rs`: `PagePut`, `PagesGet`, `PageData`, `Pages`.
+  * The TS client compiles unchanged: v1 calls keep their shape. `tree.ts` refuses a v2 manifest with a clear error until 7g.
+* **Docs:**
+  * `docs/API.md`: the route and the commit field
+  * `docs/STATS.md` §1.3: the cap, as the format allows (the client in 7g)
+  * TECH_DEBT TD-FS-LARGE-FILES: "server side done in 7f"
+
+#### Tests
+* **zen-core units:**
+  * Page and Manifest v2 round trips, and refusals: a bad count, a short page, a form byte other than 1 or 2, `m` not equal to `ceil`
+  * v1 still decodes
+  * a file chunk opens only with its key, epoch and id. Under another file key, or with a changed header epoch, it fails.
+  * the digest is domain-separated
+* **`crates/zen-server/tests/fs.rs`, both backends:**
+  * **Paged round trip:** upload chunks plus 3 pages over 2 commits, then a paged write. `file_get` returns `pages`, and `pages_get` returns the bytes.
+  * **Refusals:**
+    * an unknown page in a write
+    * a page holding an unknown chunk
+    * a page over `max_value_bytes`, or malformed
+    * different bytes under an existing page id
+    * a write with both `chunks` and `pages`
+  * **Sharing:** version B reuses 2 of version A's pages plus a new last page, then replaces A. After the grace period (test `chunk_grace_secs`), only A's unshared last page and its unique chunks are gone; B reads fully.
+  * **GC order:** a replace, then sweeps. The page is deleted first, then its chunks one grace period later. A page uploaded but never referenced is collected, and its chunks after it.
+  * **Re-upload:** the same page id again restarts its grace and doesn't double `cr` (checked through deletion timing).
+  * **Purge:** trashing and purging a paged node releases its pages.
+  * **Quota:** page bytes are counted, and released after GC.
+  * **Op chain:** a paged write's chain value equals `chain_next` over `write_paged_bytes` (as the inline test does).
+  * **Property test:** the xorshift test gains paged writes and appends (a version reusing a prefix of pages). A reference model tracks expected live pages and chunks, checked after sweeps with grace 0.
+* **`packages/client/test/vectors.test.ts`:** the new fs.json keys through wasm.
+* The existing vitest suite stays green (v1 writes).
 
 #### Verification
-* `cargo fmt --check`
-* clippy, default and `--no-default-features`
-* `cargo test -p zen-core -p zen-server`
-* `gen_vectors`: only `fs_v2` changes
-* `scripts/build-wasm.sh`
-* the existing JS tests stay green (the client still writes v1 until 7g)
-* CI green
-* Disk: `CARGO_INCREMENTAL=0`; check free space first.
+* **Disk:** `CARGO_INCREMENTAL=0`; check `df` first (about 6.9 GB at the last check).
+* **Rust:**
+  * `cargo fmt --check`
+  * `cargo clippy --all-targets -- -D warnings`, default and `--no-default-features`
+  * `cargo test -p zen-core -p zen-proto -p zen-server`
+  * `gen_vectors`: only the new fs.json keys change (`git diff spec/test-vectors`)
+  * `scripts/build-wasm.sh`
+* **JS:** `npx biome check`; tsc for client, fuse and db test; `npx vitest run`.
+* CI green on the PR (the fdb job covers the server tests on FoundationDB).
+
+#### Rhythm
+1. After #26 merges: restart from main, plan commit, new PR.
+2. On the user's go: the `spec:` commit, then the code commit.
+3. Log the 7f line, push, confirm CI is green, stop for compaction.
+4. 7g is next.
 
 ### 7g: large files in the client and zen-mount (detailed plan)
 * **`tree.ts`:**
