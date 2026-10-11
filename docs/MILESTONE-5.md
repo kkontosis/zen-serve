@@ -321,6 +321,19 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * **A 7d bug** (`crdtpersist` "two tabs … increment": 14, not 16, in about 1 run in 6). Two tabs share one counter actor but each has its own clock, so a tab's `seq` could be no newer than the other tab's last one, and the server ignored it as a re-send. `loadTotals` now observes the `seq` of the entries it reads (after the lock, which already forces the read). zendb.md §19.7 and DB.md were updated.
     * PR #27 merged; CI green on all 8 checks.
   * **7g** planned in detail (see "7g: large files in the client and zen-mount"), PR #28. Amended at the user's request: per-file keys optional per fs (`file_keys`, default off), a rekey policy after rotation (`rekey_after_rotate`, default `rewrite`), both kept in a version-2 fs header; the version-2 manifest gains `key_mode`.
+  * **7g** (large files in the client, the file-key policy): done, PR #28. As planned, with these details for 7h and step 8:
+    * **Rust:** `ManifestV2.file_key: Option<FileKey {key_epoch, key}>` (`key_mode` 0 or 1). `FsHeader.policy: FsPolicy {file_keys, rekey_after_rotate, unknown}`; a default policy is still written as header version 1. wasm: `ManifestV2.fileKey`/`keyEpoch` optional, `FsHeader.policy` and `setPolicy`. Vectors: `fs.json` `manifest_v2_fs_keys` (the 7f v2 manifests regenerated), `header.json` `policy`. wasm 2,144,771 bytes.
+    * **Client:**
+      * `UnlockedFs.policy` and `setPolicy(partial)`.
+      * `FileVersion` gains `pages`, `size`, `chunkCount`; `manifest` is `AnyManifest`. `ChunkIndex` gains `fileKey`, `keyEpoch`, `pageSize`, `pages`. `Upload` and `WrittenFile` gain `pagesUploaded` (and `Upload.pages`); their `manifest` is `ManifestV2`.
+      * `chunkIds(v, first, last)`, `readStream(node, {version, offset, length})`, `fetchChunks(ids, version?)`, `TreeOptions.pageCache`; decoded pages kept per tree by digest (256).
+      * `FileSource` (bytes, iterables, `ReadableStream`); `upload(node, data, {onProgress, resume})` with `UploadState`; `send(ops, chunks, pages)`.
+      * Default chunk size `min(64 KiB, max_value_bytes − 64)`. The inline limit comes from the sealed size of an empty manifest: `(max_value_bytes − that) / 32`.
+      * `rewrite` keeps the key for a write with `previous` and also for a write without it when the epoch hasn't changed.
+    * **Decisions beyond the plan:** with `file_keys` off, a version-1 file rewritten with `previous` reuses its chunks (both under the fs keys), instead of re-sealing them. zen-mount needed no code change (it reads whole files and passes the buffer to `chunkIndex`).
+    * **⚠️ Spec:** formats.md §11.3 (`key_mode`), §11.4, §12 (header version 2, the policy, its leakage); fs.md §4.1, §4.2 (rewritten: the policy and the three rekey rules).
+    * **Docs:** `docs/CLIENT.md` §8 (large files, streams, resumable uploads, file keys), §9; `docs/STATS.md` §1.3; TECH_DEBT: TD-FS-LARGE-FILES and TD-CRDT-ROWS-SERVER resolved.
+    * **Tests:** `packages/client/test/large.test.ts` (13: three sources, range reads and the page cache, appends, the inline limit, swapped and missing pages, version 1, resume, no `fs_pages`, and the policy: default, on, the three rekey rules, a mixed history, offline unlock); two were checked to fail with page reuse or the rekey rule broken. `txn.test.ts` +1 (a paged upload with a row), `mount.test.ts` +1 (a 4-page file through the kernel), `fsvectors.test.ts` (key_mode 0), zen-core `header.rs` and `tests/fs.rs`. 316 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

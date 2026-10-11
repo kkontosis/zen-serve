@@ -41,7 +41,7 @@ Small files are dominated by the ~650 B per-file metadata; large files cost almo
 
 ### 1.3 Limits worth knowing
 
-* **Largest file version at the defaults is about 640 GiB** with paged versions (spec/fs.md §4, server side since milestone 5 step 7f; clients write them from step 7g). A page holds up to 5,624 chunk ids (about 351 MiB at 64 KiB), and the sealed manifest lists up to about 1,870 pages at 48 B each. An inline version (the chunk list in the version itself) still tops out at about 175 MiB: 32 B per chunk within `max_value_bytes` = 90,000.
+* **Largest file version at the defaults is about 640 GiB** with paged versions (spec/fs.md §4; the server since milestone 5 step 7f, and clients page any file past the inline limit since step 7g). A page holds up to 5,624 chunk ids (about 351 MiB at 64 KiB), and the sealed manifest lists up to about 1,870 pages at 48 B each. An inline version (the chunk list in the version itself) still tops out at about 175 MiB: 32 B per chunk within `max_value_bytes` = 90,000.
 * **Page costs.** A page is one value of `4 + 16n` bytes, plus one reference-count add per chunk when first uploaded; a version that appends to a file reuses every full page of the one it replaces.
 * A commit carries at most `max_commit_bytes` = 8 MB, so a large file is uploaded over several commits (spec/fs.md §4.1).
 

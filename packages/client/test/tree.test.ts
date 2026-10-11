@@ -283,7 +283,7 @@ describe('large files and limits', () => {
     const w2 = await t.writeFile(f, next, { previous: w1.index, replaces: [w1.dot] });
     expect(w2.uploaded).toBe(1);
     expect(w2.commits).toBe(1);
-    expect(w2.manifest.chunks.filter((c, i) => equal(c, w1.manifest.chunks[i]!)).length).toBe(10);
+    expect(w2.index.chunks.filter((c, i) => equal(c, w1.index.chunks[i]!)).length).toBe(10);
     expect(equal(await b.tree(t.id).readFile(f), next)).toBe(true);
 
     // An index built from a version read back reuses as well.
@@ -305,7 +305,7 @@ describe('large files and limits', () => {
       for (let i = 0; i < data.length; i += 7777) yield data.subarray(i, i + 7777);
     }
     const r = await t.writeFile(f, pieces());
-    expect(r.manifest.chunks.length).toBe(5);
+    expect(r.manifest.chunks!.length).toBe(5);
     expect(equal(await t.readFile(f), data)).toBe(true);
     // An empty file.
     const e = await t.create(ROOT, 'empty');

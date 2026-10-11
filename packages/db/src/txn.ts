@@ -528,6 +528,7 @@ export class DbTransaction implements IndexTx {
       !c.append?.length &&
       !c.consume?.length &&
       !c.chunks?.length &&
+      !c.pages?.length &&
       !c.crdt_ops?.length &&
       !c.read_conflicts?.length &&
       !c.expect_ranges?.length &&
@@ -573,6 +574,7 @@ export class DbTransaction implements IndexTx {
     const c = this.raw.build();
     const ops =
       (c.chunks?.length ?? 0) +
+      (c.pages?.length ?? 0) +
       (c.crdt_ops?.length ?? 0) +
       (c.read_conflicts?.length ?? 0) +
       (c.expect?.length ?? 0) +
@@ -588,6 +590,8 @@ export class DbTransaction implements IndexTx {
     for (const w of c.writes ?? []) size += w.key.length + (w.value?.length ?? 0);
     for (const a of c.append ?? []) size += a.envelope.length;
     for (const ch of c.chunks ?? []) size += ch.data.length;
+    // A page also adds a reference count per chunk it lists (api.md §6).
+    for (const p of c.pages ?? []) size += p.data.length + 16 + 48 * (p.data.length >> 4);
     for (const o of c.crdt_ops ?? []) {
       if ('value' in o && o.value) size += o.value.length;
       if ('object' in o) size += o.object.length;

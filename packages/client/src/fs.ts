@@ -1,6 +1,6 @@
 // A filesystem: its header (keyslots, epoch chain) and unlocking it
 // (spec/formats.md §6, §12; api.md §4.4).
-import type { DeviceSecret, FsHeader, FsKeys } from '@zen/wasm';
+import type { DeviceSecret, FsHeader, FsKeys, FsPolicy } from '@zen/wasm';
 import { equal, utf8 } from './bytes.js';
 import { isCode, ZenError } from './errors.js';
 import { Kv, type Transaction, type TxnOptions, transaction } from './kv.js';
@@ -263,6 +263,27 @@ export class UnlockedFs {
    */
   get writable(): boolean {
     return this.keys.epoch === this.stored.header.currentEpoch;
+  }
+
+  /**
+   * The fs policy (formats.md §12, fs.md §4.2), from the header this fs was
+   * unlocked with (so offline too, from the kept one).
+   */
+  get policy(): FsPolicy {
+    return this.stored.header.policy;
+  }
+
+  /** Change the fs policy (admins). It applies to each file's next write. */
+  async setPolicy(p: Partial<FsPolicy>): Promise<void> {
+    await this.editHeader((h) => {
+      const cur = h.policy;
+      const next = { ...cur, ...p };
+      if (next.fileKeys === cur.fileKeys && next.rekeyAfterRotate === cur.rekeyAfterRotate) {
+        return false;
+      }
+      h.setPolicy(next);
+      return true;
+    });
   }
 
   /** The keys to seal new data with. Throws for a stale slot. */

@@ -183,8 +183,21 @@ fn fs_vectors_open_from_files() {
         let fs::AnyManifest::V2(m) = m else {
             panic!("version 2")
         };
-        assert_eq!(m.file_key, fk);
+        assert_eq!(
+            m.file_key,
+            Some(fs::FileKey {
+                key_epoch: 0,
+                key: fk
+            })
+        );
     }
+    let m = fs::open_any_manifest(&fsk, &tree, &node, &hx(&v["manifest_v2_fs_keys"]["sealed"]))
+        .unwrap();
+    assert_eq!(m.encode(), hx(&v["manifest_v2_fs_keys"]["plaintext"]));
+    let fs::AnyManifest::V2(m) = m else {
+        panic!("version 2")
+    };
+    assert_eq!(m.file_key, None);
     assert_eq!(
         fs::open_file_chunk(fsk.fs_id, &fk, 0, &cid, &hx(&v["file_chunk"]["sealed"])).unwrap(),
         hx(&v["file_chunk"]["plaintext"])
@@ -270,6 +283,21 @@ fn header_vectors_open_from_files() {
     assert_eq!(*h1.keys_at(&fs1, 0).unwrap().to_bundle(), *fs0.to_bundle());
     // Re-encoding gives the same bytes.
     assert_eq!(h1.encode().unwrap(), hx(&v["epoch1"]["header"]));
+    assert!(h1.policy.is_default());
+    // The policy makes a version-2 header.
+    let p = FsHeader::decode(&hx(&v["policy"]["header"])).unwrap();
+    assert_eq!(hx(&v["policy"]["header"])[0], 2);
+    assert!(p.policy.file_keys);
+    assert_eq!(
+        p.policy.rekey_after_rotate,
+        zen_core::header::RekeyAfterRotate::Eager
+    );
+    assert_eq!(p.policy.encode().unwrap(), hx(&v["policy"]["policy"]));
+    assert_eq!(
+        (p.slots.clone(), p.chain.clone()),
+        (h1.slots.clone(), h1.chain.clone())
+    );
+    assert_eq!(p.encode().unwrap(), hx(&v["policy"]["header"]));
 }
 
 #[test]

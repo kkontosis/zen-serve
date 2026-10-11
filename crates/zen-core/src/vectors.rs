@@ -312,16 +312,20 @@ fn fs_vectors() -> Result<Value> {
         size: 70_000,
         chunk_size: 65_536,
         n: 2,
-        key_epoch: 0,
-        file_key,
+        file_key: Some(fs::FileKey {
+            key_epoch: 0,
+            key: file_key,
+        }),
         body: fs::Body::Inline(chunk_ids.to_vec()),
     });
     let paged_v2 = fs::AnyManifest::V2(fs::ManifestV2 {
         size: 70_000,
         chunk_size: 65_536,
         n: 2,
-        key_epoch: 0,
-        file_key,
+        file_key: Some(fs::FileKey {
+            key_epoch: 0,
+            key: file_key,
+        }),
         body: fs::Body::Paged {
             page_size: 1,
             pages: page_ids
@@ -331,6 +335,21 @@ fn fs_vectors() -> Result<Value> {
                 .collect(),
         },
     });
+    // key_mode 0: chunks under the fs keys, as in version 1.
+    let fs_keys_v2 = fs::AnyManifest::V2(fs::ManifestV2 {
+        size: 70_000,
+        chunk_size: 65_536,
+        n: 2,
+        file_key: None,
+        body: fs::Body::Inline(chunk_ids.to_vec()),
+    });
+    let sealed_fs_keys_v2 = fs::seal_any_manifest(
+        &fsk,
+        &tree,
+        &node,
+        &fs_keys_v2,
+        &mut DetRng::new("fs-manifest-v2-fs-keys"),
+    )?;
     let sealed_inline_v2 = fs::seal_any_manifest(
         &fsk,
         &tree,
@@ -377,6 +396,8 @@ fn fs_vectors() -> Result<Value> {
             "id": h(id), "page": h(p), "digest": h(&fs::page_digest(p)),
         })).collect::<Vec<_>>(),
         "manifest_v2_inline": {"rng_seed": "fs-manifest-v2-inline", "plaintext": h(&inline_v2.encode()), "sealed": h(&sealed_inline_v2)},
+        "manifest_v2_fs_keys": {"rng_seed": "fs-manifest-v2-fs-keys", "plaintext": h(&fs_keys_v2.encode()), "sealed": h(&sealed_fs_keys_v2),
+                                 "description": "key_mode 0: chunks under the fs-data key of their header epoch"},
         "manifest_v2_paged": {"rng_seed": "fs-manifest-v2-paged", "plaintext": h(&paged_v2.encode()), "sealed": h(&sealed_paged_v2)},
         "file_chunk": {"rng_seed": "fs-file-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_file_chunk)},
         "write_paged": {"op": h(&paged_op), "chain": h(&paged_chain),
@@ -417,7 +438,7 @@ fn pwkey_vectors() -> Result<Value> {
 }
 
 fn header_vectors() -> Result<Value> {
-    use crate::header::FsHeader;
+    use crate::header::{FsHeader, FsPolicy, RekeyAfterRotate};
     let fs = fixture_fs();
     let mut header = FsHeader::new(&fs)?;
     let recovery = keyslot::create_recovery(&fs, &mut DetRng::new("header-recovery"))?;
@@ -439,12 +460,24 @@ fn header_vectors() -> Result<Value> {
     let opened = keyslot::open(&back.slots[1], Unlock::Passphrase(FIXTURE_PASSPHRASE))?;
     assert_eq!(*opened.to_bundle(), *next.to_bundle());
     assert_eq!(*back.keys_at(&opened, 0)?.to_bundle(), *fs.to_bundle());
+    // A non-default policy makes it a version-2 header.
+    header.policy = FsPolicy {
+        file_keys: true,
+        rekey_after_rotate: RekeyAfterRotate::Eager,
+        unknown: Vec::new(),
+    };
+    let policy = header.policy.encode()?;
+    let with_policy = header.encode()?;
+    assert_eq!(FsHeader::decode(&with_policy)?, header);
     Ok(json!({
         "description": "fs headers of the fixture fs (formats.md §12). epoch0: one recovery slot. epoch1: after a rotation (chain[0] opens epoch 0 from epoch 1) and a new passphrase slot on epoch 1; the recovery slot still wraps epoch 0.",
         "epoch0": {"recovery_rng_seed": "header-recovery", "recovery_key": h(recovery.1.as_ref()), "header": h(&epoch0)},
         "epoch1": {"rotate_rng_seed": "header-rotate", "pass_rng_seed": "header-pass",
                    "passphrase": String::from_utf8_lossy(FIXTURE_PASSPHRASE),
                    "fs_epoch1_bundle": h(&next.to_bundle()), "header": h(&epoch1)},
+        "policy": {"description": "epoch1 with the policy {file_keys: on, rekey_after_rotate: eager}: header version 2",
+                   "file_keys": true, "rekey_after_rotate": "eager",
+                   "policy": h(&policy), "header": h(&with_policy)},
     }))
 }
 

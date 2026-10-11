@@ -200,3 +200,37 @@ describe.skipIf(!canMount)('zen-mount', () => {
     expect(existsSync(join(mnt, 'greeting.txt'))).toBe(false);
   });
 });
+
+describe.skipIf(!canMount)('zen-mount, large files', () => {
+  let wl: World;
+  let dir: string;
+  let m: Mount;
+  let t: Tree;
+  beforeAll(async () => {
+    // A small max_value_bytes: a file of 400 chunks spans 4 pages.
+    wl = await world({ limits: { max_value_bytes: 2048, max_commit_bytes: 300000 } });
+    const u = await wl.session
+      .fs(1)
+      .init((k) => [zw.createPassphraseSlot(k, bytes.utf8('pp'), 65536, 1, 1)]);
+    dir = await mkdtemp(join(tmpdir(), 'zen-mnt-large-'));
+    t = u.tree(Tree.newId());
+    m = await mount(t, join(dir, 'm'), { attrTimeout: 0 });
+  });
+
+  afterAll(async () => {
+    await m?.unmount().catch(() => {});
+    if (dir) await rm(dir, { recursive: true, force: true });
+    await wl?.server.stop();
+  });
+
+  it('a paged file written and read through the kernel', async () => {
+    const data = new Uint8Array(400 * 1984 + 3).map((_, i) => (i * 31) % 251);
+    const p = join(m.mountpoint, 'big.bin');
+    await writeFile(p, data);
+    expect((await stat(p)).size).toBe(data.length);
+    expect(bytes.equal(new Uint8Array(await readFile(p)), data)).toBe(true);
+    const node = (await t.list(new Uint8Array(16))).find((n) => n.meta?.name === 'big.bin')!;
+    const [v] = await t.versions(node.id);
+    expect(v!.pages.length).toBe(4);
+  });
+});
