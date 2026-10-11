@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "..",
+    "paths": { "@zen/client": ["../client/src/index.ts"] }
+  },
+  "include": ["src", "test"]
+}

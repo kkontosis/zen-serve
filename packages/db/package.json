@@ -1,0 +1,24 @@
+{
+  "name": "@zen/db",
+  "version": "0.1.0",
+  "description": "zen-db: a client-side database over zen-serve's encrypted KV (spec/zendb.md)",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "@zen/client": "0.1.0",
+    "@zen/wasm": "0.1.0"
+  },
+  "sideEffects": false
+}
