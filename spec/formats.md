@@ -321,13 +321,18 @@ u8 manifest_version = 1 ‖ u64 size ‖ u32 chunk_size ‖ u32 n ‖ n × chunk
 Version 2:
 
 ```
-u8 manifest_version = 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u32 key_epoch ‖ file_key(32) ‖ u8 form ‖ body
+u8 manifest_version = 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u8 key_mode ‖ keys ‖ u8 form ‖ body
+key_mode 0:      keys = (empty)
+key_mode 1:      keys = u32 key_epoch ‖ file_key(32)
 form 1, inline:  body = n × chunk_id(16)
 form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32))
 ```
 
 * `n` is the number of chunks; `size` and `chunk_size` are as in version 1.
-* `file_key` and `key_epoch`: the file's chunk key (§11.4) and the epoch the file key was made in.
+* `key_mode` says how the chunks are sealed (§11.4):
+  * **0, fs keys:** under the filesystem AEAD key of each chunk's own header `key_epoch`, as in version 1.
+  * **1, a file key:** under the file's chunk key from `file_key`; `key_epoch` is the epoch the file key was made in.
+  * A decoder refuses any other value. Which mode a writer picks is the fs policy (§12, fs.md §4.2); a reader needs no setting.
 * **Inline:** the chunk list must equal the `chunks` of the `write` that carries the manifest.
 * **Paged:** the chunk list is split into pages (§11.6) of `page_size ≥ 1` ids each, every page full but the last, so `m = ceil(n / page_size)` (and `m = 0` when `n = 0`). Chunk `i` is in page `i / page_size` at slot `i % page_size`. The page ids must equal the `pages` of the `write`, in order. A reader checks each page against its `page_digest` and its expected count when it fetches it, so a page that was swapped, reordered or truncated is detected.
 * A decoder refuses any other `form`, a paged `m` other than `ceil(n / page_size)`, `page_size = 0` with `n > 0`, and trailing bytes.
@@ -337,9 +342,10 @@ form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_d
 
 The plaintext is the chunk's bytes. A chunk is bound to its fs and id, so the server can't substitute one chunk for another.
 
-* **Under a version-1 manifest** it is sealed under the filesystem AEAD key of `key_epoch`.
-* **Under a version-2 manifest** it is sealed under the file's chunk key `KDF("zen/v1/fs-file", file_key, u32(fs))` (§2), and its header's `key_epoch` is the manifest's `key_epoch`. A reader opens it with the key the manifest gives, and checks the header epoch against the manifest's.
-* **One file key per node**, kept across the node's versions so a new version reuses unchanged chunks. A writer whose fs is at a newer epoch than the node's `key_epoch` picks a fresh file key and re-seals every chunk (fs.md §4.2). A copy to another node may keep the key and reuse the chunks.
+* **Under a version-1 manifest, or a version-2 manifest with `key_mode 0`,** it is sealed under the filesystem AEAD key of its header's `key_epoch`. The chunks of one file may carry different epochs (a chunk reused from before a rotation keeps its own).
+* **Under a version-2 manifest with `key_mode 1`** it is sealed under the file's chunk key `KDF("zen/v1/fs-file", file_key, u32(fs))` (§2), and its header's `key_epoch` is the manifest's `key_epoch`. A reader opens it with the key the manifest gives, and checks the header epoch against the manifest's.
+* **One file key per node**, kept across the node's versions so a new version reuses unchanged chunks. After a rotation, the fs policy decides when a writer replaces it (fs.md §4.2). A copy to another node may keep the key and reuse the chunks.
+* Chunks are reused across versions only under the same key: the same file key, or both under fs keys.
 
 ### 11.5 Operation encoding and op chain
 
@@ -383,23 +389,37 @@ page_digest = BLAKE3.derive_key("zen/v1/fs-page", page)
 The fs header holds an fs's keyslots (§6) and its epoch chain (§2, §4 kind 3). The server stores it as opaque bytes, with a version for compare-and-set (api.md §4.4); only an admin may write it.
 
 ```
-u8  header_version = 1
+u8  header_version = 1 or 2
 u8  suite          = 1
 u32 fs
 u32 current_epoch                  the epoch new data is sealed under
 u16 n_slots       ‖ n_slots × lp(keyslot)            (§6), at most 256
 u16 n_chain       ‖ n_chain × lp(epoch-chain record) (kind 3, §4)
+lp(policy)                         version 2 only
 ```
+
+* **The policy** is a deterministic CBOR map (zendb.md §1) with unsigned-integer keys:
+
+  | Key | Name | Values | Default |
+  |---|---|---|---|
+  | 1 | `file_keys` | 0 off, 1 on: new files get a file key of their own (§11.3 `key_mode 1`) | 0 |
+  | 2 | `rekey_after_rotate` | 0 `rewrite`, 1 `eager`, 2 `keep` (fs.md §4.2) | 0 |
+
+  * A version-1 header has the default policy.
+  * A writer writes version 1 while the policy is the default and holds no unknown keys, so older clients still read it; otherwise version 2.
+  * Unknown keys are kept on re-encode and otherwise ignored. A known key with a value the client doesn't know makes the header undecodable: a new value comes with a new header version.
+  * The policy is advice to writers. Readers never need it, since each manifest names its `key_mode`.
 
 * **The chain.** `chain[i]` is the record written when the fs rotated to epoch `i + 1`: the keys of epoch `i + 1` open it to the keys of epoch `i`. So `n_chain = current_epoch`, and the sealed header of `chain[i]` names `key_epoch = i + 1`. A client holding epoch `e` reads any epoch `≤ e` by walking the chain back.
 * **Slots.** Each slot starts with the §6 prefix (`format_version`, `suite`, `slot_type`, `reserved = 0`, `slot_id`). Clients keep slots of types they don't know, unchanged, and never try to open them. A client finds its slot by type and by what identifies it: `recipient_fp` (device), `credential_id` (passkey PRF, OPAQUE export key), or by trying each passphrase or recovery slot.
 * **Rotation (revocation).** The admin opens a slot, rotates (`chain` gains a record, `current_epoch` += 1), re-wraps the bundle of the new epoch for every slot that keeps access, removes the others, and writes the header with `expect` set to the version read. A slot wrapping an older epoch than `current_epoch` is **stale**: it still reads old data, but a client that opens it must not write, and an admin should re-wrap or remove it.
-* **Checks on decode.** Exact length (no trailing bytes), known header version and suite, `n_chain = current_epoch`, every chain record of kind 3 with the right `key_epoch`, every slot with a valid prefix. A client also checks that a bundle it unwraps names the header's `fs`.
+* **Checks on decode.** Exact length (no trailing bytes), known header version and suite, a policy that decodes (version 2), `n_chain = current_epoch`, every chain record of kind 3 with the right `key_epoch`, every slot with a valid prefix. A client also checks that a bundle it unwraps names the header's `fs`.
 * **Writing a slot for oneself.** Header writes need admin. A member who wants a slot for a new passkey or password prepares the slot (the bundle never leaves the client unwrapped) and hands it to an admin, who adds it (`TD-FS-HEADER-SELF-SLOT`).
 
-**Leakage and rollback.** The server sees the number of slots, their types and ids, the credential ids and device fingerprints in their parameters, the Argon2id parameters, and the number of epochs. It can't open a slot or forge one that opens to real keys. It can:
+**Leakage and rollback.** The server sees the number of slots, their types and ids, the credential ids and device fingerprints in their parameters, the Argon2id parameters, the number of epochs, and the policy. It can't open a slot or forge one that opens to real keys. It can:
 * drop slots or the whole header (denial of service; detectable only out of band),
 * serve an older header: a client then sees an older `current_epoch`, and notices when it meets data sealed under a newer `key_epoch` than its keys can reach. It refuses to write under an epoch older than one it has seen (clients remember the highest epoch per fs),
+* serve another policy. That changes only how new files are keyed: both key modes are end-to-end encrypted, and only sharing a single file depends on file keys,
 * nothing else: a slot or chain record that was tampered with fails to open.
 
 A signed header (by an admin, chained like the ACL) is planned with the authenticated tier (milestone 6).
