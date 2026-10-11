@@ -1,7 +1,7 @@
 //! Paged file versions and file keys (formats.md §11.3–11.6).
 
 use zen_core::Error;
-use zen_core::fs::{self, AnyManifest, Body, Manifest, ManifestV2};
+use zen_core::fs::{self, AnyManifest, Body, FileKey, Manifest, ManifestV2};
 use zen_core::keys::FsKeys;
 use zen_core::rng::{DetRng, OsRng};
 
@@ -19,8 +19,10 @@ fn paged(n: u64, page_size: u32) -> ManifestV2 {
         size: n * 10,
         chunk_size: 10,
         n,
-        key_epoch: 3,
-        file_key: [9; 32],
+        file_key: Some(FileKey {
+            key_epoch: 3,
+            key: [9; 32],
+        }),
         body: Body::Paged {
             page_size,
             pages: (0..m).map(|i| (id(i as u8), [i as u8; 32])).collect(),
@@ -34,11 +36,19 @@ fn manifest_v2_round_trips() {
         size: 25,
         chunk_size: 10,
         n: 3,
-        key_epoch: 1,
-        file_key: [1; 32],
+        file_key: Some(FileKey {
+            key_epoch: 1,
+            key: [1; 32],
+        }),
         body: Body::Inline(vec![id(1), id(2), id(3)]),
     };
-    for m in [inline, paged(10, 4), paged(8, 4), paged(0, 4)] {
+    // key_mode 0: no file key, the chunks under the fs keys.
+    let fs_keys = ManifestV2 {
+        file_key: None,
+        ..paged(10, 4)
+    };
+    assert_eq!(fs_keys.encode().len() + 36, paged(10, 4).encode().len());
+    for m in [inline, paged(10, 4), paged(8, 4), paged(0, 4), fs_keys] {
         assert_eq!(ManifestV2::decode(&m.encode()).unwrap(), m);
         let any = AnyManifest::V2(m.clone());
         assert_eq!(AnyManifest::decode(&any.encode()).unwrap(), any);
@@ -68,8 +78,12 @@ fn manifest_v2_refuses_malformed() {
     // page_size 0 with chunks.
     let mut b = paged(0, 4).encode();
     b[13..21].copy_from_slice(&1u64.to_be_bytes());
-    let form = 1 + 8 + 4 + 8 + 4 + 32;
+    let form = 1 + 8 + 4 + 8 + 1 + 4 + 32;
     b[form + 1..form + 5].copy_from_slice(&0u32.to_be_bytes());
+    assert_eq!(ManifestV2::decode(&b), Err(Error::Format));
+    // An unknown key mode.
+    let mut b = paged(8, 4).encode();
+    b[21] = 2;
     assert_eq!(ManifestV2::decode(&b), Err(Error::Format));
     // An unknown form, a short inline list, trailing bytes, another version.
     let mut b = paged(8, 4).encode();

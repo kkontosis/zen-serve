@@ -2,15 +2,17 @@
 //! opaque bytes (spec/formats.md §12, api.md §4.4).
 //!
 //! ```text
-//! u8 header_version (= 1) || u8 suite || u32 fs || u32 current_epoch
+//! u8 header_version (1 or 2) || u8 suite || u32 fs || u32 current_epoch
 //! || u16 n_slots || n_slots × lp(keyslot)
 //! || u16 n_chain || n_chain × lp(epoch-chain record)
+//! || lp(policy)                                   (version 2 only)
 //! ```
 //!
 //! `chain[i]` is the record written when the fs rotated to epoch `i + 1`: the
 //! keys of epoch `i + 1` open it to the keys of epoch `i`. So
 //! `n_chain == current_epoch`.
 
+use crate::db::cbor::{self, Value};
 use crate::encoding::{Reader, lp};
 use crate::keys::FsKeys;
 use crate::keyslot;
@@ -19,8 +21,80 @@ use crate::seal::{self, Kind};
 use crate::suite::Suite;
 use crate::{Error, Result};
 
-/// Version of the header layout.
+/// Version of the header layout without a policy.
 pub const HEADER_VERSION: u8 = 1;
+
+/// Version of the header layout with a policy.
+pub const HEADER_VERSION_POLICY: u8 = 2;
+
+/// When a file keeps its file key after a rotation (formats.md §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RekeyAfterRotate {
+    /// A fresh key when the whole file is rewritten (no `previous`).
+    #[default]
+    Rewrite = 0,
+    /// A fresh key on the next write, every chunk re-uploaded.
+    Eager = 1,
+    /// Never a fresh key.
+    Keep = 2,
+}
+
+/// The fs policy (formats.md §12), kept in a version-2 header.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsPolicy {
+    /// New files get a file key of their own (`key_mode 1`).
+    pub file_keys: bool,
+    /// When a file key is replaced after a rotation.
+    pub rekey_after_rotate: RekeyAfterRotate,
+    /// Entries this version doesn't know, as a CBOR map (empty when none);
+    /// kept on re-encode.
+    pub unknown: Vec<u8>,
+}
+
+impl FsPolicy {
+    /// Whether this is the policy a version-1 header means.
+    pub fn is_default(&self) -> bool {
+        *self == FsPolicy::default()
+    }
+
+    /// The CBOR map `{1: file_keys, 2: rekey_after_rotate, …unknown}`.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut items = match self.unknown.is_empty() {
+            true => Vec::new(),
+            false => match cbor::decode(&self.unknown)? {
+                Value::Map(m) => m,
+                _ => return Err(Error::Param),
+            },
+        };
+        items.retain(|(k, _)| !matches!(k, Value::Int(1 | 2)));
+        items.push((Value::Int(1), Value::Int(self.file_keys as i128)));
+        items.push((Value::Int(2), Value::Int(self.rekey_after_rotate as i128)));
+        cbor::encode(&Value::Map(items))
+    }
+
+    /// Decode. A known key with a value this version doesn't know is refused.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let Value::Map(items) = cbor::decode(bytes).map_err(|_| Error::Format)? else {
+            return Err(Error::Format);
+        };
+        let mut p = FsPolicy::default();
+        let mut rest = Vec::new();
+        for (k, v) in items {
+            match (&k, &v) {
+                (Value::Int(1), Value::Int(0 | 1)) => p.file_keys = v == Value::Int(1),
+                (Value::Int(2), Value::Int(0)) => p.rekey_after_rotate = RekeyAfterRotate::Rewrite,
+                (Value::Int(2), Value::Int(1)) => p.rekey_after_rotate = RekeyAfterRotate::Eager,
+                (Value::Int(2), Value::Int(2)) => p.rekey_after_rotate = RekeyAfterRotate::Keep,
+                (Value::Int(1 | 2), _) => return Err(Error::Format),
+                _ => rest.push((k, v)),
+            }
+        }
+        if !rest.is_empty() {
+            p.unknown = cbor::encode(&Value::Map(rest)).map_err(|_| Error::Format)?;
+        }
+        Ok(p)
+    }
+}
 
 /// Most keyslots a header holds.
 pub const MAX_SLOTS: usize = 256;
@@ -36,6 +110,8 @@ pub struct FsHeader {
     pub slots: Vec<Vec<u8>>,
     /// Epoch-chain records; `chain[i]` opens epoch `i` from epoch `i + 1`.
     pub chain: Vec<Vec<u8>>,
+    /// The policy; the default in a version-1 header.
+    pub policy: FsPolicy,
 }
 
 impl FsHeader {
@@ -49,13 +125,19 @@ impl FsHeader {
             current_epoch: 0,
             slots: Vec::new(),
             chain: Vec::new(),
+            policy: FsPolicy::default(),
         })
     }
 
-    /// Encode. Fails if the header breaks the layout's rules.
+    /// Encode. Fails if the header breaks the layout's rules. A default
+    /// policy is written as version 1, so older clients still read it.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.check()?;
-        let mut out = vec![HEADER_VERSION, Suite::Modern as u8];
+        let version = match self.policy.is_default() {
+            true => HEADER_VERSION,
+            false => HEADER_VERSION_POLICY,
+        };
+        let mut out = vec![version, Suite::Modern as u8];
         out.extend_from_slice(&self.fs_id.to_be_bytes());
         out.extend_from_slice(&self.current_epoch.to_be_bytes());
         for list in [&self.slots, &self.chain] {
@@ -65,13 +147,17 @@ impl FsHeader {
                 lp(&mut out, item);
             }
         }
+        if version == HEADER_VERSION_POLICY {
+            lp(&mut out, &self.policy.encode()?);
+        }
         Ok(out)
     }
 
     /// Decode and check the layout. It doesn't decrypt anything.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != HEADER_VERSION {
+        let version = r.u8()?;
+        if version != HEADER_VERSION && version != HEADER_VERSION_POLICY {
             return Err(Error::Format);
         }
         Suite::from_id(r.u8()?)?;
@@ -84,6 +170,10 @@ impl FsHeader {
                 list.push(r.lp()?.to_vec());
             }
         }
+        let policy = match version {
+            HEADER_VERSION_POLICY => FsPolicy::decode(r.lp()?)?,
+            _ => FsPolicy::default(),
+        };
         r.finish()?;
         let [slots, chain] = lists;
         let h = FsHeader {
@@ -91,6 +181,7 @@ impl FsHeader {
             current_epoch,
             slots,
             chain,
+            policy,
         };
         h.check().map_err(|_| Error::Format)?;
         Ok(h)
@@ -228,6 +319,38 @@ mod tests {
         let mut long = h.encode().unwrap();
         long.push(0);
         assert_eq!(FsHeader::decode(&long), Err(Error::Format));
+    }
+
+    #[test]
+    fn policy_round_trips_and_defaults_stay_version_1() {
+        let (_, mut h) = header();
+        let v1 = h.encode().unwrap();
+        assert_eq!(v1[0], 1);
+        assert!(FsHeader::decode(&v1).unwrap().policy.is_default());
+
+        h.policy.file_keys = true;
+        h.policy.rekey_after_rotate = RekeyAfterRotate::Keep;
+        let v2 = h.encode().unwrap();
+        assert_eq!(v2[0], 2);
+        assert_eq!(FsHeader::decode(&v2).unwrap(), h);
+
+        // Unknown keys are kept, and keep the header at version 2.
+        let extra = Value::map(vec![(Value::Int(9), Value::text("later"))]);
+        h.policy = FsPolicy {
+            unknown: cbor::encode(&extra).unwrap(),
+            ..FsPolicy::default()
+        };
+        let back = FsHeader::decode(&h.encode().unwrap()).unwrap();
+        assert_eq!(back.policy.unknown, cbor::encode(&extra).unwrap());
+        assert_eq!(h.encode().unwrap()[0], 2);
+
+        // A known key with an unknown value is refused.
+        let bad = Value::map(vec![(Value::Int(2), Value::Int(7))]);
+        assert_eq!(
+            FsPolicy::decode(&cbor::encode(&bad).unwrap()),
+            Err(Error::Format)
+        );
+        assert_eq!(FsPolicy::decode(&[0x01]), Err(Error::Format));
     }
 
     #[test]

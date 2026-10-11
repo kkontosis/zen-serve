@@ -4,7 +4,7 @@ use crate::{core_err, js_err, serializer};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use zen_core::fs as zfs;
-use zen_core::header::FsHeader as CoreHeader;
+use zen_core::header::{FsHeader as CoreHeader, RekeyAfterRotate};
 use zen_core::keys::FsKeys as CoreKeys;
 use zen_core::keyslot::{self, Argon2Params, Unlock};
 use zen_core::rng::OsRng;
@@ -52,8 +52,10 @@ export interface NodeMeta { type: "dir" | "file" | "symlink"; name: string; mode
 export interface Manifest { size: number; chunkSize: number; chunks: Uint8Array[] }
 /** A page of a paged manifest: its id and digest (spec/formats.md §11.3, §11.6). */
 export interface PageRef { id: Uint8Array; digest: Uint8Array }
-/** Plaintext version-2 manifest (spec/formats.md §11.3): `chunks` (inline) or `pageSize` and `pages` (paged). */
-export interface ManifestV2 { version: 2; size: number; chunkSize: number; n: number; keyEpoch: number; fileKey: Uint8Array; chunks?: Uint8Array[]; pageSize?: number; pages?: PageRef[] }
+/** Plaintext version-2 manifest (spec/formats.md §11.3): `chunks` (inline) or `pageSize` and `pages` (paged). With `fileKey` and `keyEpoch` (key_mode 1) the chunks are under the file key; without them (key_mode 0), under the fs keys. */
+export interface ManifestV2 { version: 2; size: number; chunkSize: number; n: number; keyEpoch?: number; fileKey?: Uint8Array; chunks?: Uint8Array[]; pageSize?: number; pages?: PageRef[] }
+/** The fs policy kept in the header (spec/formats.md §12). */
+export interface FsPolicy { fileKeys: boolean; rekeyAfterRotate: "rewrite" | "eager" | "keep" }
 /** A manifest of either version, as `openAnyManifest` returns it. */
 export type AnyManifest = (Manifest & { version: 1 }) | ManifestV2;
 /** Plaintext event body (spec/formats.md §5). */
@@ -258,8 +260,10 @@ struct JsManifestV2 {
     size: f64,
     chunk_size: u32,
     n: f64,
-    key_epoch: u32,
-    file_key: serde_bytes::ByteBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_key: Option<serde_bytes::ByteBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chunks: Option<Vec<serde_bytes::ByteBuf>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,12 +303,19 @@ impl JsManifestV2 {
             },
             _ => return Err(js_err("a manifest has chunks, or pageSize and pages")),
         };
+        let file_key = match (&self.file_key, self.key_epoch) {
+            (None, None) => None,
+            (Some(k), Some(key_epoch)) => Some(zfs::FileKey {
+                key_epoch,
+                key: arr(k)?,
+            }),
+            _ => return Err(js_err("a file key comes with its keyEpoch")),
+        };
         Ok(zfs::ManifestV2 {
             size: self.size as u64,
             chunk_size: self.chunk_size,
             n: self.n as u64,
-            key_epoch: self.key_epoch,
-            file_key: arr(&self.file_key)?,
+            file_key,
             body,
         })
     }
@@ -331,8 +342,10 @@ impl JsManifestV2 {
             size: m.size as f64,
             chunk_size: m.chunk_size,
             n: m.n as f64,
-            key_epoch: m.key_epoch,
-            file_key: serde_bytes::ByteBuf::from(m.file_key.to_vec()),
+            key_epoch: m.file_key.map(|k| k.key_epoch),
+            file_key: m
+                .file_key
+                .map(|k| serde_bytes::ByteBuf::from(k.key.to_vec())),
             chunks,
             page_size,
             pages,
@@ -717,6 +730,13 @@ pub fn open_opaque_slot(slot: &[u8], export_key: &[u8]) -> R<FsKeys> {
 
 // ------------------------------------------------------------------ header
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsPolicy {
+    file_keys: bool,
+    rekey_after_rotate: String,
+}
+
 /// A decoded fs header (formats.md §12). Not secret.
 #[wasm_bindgen]
 pub struct FsHeader(CoreHeader);
@@ -749,6 +769,38 @@ impl FsHeader {
     #[wasm_bindgen(getter, js_name = currentEpoch)]
     pub fn current_epoch(&self) -> u32 {
         self.0.current_epoch
+    }
+
+    /// The fs policy (the defaults for a version-1 header).
+    #[wasm_bindgen(getter, unchecked_return_type = "FsPolicy")]
+    pub fn policy(&self) -> R<JsValue> {
+        let p = &self.0.policy;
+        to_js(&JsPolicy {
+            file_keys: p.file_keys,
+            rekey_after_rotate: match p.rekey_after_rotate {
+                RekeyAfterRotate::Rewrite => "rewrite",
+                RekeyAfterRotate::Eager => "eager",
+                RekeyAfterRotate::Keep => "keep",
+            }
+            .into(),
+        })
+    }
+
+    /// Set the fs policy; entries this version doesn't know are kept.
+    #[wasm_bindgen(js_name = setPolicy)]
+    pub fn set_policy(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "FsPolicy")] policy: JsValue,
+    ) -> R<()> {
+        let p: JsPolicy = from_js(policy)?;
+        self.0.policy.file_keys = p.file_keys;
+        self.0.policy.rekey_after_rotate = match p.rekey_after_rotate.as_str() {
+            "rewrite" => RekeyAfterRotate::Rewrite,
+            "eager" => RekeyAfterRotate::Eager,
+            "keep" => RekeyAfterRotate::Keep,
+            _ => return Err(js_err("rekeyAfterRotate is rewrite, eager or keep")),
+        };
+        Ok(())
     }
 
     /// The keyslots, in order.

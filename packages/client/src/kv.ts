@@ -553,6 +553,7 @@ export class Transaction {
       !this.chunks.length &&
       !x.consume?.length &&
       !x.chunks?.length &&
+      !x.pages?.length &&
       !x.crdt_ops?.length
     );
   }

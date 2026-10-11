@@ -114,7 +114,7 @@ write {node, replaces: [dot], chunks: [chunk_id] | pages: [page_id], manifest}
   * **paged:** `pages`, the ids of the pages (§4.1) that hold the chunk ids, in file order. A large file uses it: the inline list must fit one value with the manifest.
 
   The server sees the ids (so it can garbage-collect chunks and pages), but not their order's meaning or the file size. A `write` with both `chunks` and `pages` is refused (400).
-* `manifest` is the sealed manifest (formats.md §11.3): the file size, chunk size, the file key, and the same chunk list or page list, authenticated. Clients check that it matches `chunks` or `pages`, and check each page against its digest.
+* `manifest` is the sealed manifest (formats.md §11.3): the file size, chunk size, how its chunks are keyed (§4.2), and the same chunk list or page list, authenticated. Clients check that it matches `chunks` or `pages`, and check each page against its digest.
 * `write` with neither writes an empty file. The server doesn't distinguish files from directories, so the client decides whether a directory has content.
 * Every chunk, or every page, must exist when the write commits: uploaded earlier, or in the same commit.
 * `node` must exist.
@@ -131,12 +131,18 @@ write {node, replaces: [dot], chunks: [chunk_id] | pages: [page_id], manifest}
 
 ### 4.2 File keys
 
-A version-2 manifest (formats.md §11.3) carries the file's 32-byte key, under which its chunks are sealed (formats.md §11.4). This is a client rule; the server never sees the key.
+A version-2 manifest (formats.md §11.3) says how its chunks are sealed: under the fs keys (`key_mode 0`, as version 1), or under a 32-byte file key of its own (`key_mode 1`, formats.md §11.4). File keys only matter for sharing one file without the whole fs (milestone 11); they cost a re-upload after a rotation. So they are a policy of the fs, kept in its header (formats.md §12). These are client rules; the server never sees a key.
 
-* A new node gets a fresh random file key.
-* A new version of a node keeps the node's file key, so unchanged chunks are reused, **unless** the fs is now at a newer epoch than the key's `key_epoch` (after a `rotate`). The writer then picks a fresh key and re-seals and re-uploads every chunk, so a revoked member who saw the old key can't read new content even with the chunks.
-* A version-1 file rewritten by a client that writes version 2 gets a fresh file key, and its chunks are re-sealed.
-* Concurrent writers of one node may pick different file keys. Each version carries its own, so siblings stay readable.
+* **`file_keys` off (the default):** new versions use `key_mode 0`. Chunks are sealed at the fs's current epoch, and a new version reuses unchanged chunks across rotations, as version 1 does.
+* **`file_keys` on:** new versions use `key_mode 1`.
+  * The writer takes the key of the version it builds on (`previous`), or else of the node's newest version.
+  * A node with no file key yet (new, or with only `key_mode 0` or version-1 versions) gets a fresh random key at the current epoch, and every chunk is re-sealed.
+  * **After a rotation** (the key's `key_epoch` is older than the fs's current epoch), `rekey_after_rotate` decides:
+    * `rewrite` (the default): keep the key for a write that builds on a previous version, so unchanged chunks are reused; a write that replaces the whole file (no `previous`) gets a fresh key.
+    * `eager`: a fresh key on the next write, every chunk re-sealed and re-uploaded, so a revoked member who saw the old key can't read new content even with its chunks.
+    * `keep`: never a fresh key.
+* Chunks are reused only under the same key: the same file key, or both under fs keys. Switching the policy never re-keys existing files; it applies from each node's next write.
+* Concurrent writers of one node may pick different keys or modes. Each version carries its own, so siblings stay readable.
 
 ## 5. Change feed and sync
 

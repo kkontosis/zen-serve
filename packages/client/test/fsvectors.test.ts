@@ -32,11 +32,20 @@ describe('fs.json, version 2', () => {
       const m = keys.openAnyManifest(tree, node, fromHex(V[name].sealed));
       expect(m.version).toBe(2);
       if (m.version !== 2) continue;
-      expect(hex(m.fileKey)).toBe(V.file_key.key);
+      expect(hex(m.fileKey!)).toBe(V.file_key.key);
+      expect(m.keyEpoch).toBe(0);
       // Sealing it again round-trips (fresh nonce, same plaintext).
       const again = keys.openAnyManifest(tree, node, keys.sealManifestV2(tree, node, m));
       expect(again).toEqual(m);
     }
+    // key_mode 0: no file key, the chunks under the fs keys.
+    const plain = keys.openAnyManifest(tree, node, fromHex(V.manifest_v2_fs_keys.sealed));
+    expect(plain.version === 2 && plain.fileKey === undefined && plain.keyEpoch === undefined).toBe(
+      true,
+    );
+    expect(
+      keys.openAnyManifest(tree, node, keys.sealManifestV2(tree, node, plain as never)),
+    ).toEqual(plain);
     const paged = keys.openAnyManifest(tree, node, fromHex(V.manifest_v2_paged.sealed));
     expect(paged.version === 2 && paged.pages?.map((p) => hex(p.id))).toEqual(pageIds.map(hex));
     const chunkId = fromHex(V.file_chunk.id);

@@ -296,6 +296,24 @@ describe('files in a transaction (§7.6)', () => {
     expect(bytes.equal(await tree.readFile(f), data)).toBe(true);
   });
 
+  it('a paged upload is written with a row', async () => {
+    const db = await itemsDb(ns());
+    const tree = fs.tree(Tree.newId());
+    const f = await tree.create(ROOT, 'big');
+    // 64-byte chunks: past the inline limit of a 90,000-byte manifest.
+    const data = new Uint8Array(3000 * 64).map((_, i) => (i * 7) % 253);
+    const up = await tree.upload(f, data, { chunkSize: 64 });
+    expect(up.pages.length).toBeGreaterThan(0);
+    await db.transaction(async (tx) => {
+      await tx.fs(tree).write(up);
+      await tx.table('items').put({ id: 'big', v: up.pages.length });
+    });
+    expect(await db.table('items').get('big')).toEqual({ id: 'big', v: up.pages.length });
+    const [v] = await tree.versions(f);
+    expect(v!.pages).toEqual(up.pages);
+    expect(bytes.equal(await tree.readFile(f), data)).toBe(true);
+  });
+
   it('tree batches ride along; two writes to one file are refused', async () => {
     const db = await itemsDb(ns());
     const tree = fs.tree(Tree.newId());

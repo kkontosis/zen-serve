@@ -196,6 +196,15 @@ pub enum Body {
     },
 }
 
+/// A file's own content key (formats.md §11.4, `key_mode 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileKey {
+    /// The epoch the key was made in; the chunks' header epoch.
+    pub key_epoch: u32,
+    /// The key.
+    pub key: [u8; 32],
+}
+
 /// Plaintext of a version-2 manifest (formats.md §11.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestV2 {
@@ -205,24 +214,30 @@ pub struct ManifestV2 {
     pub chunk_size: u32,
     /// Number of chunks.
     pub n: u64,
-    /// The epoch the file key was made in; the chunks' header epoch.
-    pub key_epoch: u32,
-    /// The file key (formats.md §11.4).
-    pub file_key: [u8; 32],
+    /// `None` (`key_mode 0`): chunks under the fs-data key of their own header
+    /// epoch, as in version 1. `Some` (`key_mode 1`): under this file key.
+    pub file_key: Option<FileKey>,
     /// The chunk list or its pages.
     pub body: Body,
 }
 
 impl ManifestV2 {
-    /// `0x02 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u32 key_epoch ‖ file_key ‖ u8 form ‖ body`.
+    /// `0x02 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u8 key_mode ‖
+    /// [u32 key_epoch ‖ file_key] ‖ u8 form ‖ body`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(58 + 48 * self.n.min(1 << 16) as usize);
+        let mut out = Vec::with_capacity(59 + 48 * self.n.min(1 << 16) as usize);
         out.push(2);
         out.extend_from_slice(&self.size.to_be_bytes());
         out.extend_from_slice(&self.chunk_size.to_be_bytes());
         out.extend_from_slice(&self.n.to_be_bytes());
-        out.extend_from_slice(&self.key_epoch.to_be_bytes());
-        out.extend_from_slice(&self.file_key);
+        match &self.file_key {
+            None => out.push(0),
+            Some(k) => {
+                out.push(1);
+                out.extend_from_slice(&k.key_epoch.to_be_bytes());
+                out.extend_from_slice(&k.key);
+            }
+        }
         match &self.body {
             Body::Inline(chunks) => {
                 out.push(1);
@@ -252,8 +267,14 @@ impl ManifestV2 {
         let size = r.u64()?;
         let chunk_size = r.u32()?;
         let n = r.u64()?;
-        let key_epoch = r.u32()?;
-        let file_key = r.array()?;
+        let file_key = match r.u8()? {
+            0 => None,
+            1 => Some(FileKey {
+                key_epoch: r.u32()?,
+                key: r.array()?,
+            }),
+            _ => return Err(Error::Format),
+        };
         let body = match r.u8()? {
             1 => {
                 // Each id is 16 bytes, so `n` can't exceed what is left.
@@ -292,7 +313,6 @@ impl ManifestV2 {
             size,
             chunk_size,
             n,
-            key_epoch,
             file_key,
             body,
         })
@@ -316,7 +336,7 @@ impl ManifestV2 {
 pub enum AnyManifest {
     /// Version 1: chunks under the fs keys.
     V1(Manifest),
-    /// Version 2: chunks under a file key, inline or paged.
+    /// Version 2: inline or paged, chunks under the fs keys or a file key.
     V2(ManifestV2),
 }
 

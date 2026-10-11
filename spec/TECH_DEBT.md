@@ -143,11 +143,11 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-FS-LARGE-FILES
 
-* **Status:** open
+* **Status:** resolved (milestone 5 steps 7f and 7g). Files past the inline limit are paged: immutable chunk-id pages, listed with their digests in a sealed version-2 manifest, about 640 GiB at the defaults (spec/formats.md §11.3–11.6, fs.md §4.1). The client writes them from any source, streams reads (`readStream`), reuses unchanged pages on appends and resumes uploads (docs/CLIENT.md §8). Per-file content keys are a policy of the fs (fs.md §4.2). The rest (upload sessions past `chunk_grace_secs`, repacking, multi-GiB measurements) is milestone 8 (docs/MILESTONE-8.md).
 * **Context:** A file version's manifest and chunk list must fit one value: 32 B per chunk within `max_value_bytes` (90,000 by default), so a version holds at most ~2,800 chunks of 64 KiB, about **175 MiB** (docs/STATS.md §1.3). Raising `max_value_bytes` helps only up to FoundationDB's 100 KB value limit (~195 MiB).
 * **Why deferred:** The server-side CRDT filesystem (milestone 3.5) targets family-scale files; large media and disk images need a different version layout.
 * **What it would take:** Chunk lists split over several keys (e.g. `pack("tf", fs, tree, node, dot, i)` pages, or a tree of manifests), the write op carrying a list reference instead of the whole list, refcounting and GC over the pages, a matching formats.md change for the sealed manifest, and tests with multi-GiB synthetic files.
-* **Progress:** milestone 5 step 7f built the server side: pages, the paged `write`, version-2 manifests with file keys (spec/formats.md §11.3–11.6, fs.md §4). Step 7g moves the client onto them; this entry is resolved then.
+* **Progress:** milestone 5 step 7f built the server side: pages, the paged `write`, version-2 manifests with file keys (spec/formats.md §11.3–11.6, fs.md §4). Step 7g moved the client onto them, and made file keys a policy of the fs.
 * **Plan (milestone 5):** steps 7f/7g build two-level pages (immutable, server-visible chunk-id pages listed with their digests in a sealed v2 manifest, about 640 GiB at the defaults) and per-file content keys; the rest (upload sessions, repacking) is milestone 8 (docs/MILESTONE-8.md).
 
 ## TD-STORE-COMPACTION
@@ -201,7 +201,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-CRDT-ROWS-SERVER
 
-* **Status:** open
+* **Status:** resolved (milestone 5 step 3): `crates/zen-server/src/crdt.rs`, the operations and reads of api.md §13, the keyspace of keyspace.md §3.8, the sweeper purge, and the property test of `crates/zen-server/tests/crdt.rs` on both backends.
 * **Context:** zen-db CRDT tables (spec/zendb.md §19) need server-merged row objects: last-writer-wins row and field registers, per-device counters and add-wins sets, with the `row`, `lww`, `ctr`, `add` and `rem` operations in `crdt_ops`, the `/v1/crdt/get` and `/v1/crdt/range` reads, and a `"crdt_rows"` feature flag. The server implements only the filesystem's CRDT objects (spec/fs.md).
 * **Why deferred:** Milestone 4.5 is specs only. Scheduled for milestone 5 (DESIGN-3 §6), moved forward from 7, so that the offline variants of the app examples can be demonstrated with zen-db.
 * **What it would take:** The operations and their merge rules inside the commit transaction, the keyspace of zendb.md §19.5 (moved into keyspace.md), the sweeper purge of deleted objects past the horizon, the reads, api.md §6 and §12-style sections, zen-proto types, and the property test of §19.9 against an in-memory reference, on both backends.

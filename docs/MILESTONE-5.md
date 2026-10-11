@@ -319,6 +319,21 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **CI fixes on #27:**
       * **FoundationDB:** with a grace of 0, the GC tests assumed a single sweep sees the latest commits. On FoundationDB, commit versions can trail the clock the grace is measured with. The tests now use `sweep_until`, which sweeps to the expected state and checks after every sweep that no page outlives a chunk it lists. Two mutations (no chunk release; pages not counting their chunks) were each checked to fail.
       * **A 7d bug** (`crdtpersist` "two tabs … increment": 14, not 16, in about 1 run in 6). Two tabs share one counter actor but each has its own clock, so a tab's `seq` could be no newer than the other tab's last one, and the server ignored it as a re-send. `loadTotals` now observes the `seq` of the entries it reads (after the lock, which already forces the read). zendb.md §19.7 and DB.md were updated.
+    * PR #27 merged; CI green on all 8 checks.
+  * **7g** planned in detail (see "7g: large files in the client and zen-mount"), PR #28. Amended at the user's request: per-file keys optional per fs (`file_keys`, default off), a rekey policy after rotation (`rekey_after_rotate`, default `rewrite`), both kept in a version-2 fs header; the version-2 manifest gains `key_mode`.
+  * **7g** (large files in the client, the file-key policy): done, PR #28. As planned, with these details for 7h and step 8:
+    * **Rust:** `ManifestV2.file_key: Option<FileKey {key_epoch, key}>` (`key_mode` 0 or 1). `FsHeader.policy: FsPolicy {file_keys, rekey_after_rotate, unknown}`; a default policy is still written as header version 1. wasm: `ManifestV2.fileKey`/`keyEpoch` optional, `FsHeader.policy` and `setPolicy`. Vectors: `fs.json` `manifest_v2_fs_keys` (the 7f v2 manifests regenerated), `header.json` `policy`. wasm 2,144,771 bytes.
+    * **Client:**
+      * `UnlockedFs.policy` and `setPolicy(partial)`.
+      * `FileVersion` gains `pages`, `size`, `chunkCount`; `manifest` is `AnyManifest`. `ChunkIndex` gains `fileKey`, `keyEpoch`, `pageSize`, `pages`. `Upload` and `WrittenFile` gain `pagesUploaded` (and `Upload.pages`); their `manifest` is `ManifestV2`.
+      * `chunkIds(v, first, last)`, `readStream(node, {version, offset, length})`, `fetchChunks(ids, version?)`, `TreeOptions.pageCache`; decoded pages kept per tree by digest (256).
+      * `FileSource` (bytes, iterables, `ReadableStream`); `upload(node, data, {onProgress, resume})` with `UploadState`; `send(ops, chunks, pages)`.
+      * Default chunk size `min(64 KiB, max_value_bytes − 64)`. The inline limit comes from the sealed size of an empty manifest: `(max_value_bytes − that) / 32`.
+      * `rewrite` keeps the key for a write with `previous` and also for a write without it when the epoch hasn't changed.
+    * **Decisions beyond the plan:** with `file_keys` off, a version-1 file rewritten with `previous` reuses its chunks (both under the fs keys), instead of re-sealing them. zen-mount needed no code change (it reads whole files and passes the buffer to `chunkIndex`).
+    * **⚠️ Spec:** formats.md §11.3 (`key_mode`), §11.4, §12 (header version 2, the policy, its leakage); fs.md §4.1, §4.2 (rewritten: the policy and the three rekey rules).
+    * **Docs:** `docs/CLIENT.md` §8 (large files, streams, resumable uploads, file keys), §9; `docs/STATS.md` §1.3; TECH_DEBT: TD-FS-LARGE-FILES and TD-CRDT-ROWS-SERVER resolved.
+    * **Tests:** `packages/client/test/large.test.ts` (13: three sources, range reads and the page cache, appends, the inline limit, swapped and missing pages, version 1, resume, no `fs_pages`, and the policy: default, on, the three rekey rules, a mixed history, offline unlock); two were checked to fail with page reuse or the rekey rule broken. `txn.test.ts` +1 (a paged upload with a row), `mount.test.ts` +1 (a 4-page file through the kernel), `fsvectors.test.ts` (key_mode 0), zen-core `header.rs` and `tests/fs.rs`. 316 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
@@ -1875,39 +1890,189 @@ Step 8's replica will store and replay manifests and `write` ops, and milestones
 4. 7g is next.
 
 ### 7g: large files in the client and zen-mount (detailed plan)
-* **`tree.ts`:**
-  * **`upload(node, source)`** takes a `Uint8Array`, a `ReadableStream` or an `AsyncIterable<Uint8Array>`, with constant memory:
-    * chunks are sealed as they come and flushed in commits
-    * pages are uploaded as they fill
-    * the inline form is used when the file fits
-  * **File key:** a new node gets a fresh one. Otherwise the key comes from the current version's manifest, or a fresh one after a rotation.
-  * **`previous`** reuses unchanged chunks by hash, and also whole pages whose chunk ids are unchanged (appends).
-  * **`read(node, v, offset, length)`** goes through the pages. A page cache sits next to the chunk cache, and a page is checked against its digest when fetched.
-  * **`readStream(node, v, {offset, length})` → `ReadableStream`** decrypts chunk by chunk. M9's service worker and step 8 use it.
-  * `versions` reads v1 and v2 manifests.
-  * **Resumable uploads:** `Upload` gains a serializable state (the chunks and pages uploaded so far), so step 8 can keep it on the local store. A resume works within `chunk_grace_secs`; past that is M8.
-* **zen-mount:** it works unchanged on v2 files. Large writes are still buffered in memory until step 8 (documented).
-* **Docs:**
-  * `docs/CLIENT.md` §8 (pages, file keys, streams, resumable uploads) and §9 (the limits)
-  * `docs/STATS.md` (the new cap)
-  * TECH_DEBT: TD-FS-LARGE-FILES resolved, with the rest in M8
-  * TD-CRDT-ROWS-SERVER marked resolved (step 3; the survey found it stale)
-* **Tests (`tree.test.ts`)**, with lowered `max_value_bytes` and small chunks, so files of many pages stay cheap:
-  * a multi-page round trip
-  * a range read fetches only its page and its chunks (calls counted)
-  * an append re-uploads only the last page and the new chunks
-  * a streamed upload from a generator
-  * a page swapped on the server (a wrapped `session.call`) is detected
-  * an old v1 file still reads, and a v1 file rewritten becomes v2 with its chunks re-sealed
-  * two files' chunks don't open with each other's keys
-  * after `rotate`, the next write uses a fresh file key
-  * the `fs_v2` vectors (`vectors.test.ts`)
-  * zen-mount: a file of several pages read through the mount
+
+**Context.** 7f (PR #27, merged) gives the server paged versions and the formats: version-2 manifests with a file key, pages, and `write_paged`. The TS client still writes version 1 and refuses paged versions (`unsupported`).
+
+7g moves `@zen/client`'s `Tree` (and so zen-mount and `@zen/db`'s `tx.fs`) onto version 2:
+* every new write is a version-2 manifest with a file key
+* a file too large for the inline form is paged
+* reads go through pages
+* uploads stream and can resume
+
+This resolves TD-FS-LARGE-FILES.
+
+**User decisions (after the 7g plan):**
+* **Per-file keys are optional per filesystem.** Paged versions (large files) are always available. Per-file keys, which only buy sharing one file, are a policy of the fs: `file_keys: off` (default) seals chunks under the fs keys, as version 1 does; `on` uses a file key per node. Readers need no setting, because the manifest says which mode a file uses.
+* **The rekey policy after a rotation**, for `file_keys: on`, is `rekey_after_rotate`:
+  * `rewrite` (default): a fresh key only when the whole file is rewritten (no `previous`)
+  * `eager`: a fresh key on the next write, re-uploading every chunk
+  * `keep`: never
+* **The policy lives in the fs header** (admin-only, read by unlock, kept offline since 7e, signed in milestone 6), in a header version 2.
+
+**After compaction, re-read:**
+* this section and the 7f log line
+* `spec/formats.md` §11.3–11.6, `spec/fs.md` §4–4.2
+* `packages/client/src/tree.ts`:
+  * types (~50–190)
+  * `versions`, `pickVersion`, `readFile`, `read`, `fetchChunks`, `chunkIndex`
+  * `writeFile`, `upload`, `writeOp`, `stage`, `resolve` (~375–700)
+  * `blocks`
+* `packages/client/src/fs.ts` (`sealKeys`, `keysFor`, `keysAt`, `rotate`)
+* `crates/zen-wasm/src/crypto.rs`: the 7f bindings (`sealManifestV2`, `openAnyManifest`, `sealFileChunk`/`openFileChunk`, page codecs)
+* `packages/db/src/{files,txn}.ts` (`checkLimits`, `crdtOnly`)
+* `packages/fuse/src/mount.ts` (~140–350)
+* `packages/client/test/tree.test.ts` (setup)
+* `packages/fuse/test/mount.test.ts`
+
+**Branch/PR.** #27 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7g plan`), and open a new PR that 7g joins.
+
+#### Part A: the format and the header (⚠️ `spec:` commit, Rust, vectors)
+1. **Manifest v2 `key_mode`** (formats.md §11.3, §11.4; safe now, since no client has written version 2 yet and the server never opens manifests):
+   ```
+   u8 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u8 key_mode ‖ [u32 key_epoch ‖ file_key(32) if key_mode = 1] ‖ u8 form ‖ body
+   ```
+   * `key_mode 0`: chunks under the fs-data key of each chunk's own header epoch, as in version 1.
+   * `key_mode 1`: the file key, as 7f specified.
+   * Any other value is refused.
+   * zen-core: `ManifestV2.file_key: Option<FileKey {key_epoch, key}>`. wasm: `fileKey`/`keyEpoch` optional in `ManifestV2`. The `fs.json` v2 vectors gain a `key_mode 0` manifest; the 7f ones are regenerated.
+   * fs.md §4.2: the per-node key rule applies only with `key_mode 1`.
+2. **Header version 2** (formats.md §12):
+   * The version-1 fields, then `lp(policy)`: a CBOR map with integer keys:
+     * `1: file_keys` (0 off, 1 on)
+     * `2: rekey_after_rotate` (0 rewrite, 1 eager, 2 keep)
+   * Unknown keys are kept on re-encode and ignored. A version-1 header reads as the defaults (`off`, `rewrite`).
+   * Writing a header keeps version 1 while the policy is the default and nothing unknown is kept, so old clients still read it. Otherwise it is version 2.
+   * The leakage note: the server sees the policy. Before milestone 6 it could serve another one; that is harmless, since both modes are end-to-end encrypted and only single-file sharing changes.
+   * zen-core `FsHeader.policy` (`FsPolicy {file_keys, rekey_after_rotate, unknown}`), decode and encode, `header.json` vectors for v2.
+   * wasm `FsHeader.policy` getter and setter.
+   * Client: `UnlockedFs.policy` (from the unlocked header, so also offline from the kept one), and `UnlockedFs.setPolicy(p)` for admins, through `editHeader`.
+
+#### `tree.ts`
+1. **Types:**
+   * `FileVersion`:
+     * `manifest: AnyManifest`, the 7f shape: v1 `{version: 1, size, chunkSize, chunks}`, or v2 with `n`, `keyEpoch`, `fileKey`, and `chunks` or `pageSize` + `pages`
+     * `chunks`: inline ids, empty when paged
+     * `pages`: page ids, empty when inline
+     * `size` and `chunkCount`, for convenience
+   * `ChunkIndex` gains `fileKey?`, `keyEpoch?` (absent: version-1 chunks, which can't be reused), and `pageSize?` with `pages?: {id, digest}[]` (for page reuse).
+   * `Upload` carries `manifest: AnyManifest`, `pages`, `pagesUploaded`.
+   * The `Manifest` export stays the v1 shape; `AnyManifest` and `ManifestV2` are added. Documented as an API change of `FileVersion.manifest`; `size` and `chunkSize` keep their meaning.
+2. **`versions(node)`:**
+   * Opens with `openAnyManifest`.
+   * Checks the list against the manifest: v1 and v2 inline against `chunks`; paged against `pages` (ids in order).
+   * The 7f `unsupported` guard goes.
+3. **Chunk ids of a range: `chunkIds(v, first, last)`.**
+   * Inline: a slice.
+   * Paged:
+     * Fetch the pages covering chunks `first..last` through `/v1/fs/pages/get` (64 per request), with a page cache: `TreeOptions.pageCache?: ChunkCache` (the same `get`/`put` interface, so step 8 can persist it), plus a small in-memory LRU of decoded pages (256).
+     * Each fetched page is checked against its manifest digest (`pageDigest`) and its expected count (the last page is shorter). A mismatch or a missing page → `ZenError(0, 'format' | 'not_found')`.
+4. **Opening chunks:**
+   * `openChunk(v, id, sealed)` uses `openFileChunk(fs, fileKey, keyEpoch, …)` for v2, and the fs keys (`keysFor`) for v1.
+   * `fetchChunks(ids, version?)`: the version picks the opener (default v1, so existing callers are unchanged). The chunk cache keeps sealed bytes, as now.
+5. **Reads:**
+   * `read(node, v, offset, length)` goes through `chunkIds`.
+   * **New `readStream(node, version?, {offset, length})` → `ReadableStream<Uint8Array>`:**
+     * windows of up to 64 chunks per pull, fetched and opened lazily
+     * pages fetched as reached
+     * `cancel` stops fetching
+     * memory: one window
+   * `readFile` keeps its signature (the whole file in memory, documented).
+   * `chunkIndex(node, v, data?)`: without `data`, it hashes through `readStream`, so it never holds the file. It records `fileKey`/`keyEpoch` and `pageSize`/`pages`.
+6. **The key mode**, from `fs.policy.file_keys`, read when the write starts:
+   * **`off`:** chunks are sealed with the fs keys (`sealChunk`, at the current epoch), and the manifest has `key_mode 0`. Chunks of a `previous` with `key_mode 0` or version 1 are reused, as now.
+   * **`on`:** `fileKeyFor(node, previous?)` (fs.md §4.2):
+     * the key of `previous` when given; otherwise the newest version's key (from the `versions` read the write does anyway for `replaces: 'current'`; one extra `file/get` otherwise)
+     * after a rotation (the key's `keyEpoch` < the current epoch), `rekey_after_rotate` decides:
+       * `rewrite`: keep it when the write has a `previous` (reuse), and pick a fresh one for a write without it
+       * `eager`: always pick a fresh one
+       * `keep`: always keep it
+     * no key yet (a new node, or a `previous` in `key_mode 0` or v1): a fresh `newFileKey()` at the current epoch, and every chunk re-sealed
+   * Chunks are reused only under the same key, or both under fs keys.
+7. **Writing (`stage`):**
+   * **Source:** a `Uint8Array`, `Iterable`, `AsyncIterable` or `ReadableStream` (`blocks()` reads a stream through its reader).
+   * **Chunk bytes** are sealed with `sealFileChunk` and flushed in commits as now. Memory is one commit's chunks, plus 16 B per chunk id and 32 B per hash (for the index).
+   * **Default chunk size:** `min(64 KiB, max_value_bytes − 64)`, so a server with a small `max_value_bytes` still works. An explicit `chunkSize` is kept and checked as now.
+   * **Form:**
+     * The ids collect in memory until the count passes the inline limit: the largest `n` with `sealedManifestV2Inline(n) + 16n ≤ max_value_bytes`, computed from the sizes, about 2,800 at the defaults.
+     * Past it the write is paged: `pageSize = pageCapacity(max_value_bytes)`. Each full page is encoded and joins the pending commit (`pages` field; cost `512 + data + 16 + 48 × ids`, as the server counts), once its chunks are in that commit or an earlier one.
+     * The last partial page goes in the final flush.
+     * Paged needs the `"fs_pages"` feature (`client.info()`); without it, a file past the inline limit → 413, as before.
+   * **Page reuse (appends):** with `previous` paged at the same `pageSize`, page `i` reuses the previous page `i` (its id and digest, no upload) when its chunk ids equal the previous slice. They do when the chunks were reused, as in an append.
+   * **Manifest:** v2, sealed with `sealManifestV2`; its sealed size + 16 × (chunks | pages) ≤ `max_value_bytes`, else 413.
+8. **Resumable uploads:**
+   * `upload(node, data, {onProgress?(state), resume?: state})`.
+   * After each flush, `onProgress` gets an `UploadState`: plain data (bytes and numbers) that the caller can keep (step 8 keeps it on the local store). It holds:
+     * `node`, `fileKey`, `keyEpoch`, `chunkSize`
+     * `size` and the flushed chunks' ids and hashes
+     * the full pages flushed (`{id, digest}`)
+     * `form`
+   * With `resume`, `data` is the rest of the source from `state.size`, which is always a multiple of `chunkSize`. Nothing already flushed is sent again.
+   * It works within `chunk_grace_secs`; documented, with longer resumes in M8.
+9. **`writeOp(u)`:** the op carries `chunks` or `pages`. `writeFile`'s write-cost estimate counts `pages`.
+10. **`resolve`:** rewrites a kept version with its `chunks` or `pages` and its sealed manifest, as now.
+
+#### `@zen/db`
+* `txn.ts` `checkLimits` counts `c.pages` (one op each, plus `data + 48 × ids` bytes).
+* `crdtOnly` treats `pages` like `chunks`.
+* `files.ts` needs no change: `writeOp` carries pages.
+
+#### zen-mount (`packages/fuse/src/mount.ts`)
+* It works on `FileVersion` v2 through the tree API.
+* `size` comes from `manifest.size`, unchanged.
+* `chunkIndex` hashes without the buffer when the file wasn't read whole.
+* Large writes are still buffered in memory until step 8 (documented in CLIENT.md §9).
+
+#### Docs
+* `docs/CLIENT.md`:
+  * §8: version 2, file keys, pages, `readStream`, streaming and resumable uploads, `pageCache`
+  * §9: limits, which are now about 640 GiB at the defaults; zen-mount still buffers a written file in memory
+* `docs/STATS.md` §1.3: clients write paged versions.
+* `spec/TECH_DEBT.md`:
+  * TD-FS-LARGE-FILES resolved (the rest is M8)
+  * TD-CRDT-ROWS-SERVER marked resolved (step 3; stale)
+
+#### Tests
+* **`packages/client/test/large.test.ts`** (new, its own server: `max_value_bytes` 2,048, so chunks are about 1.9 KiB, a page holds 127 ids and the inline limit is about 55 chunks):
+  * **Round trip:** a file of about 400 chunks (≥ 3 pages) written from a `Uint8Array`, an async generator and a `ReadableStream`. `readFile` and `readStream` equal the source; `FileVersion.pages` has the right count.
+  * **Range reads:** a read in the middle fetches one page and only its chunks (`/v1/fs/pages/get` and `/v1/fs/chunks/get` calls counted through a wrapped `session.call`). A second read of the same page hits the page cache.
+  * **Append:** `writeFile` with `previous` and appended bytes. Only the last page and the new chunks are uploaded (`uploaded`, `pagesUploaded`), the file key is unchanged, and the old full pages are reused by id.
+  * **Small files:** stay inline v2 (`pages` empty); a file crossing the inline limit becomes paged.
+  * **Tampering:** a page swapped on the server (a wrapped `session.call` that returns another page's bytes) → `format`; a missing page → `not_found`.
+  * **Version 1:** a v1 version written by hand (`sealManifest`, `sealChunk` and a raw write op) reads, through `readFile`, `read` and `readStream`. Rewriting it with `previous` gives v2 with a fresh key and every chunk re-sealed (`uploaded` = all).
+  * **Policy and keys:**
+    * the default policy (`off`): chunks open with the fs keys, the manifest has `key_mode 0`, and an append reuses chunks across a `rotate`
+    * `setPolicy({fileKeys: 'on'})`, then a new write: `key_mode 1`. Two files' chunks don't open with each other's keys (`openFileChunk`), and without rotation the key is kept.
+    * after `fs.rotate` (and a new unlock), the three rekey rules:
+      * `rewrite`: an append with `previous` keeps the key and reuses chunks; a write without it gets a fresh key
+      * `eager`: a fresh key and every chunk uploaded
+      * `keep`: the old key, and chunks reused
+    * a mixed file history (`off`, then `on`, then `off`) reads back at every step
+    * the policy survives an offline unlock (the kept header)
+  * **Resume:**
+    * a source that throws after some chunks
+    * the last `onProgress` state, then `upload(…, {resume})` with the rest
+    * the result reads back equal, and the chunks and pages already flushed are not uploaded again (calls counted)
+  * **No `"fs_pages"`** (a wrapped `client.info`): a file past the inline limit → 413.
+* **`tree.test.ts`:** the existing tests pass on v2 (the `uploaded` counts in reuse tests unchanged).
+* **`@zen/db`:** a `tx.fs(tree).write(upload)` of a paged upload in a transaction with a row (`txn.test.ts` or `files`), and `checkLimits` counting pages.
+* **zen-mount** (`mount.test.ts`, skipped where FUSE is missing, run in CI): a file of several pages written through the kernel and read back. Its world gets a lowered `max_value_bytes`, or a separate describe with one.
+* **Rust (Part A):**
+  * zen-core unit tests: `key_mode` round trips and refusals; header v2 policy round trip, unknown keys kept, defaults from v1, v1 written while the policy is the default
+  * `tests/vectors.rs` for the regenerated `fs.json` and `header.json`
+  * the server needs no change (the policy is client-side); its tests stay green
 * **Verification:**
+  * Rust: `cargo fmt --check`; clippy, default and `--no-default-features`; `cargo test -p zen-core -p zen-server`; `gen_vectors` (only the `fs.json` v2 keys and `header.json`'s new entries change); `scripts/build-wasm.sh`
   * `npx biome check`
-  * tsc for client, fuse and db test
+  * tsc for client (test), fuse, db (test)
   * `npx vitest run` three times
-  * CI green
+  * CI green on the PR
+  * **Disk:** `CARGO_INCREMENTAL=0`; check `df` first
+
+#### Rhythm
+1. Restart from main, commit the plan, open a new PR.
+2. On the user's go: the `spec:` commit (Part A), then the code commit.
+3. Log the 7g line in both plan copies, push, confirm CI is green, stop for compaction.
+4. 7h is next.
 
 ### 7h: a credential vault on the local store (detailed plan)
 **Context.** A service worker (M9), a git helper (M10) or a restarted zen-mount must sign in and unlock with no page or prompt. Today the app holds the device identity and the session token itself. GAPS G15 asks for keys wrapped at rest under a non-extractable WebCrypto key, which the sealed store's device layer already provides.
