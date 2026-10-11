@@ -4,6 +4,7 @@
 import { bytes } from '@zen/client';
 import type { IndexDef, IndexField, TableRecord } from './catalog.js';
 import { encode, same, type Value } from './cbor.js';
+import { crdtRange, mergeState, overlay, viewOf } from './crdt.js';
 import { DbError } from './errors.js';
 import { privateScan, sealedScan } from './index/private.js';
 import { entryPk } from './index/unique.js';
@@ -296,6 +297,7 @@ export class Query<T extends Fields = Fields> {
     const bound = (fields: string[]) => fields.every((f) => eq.has(f) && eq.get(f) !== null);
     const keep = (r: Fields) => this.conds.every((c) => matches(r, c));
     const tt = tx.table(this.table);
+    if (t.merge === 'crdt' && !bound(t.pk)) return this.crdtScan(tx, t, keep);
 
     // 1–2. pk or unique equality: at most one row.
     let pk: Value | undefined;
@@ -348,6 +350,55 @@ export class Query<T extends Fields = Fields> {
     if (this.max !== undefined && rows.length >= this.max && rows.length) {
       const last = rows.at(-1)!;
       out.cursor = { [CURSOR]: last.key ? { path, key: last.key } : { path, pk: last.pk } };
+    }
+    return out;
+  }
+
+  /**
+   * A CRDT table without a pk lookup (§19.4): its objects in pages of
+   * `/v1/crdt/range`, merged and filtered here. Order and paging as for a
+   * table scan; indexes come with the indexer.
+   */
+  private async crdtScan(
+    tx: DbTransaction,
+    t: TableRecord,
+    keep: (r: Fields) => boolean,
+  ): Promise<Page<T>> {
+    this.warn(`zen-db: query on ${this.table} scans the whole table (no index fits)`);
+    const from = this.position('crdt');
+    let begin = from ? bytes.keyAfter(tx.keys.row(t.id, encode(from.pk!))) : undefined;
+    const ordered = !this.order;
+    const want = this.want(ordered);
+    const batch = Number.isFinite(want)
+      ? Math.min(Math.max(this.conds.length ? want * 2 : want, 16), 1000)
+      : 1000;
+    const rows: { pk: Value; row: Fields }[] = [];
+    for (let more = true; more && rows.length < want; ) {
+      tx.live();
+      const page = await crdtRange(tx.db, t, begin, batch, tx.raw.readVersion);
+      more = page.more && page.objects.length > 0;
+      for (const s of page.objects) {
+        begin = bytes.keyAfter(s.object);
+        const m = mergeState(tx.db, t, s);
+        if (m.pk === undefined) continue;
+        const row = viewOf(t, overlay(m, m.pk, tx.crdtPending(t, encode(m.pk))));
+        if (row && keep(row)) rows.push({ pk: m.pk, row });
+        if (rows.length >= want) break;
+      }
+    }
+    if (!ordered) {
+      const { field, desc } = this.order!;
+      if (this.max !== undefined && rows.length > this.max) {
+        throw new DbError('needs_index', `orderBy ${field} needs an index for a limited result`);
+      }
+      rows.sort(
+        (a, b) => compareValues(a.row[field] ?? null, b.row[field] ?? null) * (desc ? -1 : 1),
+      );
+      return { rows: rows.map((r) => r.row as T) };
+    }
+    const out: Page<T> = { rows: rows.map((r) => r.row as T) };
+    if (this.max !== undefined && rows.length >= this.max && rows.length) {
+      out.cursor = { [CURSOR]: { path: 'crdt', pk: rows.at(-1)!.pk } };
     }
     return out;
   }
