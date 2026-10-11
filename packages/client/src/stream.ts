@@ -158,7 +158,7 @@ interface SubState {
 }
 
 /** u64be(v) ‖ 0xFFFF ‖ 0xFFFF: an offset after every event committed at or before version v. */
-function offsetAfterVersion(v: bigint): Uint8Array {
+export function offsetAfterVersion(v: bigint): Uint8Array {
   const out = new Uint8Array(12).fill(0xff);
   new DataView(out.buffer).setBigUint64(0, v);
   return out;
@@ -430,12 +430,7 @@ export class Stream {
       // Without `after`, start from the current version rather than letting
       // the server pick its head: the cursor is then known from the start,
       // and a reconnection before the first event still misses nothing.
-      s.cursor =
-        opts.after ??
-        offsetAfterVersion(
-          (await this.session.call('/v1/grv', zw.encodeEmpty, zw.decodeReadVersion, {}))
-            .read_version,
-        );
+      s.cursor = opts.after ?? offsetAfterVersion(await this.session.readVersion());
     } else {
       s.seen = new Map();
     }

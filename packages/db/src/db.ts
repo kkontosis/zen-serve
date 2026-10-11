@@ -40,6 +40,7 @@ import type { Node } from './index/node.js';
 import { Keys } from './keys.js';
 import { type MigrationFn, migrate } from './migrate.js';
 import { encodeMsg, type Msg } from './msg.js';
+import { type BroadcastChannelLike, type ChannelFactory, TabSource } from './proxy.js';
 import { type Page, Query } from './query.js';
 import {
   DEDUP_TTL,
@@ -56,6 +57,7 @@ import {
   sendReply,
 } from './reply.js';
 import type { Fields } from './row.js';
+import { Saga, type SagaOptions, type SagaStep } from './saga.js';
 import { type ScheduleOptions, Scheduler, type SchedulerOptions } from './sched.js';
 import { SYSTEM_TABLES, systemTable } from './system.js';
 import { type LockManagerLike, Owner } from './tabs.js';
@@ -82,6 +84,12 @@ export interface DbOptions {
   locks?: LockManagerLike | null;
   /** `false`: never become the owner (default true). */
   owner?: boolean;
+  /**
+   * The channel to the other tabs (§9.2): with Web Locks, a tab that isn't
+   * the owner subscribes through the owner's stream. Default
+   * `BroadcastChannel` where it exists; `null`: every instance streams itself.
+   */
+  channel?: ChannelFactory | null;
   /** `false`: don't run the scheduler in the owner (§12.4; default true). */
   scheduler?: boolean;
   /** The scheduler's poll interval, lease and batch. */
@@ -184,15 +192,18 @@ export class Db {
     const info = await fs.session.client.info();
     const db = new Db(fs, ns, new Keys(fs.keys.db(ns)), info.limits, opts);
     await db.init();
-    db.owner = new Owner(
-      opts.owner === false
-        ? undefined
-        : opts.locks === undefined
-          ? (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks
-          : (opts.locks ?? undefined),
-      `zen/db/${fs.id}/${ns}`,
-      opts.owner !== false,
-    );
+    const locks =
+      opts.locks === undefined
+        ? (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks
+        : (opts.locks ?? undefined);
+    const name = `zen/db/${fs.id}/${ns}`;
+    db.owner = new Owner(opts.owner === false ? undefined : locks, name, opts.owner !== false);
+    const BC = (globalThis as { BroadcastChannel?: new (n: string) => BroadcastChannelLike })
+      .BroadcastChannel;
+    const channel =
+      opts.channel === undefined ? (BC ? (n: string) => new BC(n) : undefined) : opts.channel;
+    // Without locks every instance owns: nothing to proxy.
+    if (locks && channel) db.stream = new TabSource(db, channel(name));
     if (opts.scheduler !== false) {
       const s = new Scheduler(db, opts.schedulerOptions);
       db.scheduler = s;
@@ -562,6 +573,19 @@ export class Db {
     const h = new ConsumerHandle(this, opts, run as never, false, fail);
     this.consumers.add(h);
     return h;
+  }
+
+  /**
+   * A saga and its orchestrator (§12.5): `start(data, tx?)` runs the steps'
+   * commands in order and, on an error reply or a timeout, the completed
+   * steps' compensations newest first. The orchestrator runs in the owner.
+   */
+  saga<D extends Record<string, Value> = Record<string, Value>>(
+    name: string,
+    steps: SagaStep[],
+    opts: SagaOptions = {},
+  ): Saga<D> {
+    return new Saga<D>(this, name, steps, opts);
   }
 
   /** Reply to a request outside a consumer (§12.3): an `on` responder, scatter-gather. */

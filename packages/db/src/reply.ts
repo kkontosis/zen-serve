@@ -65,7 +65,7 @@ export const errorBody = (e: ReplyError): Value =>
   e.data === undefined ? { message: e.message } : { message: e.message, data: e.data };
 
 /**
- * An instance's inbox (§12.3): the topic `("zen", "inbox", instance)` with
+ * Each `Db`'s inbox (§12.3): the topic `("zen", "inbox", instance)` with
  * an `on` subscription from its start, so no reply can come before it, and
  * an ephemeral one.
  */
@@ -158,14 +158,26 @@ export class Inbox {
 }
 
 /** What a reply needs of its request. */
-export type RequestMsg = Pick<Message<unknown>, 'type' | 'id' | 'corr' | 'replyTo'>;
+export type RequestMsg = Pick<Message<unknown>, 'type' | 'id' | 'corr' | 'replyTo'> &
+  Partial<Pick<Message<unknown>, 'saga' | 'step'>>;
 
-/** @internal The reply Msg to a request. */
+/** @internal The reply Msg to a request; a saga command's reply carries its `saga` and `step` (§12.5). */
 export function replyMsg(req: RequestMsg, r: ReplyBody): Msg {
-  return { type: r.type, id: bytes.randomBytes(16), corr: req.corr ?? req.id, body: r.body };
+  return {
+    type: r.type,
+    id: bytes.randomBytes(16),
+    corr: req.corr ?? req.id,
+    ...(req.saga ? { saga: req.saga } : {}),
+    ...(req.step !== undefined ? { step: req.step } : {}),
+    body: r.body,
+  };
 }
 
-/** @internal Send a reply to `reply_to`: an event in `tx`, or ephemeral after its commit. */
+/**
+ * @internal Send a reply to `reply_to`: an event in `tx` (keyed by the saga
+ * id for a saga command, so its orchestrator sees it in order), or
+ * ephemeral after its commit.
+ */
 export function sendReply(
   tx: DbTransaction,
   req: RequestMsg,
@@ -176,7 +188,7 @@ export function sendReply(
   const to = tx.db.topic(...req.replyTo);
   const m = replyMsg(req, r);
   if (ephemeral) tx.after(() => void tx.db.publishMsg(to, m).catch((e) => tx.db.warn(String(e))));
-  else appendMsg(tx, to, m, undefined);
+  else appendMsg(tx, to, m, req.saga);
 }
 
 // ------------------------------------------------------------ dedup

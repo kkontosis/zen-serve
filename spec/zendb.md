@@ -603,9 +603,13 @@ In a browser, every tab of one origin is the same device and shares the same cac
   * the scheduler leader
   * migrations
   * the stream connection
-* **Other tabs** send it their transactions and subscriptions over a `BroadcastChannel`. Where `SharedWorker` exists, the owner is a shared worker instead of a tab.
+* **Other tabs** run their own transactions (they are serializable either way) and send the owner their subscriptions (`on`, ephemeral, the inbox) over the `BroadcastChannel` `zen/db/<fs>/<ns>`. A `SharedWorker` owner is a later option (TD-DB-SHAREDWORKER).
+  * **Start.** A tab resolves its subscription's start itself (`after`, or the offset after its read version), so the start doesn't depend on which tab owns.
+  * **Log events** are forwarded sealed: the owner subscribes to the topic id (a prefix, with no topics to open), and each tab opens the envelopes with its own topic keys, which also observes their HLCs.
+  * **Ephemeral messages** are forwarded opened: the stream has no sealed form for them. The channel is same-origin, like the caches.
+  * **Messages.** A tab sends `hello` (who owns?), `sub {prefix, exact, after}`, `esub {path}`, `unsub`, `epub {path, data}` and `bye` (when it closes or the page hides). The owner answers `owner` (on taking the lock and to `hello`), `ok` / `err` to each request, `ev` / `eev` for each event, and `end` when a subscription ends.
 * **When the owner closes,** its lock is released and the next tab takes over:
-  * it reopens the stream from the last offsets it has seen (§11.2)
+  * every tab re-subscribes through it (or, itself, directly) from the last offset it delivered, and drops offsets at or before it: nothing is lost or repeated
   * it waits for any old lease to expire, or re-campaigns (api.md §8.2)
 * Without Web Locks every tab is its own owner. That is correct, but it duplicates connections and wastes campaigns.
 
@@ -733,7 +737,7 @@ Every database has these tables, created with the DbRecord. They don't count as 
 |---|---|---|---|
 | `$cursors` | `[device, name]` | `topic: [bytes]`, `offset: bytes` | – |
 | `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic?: [bytes]`, `key?: bytes` (the event key's bytes), `msg?: bytes` (CBOR Msg, for `emit`), `gc?: [[bytes]]` (for `gc`: paths of elements under `D`, each deleted with every key under it) | private on `at` |
-| `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` | – |
+| `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` (the `$sched` id of the pending timeout), `corr?: bytes` (the corr of the message in flight) | – |
 | `$inbox` | `[scope, id]` | `at: int`, `reply?: {type: text, body: any}` (the reply a dedup responder sends again) | – |
 | `$ixrows` | `[table_id, pk]` | `values: {index_id: value}` (the values last indexed) | – (§19.6) |
 
@@ -773,7 +777,7 @@ Publishing is `emit`, usually inside the transaction that made the change (the o
 
 ### 12.3 Request/reply
 
-* **Inbox.** Each app instance (each owner, §9.2) has an inbox topic `("zen", "inbox", instance)`, with `instance` 16 random bytes. The class subscribes to it with `on` on first use, from the start of the topic (`after` = 12 zero bytes): the topic is new and only this instance's, so there is nothing to replay, and no reply can come before the subscription. It also subscribes to the inbox's ephemeral messages.
+* **Inbox.** Each `Db` instance (each tab, §9.2) has an inbox topic `("zen", "inbox", instance)`, with `instance` 16 random bytes. The class subscribes to it with `on` on first use, from the start of the topic (`after` = 12 zero bytes): the topic is new and only this instance's, so there is nothing to replay, and no reply can come before the subscription. It also subscribes to the inbox's ephemeral messages.
 * **Requester:** `request(topic, type, body, {timeoutMs, key?})` emits `Msg {type, id, corr: random, reply_to: inbox path, body}`. Inside a transaction it is sent when the transaction commits. The requester then waits for a message on its inbox with the same `corr`:
   * a timeout fails the request with `timeout`; the timer starts at the commit
   * late replies are dropped
@@ -825,26 +829,26 @@ The server has no timers (TD-BROKER-SERVER-TIMERS). A **scheduler leader** insid
 A saga is a series of local transactions in different services, each with a compensation, coordinated by an **orchestrator** in the app.
 
 ```
-saga(name, steps: [{name, command: topic, compensate?: topic, timeoutMs?}])
+saga(name, steps: [{name, command: topic, compensate?: topic, timeoutMs?}], {group?})
 ```
 
-* **State.** One `$sagas` row per instance: `step`, `status` (`running`, `compensating`, `done`, `failed`, `stuck`), app `data`, completed steps, the pending timeout's `$sched` id.
-* **Start:** `start(data)`, usually inside the transaction that created the business object:
-  1. insert the row
-  2. emit step 0's command, `Msg {type: name + "." + step, saga: id, step, reply_to: ("zen", "saga", ns, name), body: data}`
-  3. schedule a timeout to the same reply topic
-* **Participants** are ordinary responders (§12.3). Each one handles the command in its own transaction and replies `ok` or `fail` (with data) in that transaction.
-* **The orchestrator** consumes `("zen", "saga", ns, name)` with `per_key`, keyed by the saga id. So each instance's events are handled one at a time, and different instances in parallel. Each reply or timeout is one transaction:
-  1. Read the saga row. A reply for another step than the current one is stale: acknowledge it and stop.
-  2. On `ok`:
-     * record the step
-     * cancel its timeout
-     * either emit the next command and schedule its timeout, or set `done`
-  3. On `fail` or timeout: set `compensating`, then emit the compensations of the completed steps, one at a time in reverse order, each answered like a command.
-     * When all are done: `failed`.
-     * A compensation that ends in the DLQ leaves the saga `stuck`, for an operator.
-  4. Acknowledge (the consume step).
-* **Guarantee.** Every saga transition happens exactly once: the row update, the next command and the consume step are one commit. A participant's database work is exactly once, too. Its external calls are at least once, with the command's `id` as idempotency key (§12.6).
+* **State.** One `$sagas` row per instance: `step` (the step in flight), `status` (`running`, `compensating`, `done`, `failed`, `stuck`), app `data`, `done` (the completed steps), the pending timeout's `$sched` id, and the `corr` of the message in flight.
+* **Messages.** All of an instance's messages are keyed by the saga id. Each carries `saga`, `step` (the step's name) and a fresh random `corr`.
+  * A command: `Msg {type: name + "." + step, saga, step, corr, reply_to: ("zen", "saga", ns, name), body: data}`, to the step's `command` topic.
+  * A compensation: the same with type `name + "." + step + ".compensate"`, to its `compensate` topic.
+  * A timeout: `Msg {type: "zen.saga.timeout", saga, step, corr}`, scheduled (§12.4) to the reply topic after `timeoutMs` (default 60,000), with the corr of the message it guards.
+* **Start:** `start(data, tx?)`, usually inside the transaction that created the business object: insert the row, emit step 0's command and schedule its timeout.
+* **Participants** are ordinary responders (§12.3). Each one handles the command in its own transaction and replies `ok` (`<type>.reply`) or fails with a `ReplyError` (`<type>.error`) in that transaction. A reply copies the request's `saga` and `step` and is keyed by the saga id.
+* **The orchestrator** consumes `("zen", "saga", ns, name)` with a `per_key` group (default `"orchestrator"`). So each instance's events are handled one at a time, and different instances in parallel. Each reply or timeout is one transaction:
+  1. Read the saga row. A message whose `corr` isn't the row's is stale (an earlier step's, a late reply, a fired timeout already answered): acknowledge it and stop.
+  2. A reply cancels the pending timeout.
+  3. **Running, `ok`:** merge an object body into `data` (shallow), add the step to `done`, then either emit the next command and schedule its timeout, or set `done`.
+  4. **Running, an error reply or a timeout:** store the error body (or `{message: "timeout", step}`) in `data.error`, then compensate: emit the compensation of the newest completed step that has one, with its timeout. With none left: `failed`.
+  5. **Compensating, `ok`:** the next older compensation, or `failed` when none is left.
+  6. **Compensating, an error reply or a timeout:** `stuck`, for an operator. Compensations retry inside their participant until it gives up.
+  7. Acknowledge (the consume step).
+* **Stuck through the DLQ.** The orchestrator also consumes each compensate topic's class DLQ `<compensate> ‖ "zen.dlq"` (§12.2, a `sequential` group `<group>.<name>.dlq`). A dead-lettered compensation whose `corr` is its row's sets `stuck`. This needs participants with `retry: "delay"`; with `nack`, the server DLQ isn't visible to the orchestrator and the compensation's timeout covers it.
+* **Guarantee.** Every saga transition happens exactly once: the row update, the next message, the timeout, the cancel and the consume step are one commit. A participant's database work is exactly once, too. Its external calls are at least once, with the command's `id` as idempotency key (§12.6).
 * **Compensations** must be idempotent and retriable.
 
 ### 12.6 Outbox, inbox and external effects
