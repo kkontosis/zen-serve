@@ -237,7 +237,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Tests:** `crdtoffline.test.ts` (15: read modes, the queue, a lost response, a rebase past a 1 s horizon, mixed flushes, a dropped table, learned dots, the 3-installation property test with three seeds); `kv.test.ts` +1; `tests/crdt.rs` +1. 256 vitest tests in all.
     * PR #23 merged.
   * **Replanned after 7c (merged, #23):** step 7 gains 7d (a sealed local store, the persisted queue) and 7e (persisted caches, offline open), a PR each. See Step 7, 7d and 7e.
-  * **7d** (sealed local store, persisted queue): done, PR #24 (the plan commit restarted the branch from main). As planned, with these details for 7e:
+  * **7d** (sealed local store, persisted queue): done, PR #24 (merged; the plan commit restarted the branch from main). As planned, with these details for 7e:
     * **Rust:** seal kind 8 (`Kind::Local`, label `zen/v1/aad/local`), zen-core `db::seal_local` / `open_local`, wasm `FsKeys.sealLocal` / `openLocal`, the `local` vectors section.
     * **`@zen/client` `src/local/`:**
       * `store.ts`: `LocalStore` (`get`, `put`, `delete`, `list`, `clear`, `deviceKey`, `close`) and `memoryLocalStore`.
@@ -263,6 +263,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `vectors.test.ts` +1 (local records).
       * `crdtpersist.test.ts` (10): a restart, a crash after a lost reply (the same `commit_id`, counted once), a crash before any send, three layer settings, another fs, `Db.wipe`, owner-only sending with handover, and two tabs of one installation incrementing at once. Both crash and counter tests were checked to fail without the change.
       * New dev dependency `fake-indexeddb` 6.2.5.
+  * **7e** (persisted caches, offline open): planned in detail (see Step 7, 7e). #24 is merged, so the plan commit restarts the branch from main and opens a new PR.
 
 ## Facts the work must respect (from the code survey)
 
@@ -1526,16 +1527,94 @@ Step 7 builds the class side.
   * CI green on the PR before stopping
 * **Disk:** `CARGO_INCREMENTAL=0`; check disk first.
 
-### 7e: persisted caches and offline open (outline; detailed after 7d)
-* **Caches on the sealed store**, write-through with versions, loaded at open and bounded by the same LRU sizes (eviction deletes):
-  * CRDT ObjStates, with `checked` times: `cache` and `auto` reads after a restart
-  * rows and TableRecords: their versions keep §7.7's `expect`s coherent, so a stale copy only causes a retry
-  * private-index nodes (immutable, by id) and sealed blobs (by index and digest), read lazily on a miss
-* **Offline open:**
-  * the fs header (already sealed) is stored at `unlock`, and `unlock` falls back to it offline
-  * `Db.open` stores `/v1/info` limits and features, the DbRecord and the catalog; offline it opens from them when the stored schema equals the app's, and migrations wait for the server
-  * the app keeps its own session token
-* **Tests:** a cold start offline reads CRDT rows (both read modes) and cached rows; a stale persisted row re-runs its transaction; no node fetches on a warm start; wipe. TD-DB-PERSISTENT-CACHE resolved.
+### 7e: persisted caches and offline open (detailed plan)
+
+**Context.** 7d (PR #24, merged) gives the sealed local store and puts the CRDT queue on it. Every cache is still in memory, so a restart starts cold, and nothing opens offline: `unlock` fetches the fs header, and `Db.open` calls `/v1/info`, reads the DbRecord, runs `migrate` and loads the catalog, all from the server. 7e puts the caches on the store and lets `unlock` and `Db.open` work offline. It resolves TD-DB-PERSISTENT-CACHE and finishes step 7.
+
+**User decisions:**
+* All four caches persist: CRDT states, rows and the catalog, private-index nodes, sealed blobs.
+* `unlock` and `Db.open` work offline from stored state; migrations wait for the server.
+* **Offline reads of transactional rows are opt-in** (`read: 'cache'`). The default stays strict: offline, a read-only transaction that used cached rows fails, as now.
+
+**After compaction, re-read:**
+* this section and the 7d log line
+* `spec/zendb.md` §3.1, §7.7, §9.3, §19.4
+* `packages/db/src/{db,txn,crdtcache,localq,query}.ts`, `index/{private,sealed}.ts`
+* `packages/client/src/{fs,client,local/sealed}.ts`
+* `packages/db/test/{crdtpersist,crdtoffline,txn}.test.ts` (setup, `net`)
+
+**Branch/PR.** #24 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7e plan`), and open a new PR that 7e joins.
+
+#### Client: `unlock` offline (`packages/client/src/fs.ts`)
+* `Fs.unlock(how?, {local?: SealedStore})` and `Fs.header({local})`:
+  * Online: as now, then store the header's bytes (`header.encode()`) and its `version` in store `fs/<fs id>`, key `header`.
+  * On a `network` error: decode the stored header (`zw.FsHeader.decode`, the fs-id check) and open it with `openHeader` as now. With nothing stored, the error stands.
+  * The header carries its own protection (slots are AEAD-sealed). It is no less trusted than one fetched online, since signed headers come in milestone 6.
+* **Layers.** The fs layer can't seal the header it unlocks, so `unlock` refuses a store with the fs layer (`TypeError`). An app that wants the fs layer for its database uses two `sealedStore`s over one backend (documented).
+* `Fs.forget(local)` deletes the stored header (sign-out).
+* `UnlockedFs.editHeader` refreshes the stored copy when it was unlocked with `local`.
+* **Session offline:** the app resumes its own session with `client.resume(token)`, which is already offline. Unlock material is then explicit, since a resumed session holds none (documented).
+
+#### `@zen/db`: caches on the store
+1. **`localcache.ts`, a write-behind layer:** `LocalCache(sealed, store)` with `put(key, bytes)`, `delete(key)` and `load()`.
+   * Writes are gathered and flushed every 100 ms and on `close()`, so filling a cache costs no store round trip per entry.
+   * A write lost to a crash only means a colder cache: every entry is checked by its version or digest when used.
+   * Store names, all listed in `localStores(ns)` so `Db.wipe` clears them: `queue/<ns>`, `db/<ns>`, `rows/<ns>`, `crdt/<ns>`, `nodes/<ns>`, `sealed/<ns>`.
+2. **What each cache stores** (with `DbOptions.local`; `DbOptions.persist: false` keeps caches in memory while the queue stays persisted):
+   * **Catalog** (`db/<ns>`): `info` (the `/v1/info` limits and features), `db` (the DbRecord), and `t<name>` (a TableRecord with its version, via `encodeTableRecord`). Written at open, and on every `catalogSet` / `catalogStale` through `Db`. Loaded at open (offline open, below).
+   * **Rows** (`rows/<ns>`, key = the stored row key): `{1: version, 2: fields (CBOR), 3: parts}`. Written by `cacheRow`, deleted by `dropRow`, `rowsWritten` and LRU eviction. Loaded at open, newest first, up to `rowCache`; the excess is deleted. The checks of §7.7 are unchanged: a stale persisted row makes its transaction re-run once.
+   * **CRDT states** (`crdt/<ns>`, key = object): `{1: ObjState (zw.encodeObjState) or absent, 2: checked, 3: stale}`. Written by `put`, `confirm` and `markStale`, deleted by eviction. Loaded at open up to `crdtCache`, so `cache` reads, `auto` reads (an old `checked` costs a version check), `statesIn` scans and offline reads work after a restart. The in-flight marks (`marks`, `gen`) aren't stored.
+   * **Private-index nodes** (`nodes/<ns>`, key = index id ‖ node id): the node bytes. Read lazily on a memory miss, before the server, and checked against `IndexKeys.nodeId`. Written by `cacheNode`; evicted with the memory LRU (`NODE_CACHE`).
+   * **Sealed blobs** (`sealed/<ns>`, key = index id): `{1: digest, 2: blob}`. Read lazily when the head's digest misses in memory, checked with `partsDigest`. Written by `cacheSealed`; one per index, replaced.
+3. **Opt-in offline reads of transactional rows (`read: 'cache'`):**
+   * `db.transaction(fn, {read: 'cache'})` and `table.get(pk, {read: 'cache'})` already exist for CRDT tables.
+   * On transactional tables, `cache` means: online, exactly as now (cached rows checked by version). When the server can't be reached, a read-only transaction answers from cached rows unchecked, and a row that isn't cached is `offline`.
+   * Writes, queries on transactional tables (their roots and index entries need the server), and the default `auto` mode stay strict offline.
+   * The finish check: a `network` error in `finish`'s `snapshotGet` is accepted in `cache` mode for a read-only transaction.
+4. **Offline open (`Db.open`):**
+   * Online: as now, then store `info`, the DbRecord and the catalog.
+   * When `/v1/info` fails with `network` and `local` holds this database:
+     * Open from the stored `info`, DbRecord and catalog, if the format and integrity pass and the stored schema equals `opts.schema`. Otherwise `DbError('offline', 'the database needs the server to open (a migration is due)')`.
+     * `init` and `migrate` are skipped; they run at the next online open.
+     * The owner election, scheduler, indexers and consumers start as usual and back off while offline (their existing network handling).
+   * `db.offline` (true when it opened from stored state) lets apps tell.
+   * Clock: a cold start offline ticks from the local wall clock (no `sync`). Queued edits are re-stamped on `stale_op` / `clock_skew` at send, as now. To keep the HLC and the counter actor across restarts, the app gives the session a `ClockStore` (documented; a store on the local store would need an async `ClockStore`, out of scope).
+5. **Wipe:** `Db.wipe(local, ns)` clears every store above; `Fs.forget(local)` the header.
+
+#### Spec (⚠️ `spec:` commit)
+* **zendb.md §9.3:** what is stored (the stores and records above), write-behind, every entry checked on use, `persist: false`, wipe.
+* **§3.1:** opening offline (stored info, DbRecord and catalog; the schema must match; migrations wait).
+* **§7.7:** persisted rows; `read: 'cache'` on transactional tables.
+* **§19.4:** CRDT states persist with their `checked` times.
+* **fs.md (or the unlock section of formats.md §12):** the stored header used offline.
+
+#### Docs
+* `docs/CLIENT.md` §4 (`unlock({local})`, `forget`) and §10.
+* `docs/DB.md`: caches and coherence (persisted caches), opening offline, `read: 'cache'` on transactional tables.
+* `spec/TECH_DEBT.md`: TD-DB-PERSISTENT-CACHE resolved.
+
+#### Tests
+* **`packages/client/test/local.test.ts`** (with a server, or a separate `unlockoffline` test in `kv.test.ts`'s world):
+  * `unlock({local})` online stores the header; offline (`network` from a wrapped `session.call`) it unlocks from it and reads nothing else.
+  * Nothing stored → `network`. A store with the fs layer is refused.
+  * `forget` removes it.
+* **`packages/db/test/dbpersist.test.ts`** (its own server; `net` as in crdtpersist):
+  * **Cold start offline:** open online with `local`, read CRDT rows and transactional rows, close. Then go offline, unlock from the stored header, and `Db.open` from stored state (`db.offline`):
+    * CRDT `get` in `auto` and `cache` modes, and a `cache` query, answer.
+    * A transactional `get` with `read: 'cache'` answers.
+    * The default read fails `offline` (strict).
+    * Queued CRDT writes work and are sent once online.
+  * **Schema mismatch offline** → `offline`; online it migrates.
+  * **Warm start online:** a reopened `Db` serves a cached row with no row fetch (`stats.rowHits`); a private-index query fetches no nodes (count `/v1/kv/get` of node keys); a sealed query fetches no parts.
+  * **A stale persisted row** (changed by another installation while closed) re-runs its transaction once and returns the new value.
+  * **CRDT `auto` after a restart** costs one version check, not a `get`.
+  * **Tampering:** a flipped persisted record is dropped with a warning and fetched again.
+  * **`persist: false`:** caches stay cold; the queue still persists.
+  * **`Db.wipe` / `Fs.forget`** leave the store empty.
+* **Verification:**
+  * JS: `npx biome check`; tsc for client (test config), fuse and db test; `npx vitest run` three times.
+  * Rust is unchanged unless the spec needs vectors (none planned).
+  * CI green on the PR before stopping.
 
 ### Rhythm
 1. Restart from main, log the step 7 plan line, commit, push, open a new PR.
