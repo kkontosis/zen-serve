@@ -9,7 +9,14 @@ import {
   ZenError,
 } from '@zen/client';
 import type { CommitResult } from '@zen/wasm';
-import { appendMsg, type Binding, checkType, type EmitOptions } from './broker.js';
+import {
+  appendMsg,
+  type Binding,
+  checkHeaders,
+  checkType,
+  type EmitOptions,
+  emitKey,
+} from './broker.js';
 import { encodeTableRecord, type IndexDef, type TableRecord } from './catalog.js';
 import { encode, isPlainObject, type Value } from './cbor.js';
 import type { Db } from './db.js';
@@ -25,7 +32,15 @@ import type { IndexTx } from './index/types.js';
 import { uniqueChange } from './index/unique.js';
 import type { Keys } from './keys.js';
 import { Query } from './query.js';
+import {
+  type Reply,
+  type RequestAllOptions,
+  type RequestMsg,
+  type RequestOptions,
+  sendReply,
+} from './reply.js';
 import { decodeRow, type Fields, joinParts, layoutRow } from './row.js';
+import { dueAt, type ScheduleOptions, scheduleGc, scheduleMsg, type When } from './sched.js';
 import { fitsType } from './sortkey.js';
 
 /** A row as read back: its fields and how many parts it is stored in. */
@@ -69,6 +84,8 @@ export class DbTransaction implements IndexTx {
     string,
     { t: TableRecord; pk: Value; pkEl: Uint8Array; existed: boolean; row: Fields | undefined }
   >();
+  /** `gc` jobs to insert at `finish` (parts of emits with `ttlMs`). */
+  private readonly gcs: { paths: Uint8Array[][]; at: number }[] = [];
   /**
    * The id of the event this transaction handles (§10.2): every event it
    * appends carries it as `causation`. Set for consumer handlers.
@@ -126,14 +143,108 @@ export class DbTransaction implements IndexTx {
   emit(topic: Topic, type: string, body: Value, opts: EmitOptions = {}): Uint8Array {
     this.live();
     checkType(type);
+    checkHeaders(opts.headers);
     const id = opts.id ?? bytes.randomBytes(16);
-    appendMsg(
+    const s = appendMsg(
       this,
       topic,
       { type, id, ...(opts.headers ? { headers: opts.headers } : {}), body },
+      emitKey(opts),
+    );
+    if (s.parts && opts.ttlMs !== undefined) {
+      // Delete the body's parts after the ttl (§10.3): a `gc` job, inserted at `finish`.
+      this.gcs.push({
+        paths: [[bytes.utf8('m'), id]],
+        at: dueAt(this.db, { delayMs: opts.ttlMs }),
+      });
+    }
+    return id;
+  }
+
+  /**
+   * Schedule a message for later (§12.4): delivered at `at` (or after
+   * `delayMs`) by the scheduler, if this transaction commits. Returns its
+   * id, which `cancel` takes.
+   */
+  async schedule(
+    topic: Topic,
+    type: string,
+    body: Value,
+    opts: ScheduleOptions,
+  ): Promise<Uint8Array> {
+    this.live();
+    checkType(type);
+    checkHeaders(opts.headers);
+    const id = opts.id ?? bytes.randomBytes(16);
+    const m = { type, id, ...(opts.headers ? { headers: opts.headers } : {}), body };
+    await scheduleMsg(this, topic, m, opts.key, dueAt(this.db, opts));
+    return id;
+  }
+
+  /** Cancel a scheduled message. False if it was delivered (or never scheduled). */
+  cancel(id: Uint8Array): Promise<boolean> {
+    return this.table('$sched').delete(id);
+  }
+
+  /** @internal A `gc` job: delete these paths (under `D`) and everything under them, later. */
+  gc(paths: Uint8Array[][], when: When): Promise<void> {
+    return scheduleGc(this, paths, dueAt(this.db, when));
+  }
+
+  /**
+   * Send a request (§12.3) when this transaction commits. The promise
+   * settles with the reply, or `timeout`, counted from the commit; if this
+   * attempt doesn't commit it never settles (a re-run sends a new one).
+   * Await it after the transaction, never inside it.
+   */
+  request<B = Value>(
+    topic: Topic,
+    type: string,
+    body: Value,
+    opts: RequestOptions = {},
+  ): Promise<Reply<B>> {
+    return this.ask(topic, type, body, false, opts) as Promise<Reply<B>>;
+  }
+
+  /** Scatter-gather (§12.3): every reply until the timeout or `max`, when this transaction commits. */
+  requestAll<B = Value>(
+    topic: Topic,
+    type: string,
+    body: Value,
+    opts: RequestAllOptions = {},
+  ): Promise<Reply<B>[]> {
+    return this.ask(topic, type, body, true, opts) as Promise<Reply<B>[]>;
+  }
+
+  private ask(
+    topic: Topic,
+    type: string,
+    body: Value,
+    all: boolean,
+    opts: RequestAllOptions,
+  ): Promise<unknown> {
+    this.live();
+    checkType(type);
+    const inbox = this.db.inbox;
+    const ready = inbox.start();
+    const corr = opts.corr ?? bytes.randomBytes(16);
+    appendMsg(
+      this,
+      topic,
+      { type, id: bytes.randomBytes(16), corr, replyTo: inbox.path, body },
       opts.key,
     );
-    return id;
+    return new Promise((resolve, reject) => {
+      this.raw.onCommit(() => {
+        ready.then(() => inbox.wait(corr, type, all, opts).then(resolve, reject), reject);
+      });
+    });
+  }
+
+  /** Reply to a request in this transaction (an `on` responder, a manual consumer). */
+  reply(req: RequestMsg, body: Value): void {
+    this.live();
+    sendReply(this, req, { type: `${req.type}.reply`, body });
   }
 
   /**
@@ -306,6 +417,7 @@ export class DbTransaction implements IndexTx {
   async finish(): Promise<void> {
     this.live();
     this.emitChanges();
+    for (const g of this.gcs.splice(0)) await scheduleGc(this, g.paths, g.at);
     for (const p of this.ops.values()) {
       if (p.ops.size) await applyPrivate(this, p.ix, p.shard, p.ops);
     }
@@ -413,7 +525,8 @@ export class TableTx<T extends Fields = Fields> {
     const t = await this.tx.tableRecord(this.name);
     const pk = pkOf(t, row);
     const pkEl = encode(pk);
-    const old = await this.read(t, pkEl);
+    // A cached copy may be stale (a read that raced a delete): check `exists` on the server.
+    const old = await this.read(t, pkEl, true);
     if (old) throw new DbError('exists', `table ${t.name} already has this row`, { pk });
     await this.write(t, pk, pkEl, undefined, row);
   }
@@ -460,13 +573,15 @@ export class TableTx<T extends Fields = Fields> {
 
   /**
    * Read a row by its pk element (into the read set), with its parts: a
-   * cached copy by its version (§7.7), otherwise from the server. @internal
+   * cached copy by its version (§7.7), otherwise (or `fresh`) from the
+   * server. @internal
    */
-  async read(t: TableRecord, pkEl: Uint8Array): Promise<ReadRow | undefined> {
+  async read(t: TableRecord, pkEl: Uint8Array, fresh = false): Promise<ReadRow | undefined> {
     const tx = this.tx;
     tx.live();
     const key = this.keys.row(t.id, pkEl);
-    if (!tx.raw.owns(key)) {
+    if (fresh) tx.db.dropRow(bytes.hex(key));
+    else if (!tx.raw.owns(key)) {
       const h = bytes.hex(key);
       const c = tx.db.cachedRow(h);
       if (c) {

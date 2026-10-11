@@ -732,9 +732,9 @@ Every database has these tables, created with the DbRecord. They don't count as 
 | Table | pk | Fields | Indexes |
 |---|---|---|---|
 | `$cursors` | `[device, name]` | `topic: [bytes]`, `offset: bytes` | – |
-| `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic: [bytes]`, `key?: bytes`, `msg: bytes` (CBOR Msg), `gc?: [[bytes]]` (KV paths to delete) | private on `at` |
+| `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic?: [bytes]`, `key?: bytes` (the event key's bytes), `msg?: bytes` (CBOR Msg, for `emit`), `gc?: [[bytes]]` (for `gc`: paths of elements under `D`, each deleted with every key under it) | private on `at` |
 | `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` | – |
-| `$inbox` | `[scope, id]` | `at: int` | – |
+| `$inbox` | `[scope, id]` | `at: int`, `reply?: {type: text, body: any}` (the reply a dedup responder sends again) | – |
 | `$ixrows` | `[table_id, pk]` | `values: {index_id: value}` (the values last indexed) | – (§19.6) |
 
 ## 12. Patterns
@@ -766,22 +766,27 @@ Publishing is `emit`, usually inside the transaction that made the change (the o
   * Native competing consumers are TD-CONSUME-COMPETING.
 * **Retries.** The default is `retry: "nack"`: immediate redelivery and order kept, then the DLQ.
   * `retry: "delay"` instead acknowledges the message and, in the same transaction, schedules (§12.4) a copy for `now + backoff(attempt)` with header `zen.attempt` incremented. That gives backoff, but loses the order within the key.
-  * After `maxAttempts` the copy goes to the dead letters of the class: a scheduled `emit` to `<topic>/zen.dlq`.
+    * **Attempts.** A message without `zen.attempt` is attempt 1. The default backoff is `min(1000 · 2^(attempt−1), 300000)` ms.
+    * **The copy** keeps the `id`, `corr`, `reply_to`, saga fields, headers and body. A consumer knows only the event key's token, so the copy carries the group's key (`single_key`) or a fresh random one.
+  * After `maxAttempts` (default 5) the copy goes to the dead letters of the class: an `emit` to `<topic> ‖ "zen.dlq"` in the same transaction, at once, with `zen.attempt` the last attempt.
+  * Header names starting with `zen.` are reserved for the class, like message types (§10.1).
 
 ### 12.3 Request/reply
 
-* **Inbox.** Each app instance (each owner, §9.2) has an inbox topic `("zen", "inbox", instance)`. The class subscribes to it with `on`, from now, on first use.
+* **Inbox.** Each app instance (each owner, §9.2) has an inbox topic `("zen", "inbox", instance)`, with `instance` 16 random bytes. The class subscribes to it with `on` on first use, from the start of the topic (`after` = 12 zero bytes): the topic is new and only this instance's, so there is nothing to replay, and no reply can come before the subscription. It also subscribes to the inbox's ephemeral messages.
 * **Requester:** `request(topic, type, body, {timeoutMs, key?})` emits `Msg {type, id, corr: random, reply_to: inbox path, body}`. Inside a transaction it is sent when the transaction commits. The requester then waits for a message on its inbox with the same `corr`:
-  * a timeout fails the request with `timeout`
+  * a timeout fails the request with `timeout`; the timer starts at the commit
   * late replies are dropped
+  * **In a transaction.** If the transaction's attempt doesn't commit, its request is never sent and its wait never ends; a re-run sends a new request. So the wait is awaited after the transaction, never inside it.
 * **Responder:** `serve({group, topic, mode}, handler(msg, tx) → reply)` is a `consume` whose handler returns the reply body. The class emits `Msg {type: msg.type + ".reply", corr: msg.corr, body: reply}` to `reply_to` **in the same transaction** that consumes the request. So the request's database effects and the reply happen together, exactly once.
-  * A handler that throws `ReplyError` sends an error reply (`type ".error"`) and consumes the request.
+  * A handler that throws `ReplyError` sends an error reply (`type ".error"`, body `{message: text, data?: any}`) and consumes the request, in a transaction of its own: the handler's writes are dropped. The requester's request fails with that error.
+  * The reply's `corr` is the request's `corr`, or its `id` without one. A request without `reply_to` gets no reply.
   * Any other throw goes through `nack`.
 * **Repeated requests.** A requester that retries after a timeout sends the request again with the same `corr`. A responder with `dedup: true` records `($inbox, scope = group, id = corr)` in the handling transaction and replies again without re-running the handler.
 * **Ephemeral replies.** `reply: "ephemeral"` sends the reply with `epub` after the commit, not as an event.
   * It costs no log space, but may be lost, and is rate-limited.
   * It suits cheap queries such as "who is online".
-* **Scatter-gather.** A request to a topic that several `on` subscribers answer collects every reply until the timeout.
+* **Scatter-gather.** A request to a topic that several `on` subscribers answer (`reply(msg, body)`) collects every reply until the timeout, or until `max` replies: `requestAll` returns what arrived, with no `timeout` error.
 * **Grants (formats.md §9.1):**
   * the requester needs `append` on the request topic and `read` on its inbox
   * the responder needs `consume` on the request topic and `append` on the inbox
