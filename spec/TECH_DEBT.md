@@ -204,3 +204,31 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** Milestone 4.5 is specs only. Scheduled for milestone 5 (DESIGN-3 §6), moved forward from 7, so that the offline variants of the app examples can be demonstrated with zen-db.
 * **What it would take:** The operations and their merge rules inside the commit transaction, the keyspace of zendb.md §19.5 (moved into keyspace.md), the sweeper purge of deleted objects past the horizon, the reads, api.md §6 and §12-style sections, zen-proto types, and the property test of §19.9 against an in-memory reference, on both backends.
 
+## TD-DB-PERSISTENT-CACHE
+
+* **Status:** open
+* **Context:** zen-db's caches (catalog records, rows, private-index nodes, sealed blobs) are kept in memory per `Db` instance (spec/zendb.md §9.3). A new page load starts cold, and offline reads need the zen-fs replica or CRDT tables.
+* **Why deferred:** Milestone 5 decided on memory only. A persistent cache needs a key that never leaves the device (a non-extractable WebCrypto key, DESIGN-2 §4) and a way to evict entries, and the version checks of §7.7 make any cache safe to add later.
+* **What it would take:** An encrypted IndexedDB (browser) or file (Node) store behind the same LRUs, sealed with a device-local non-extractable key; versions kept with every entry so §7.7's `expect`s keep it coherent; an option to turn it on, a wipe on sign-out, and tests that a stale persistent entry causes a retry.
+
+## TD-DB-TAB-PROXY
+
+* **Status:** open
+* **Context:** zen-db elects one owner tab per database with Web Locks (spec/zendb.md §9.2, `packages/db/src/tabs.ts`), but other tabs still run their own transactions and will run their own subscriptions instead of sending them to the owner over a `BroadcastChannel`.
+* **Why deferred:** Transactions are serializable on the server, so running them in every tab is correct. Forwarding only saves connections and duplicate work, and it matters once subscriptions exist (milestone 5 step 6).
+* **What it would take:** A message protocol over `BroadcastChannel` (request, result, error, subscription events, cancel), which carries transaction functions as named operations because closures can't cross tabs; a fallback to running locally while no owner answers; and tests with simulated tabs. Resolved in step 6 if it lands there.
+
+## TD-DB-OBLIVIOUS-INDEX
+
+* **Status:** open
+* **Context:** spec/zendb.md §5.8 specifies an `oblivious` index (a B+tree inside Path ORAM) that hides access patterns. `createIndex` refuses `kind: "oblivious"` with `format`.
+* **Why deferred:** Milestone 5 builds the unique, fast, private and sealed kinds. ORAM is the costliest one (every access, even a read, rewrites paths) and needs its own tests of stash bounds.
+* **What it would take:** The bucket, Block, head and stash encodings of §5.8 with their vectors (§17), the access with eviction, a B+tree over ORAM blocks, the stash bound under long random runs, and the property test that it answers like `private`.
+
+## TD-DB-SHAREDWORKER
+
+* **Status:** open
+* **Context:** spec/zendb.md §9.2 says that where `SharedWorker` exists, the owner is a shared worker instead of a tab. zen-db elects a tab.
+* **Why deferred:** It needs the tab proxy (TD-DB-TAB-PROXY) first, plus a worker bundle with the wasm module.
+* **What it would take:** A worker entry point that opens the `Db` and serves the proxy protocol, a page-side client that prefers it when `SharedWorker` exists, key handling (unlock material passed to the worker once), and browser tests.
+

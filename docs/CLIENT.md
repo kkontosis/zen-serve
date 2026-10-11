@@ -90,6 +90,9 @@ await fs.transaction(async (tx) => {
 * **Snapshot reads** (`tx.snapshotGet(paths)`, `tx.snapshotRange(prefix)`) read at the transaction's read version (`tx.readVersion`, set by its first read) but record nothing: no read conflict, no `expect`. Use them for data whose consistency is checked another way, such as content-addressed nodes.
 * `tx.expectKey(path, version)` makes the commit fail with `conflict` unless the key is still at `version` (still absent for `undefined`). It puts a record read earlier, such as one from a cache, into the read set, in either mode.
 * Other parts add to the commit with `tx.addCrdtOps(ops)` and `tx.addChunks(chunks)`. `tx.onCommit(fn)` runs once the attempt commits; `tx.onError(fn)` runs when it fails, and if a hook returns true the transaction runs again (a tree rebase does this). `tx.result` carries `dots`, `offsets` and `set_dots`.
+* `tx.getEntries(keys)` is `getAll` with each entry's key and version (undefined for the transaction's own writes), for caching. `tx.owns(key)` tells whether the transaction wrote, deleted or cleared a key.
+* `{retry: (e) => boolean}` chooses which errors re-run the function (default: `conflict` and `too_old`). zen-db's `auto` mode retries only `conflict` in its short phase.
+* `commitTransaction(tx)` commits a `new Transaction(fs, mode)` the caller built itself, and runs its `onCommit` hooks. It returns undefined when there is nothing to send. On a failure the caller decides; there is no retry. zen-db's `db.begin()` uses it.
 
 ## 6. Topics, consumers and leaders
 

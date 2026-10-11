@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { bytes, fullGrants, isCode, member, type UnlockedFs, ZenError, zw } from '../src/index.js';
+import {
+  bytes,
+  commitTransaction,
+  fullGrants,
+  isCode,
+  member,
+  Transaction,
+  type UnlockedFs,
+  ZenError,
+  zw,
+} from '../src/index.js';
 import { testUser } from '../src/testing/index.js';
 import { type World, world } from './helpers.js';
 
@@ -356,5 +366,54 @@ describe('snapshot reads, expectKey and commit hooks', () => {
       tx.onError(async (e) => isCode(e, 'bad_request'));
     });
     expect(runs).toBe(2);
+  });
+});
+
+describe('retry filter, getEntries, commitTransaction', () => {
+  it('retry: only the errors it accepts re-run fn', async () => {
+    let runs = 0;
+    const p = fs.transaction(
+      async () => {
+        runs++;
+        throw new ZenError(409, 'too_old', 'test');
+      },
+      { retry: (e) => isCode(e, 'conflict') },
+    );
+    await expect(p).rejects.toThrow('too_old');
+    expect(runs).toBe(1);
+  });
+
+  it("getEntries: versions equal snapshotGet's; own writes have none", async () => {
+    await fs.kv.set(['ge', 'a'], u('A'));
+    await fs.transaction(async (tx) => {
+      tx.set(['ge', 'b'], u('B'));
+      const [a, b, c] = await tx.getEntries([
+        ['ge', 'a'],
+        ['ge', 'b'],
+        ['ge', 'c'],
+      ]);
+      const [sa] = await tx.snapshotGet([['ge', 'a']]);
+      expect(s(a!.value)).toBe('A');
+      expect(bytes.hex(a!.version!)).toBe(bytes.hex(sa!.version));
+      expect(s(b!.value)).toBe('B');
+      expect(b!.version).toBeUndefined();
+      expect(c).toBeUndefined();
+      expect(tx.owns(fs.kv.key(['ge', 'b']))).toBe(true);
+      expect(tx.owns(fs.kv.key(['ge', 'a']))).toBe(false);
+    });
+  });
+
+  it('commitTransaction commits, runs the hooks, and sends nothing when empty', async () => {
+    const tx = new Transaction(fs, 'short');
+    expect(await commitTransaction(tx)).toBeUndefined();
+    const tx2 = new Transaction(fs, 'short');
+    tx2.set(['ct'], u('x'));
+    let hooked = 0;
+    tx2.onCommit(() => hooked++);
+    const r = await commitTransaction(tx2);
+    expect(r).toBeDefined();
+    expect(tx2.result).toBe(r);
+    expect(hooked).toBe(1);
+    expect(s(await fs.kv.get(['ct']))).toBe('x');
   });
 });

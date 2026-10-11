@@ -289,6 +289,7 @@ export class Query<T extends Fields = Fields> {
   }
 
   private async run(tx: DbTransaction): Promise<Page<T>> {
+    tx.live();
     const t = await tx.tableRecord(this.table);
     const eq = new Map<string, Value>();
     for (const c of this.conds) if (c.op === '=' && !eq.has(c.field)) eq.set(c.field, c.value);
@@ -395,17 +396,19 @@ export class Query<T extends Fields = Fields> {
     const rows: { pk: Value; row: Fields }[] = [];
     let more = true;
     while (more && rows.length < want) {
+      tx.live();
       const page = await tx.raw.rangeStored(begin, end, batch ? { limit: batch } : {});
       more = batch !== undefined && page.length >= batch;
       const last = page.at(-1);
       if (last) begin = bytes.keyAfter(last.key);
       if (fast) {
         const pks = page.map((e) => entryPk(e.value));
-        const got = await tx.raw.getAll(pks.map((p) => tx.keys.row(t.id, encode(p))));
+        const got = await tx.raw.getEntries(pks.map((p) => tx.keys.row(t.id, encode(p))));
         for (let i = 0; i < pks.length && rows.length < want; i++) {
-          const b = got[i];
-          if (!b) continue; // an entry written with its row: absent only mid-change
-          const r = await tt.decode(t, encode(pks[i]!), b);
+          const e = got[i];
+          if (!e) continue; // an entry written with its row: absent only mid-change
+          const r = await tt.decode(t, encode(pks[i]!), e.value);
+          tx.noteRow(e.key, e.version, r);
           if (keep(r.fields)) rows.push({ pk: pks[i]!, row: r.fields });
         }
       } else {
@@ -413,6 +416,7 @@ export class Query<T extends Fields = Fields> {
           if (rows.length >= want) break;
           const pk = decodeRow(e.value).pk;
           const r = await tt.decode(t, encode(pk), e.value);
+          tx.noteRow(e.key, e.version, r);
           if (keep(r.fields)) rows.push({ pk, row: r.fields });
         }
       }
@@ -459,11 +463,13 @@ export class Query<T extends Fields = Fields> {
         batch.push({ key: r.value, pk: parts.length === 1 ? parts[0]! : parts });
       }
       if (!batch.length) break;
-      const got = await tx.raw.getAll(batch.map((b) => tx.keys.row(t.id, encode(b.pk))));
+      tx.live();
+      const got = await tx.raw.getEntries(batch.map((b) => tx.keys.row(t.id, encode(b.pk))));
       for (let i = 0; i < batch.length && rows.length < want; i++) {
-        const b = got[i];
-        if (!b) continue; // long mode: the row went after the index was read
-        const r = await tt.decode(t, encode(batch[i]!.pk), b);
+        const e = got[i];
+        if (!e) continue; // long mode: the row went after the index was read
+        const r = await tt.decode(t, encode(batch[i]!.pk), e.value);
+        tx.noteRow(e.key, e.version, r);
         if (keep(r.fields)) rows.push({ ...batch[i]!, row: r.fields });
       }
       if (batch.length < n) break;

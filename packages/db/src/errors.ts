@@ -23,7 +23,9 @@ export type DbErrorCode =
   /** An unknown format, integrity level or index kind (§3). */
   | 'format'
   /** A unique index whose backfill found duplicates (§8.2). */
-  | 'building';
+  | 'building'
+  /** A manual transaction used after its `commit` or `abort` (§7.2). */
+  | 'closed';
 
 /** A zen-db error. */
 export class DbError extends Error {

@@ -1,10 +1,12 @@
 // zen-db transactions (spec/zendb.md §4.4, §5.5, §7): rows and their index
 // entries on top of an M4 `Transaction`.
-import { bytes, type Transaction, ZenError } from '@zen/client';
+import { bytes, commitTransaction, type Transaction, type Tree, ZenError } from '@zen/client';
+import type { CommitResult } from '@zen/wasm';
 import { encodeTableRecord, type IndexDef, type TableRecord } from './catalog.js';
 import { encode, isPlainObject, type Value } from './cbor.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
+import { TxFiles } from './files.js';
 import { fastChange } from './index/fast.js';
 import type { RootRecord } from './index/node.js';
 import { decodeRoot } from './index/node.js';
@@ -19,9 +21,24 @@ import { decodeRow, type Fields, joinParts, layoutRow } from './row.js';
 import { fitsType } from './sortkey.js';
 
 /** A row as read back: its fields and how many parts it is stored in. */
-interface ReadRow {
+export interface ReadRow {
   fields: Fields;
   parts: number;
+}
+
+/**
+ * @internal Thrown in the short phase of an `auto` transaction once its
+ * `autoSwitchMs` passed: the function re-runs in long mode (§7.1).
+ */
+export class SwitchToLong extends Error {
+  override name = 'SwitchToLong';
+}
+
+/** A cached record (catalog or row) a transaction used: its version, and how to drop it. */
+interface Used {
+  key: Uint8Array;
+  version: Uint8Array | undefined;
+  drop: () => void;
 }
 
 /** A zen-db transaction. Every method may run several times (§7.1). */
@@ -35,24 +52,49 @@ export class DbTransaction implements IndexTx {
   /** Private-index roots this transaction read (its snapshot of each tree). */
   private readonly roots = new Map<string, RootRecord | undefined>();
   private readonly sealedStates = new Map<string, SealedState>();
-  /** Cached catalog records this transaction used, by stored key: their versions. */
-  private readonly cached = new Map<
-    string,
-    { name: string; key: Uint8Array; version?: Uint8Array }
-  >();
+  /** Cached records this transaction used (catalog and rows), by stored key. */
+  private readonly cached = new Map<string, Used>();
+  /** @internal Nodes written by `fs(tree).write` (one write per node per commit). */
+  readonly fileWrites = new Set<string>();
 
   constructor(
     readonly db: Db,
     /** The M4 transaction underneath: writes, appends, file operations. */
     readonly raw: Transaction,
+    /** @internal In the short phase of `auto`: when to switch to long (ms since epoch). */
+    readonly deadline?: number,
   ) {
     raw.onError(async (e) => {
-      // A stale cached catalog record fails its `expect`: read it afresh.
+      // A stale cached record fails its `expect`: read it afresh next time.
       if (e instanceof ZenError && e.code === 'conflict') {
         for (const name of this.tables.keys()) db.catalogStale(name);
+        for (const u of this.cached.values()) u.drop();
       }
       return false;
     });
+    // Rows this commit wrote have new versions: drop their cached copies.
+    raw.onCommit(() => db.rowsWritten(raw));
+  }
+
+  /**
+   * @internal Called before every read and at `finish`: the short phase of
+   * `auto` switches to long once its time is up; a closed manual
+   * transaction refuses.
+   */
+  live(): void {
+    if (this.deadline !== undefined && Date.now() > this.deadline) throw new SwitchToLong();
+  }
+
+  /** @internal Use a cached record: its version joins the read set (§7.7). */
+  useCached(key: Uint8Array, version: Uint8Array | undefined, drop: () => void): void {
+    this.raw.expectKey(key, version);
+    this.cached.set(bytes.hex(key), { key, version, drop });
+  }
+
+  /** @internal Keep a row read in this transaction in the row cache. */
+  noteRow(key: Uint8Array, version: Uint8Array | undefined, r: ReadRow): void {
+    if (!version || this.raw.owns(key)) return;
+    this.db.cacheRow(bytes.hex(key), { version, fields: r.fields, parts: r.parts });
   }
 
   get keys(): Keys {
@@ -61,6 +103,12 @@ export class DbTransaction implements IndexTx {
 
   get mode(): 'short' | 'long' {
     return this.raw.mode;
+  }
+
+  /** File operations in this transaction's commit (§7.6). */
+  fs(tree: Tree): TxFiles {
+    this.live();
+    return new TxFiles(this, tree);
   }
 
   get partSize(): number {
@@ -91,6 +139,7 @@ export class DbTransaction implements IndexTx {
     const key = this.keys.root(ix.id, shard);
     const h = bytes.hex(key);
     if (this.roots.has(h)) return this.roots.get(h);
+    this.live();
     const b = await this.raw.get(key);
     const r = b ? decodeRoot(b) : undefined;
     this.roots.set(h, r);
@@ -102,6 +151,7 @@ export class DbTransaction implements IndexTx {
     const h = bytes.hex(ix.id);
     let s = this.sealedStates.get(h);
     if (!s) {
+      this.live();
       const r = await readSealed(this, ix.id, (d) => this.db.cachedSealed(h, d));
       if (r.digest) this.db.cacheSealed(h, bytes.hex(r.digest), [...r.keys]);
       s = new SealedState(this, ix.id, ix.maxBytes ?? SEALED_MAX_BYTES, r.keys, r.parts);
@@ -112,6 +162,7 @@ export class DbTransaction implements IndexTx {
 
   /** A table in this transaction. */
   table<T extends Fields = Fields>(t: string | { name: string }): TableTx<T> {
+    this.live();
     return new TableTx<T>(this, typeof t === 'string' ? t : t.name);
   }
 
@@ -129,6 +180,7 @@ export class DbTransaction implements IndexTx {
   async tableRecordOrNone(name: string): Promise<TableRecord | undefined> {
     const mine = this.tables.get(name);
     if (mine) return mine;
+    this.live();
     const key = this.keys.tableRecord(name);
     if (this.raw.writes.has(bytes.hex(key))) {
       const [e] = await this.raw.snapshotGet([key]);
@@ -137,12 +189,7 @@ export class DbTransaction implements IndexTx {
     const cached = this.db.catalogEntry(name);
     let rec: TableRecord | undefined;
     if (cached) {
-      this.raw.expectKey(key, cached.version);
-      this.cached.set(bytes.hex(key), {
-        name,
-        key,
-        ...(cached.version ? { version: cached.version } : {}),
-      });
+      this.useCached(key, cached.version, () => this.db.catalogStale(name));
       rec = cached.record;
     } else {
       const [e] = await this.raw.snapshotGet([key]);
@@ -170,11 +217,12 @@ export class DbTransaction implements IndexTx {
 
   /**
    * Before committing. A read-only transaction commits nothing, so the
-   * server never checks its `expect`s: check the cached catalog records it
-   * used here, and re-run it on a stale one. Then fail early with
+   * server never checks its `expect`s: check the cached records (catalog
+   * and rows) it used here, with one read, and re-run it on a stale one. Then fail early with
    * `too_large` if the commit would break the server's limits (§7.5).
    */
   async finish(): Promise<void> {
+    this.live();
     for (const p of this.ops.values()) {
       if (p.ops.size) await applyPrivate(this, p.ix, p.shard, p.ops);
     }
@@ -193,8 +241,8 @@ export class DbTransaction implements IndexTx {
         return !(v && u.version ? bytes.equal(v, u.version) : !v && !u.version);
       });
       if (!stale.length) return;
-      for (const u of stale) this.db.catalogStale(u.name);
-      throw new ZenError(409, 'conflict', 'a cached catalog record changed');
+      for (const u of stale) u.drop();
+      throw new ZenError(409, 'conflict', 'a cached record changed');
     }
     this.checkLimits();
   }
@@ -327,10 +375,27 @@ export class TableTx<T extends Fields = Fields> {
 
   // ------------------------------------------------------------ internals
 
-  /** Read a row by its pk element (into the read set), with its parts. @internal */
+  /**
+   * Read a row by its pk element (into the read set), with its parts: a
+   * cached copy by its version (§7.7), otherwise from the server. @internal
+   */
   async read(t: TableRecord, pkEl: Uint8Array): Promise<ReadRow | undefined> {
-    const b = await this.tx.raw.get(this.keys.row(t.id, pkEl));
-    return b ? this.decode(t, pkEl, b) : undefined;
+    const tx = this.tx;
+    tx.live();
+    const key = this.keys.row(t.id, pkEl);
+    if (!tx.raw.owns(key)) {
+      const h = bytes.hex(key);
+      const c = tx.db.cachedRow(h);
+      if (c) {
+        tx.useCached(key, c.version, () => tx.db.dropRow(h));
+        return { fields: c.fields, parts: c.parts };
+      }
+    }
+    const [e] = await tx.raw.getEntries([key]);
+    if (!e) return undefined;
+    const r = await this.decode(t, pkEl, e.value);
+    tx.noteRow(key, e.version, r);
+    return r;
   }
 
   /** Decode a stored Row, fetching its parts. @internal */
@@ -437,5 +502,36 @@ export async function changeIndex(
     }
     default:
       throw new DbError('format', `index ${ix.name}: kind ${ix.kind} is not supported yet`);
+  }
+}
+
+/**
+ * A transaction the app commits or aborts itself (§7.2): no automatic
+ * retry, so `conflict` reaches the caller. Get one with `db.begin()`.
+ */
+export class ManualTransaction extends DbTransaction {
+  private closed = false;
+
+  override live(): void {
+    if (this.closed) throw new DbError('closed', 'the transaction was committed or aborted');
+  }
+
+  /** Commit; undefined if there was nothing to send. Afterwards the transaction is closed. */
+  async commit(): Promise<CommitResult | undefined> {
+    this.live();
+    try {
+      await this.finish();
+      return await commitTransaction(this.raw);
+    } catch (e) {
+      for (const h of this.raw.errorHooks) await h(e, 1);
+      throw e;
+    } finally {
+      this.closed = true;
+    }
+  }
+
+  /** Drop the transaction: nothing is sent. */
+  abort(): void {
+    this.closed = true;
   }
 }

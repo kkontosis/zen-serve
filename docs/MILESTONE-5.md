@@ -96,7 +96,34 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `prolly.test.ts` (9, in memory against `IndexKeys.build`): random batches at fanout 2/4/64, the entry and byte caps, scans, decoys.
       * `indexes.test.ts` (18, server).
       * 140 vitest tests in all.
-  * **5c**: next (transaction modes, cache coherence, files, bulk import, tabs). The node cache is per `Db`, memory only, and so is the sealed cache. 5c's row cache (§7.7) can follow the same pattern.
+  * **5c** (transaction modes, cache coherence, files, bulk import, owner): done, PR (see below). As planned, with these details for step 6:
+    * **Client:**
+      * `TxnOptions.retry` chooses which errors re-run `fn`.
+      * `Transaction.getEntries` (with versions; none for own writes) and `owns(key)` are new.
+      * `commitTransaction(tx)` is exported.
+      * `transaction()` now runs the `onError` hooks on the last attempt too, so caches drop stale entries.
+    * **`Db.transaction`:**
+      * `auto` runs short with `retry` = conflict only. `DbTransaction.live()` (called at every read, query page and `finish`) throws `SwitchToLong` past the deadline. `SwitchToLong` or `too_old` → one long run with the remaining attempts.
+      * In long mode, a `ZenError too_large` thrown inside `fn` becomes `DbError('too_large', '… split the work')`.
+    * **`db.begin()`** → `ManualTransaction`. It overrides `live()` to throw `closed`, and runs the raw error hooks on a failed commit.
+    * **Row cache:**
+      * `Db.rows` is an LRU (`rowCache`, default 1,024). Copies are cloned in and out. `db.stats.rowHits/rowMisses`.
+      * `TableTx.read`: a hit is `useCached` → `expectKey` + `DbTransaction.cached`. A miss is `getEntries` + `noteRow`. Query paths fill the cache too.
+      * `onCommit` drops written keys (all rows if the commit clears a range). `conflict` drops every cached record used. A read-only `finish` checks catalog records and rows in one `snapshotGet`.
+    * **Files:** `files.ts` `TxFiles` (`tx.fs(tree).write(upload, {replaces})`, `.ops(batch | PendingOp[])`) over `Tree.writeIn`. Duplicate node writes are refused via `DbTransaction.fileWrites`.
+    * **`db.importRows`**, as planned.
+    * **Owner:**
+      * `tabs.ts` `Owner` with `LockManagerLike`. `DbOptions.locks` defaults to `navigator.locks`; `null` means none. `owner: false` never campaigns.
+      * `db.isOwner`, `db.onOwner(fn)` (fires at once if already owner), `db.ownerChange`.
+      * The lock name is `zen/db/<fs id>/<ns>` (the fs id is a number).
+      * **Step 6 hangs consumers, the scheduler and the stream off `onOwner`.**
+    * **Docs:** new `docs/DB.md` (database part; step 6 adds the broker), `docs/CLIENT.md` §5, TECH_DEBT: TD-DB-PERSISTENT-CACHE, TD-DB-TAB-PROXY, TD-DB-OBLIVIOUS-INDEX, TD-DB-SHAREDWORKER.
+    * **Tests:**
+      * `packages/db/test/txn.test.ts` (18), with fake Web Locks.
+      * `kv.test.ts` +3.
+      * `expectCanonical` moved to `packages/db/test/helpers.ts`.
+      * 161 vitest tests in all.
+* **Step 6** (broker): next.
 
 ## Facts the work must respect (from the code survey)
 
@@ -429,28 +456,132 @@ Log the 5b line in `docs/MILESTONE-5.md` (and here), commit (spec separately if 
 
 </details>
 
-### 5c: transaction modes, cache coherence, files, bulk import, tabs
-* **`auto` mode (§7.1):** run short; on `too_old`, or after `auto_switch_ms` (default 3,000) via a timer flag checked at the next read or commit, re-run as long. A too-large range in long mode → `too_large`.
-* **`db.begin({mode})` (§7.2):** a manual transaction with `commit()`/`abort()` and no retry. `consumes` is added in step 6.
-* **Cache coherence (§7.7):** rows and catalog records cached with their version. A transaction using a cached record calls `tx.expectKey` (long) or adds a conflict key (short), so a stale cache retries.
-* **Files (§7.6):** `tx.fs(tree)` → `{write(node, upload, opts), ops(…)}` over step 4's `Tree.writeIn`/`upload`/`writeOp`.
-* **`importRows(table, rows)`** (§7.5): split by the budget into several commits.
-* **`tabs.ts` (§9.2):**
-  * The owner is elected with the Web Lock `zen/db/<fs>/<ns>`.
-  * Non-owner tabs proxy transactions over a `BroadcastChannel` (serialized function calls are impossible, so proxying covers the table ops and queries, not arbitrary `transaction` closures, which run locally since they are serializable on the server anyway).
-  * Without Web Locks, every instance is its own owner.
-  * An `owner` event is the hook step 6 uses for consumers, the scheduler and the stream. Node tests use injected fake `locks` and `BroadcastChannel`.
-* **Docs:** `docs/DB.md` (the database part).
+### 5c: transaction modes, cache coherence, files, bulk import, tabs (detailed plan)
 
-**Tests 5c:**
-* An `auto` switch (a slow function and a forced `too_old`).
-* `begin` conflict surfaces.
-* A stale cached row → a retry.
-* Rows plus a file write in one commit, with a conflict re-running both.
-* `importRows` across commits.
-* Tab ownership handover with fakes.
+**Context.** 5a and 5b (PRs #14, #15) give `@zen/db` its rows, indexes and queries, in `short` and `long` transactions with automatic retry. 5c finishes Part A of zendb.md:
+* the `auto` mode and manual transactions (§7.1–7.2)
+* cached rows (§7.7)
+* file operations in a transaction (§7.6)
+* bulk import (§7.5)
+* the owner tab (§9.2)
+* the database half of `docs/DB.md`
 
-**Verification (each sub-step):** `scripts/build-wasm.sh`, then `npx biome check`, `npx tsc --noEmit` (client, fuse, db) and `npx vitest run`. CI's `client` job runs `packages/*/test`, so `@zen/db` is picked up; check that the job's tsc/build step includes the new package.
+**User decisions:**
+* **Tabs:** owner election only. The BroadcastChannel proxy of transactions and subscriptions moves to step 6, where subscriptions need it; until then every tab runs its own operations (safe: transactions are serializable).
+* **Row cache:** build a small per-`Db` LRU.
+
+**After compaction, re-read:** this section; `spec/zendb.md` §7, §9; `packages/db/src/{db,txn,query}.ts`; `packages/client/src/kv.ts` (`Transaction`, `transaction`, `sendCommit`); `packages/client/src/tree.ts` (`upload`, `writeOp`, `writeIn`, `TreeBatch.commitIn`, `Prepared`); `packages/client/test/tree.test.ts` (tree setup); `packages/db/test/db.test.ts` (setup, `barrier`, `code`).
+
+**Branch/PR.** If PR #15 is merged, restart the branch from main and open a new PR; otherwise 5c joins #15 (update its title and body).
+
+#### Client changes (`packages/client/src/kv.ts`)
+1. **`TxnOptions.retry?: (e: unknown) => boolean`:** which errors re-run `fn` (default `ZenError.retryable`). `auto` uses it to stop the short phase at `too_old`.
+2. **`Transaction.getEntries(keys)`:** like `getAll`, recorded the same way (conflict or `expect`), but returning `KvEntry | undefined` with the version. Own writes come back with no version, and are never cached. `getAll` becomes a wrapper of it.
+3. **`commitTransaction(tx): Promise<CommitResult | undefined>`:** the body of the commit step of `transaction()`: nothing to send → undefined; otherwise `sendCommit`, `tx.result`, then the commit hooks. `transaction()` uses it. Exported for manual transactions; on a failure the caller runs `tx.errorHooks`.
+4. Tests in `kv.test.ts`:
+   * `retry` stops at a chosen code
+   * `getEntries` versions equal `snapshotGet`'s
+   * `commitTransaction` runs the hooks
+
+#### `@zen/db`
+1. **`auto` mode (§7.1), in `Db.transaction`:**
+   * **Modes:** `mode: 'short' | 'long' | 'auto'`, with `DbOptions.autoSwitchMs` (default 3,000) and a per-call `autoSwitchMs`.
+   * **Short phase:** `fs.transaction` in short mode with `retry` = conflict only. The `DbTransaction` gets a `deadline`, and `checkDeadline()` throws an internal `SwitchToLong` once it has passed. It is called at every table read, query page, index read, and in `finish` before the commit.
+   * **Switch:** on `SwitchToLong` or a `too_old` (from a read or the commit), re-run the whole function once in long mode, with the remaining attempts.
+   * **Long phase:** a `ZenError` `too_large` from a long-mode range becomes `DbError('too_large', 'a range too large for a long transaction: split the work')`. That conversion applies in plain `long` mode too.
+   * **Report:** `DbTransaction.mode` gives the phase, so tests and callers can see it.
+2. **Manual transactions (§7.2): `db.begin({mode: 'short' | 'long'})` → `ManualTransaction`.**
+   * It extends `DbTransaction` with a raw `new Transaction(fs, mode)` and has `commit()` and `abort()`.
+   * **`commit()`:** runs `finish()`, then `commitTransaction(raw)`. On an error it runs the raw error hooks, which refresh the caches, and rethrows: `conflict` reaches the caller, with no retry.
+   * **After `commit()` or `abort()`:** every method throws `DbError('closed')`, a new code.
+   * `consumes` comes in step 6. `mode: 'auto'` is refused (`bad_value`).
+3. **Row cache (§7.7):**
+   * **Storage:** `Db` keeps an LRU of `row stored key hex → {version, fields, parts}`. `DbOptions.rowCache` sets its size (default 1,024; 0 turns it off).
+   * **`TableTx.read`, in this order:**
+     * a key this transaction wrote → read as now
+     * a cached entry → `raw.expectKey(key, version)` (into the read set in both modes) and record it in `DbTransaction.cached` (shared with the catalog records)
+     * otherwise `raw.getEntries([key])` and cache the result (a row with parts is cached decoded)
+     * Absent rows are not cached.
+   * **Queries:** the pk lookup goes through `read`. Rows fetched by index and fast paths use `getEntries` and fill the cache. Scans fill it too (`rangeStored` gives versions).
+   * **Invalidation:**
+     * After a commit, the `onCommit` hook drops every row key the commit wrote. Versions aren't known before commit, so they aren't updated in place.
+     * On `conflict`, the `onError` hook drops every cached row the transaction used.
+     * `Db.close` clears the cache.
+   * **Read-only transactions:** `finish` checks every cached record used (catalog and rows) with one `snapshotGet`. A stale one is dropped and `conflict` re-runs the transaction (this generalizes 5a's catalog check).
+4. **Files (§7.6): `tx.fs(tree)` → `TxFiles`, in a new `files.ts`.**
+   * `write(upload, {replaces?})` turns an upload into its op with `tree.writeOp(upload, replaces)`.
+   * `ops(batch: TreeBatch | PendingOp[])` adds a batch's ops.
+   * Both call `tree.writeIn(tx.raw, ops)`, which brings the tree's own `onCommit`/`onError` hooks (accept, and rebase on `stale_op`/`clock_skew`).
+   * A second `write` to one node in one transaction is refused (`bad_value`; fs.md: one write per node per commit).
+   * Chunks are uploaded before the transaction with `tree.upload(node, data)`, which docs and tests show; a write therefore costs only its op inside the transaction.
+   * The ops count in `checkLimits` already (`crdt_ops`, `chunks`).
+5. **`db.importRows(table, rows, {replace?, onCommit?})` (§7.5):**
+   * **Batches:** commits of `n` rows, starting at 256. Each uses `insert`, or `put` with `replace`.
+   * **On `too_large`** (the client's estimate, or the server's 413): halve `n` and retry the same rows. A single row that is too large rethrows.
+   * **After 4 successes in a row:** double `n`, up to 4,096.
+   * **Result:** the number of rows written. Each commit is atomic, the load isn't, as documented. `onCommit(done)` reports progress.
+6. **Owner (§9.2): `tabs.ts`.**
+   * **Election:** `Db.open(…, {locks?, owner?: boolean})`. With `navigator.locks` (or injected `locks`), a background `locks.request('zen/db/<fs id hex>/<ns>', {mode: 'exclusive'}, held)` holds the lock until `db.close()`.
+   * **Events:**
+     * `db.isOwner` is the current state.
+     * `db.onOwner(fn)` (and `fn` unsubscribes) fires on becoming owner.
+     * `db.ownerChange` is a promise for tests.
+   * **Without Web Locks:** every instance is its own owner at once.
+   * **Handover:** `close()` releases the lock (resolves the held promise), and the next waiting instance becomes owner.
+   * Step 6 hangs consumers, the scheduler and the stream off `onOwner`. Migrations still run in every instance, which is safe (paged, conflict-checked), as now.
+7. **Errors:** `DbError` codes gain `closed`. A long-mode range `too_large` maps as above.
+8. **Docs:**
+   * New `docs/DB.md` (the database part):
+     * opening, schema and migrations
+     * tables and rows
+     * indexes: kinds, options, leakage (the §5.6 table)
+     * queries and paging
+     * transactions: modes, `begin`, limits, `importRows`
+     * files in a transaction
+     * caches and coherence
+     * tabs and the owner
+     * errors
+   * `docs/CLIENT.md`: the new client methods.
+   * `spec/TECH_DEBT.md`:
+     * TD-DB-PERSISTENT-CACHE: caches are memory only; an encrypted persistent cache is undecided (§9.3)
+     * TD-DB-TAB-PROXY: the proxy moves to step 6; resolved there
+     * TD-DB-OBLIVIOUS-INDEX
+     * TD-DB-SHAREDWORKER: a SharedWorker owner
+
+#### Tests (`packages/db/test/txn.test.ts`, a new file, its own server)
+* **auto:**
+  * A function that awaits past a lowered `autoSwitchMs` on its first run commits in long mode on the second (runs = 2; `tx.mode` short then long).
+  * A forced `too_old` (a short read held past the server's window via a test limit, or a thrown `ZenError(409, 'too_old')` from inside `fn` on the first run) switches to long.
+  * A long run over a range larger than `max_range_items` fails with `too_large`.
+* **begin:**
+  * commit works
+  * a concurrent write makes `commit()` throw `conflict` once, with no retry
+  * use after `commit` or `abort` throws `closed`
+  * `abort` sends nothing
+* **Row cache:**
+  * A second `get` of a row in a new transaction costs no read. A counter on `raw.getEntries` via a wrapping test hook, or the cache hit count `db.stats.rowHits`.
+  * A row changed by another `Db` → a write transaction using the cached copy conflicts once, re-runs with fresh data and commits the right value.
+  * A read-only transaction with a stale cached row re-runs and returns the new value.
+  * `rowCache: 0` disables it.
+* **Files:**
+  * Upload, then a transaction that inserts a row and writes the file → both visible.
+  * A conflict on the row (a concurrent writer, with a barrier) re-runs both, and the file has one version.
+  * Two writes to one node → `bad_value`.
+* **importRows:**
+  * 1,000 rows into a table with a private and a unique index under a low `max_commit_ops`: several commits (count `onCommit`), every row present, the tree canonical (`expectCanonical` moved to a shared test helper).
+  * A duplicate in the input → `unique_violation`, with the earlier commits kept.
+* **Owner:**
+  * Fake `locks` (an in-memory exclusive queue): the first `Db` owns, the second waits; `close()` on the first makes the second owner (`onOwner` fires once).
+  * Without `locks`, `isOwner` is true at once.
+
+**Verification:**
+* `npx biome check`
+* tsc for client, fuse, db
+* `npx vitest run` (several times)
+* CI green on the PR before stopping
+
+#### Rhythm
+Log the 5c line in `docs/MILESTONE-5.md` (and here), commit, push, update or open the PR, then stop for compaction. Step 6 (the broker) is next.
 
 ## Step 6: `@zen/db` part B, the broker (zendb.md §10–13)
 * **Base:** `msg.ts` (Msg encoding, BodyRef, causation), `emit`, `on` (plain, `after`, `cursor`), `consume` (group id, the loop table of §11.3, `ack`, `begin({consumes})`), the system tables, ephemeral messages.

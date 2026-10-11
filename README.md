@@ -23,6 +23,7 @@ Building blocks:
 | [`crates/zen-server`](crates/zen-server) | The `zen-serve` binary: auth, signed ACL, KV, commit, event log, consumer groups, WebSocket stream, static files, FoundationDB supervisor, backup/export |
 | [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
 | [`packages/client`](packages/client) | `@zen/client`: the TypeScript client library, Node and browsers ([`docs/CLIENT.md`](docs/CLIENT.md)) |
+| [`packages/db`](packages/db) | `@zen/db`: the client-side database (tables, indexes, queries, transactions; the broker and CRDT tables to come) ([`docs/DB.md`](docs/DB.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
 

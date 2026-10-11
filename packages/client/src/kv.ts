@@ -147,6 +147,18 @@ export interface TxnOptions {
   mode?: 'short' | 'long';
   /** Attempts on `conflict` / `too_old` (default 8). */
   attempts?: number;
+  /**
+   * Which errors re-run `fn` (default: a retryable `ZenError`, i.e.
+   * `conflict` or `too_old`). The others reach the caller.
+   */
+  retry?: (e: unknown) => boolean;
+}
+
+/** An entry read in a transaction: its version is undefined for the transaction's own write. */
+export interface TxEntry {
+  key: Uint8Array;
+  value: Uint8Array;
+  version: Uint8Array | undefined;
 }
 
 /** A transaction's view: reads, buffered writes and appends. */
@@ -211,13 +223,21 @@ export class Transaction {
    * conflict in short mode, an `expect` in long mode.
    */
   async getAll(paths: (Path | Uint8Array)[]): Promise<(Uint8Array | undefined)[]> {
+    return (await this.getEntries(paths)).map((e) => e?.value);
+  }
+
+  /**
+   * `getAll` with each entry's key and version (undefined for this
+   * transaction's own writes), e.g. to cache it.
+   */
+  async getEntries(paths: (Path | Uint8Array)[]): Promise<(TxEntry | undefined)[]> {
     const keys = paths.map((p) => this.key(p));
-    const out: (Uint8Array | undefined)[] = new Array(keys.length);
+    const out: (TxEntry | undefined)[] = new Array(keys.length);
     const need: number[] = [];
     keys.forEach((k, i) => {
       const own = this.own(k);
-      if (own) out[i] = own.value;
-      else need.push(i);
+      if (!own) need.push(i);
+      else if (own.value) out[i] = { key: k, value: own.value, version: undefined };
     });
     if (!need.length) return out;
     const r = await this.fs.session.call('/v1/kv/get', zw.encodeKvGet, zw.decodeKvItems, {
@@ -238,9 +258,16 @@ export class Transaction {
           ...(it.version ? { version: it.version } : {}),
         });
       }
-      out[i] = it.value ? this.fs.kv.open(key, it.value) : undefined;
+      if (it.value && it.version) {
+        out[i] = { key, value: this.fs.kv.open(key, it.value), version: it.version };
+      }
     });
     return out;
+  }
+
+  /** Whether this transaction wrote, deleted or cleared a stored key. */
+  owns(key: Uint8Array): boolean {
+    return this.own(key) !== undefined;
   }
 
   /**
@@ -527,10 +554,24 @@ export class Transaction {
 
 const backoff = (i: number) => sleep(Math.min(10 * 2 ** i, 1000) * (0.5 + Math.random()));
 
+const retryable = (e: unknown) => e instanceof ZenError && e.retryable;
+
+/**
+ * Commit a transaction: nothing to send gives undefined, otherwise the
+ * result, after the `onCommit` hooks ran. On a failure the caller decides
+ * what to do (`transaction` runs the `onError` hooks and maybe re-runs).
+ */
+export async function commitTransaction(tx: Transaction): Promise<CommitResult | undefined> {
+  if (tx.empty) return undefined;
+  tx.result = await sendCommit(tx.fs.session, tx.build());
+  for (const h of tx.commitHooks) h(tx.result);
+  return tx.result;
+}
+
 /**
  * Run `fn` in a transaction and commit it, re-running it on `conflict` or
- * `too_old`, or when an `onError` hook asks for it. A transaction that only
- * reads commits nothing.
+ * `too_old` (or what `opts.retry` accepts), or when an `onError` hook asks
+ * for it. A transaction that only reads commits nothing.
  */
 export async function transaction<T>(
   fs: UnlockedFs,
@@ -538,6 +579,7 @@ export async function transaction<T>(
   opts: TxnOptions = {},
 ): Promise<T> {
   const attempts = opts.attempts ?? 8;
+  const retry = opts.retry ?? retryable;
   for (let i = 1; ; i++) {
     const tx = new Transaction(fs, opts.mode ?? 'short');
     let out: T;
@@ -546,7 +588,7 @@ export async function transaction<T>(
     } catch (e) {
       // A read that hit `too_old`, or a check of `fn`'s own that found a
       // concurrent change, re-runs it like a failed commit.
-      if (i >= attempts || !(e instanceof ZenError && e.retryable)) throw e;
+      if (i >= attempts || !retry(e)) throw e;
       await backoff(i);
       continue;
     }
@@ -554,12 +596,12 @@ export async function transaction<T>(
     try {
       tx.result = await sendCommit(fs.session, tx.build());
     } catch (e) {
-      if (i >= attempts) throw e;
-      const retryable = e instanceof ZenError && e.retryable;
-      let again = retryable;
+      // The hooks always run, so caches are dropped even on the last attempt.
+      const again0 = retry(e);
+      let again = again0;
       for (const h of tx.errorHooks) if (await h(e, i)) again = true;
-      if (!again) throw e;
-      if (retryable) await backoff(i);
+      if (!again || i >= attempts) throw e;
+      if (again0) await backoff(i);
       continue;
     }
     for (const h of tx.commitHooks) h(tx.result);

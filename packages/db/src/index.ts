@@ -12,8 +12,16 @@ export type {
 } from './catalog.js';
 export type { Value } from './cbor.js';
 export * as cbor from './cbor.js';
-export { Db, type DbOptions, type DbTxnOptions, Table } from './db.js';
+export {
+  Db,
+  type DbOptions,
+  type DbStats,
+  type DbTxnOptions,
+  type ImportOptions,
+  Table,
+} from './db.js';
 export { DbError, type DbErrorCode } from './errors.js';
+export { TxFiles } from './files.js';
 export {
   type CreateIndexOptions,
   type CreateTableOptions,
@@ -24,4 +32,5 @@ export {
 export { type Cursor, compareValues, type Op, type Page, Query } from './query.js';
 export { decodeRow, encodeRow, type Fields, layoutRow, rowBucket } from './row.js';
 export { type FieldType, MAX_SORT_KEY, type SortField, sortKey } from './sortkey.js';
-export { DbTransaction, TableTx } from './txn.js';
+export { type LockManagerLike, Owner } from './tabs.js';
+export { DbTransaction, ManualTransaction, TableTx } from './txn.js';
