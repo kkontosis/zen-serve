@@ -320,7 +320,7 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * **FoundationDB:** with a grace of 0, the GC tests assumed a single sweep sees the latest commits. On FoundationDB, commit versions can trail the clock the grace is measured with. The tests now use `sweep_until`, which sweeps to the expected state and checks after every sweep that no page outlives a chunk it lists. Two mutations (no chunk release; pages not counting their chunks) were each checked to fail.
       * **A 7d bug** (`crdtpersist` "two tabs … increment": 14, not 16, in about 1 run in 6). Two tabs share one counter actor but each has its own clock, so a tab's `seq` could be no newer than the other tab's last one, and the server ignored it as a re-send. `loadTotals` now observes the `seq` of the entries it reads (after the lock, which already forces the read). zendb.md §19.7 and DB.md were updated.
     * PR #27 merged; CI green on all 8 checks.
-  * **7g** planned in detail (see "7g: large files in the client and zen-mount").
+  * **7g** planned in detail (see "7g: large files in the client and zen-mount"), PR #28. Amended at the user's request: per-file keys optional per fs (`file_keys`, default off), a rekey policy after rotation (`rekey_after_rotate`, default `rewrite`), both kept in a version-2 fs header; the version-2 manifest gains `key_mode`.
 
 ## Facts the work must respect (from the code survey)
 
@@ -1886,7 +1886,15 @@ Step 8's replica will store and replay manifests and `write` ops, and milestones
 * reads go through pages
 * uploads stream and can resume
 
-This resolves TD-FS-LARGE-FILES. The wire and the spec are unchanged, unless an edge case shows up (then a `spec:` commit).
+This resolves TD-FS-LARGE-FILES.
+
+**User decisions (after the 7g plan):**
+* **Per-file keys are optional per filesystem.** Paged versions (large files) are always available. Per-file keys, which only buy sharing one file, are a policy of the fs: `file_keys: off` (default) seals chunks under the fs keys, as version 1 does; `on` uses a file key per node. Readers need no setting, because the manifest says which mode a file uses.
+* **The rekey policy after a rotation**, for `file_keys: on`, is `rekey_after_rotate`:
+  * `rewrite` (default): a fresh key only when the whole file is rewritten (no `previous`)
+  * `eager`: a fresh key on the next write, re-uploading every chunk
+  * `keep`: never
+* **The policy lives in the fs header** (admin-only, read by unlock, kept offline since 7e, signed in milestone 6), in a header version 2.
 
 **After compaction, re-read:**
 * this section and the 7f log line
@@ -1904,6 +1912,27 @@ This resolves TD-FS-LARGE-FILES. The wire and the spec are unchanged, unless an 
 * `packages/fuse/test/mount.test.ts`
 
 **Branch/PR.** #27 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7g plan`), and open a new PR that 7g joins.
+
+#### Part A: the format and the header (⚠️ `spec:` commit, Rust, vectors)
+1. **Manifest v2 `key_mode`** (formats.md §11.3, §11.4; safe now, since no client has written version 2 yet and the server never opens manifests):
+   ```
+   u8 2 ‖ u64 size ‖ u32 chunk_size ‖ u64 n ‖ u8 key_mode ‖ [u32 key_epoch ‖ file_key(32) if key_mode = 1] ‖ u8 form ‖ body
+   ```
+   * `key_mode 0`: chunks under the fs-data key of each chunk's own header epoch, as in version 1.
+   * `key_mode 1`: the file key, as 7f specified.
+   * Any other value is refused.
+   * zen-core: `ManifestV2.file_key: Option<FileKey {key_epoch, key}>`. wasm: `fileKey`/`keyEpoch` optional in `ManifestV2`. The `fs.json` v2 vectors gain a `key_mode 0` manifest; the 7f ones are regenerated.
+   * fs.md §4.2: the per-node key rule applies only with `key_mode 1`.
+2. **Header version 2** (formats.md §12):
+   * The version-1 fields, then `lp(policy)`: a CBOR map with integer keys:
+     * `1: file_keys` (0 off, 1 on)
+     * `2: rekey_after_rotate` (0 rewrite, 1 eager, 2 keep)
+   * Unknown keys are kept on re-encode and ignored. A version-1 header reads as the defaults (`off`, `rewrite`).
+   * Writing a header keeps version 1 while the policy is the default and nothing unknown is kept, so old clients still read it. Otherwise it is version 2.
+   * The leakage note: the server sees the policy. Before milestone 6 it could serve another one; that is harmless, since both modes are end-to-end encrypted and only single-file sharing changes.
+   * zen-core `FsHeader.policy` (`FsPolicy {file_keys, rekey_after_rotate, unknown}`), decode and encode, `header.json` vectors for v2.
+   * wasm `FsHeader.policy` getter and setter.
+   * Client: `UnlockedFs.policy` (from the unlocked header, so also offline from the kept one), and `UnlockedFs.setPolicy(p)` for admins, through `editHeader`.
 
 #### `tree.ts`
 1. **Types:**
@@ -1936,11 +1965,16 @@ This resolves TD-FS-LARGE-FILES. The wire and the spec are unchanged, unless an 
      * memory: one window
    * `readFile` keeps its signature (the whole file in memory, documented).
    * `chunkIndex(node, v, data?)`: without `data`, it hashes through `readStream`, so it never holds the file. It records `fileKey`/`keyEpoch` and `pageSize`/`pages`.
-6. **The file key**, `fileKeyFor(node, previous?)`, following fs.md §4.2:
-   * the key of `previous` when given; otherwise the newest version-2 manifest's key (from the `versions` read the write does anyway for `replaces: 'current'`; one extra `file/get` otherwise)
-   * kept only if its `keyEpoch` equals the fs's current epoch (`sealKeys().epoch`)
-   * otherwise a fresh `newFileKey()` at the current epoch
-   * Reusing chunks from `previous` needs the same key (a v1 `previous`, or a fresh key, re-seals every chunk).
+6. **The key mode**, from `fs.policy.file_keys`, read when the write starts:
+   * **`off`:** chunks are sealed with the fs keys (`sealChunk`, at the current epoch), and the manifest has `key_mode 0`. Chunks of a `previous` with `key_mode 0` or version 1 are reused, as now.
+   * **`on`:** `fileKeyFor(node, previous?)` (fs.md §4.2):
+     * the key of `previous` when given; otherwise the newest version's key (from the `versions` read the write does anyway for `replaces: 'current'`; one extra `file/get` otherwise)
+     * after a rotation (the key's `keyEpoch` < the current epoch), `rekey_after_rotate` decides:
+       * `rewrite`: keep it when the write has a `previous` (reuse), and pick a fresh one for a write without it
+       * `eager`: always pick a fresh one
+       * `keep`: always keep it
+     * no key yet (a new node, or a `previous` in `key_mode 0` or v1): a fresh `newFileKey()` at the current epoch, and every chunk re-sealed
+   * Chunks are reused only under the same key, or both under fs keys.
 7. **Writing (`stage`):**
    * **Source:** a `Uint8Array`, `Iterable`, `AsyncIterable` or `ReadableStream` (`blocks()` reads a stream through its reader).
    * **Chunk bytes** are sealed with `sealFileChunk` and flushed in commits as now. Memory is one commit's chunks, plus 16 B per chunk id and 32 B per hash (for the index).
@@ -1992,10 +2026,15 @@ This resolves TD-FS-LARGE-FILES. The wire and the spec are unchanged, unless an 
   * **Small files:** stay inline v2 (`pages` empty); a file crossing the inline limit becomes paged.
   * **Tampering:** a page swapped on the server (a wrapped `session.call` that returns another page's bytes) → `format`; a missing page → `not_found`.
   * **Version 1:** a v1 version written by hand (`sealManifest`, `sealChunk` and a raw write op) reads, through `readFile`, `read` and `readStream`. Rewriting it with `previous` gives v2 with a fresh key and every chunk re-sealed (`uploaded` = all).
-  * **Keys:**
-    * two files' chunks don't open with each other's keys (`openFileChunk`)
-    * after `fs.rotate` (and a new unlock), the next write picks a fresh key at the new epoch and re-uploads every chunk
-    * without rotation, the key is kept
+  * **Policy and keys:**
+    * the default policy (`off`): chunks open with the fs keys, the manifest has `key_mode 0`, and an append reuses chunks across a `rotate`
+    * `setPolicy({fileKeys: 'on'})`, then a new write: `key_mode 1`. Two files' chunks don't open with each other's keys (`openFileChunk`), and without rotation the key is kept.
+    * after `fs.rotate` (and a new unlock), the three rekey rules:
+      * `rewrite`: an append with `previous` keeps the key and reuses chunks; a write without it gets a fresh key
+      * `eager`: a fresh key and every chunk uploaded
+      * `keep`: the old key, and chunks reused
+    * a mixed file history (`off`, then `on`, then `off`) reads back at every step
+    * the policy survives an offline unlock (the kept header)
   * **Resume:**
     * a source that throws after some chunks
     * the last `onProgress` state, then `upload(…, {resume})` with the rest
@@ -2004,16 +2043,21 @@ This resolves TD-FS-LARGE-FILES. The wire and the spec are unchanged, unless an 
 * **`tree.test.ts`:** the existing tests pass on v2 (the `uploaded` counts in reuse tests unchanged).
 * **`@zen/db`:** a `tx.fs(tree).write(upload)` of a paged upload in a transaction with a row (`txn.test.ts` or `files`), and `checkLimits` counting pages.
 * **zen-mount** (`mount.test.ts`, skipped where FUSE is missing, run in CI): a file of several pages written through the kernel and read back. Its world gets a lowered `max_value_bytes`, or a separate describe with one.
+* **Rust (Part A):**
+  * zen-core unit tests: `key_mode` round trips and refusals; header v2 policy round trip, unknown keys kept, defaults from v1, v1 written while the policy is the default
+  * `tests/vectors.rs` for the regenerated `fs.json` and `header.json`
+  * the server needs no change (the policy is client-side); its tests stay green
 * **Verification:**
+  * Rust: `cargo fmt --check`; clippy, default and `--no-default-features`; `cargo test -p zen-core -p zen-server`; `gen_vectors` (only the `fs.json` v2 keys and `header.json`'s new entries change); `scripts/build-wasm.sh`
   * `npx biome check`
   * tsc for client (test), fuse, db (test)
   * `npx vitest run` three times
-  * Rust unchanged (`cargo test` not needed unless wasm changes)
   * CI green on the PR
+  * **Disk:** `CARGO_INCREMENTAL=0`; check `df` first
 
 #### Rhythm
 1. Restart from main, commit the plan, open a new PR.
-2. On the user's go: the code commit (a `spec:` commit only if needed).
+2. On the user's go: the `spec:` commit (Part A), then the code commit.
 3. Log the 7g line in both plan copies, push, confirm CI is green, stop for compaction.
 4. 7h is next.
 
