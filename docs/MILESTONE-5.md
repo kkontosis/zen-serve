@@ -66,7 +66,16 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
   * `Transaction`: `readVersion`, `snapshotGet`, `snapshotRange`/`snapshotRangeStored`, `expectKey(path | storedKey, version)`, `addCrdtOps`, `addChunks`, `onCommit`, `onError`.
   * `Tree`: `prepare`/`accept`/`rebase`, `writeIn(tx, ops, chunks)`, `TreeBatch.commitIn(tx)`, `upload` + `writeOp`.
   * Tests: 72 vitest tests (client and fuse).
-* **Step 5** (`@zen/db` database): next.
+* **Step 4** was merged with PR #13.
+* **Step 5** (`@zen/db` database): planned (see Step 5: sub-steps 5a, 5b and 5c, a PR each).
+  * **5a** (foundation): done, PR #14. `packages/db`: `cbor.ts`, `sortkey.ts`, `row.ts`, `keys.ts`, `catalog.ts`, `db.ts` (`Db.open`, `Table`, catalog cache), `txn.ts` (`DbTransaction`, `TableTx`, `changeIndex`), `index/{unique,fast,types}.ts`, `query.ts` (pk, unique, fast, scan), `migrate.ts` (`Migrator`, `migrate`). For the next sub-steps:
+    * `changeIndex` (txn.ts) dispatches on `kind`; 5b adds `private` and `sealed` there, to `SUPPORTED` in migrate.ts, and a plan step to `query.ts`. `IndexChange` carries only the CBOR elements: 5b adds the raw values for sort keys.
+    * A migration op is paged through `Migrator.run`: progress `{op, key}` in the MigrationRecord; each page re-reads it, so duplicate runners conflict.
+    * The catalog cache: a TableRecord is read once per transaction, by its cached version with `expectKey`, and refreshed after a `conflict`. A read-only transaction commits nothing, so `DbTransaction.finish` checks its cached records with one `snapshotGet` and re-runs on a stale one (an extra round trip per read-only transaction; 5c can batch it).
+    * Client changes: `Transaction.get/set/delete/range/clearPrefix` take stored keys; new `getAll`, `rangeStored(begin, end, {limit})` (records only the part read), `clearRange`; `transaction()` also re-runs on a retryable `ZenError` thrown inside `fn` (a read's `too_old`, or a check of the caller's).
+    * Spec: zendb.md §4.3 clarified (the last part of a padded row is padded to a multiple of 16 KiB; a padded Row that its bucket would push past one value goes to parts).
+    * Tests: `packages/db/test/vectors.test.ts` (11; the CBOR duplicate-key refusal can't be expressed in JavaScript and is skipped), `db.test.ts` (22). 109 vitest tests in all. CI typechecks `packages/db/tsconfig.test.json`; it maps `@zen/client` to the client's sources.
+  * **5b** (private and sealed indexes): next.
 
 ## Facts the work must respect (from the code survey)
 
@@ -216,29 +225,118 @@ Every new export goes in a lean module. Re-measure the wasm size and update `doc
 
 **Verification:** `scripts/build-wasm.sh`, then `npx biome check`, `npx tsc --noEmit` (client, fuse) and `npx vitest run` (client, fuse).
 
-## Step 5: `@zen/db` part A, the database (zendb.md §2–9)
-`packages/db/src/`:
-* **Structure:** `db.ts` (the `Db` class, open and catalog), `catalog.ts`, `row.ts` (encoding, parts, padding), `sortkey` via wasm.
-* **Indexes:**
-  * `index/unique.ts`, `index/fast.ts`
-  * `index/prolly.ts`: canonical tree, read, write, shards, decoys and padding
-  * `index/sealed.ts`
-* **The rest:**
-  * `query.ts`: planner, paging, re-check
-  * `txn.ts`: `transaction` with short, long and auto; `begin`; commit assembly; limits budget
-  * `migrate.ts`: steps, paged backfill, drops
-  * `tabs.ts`: Web Locks owner, `BroadcastChannel` proxy, `SharedWorker` where available
-  * `importRows`
+## Step 5: `@zen/db` part A, the database (zendb.md §1–9, §17)
 
-**Tests:**
-* CRUD; unique conflicts between two clients
-* queries against a naive model (property)
-* prolly history independence (random insert and delete orders give the same root)
-* shard and decoy behaviour, sealed blob cap
-* long, short and auto modes
-* migrations resumed after a kill
-* the cache-staleness retry
-* commit-limit errors
+Three sub-steps, **one PR each**, with the same rhythm as the steps: log, commit, push, PR, then stop for compaction.
+
+**What exists.**
+* `packages/db` doesn't exist yet.
+* wasm (`crates/zen-wasm/src/db.rs`) gives only what needs a key:
+  * `FsKeys.db(ns)` → `DbKeys {prefix, key(elements), index(id), crdt(id)}`
+  * `IndexKeys {isBoundary, boundaries(level, keys, fanout), shard, nodeId, build}`
+  * `partsDigest`, `TopicKeys.groupId`
+* Everything keyless gets written in TS and must match `spec/test-vectors/zendb.json`:
+  * deterministic CBOR (`cbor.ok`/`refused_*`)
+  * `sort_keys`
+  * `rows` (plain, parts, padded, buckets)
+  * `prolly`
+  * `sealed_index`
+  * `database`
+* The client `Transaction` (`packages/client/src/kv.ts`) takes stored keys (`Uint8Array`) in `snapshotGet`/`expectKey` but not in `get`/`set`/`delete`/`range`/`clearPrefix`. Its `transaction()` has `short` and `long` but no `auto`, and nothing reports `too_old`→long.
+
+**Common decisions.**
+* **Stored keys.** zen-db computes its stored keys with `DbKeys.key([...elements])`. Elements are UTF-8 text, CBOR bytes, 16-byte ids and `u32`/`u64` BE. A small client change widens `Transaction.get`/`set`/`delete`/`clearPrefix`/`range` to `Path | Uint8Array`, the same way `key()` already does (no behaviour change for paths). Sealing stays kind-1, through `fs.sealKeys().sealValue(storedKey, …)`.
+* **Errors.** `DbError extends Error {code}`. The codes are `exists`, `not_found`, `unique_violation`, `bad_type`, `schema_newer`, `needs_index`, `too_large`, `corrupt`, `format` and `building` (a duplicate found by a unique backfill). Server errors pass through as `ZenError`.
+* **Persistent cache (§9.3, "milestone 5 decides").** Memory only. Recorded in DB.md; the encrypted persistent cache becomes TD-DB-PERSISTENT-CACHE.
+* **Oblivious (§5.8).** `kind: "oblivious"` is refused (`format`) at createIndex, per the milestone decision (TD-DB-OBLIVIOUS-INDEX).
+* **Change topics (`ChangeDef`).** Stored in the TableRecord now; the appends are emitted by step 6.
+* **HLCs.** `created_hlc` and the MigrationRecord `hlc` come from `fs.session.clock.tick()`.
+* **Package.** `packages/db`, modelled on `packages/client`'s `package.json`, with a dependency on `@zen/client`, a vitest alias in `vitest.config.ts`, and the TS project wiring the client package uses. Tests go in `packages/db/test`, reusing `packages/client/test/helpers.ts` (`world`, `signInDevice`) through a relative import.
+
+### 5a: foundation, rows, unique and fast indexes, catalog and migrations
+**Files** (`packages/db/src/`):
+* `cbor.ts`: deterministic encode/decode (§1): shortest heads, integers as numbers in ±2^53 and `bigint` beyond, 64-bit floats, sorted map keys, refusals.
+* `sortkey.ts`: §5.1, by declared type, `desc`, escaping, the pk suffix, the 4,096-byte cap.
+* `keys.ts`: the `D ‖ …` element builders on `DbKeys`, and their prefix ranges (`prefixEnd`).
+* `row.ts`: Row encode/decode (§4.1), parts and digest (§4.2), padding buckets (§4.3), zero-tail checks.
+* `catalog.ts`: DbRecord, TableRecord, IndexDef and MigrationRecord codecs (integer-keyed CBOR), plus the in-memory catalog cache with versions.
+* `db.ts`: the `Db` class.
+  * `zen.db(fs, ns, {schema, migrations})` and `Db.open` (§3.1): unknown format or non-basic integrity → `format`; a newer schema → `schema_newer`; create at 0, then migrate.
+  * `db.table<T>(name)` returns a `Table` with `get`/`insert`/`put`/`update`/`delete`.
+* `txn.ts`: `DbTransaction`, wrapping a client `Transaction`.
+  * `tx.table(t)` CRUD (§4.4), reading the TableRecord into the read set (§7.4) and the old row first.
+  * Index maintenance (§5.5) for unique (§5.2: short = conflict read, long = expect-absent) and fast (§5.3).
+  * A limits budget (§7.5) checked against `/v1/info` `max_commit_ops`/`max_commit_bytes`/`max_value_bytes` before sending → `too_large`.
+  * `db.transaction(fn, {mode: 'short'|'long', attempts})` over client `transaction()`.
+* `index/unique.ts`, `index/fast.ts`.
+* `query.ts` (first part): plan steps 1–3 and 5 of §6.1 (pk, unique and fast equality, then a scan with a warning and a client-side filter), the other predicates applied client-side, and a cursor for scans (§6.2).
+* `migrate.ts` (§8): the runner, with MigrationRecord logging and resume from `progress`.
+  * Ops: `createTable`, `dropTable`, `renameTable`, `createIndex`, `dropIndex`, `transform`.
+  * Paged backfill with `built_to`, for unique and fast in 5a. The kind-specific "add entries for a page" is a hook that 5b fills in for private and sealed.
+  * A unique duplicate → stays `building` with the duplicates reported.
+  * Paged drops through `clear_ranges` within `max_range_items`.
+
+**Tests 5a:**
+* The TS encoders reproduce the vectors: cbor, sort_keys, rows and database keys.
+* CRUD with `exists` and `not_found`; large rows with parts (a lowered `max_value_bytes` in `world({limits})`); padding sizes.
+* Unique: a violation; two clients inserting the same value concurrently, where one wins and the other gets `unique_violation` after a retry, in both short and long mode.
+* Fast-index equality.
+* Long mode.
+* Migrations:
+  * create, rename and drop
+  * `transform`
+  * a resume after a simulated kill (throw mid-step, reopen)
+  * a unique backfill over existing duplicates
+  * a writer during a backfill keeps the index complete
+* A schema change concurrent with a write → the write retries.
+* `schema_newer`.
+* A commit-limit `too_large`.
+
+### 5b: private and sealed indexes, ordered queries
+**Files:**
+* `index/prolly.ts`:
+  * The Node and RootRecord codecs.
+  * **Incremental canonical writes (§5.4.4):** re-chunk the touched leaves until a boundary lines up with an old one, level by level, with boundaries batched per level through `IndexKeys.boundaries`. Then write new nodes, delete old ones, and write or delete the root.
+  * **Reads (§5.4.3):** the root in the read set, nodes by `snapshotGet` with no conflict, and an immutable per-index node cache by id. A missing node → restart (outside a transaction) or a retry (`conflict`-like re-run via an `onError`/throw inside one).
+  * **Shards (§5.4.5):** the shard by `IndexKeys.shard`, and a K-way merge for range reads.
+  * **Decoys (§5.4.6):** a random leaf by `count` descent, a fresh salt, the node padding buckets.
+  * Changes from one transaction are applied together at commit build (§5.5 last paragraph): writes are collected per index and the tree is rewritten in a pre-commit step of `DbTransaction`.
+* `index/sealed.ts` (§5.7): the Blob, parts padded to a power of two, SealedHead with digest and count, a cache validated by the head version, uniqueness checked in the list, `max_bytes` → `too_large`.
+* `query.ts`: plan step 4 (a private or sealed range: leading `=` fields plus a range or `orderBy`), `orderBy` on the client otherwise or `needs_index`, `limit`, a sort-key cursor with `after`, `prefix` and `in`, and isolation per §6.3.
+* Backfill hooks for private and sealed.
+
+**Tests 5b:**
+* TS incremental trees equal the vector tree and `IndexKeys.build` (the Rust reference) after every step.
+* **Property:** random insert and delete orders → an identical root and node set.
+* Shard selection matches the vectors, and two shards' writers don't conflict.
+* Decoys: the node count and sizes stay in buckets, and the tree stays correct.
+* A sealed index matches the vectors and its cap.
+* **Property:** query results equal a naive in-memory model, over private, sealed and fast; sealed answers like private.
+* A missing node under a concurrent writer → a restart.
+* Concurrent writers never lose an entry.
+
+### 5c: transaction modes, cache coherence, files, bulk import, tabs
+* **`auto` mode (§7.1):** run short; on `too_old`, or after `auto_switch_ms` (default 3,000) via a timer flag checked at the next read or commit, re-run as long. A too-large range in long mode → `too_large`.
+* **`db.begin({mode})` (§7.2):** a manual transaction with `commit()`/`abort()` and no retry. `consumes` is added in step 6.
+* **Cache coherence (§7.7):** rows and catalog records cached with their version. A transaction using a cached record calls `tx.expectKey` (long) or adds a conflict key (short), so a stale cache retries.
+* **Files (§7.6):** `tx.fs(tree)` → `{write(node, upload, opts), ops(…)}` over step 4's `Tree.writeIn`/`upload`/`writeOp`.
+* **`importRows(table, rows)`** (§7.5): split by the budget into several commits.
+* **`tabs.ts` (§9.2):**
+  * The owner is elected with the Web Lock `zen/db/<fs>/<ns>`.
+  * Non-owner tabs proxy transactions over a `BroadcastChannel` (serialized function calls are impossible, so proxying covers the table ops and queries, not arbitrary `transaction` closures, which run locally since they are serializable on the server anyway).
+  * Without Web Locks, every instance is its own owner.
+  * An `owner` event is the hook step 6 uses for consumers, the scheduler and the stream. Node tests use injected fake `locks` and `BroadcastChannel`.
+* **Docs:** `docs/DB.md` (the database part).
+
+**Tests 5c:**
+* An `auto` switch (a slow function and a forced `too_old`).
+* `begin` conflict surfaces.
+* A stale cached row → a retry.
+* Rows plus a file write in one commit, with a conflict re-running both.
+* `importRows` across commits.
+* Tab ownership handover with fakes.
+
+**Verification (each sub-step):** `scripts/build-wasm.sh`, then `npx biome check`, `npx tsc --noEmit` (client, fuse, db) and `npx vitest run`. CI's `client` job runs `packages/*/test`, so `@zen/db` is picked up; check that the job's tsc/build step includes the new package.
 
 ## Step 6: `@zen/db` part B, the broker (zendb.md §10–13)
 * **Base:** `msg.ts` (Msg encoding, BodyRef, causation), `emit`, `on` (plain, `after`, `cursor`), `consume` (group id, the loop table of §11.3, `ack`, `begin({consumes})`), the system tables, ephemeral messages.
