@@ -1,6 +1,6 @@
 # @zen/db
 
-`@zen/db` is a client-side database over zen-serve's encrypted KV ([`spec/zendb.md`](../spec/zendb.md) Part A). Rows, indexes and the catalog are sealed KV values under PRF-token keys. The server sees opaque keys and values, and the access pattern that each index kind leaks (§5.6 below). Sections 1–9 cover the database (Part A), sections 10–18 the broker (Part B). CRDT tables come in milestone 5 step 7.
+`@zen/db` is a client-side database over zen-serve's encrypted KV ([`spec/zendb.md`](../spec/zendb.md) Part A). Rows, indexes and the catalog are sealed KV values under PRF-token keys. The server sees opaque keys and values, and the access pattern that each index kind leaks (§5.6 below). Sections 1–9 cover the database (Part A), sections 10–18 the broker (Part B). Section 19 covers CRDT tables (Part D).
 
 ## 1. Opening
 
@@ -187,7 +187,7 @@ In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lo
 | `closed` | a manual transaction used after `commit` or `abort`; a request pending when the database closed |
 | `poisoned` | a message that doesn't decode, or whose body parts are gone |
 | `timeout` | a request without a reply in time; no owner tab answering |
-| `unsupported` | a CRDT table on a server without `"crdt_rows"`; an index on a CRDT table (until the indexer) |
+| `unsupported` | a CRDT table on a server without `"crdt_rows"` |
 
 ---
 
@@ -342,9 +342,20 @@ await cards.delete(id);
 
 * **`insert`** sets the fields given: `lww` fields, counters incremented by the value, set elements added. Fields not given keep their merged values.
 * **Reads** (`get`, `query`) merge the server's state on the client: declared counters read 0 and sets `[]` until written. Inside a transaction they see its own operations, and are **not** in its read set: a transaction that reads a CRDT row never conflicts on it.
-* **Queries** look up by pk or scan the table (the predicates, `orderBy` and paging as for a scan). Indexes on CRDT tables come with the indexer.
+* **Queries** look up by pk, use an index (below), or scan the table (the predicates, `orderBy` and paging as for a scan).
 * **Timestamps** are stamped when the transaction commits, from the session clock. A commit refused with `stale_op` or `clock_skew` is re-run with fresh ones, after reading the server clock.
 * **Counters** need an installation id (the clock's `actor`): a persisted clock store must keep it with the HLC (docs/CLIENT.md). One installation's counter commits go one at a time.
 * **Change events** carry `{op, table, pk}`: `delete` when the transaction last deleted the row, `put` otherwise.
-* **Dropping** a CRDT table deletes its rows in pages; the server purges them after its horizon.
+* **Dropping** a CRDT table deletes its rows in pages, with their index entries; the server purges the rows after its horizon.
+
+### Indexes on CRDT tables
+
+`fast`, `private` and `sealed` indexes work on CRDT tables, never `unique`, and the table must have `changes`. Writers can't maintain them, since the merged value exists only on the server: an **indexer** does. It is a `per_key` consumer group `$index` on the change topic, run by the owner like every consumer. For each change event it reads the row's merged state and moves its entries from the values it last indexed (kept in the system table `$ixrows`).
+
+* **They lag.** A query through an index sees what the indexer has indexed: a row changed a moment ago may be missing from the result, or sit at its old place in the order, until the indexer catches up. With no instance running the indexer, the indexes stop.
+* **They never lie.** Every predicate is re-checked on the merged row the query fetches, so a stale entry never returns a row that doesn't match.
+* **A value of the wrong type** (text where the index says `int`) can't be refused, since the write already happened: that row is left out of that index, with a warning.
+* **Creating an index** backfills the existing rows in pages; rows the indexer reached first are skipped.
+* **`DbOptions.indexer: false`** keeps an instance from running the indexer (tests use it to make lag). An instance runs it for the tables that had indexes when it opened; migrations run at open, so that is the normal case.
+* **In tests**, wait for the indexer by polling a query (or `$ixrows`) until it shows the change.
 

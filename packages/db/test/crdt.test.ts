@@ -405,9 +405,6 @@ describe('CRDT tables (§19)', () => {
       ),
     ).toBe('bad_value');
     expect(
-      await code(step2((m) => m.createIndex('cards', 'p', { fields: [['title', 'text']] }))),
-    ).toBe('unsupported');
-    expect(
       await code(step2((m) => m.createTable('x', { pk: ['id'], merge: 'crdt', pad: true }))),
     ).toBe('bad_value');
     expect(

@@ -209,6 +209,17 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `vectors.test.ts` +1 (tokens, the sealed values, a merged ObjState).
       * 231 vitest tests in all.
 
+  * **Replanned after 7a (merged, #21):** the rest of step 7 is 7b (the indexer, indexes on CRDT tables) and 7c (the offline queue, read modes with a thin `/v1/crdt/versions` check, the property test), a PR each. See Step 7.
+  * **7b** (the indexer, indexes on CRDT tables): done, PR #22. As planned, with these details for 7c:
+    * **Files:**
+      * `ixer.ts`: `reindex(tx, t, pk, pkEl, {only, row})` and `startIndexers(db, tables)` (one `$index` group per distinct change topic, started in `Db.open` after the migrations; `DbOptions.indexer: false` turns it off).
+      * `migrate.ts`: `createIndex` on a CRDT table needs `changes` and refuses `unique`; `backfillCrdt` pages `crdtRange` at the transaction's read version; `dropCrdtPage` also deletes `$ixrows` rows (`dropIxRows`, one `getEntries`), then clears the index ranges.
+      * `query.ts`: CRDT tables go through the planner; `fetchRows` fetches index candidates (`crdtRows` for CRDT tables); `crdtScan` runs only when no index fits.
+    * **`$ixrows` `values`** is keyed by the index id in hex text: CBOR map keys are text or unsigned integers (§1).
+    * **⚠️ Spec:** §19.6 (the indexer, wrong types left out, the backfill rule, freshness), §11.5 (`$ixrows` values), §8.3 (dropping a CRDT table clears `$ixrows` and its index entries).
+    * **Docs:** `docs/DB.md` §19 "Indexes on CRDT tables".
+    * **Tests:** `crdtindex.test.ts` (9): refusals, fast/private/sealed queries, merged counters from two installations, lag and re-check, resume after a stop, deletes and wrong types, backfills (also during writes with the indexer on), drops. The `unsupported` createIndex case left `crdt.test.ts`.
+
 ## Facts the work must respect (from the code survey)
 
 **Wasm exposure.** JS can't compute any zendb.md derivation today:
@@ -1164,45 +1175,121 @@ Step 7 builds the class side.
   * `unique` and `put` refused
 * **Scan query:** paging with cursors, predicates, `needs_index`.
 
-### 7b: the indexer, the offline queue, batching (outline; detailed after 7a)
-* **The indexer (§19.6):**
-  * a `per_key` group `"$index"` on each indexed CRDT table's change topic, run in the owner
-  * each event is one short transaction: merged row, `$ixrows` entry, `changeIndex` old → new for every index, `$ixrows` written, consume step
-* **Indexes on CRDT tables:**
-  * `createIndex` (kinds fast, private and sealed) requires `changes`
-  * the backfill scans `crdt/range` and writes `$ixrows`
-  * queries use the index path, then re-check every predicate on the merged rows fetched with `crdt/get`
-* **The queue (`crdtq.ts`, §19.7):**
-  * **Entries:**
-    * atomic: a CRDT-only transaction (no transactional reads or writes, no consume; its emits and change events included)
-    * single-op: a `Table` call
-    * Mixed transactions never queue. They wait for the queue to drain first, so counter `seq`s stay in order. Offline they fail as now.
-  * **Stamping:**
-    * `row` / `lww` `hlc`s are stamped when queued: the offline edit's time.
-    * `ctr` `seq` and total are assigned when sent, so they stay in send order.
-    * `rem` dots: dots observed when queued, plus the `set_dots` of this queue's earlier `add`s of the element, filled in when those commit.
-  * **Batching:**
-    * consecutive entries are packed into one long-mode commit up to `max_commit_ops` and `max_commit_bytes` (an atomic entry is never split)
-    * entries arriving within `batchMs` (default 0: the same tick) join one send
-  * **Coalescing** (single-op entries only):
-    * a later `lww` on the same object and field drops the earlier one
-    * `incr`s on one counter sum
-  * **Idempotency:** a built commit is kept with its `commit_id` until it succeeds, and re-sent unchanged after a network error. On `stale_op` or `clock_skew` it is restamped and rebuilt with a new id.
-  * **Resolving:** writes resolve once queued (`{wait: true}`: on commit). `db.crdt.pending`, `flushed()`, and `onSync(fn)` events.
-  * **Offline detection:** a network error keeps the entry and retries with backoff (100 ms up to 30 s), and on `online` events where they exist.
-  * **`QueueStore`:** `{load(): Entry[], append(e), remove(ids)}`, memory by default; step 8 adds persisted stores.
-  * **Local view:** `get` and `query` overlay the queued ops on the merged state (pending `lww` and `row` by `hlc`, `incr` deltas, adds and removes), so a tab sees its own offline edits.
+### 7b: the indexer and indexes on CRDT tables (detailed plan)
+
+**Context.** 7a (PR #21, merged) gives CRDT tables online: writes, merged reads, scans and change events. Indexes on them are refused (`unsupported`). 7b adds them (zendb.md §19.6). Writers can't maintain these indexes, because the merged value exists only on the server. Instead an **indexer** consumer reads each changed row's merged state and updates the indexes from the values it last indexed (`$ixrows`).
+
+**User decisions (step 7 replanned after 7a):**
+* **Split:** the rest of step 7 becomes 7b (the indexer) and 7c (the offline queue, read modes, the property test), a PR each.
+* **Queueing:** a CRDT-only `db.transaction` queues by default as one atomic entry; `{queue: false}` commits it directly.
+* **Reads (7c):** three modes:
+  * **default:** an expiring cache. Once an entry has expired, the read asks the server with a thin version check whether the row changed.
+  * `'cache'`: offline first, the cached state regardless of age.
+  * `'server'`: online only, always fresh.
+
+**After compaction, re-read:**
+* this section and the 7a log line
+* `spec/zendb.md` §5.5, §8.2, §11.5, §19.4, §19.6
+* `packages/db/src/{crdt,txn,query,migrate,db,system,broker}.ts` and `index/{private,fast,sealed}.ts`
+* `packages/db/test/{crdt.test.ts,helpers.ts}`
+
+**Branch/PR.** #21 is merged: restart the branch from main, commit this plan (`docs: milestone 5 step 7b plan`), and open a new PR that 7b joins.
+
+#### Files
+1. **`ixer.ts` (new): the indexer (§19.6).**
+   * **`reindex(tx, t, pk, pkEl, only?: IndexDef)`:**
+     1. Read the merged row (`TableTx.crdtRows`).
+     2. Read its `$ixrows` row `[t.id, pkEl]`, through `tx.table('$ixrows')`, so it is in the read set.
+     3. For each maintained index (or only `only`): `oldV = values[ix.id]`, and `newV = indexedValue(ix, row)` when the row exists.
+        * A value of the wrong type can't be refused (the write has happened), so that row is **left out of that index** (`newV` undefined), with a warning.
+        * When `oldV` and `newV` differ (`same`), `changeIndex(tx, t, ix, pk, pkEl, oldV, newV)`.
+     4. Write `$ixrows`, `{table_id, pk, values: Map<index id bytes, Value[]>}`. It keeps only the maintained indexes, which drops dropped ones lazily, and is deleted when the row is gone or indexed nowhere.
+   * **`startIndexers(db)`:** for every CRDT table with a maintained index, a `db.consume({group: '$index', topic: change topic, mode: 'per_key', maxInflight: 8, start: 'earliest'})`. Each event `{table, pk}` runs `reindex` in the handler's transaction; an unknown or dropped table is acknowledged and skipped.
+     * It runs in the owner (`onOwner`, as consumers do), started by `Db.open` after the migrations, and stopped by `close()`.
+     * `DbOptions.indexer?: boolean` (default true): tests turn it off to make lag.
+     * An index created later, while this instance is open, is picked up at the next open. Migrations run at open, so that is the normal path; it is documented.
+   * Events from before the index existed are handled too (`earliest`): that is harmless, since `reindex` is idempotent.
+2. **`migrate.ts`:**
+   * **`createIndex` on a CRDT table:**
+     * It requires `changes` (`bad_value`).
+     * It refuses `unique`, and so `kind: 'none'` (`bad_value`), as well as `oblivious` (`format`, as now).
+     * The `unsupported` refusal of 7a goes.
+   * **Backfill:** pages of `crdtRange` from `builtTo` (`pageSize`). For each live object, `reindex(tx, t, pk, pkEl, ix)` for the building index, unless its `$ixrows` row already holds a value for that index (the indexer got there first and keeps it current). A concurrent indexer commit on the same `$ixrows` row conflicts, and the page re-runs. `builtTo` is the last object, and `active` comes when `more` is false.
+   * **`dropIndex`:** the same paged clears as for transactional tables. Stale `$ixrows` values are dropped lazily (above).
+   * **`dropTable` (CRDT):** each page also deletes the `$ixrows` rows of its objects, and the index ranges are cleared after the rows.
+3. **`query.ts`:**
+   * A CRDT table goes through the same planner (pk, fast equality, private or sealed range, scan); `crdtScan` remains the scan.
+   * The index paths fetch their candidate rows through one fetch, by kind of table:
+     * transactional: `getEntries` + `decode`, as now
+     * CRDT: `crdtRows` (batched `crdt/get`, the transaction's own operations overlaid)
+   * Every predicate is re-checked on the merged row, as now (`keep`). So an entry that is stale or not yet indexed never returns a wrong row.
+   * Order and cursors follow the index. A row whose indexed value changed after it was last indexed appears at its old place until reindexed (documented).
+4. **`txn.ts`:** nothing new for writers. CRDT writes never call `changeIndex`, since only the indexer maintains these indexes.
+5. **Spec (⚠️ `spec:` commit):**
+   * **§19.6:**
+     * `$ixrows` values are a map from index id to the indexed value.
+     * A value of the wrong type leaves the row out of that index.
+     * The group starts at `earliest`, with `maxInflight` 8.
+     * The backfill rule (rows already in `$ixrows` for the index are skipped).
+     * `createIndex` requires `changes`.
+     * Results follow the index order of the last indexing.
+   * **§11.5:** the `$ixrows` row's fields.
+   * **§8.3:** dropping a CRDT table also deletes its `$ixrows` rows.
+6. **Docs:** `docs/DB.md` §19 gains "Indexes on CRDT tables": the lag, re-checks, ordering, `DbOptions.indexer`, and how to wait for the indexer in tests.
+
+#### Tests (`packages/db/test/crdtindex.test.ts`, its own server)
+* **Refusals:**
+  * `createIndex` without `changes` → `bad_value`
+  * `unique` / `kind: 'none'` → `bad_value`
+* **Indexes:** fast equality, a private range with `orderBy` both ways and paging, a sealed range, all after the indexer caught up (`until`).
+* **Lag and re-check:**
+  * A writer Db with `indexer: false` patches rows. An old-value query returns nothing (re-checked), and a new-value query misses the row.
+  * Then another Db with the indexer starts, and the queries are right.
+* **Restart:** the indexer Db closes mid-stream and more writes come. A new one resumes; the tree equals `expectCanonical` of the merged rows, and `$ixrows` matches.
+* **Deletes and types:**
+  * `delete` removes the entries.
+  * A patch to a value of the wrong type takes the row out of that index, with a warning.
+* **Backfill:**
+  * Rows exist, then a migration creates a private and a sealed index with `pageSize: 2`: canonical tree and list.
+  * Writes during the backfill, with the indexer on, still end canonical.
+* **Drop:** `dropIndex` clears its keys, and `dropTable` clears `$ixrows` and the index ranges.
+* **Verification:**
+  * `npx biome check`
+  * tsc: client, fuse, db test
+  * `npx vitest run` three times
+  * CI green on the new PR before stopping
+
+### 7c: the offline queue, read modes, the property test (outline; detailed after 7b)
+* **Read modes** (user decision) on `get` and `query`: `{read: 'auto' | 'cache' | 'server'}`, and `DbOptions.crdtRead` for the default.
+  * **The cache:** an LRU per `Db` of merged CRDT states, with the object's `version` (the ObjState's 10-byte versionstamp) and when it was checked.
+  * **`auto` (default):**
+    * An entry younger than `crdtCacheMs` (default 5,000) is served as it is.
+    * An older one is checked with **`POST /v1/crdt/versions {fs, objects}` → `{read_version, versions: [bytes(10) | null]}`**, a new thin server endpoint (api.md §13.3; zen-proto, zen-server, wasm). The full state is fetched (`crdt/get`) only for changed objects.
+    * Offline (a network error), the cached state is served.
+  * **`cache`:** the cached state regardless of age. The server is read only for a row never cached, and a miss offline is `unsupported_offline`, or undefined; to be decided in 7c.
+  * **`server`:** always `crdt/get`, and fails offline.
+  * Every mode overlays the queued operations.
+  * Queries scan the server in `auto` and `server`. In `cache` they answer from the cached rows (documented as possibly incomplete).
+* **The queue (`crdtq.ts`, §19.7):** as outlined before:
+  * **Entries:** an atomic entry for a CRDT-only transaction (the default, `{queue: false}` opts out); a single-op entry for a `Table` call.
+  * **Stamping:** `row` / `lww` at queue time; `ctr` `seq` and totals at send time; `rem` dots observed at queue time plus the `set_dots` of earlier queued adds.
+  * **Sending:** batching up to the limits (`batchMs`); coalescing of single-op entries; a built commit kept with its `commit_id`, rebuilt on `stale_op` / `clock_skew`.
+  * **Resolving:** once queued by default (`{wait: true}`: on commit); `db.crdt.pending`, `flushed()` and `onSync`.
+  * **Offline:** backoff from 100 ms to 30 s, plus `online` events. Mixed transactions drain the queue first.
+  * **Store:** `QueueStore` `{load, append, remove}` in memory; step 8 adds persisted ones.
 * **Tests:**
-  * the indexer: lag then re-check, a restart resumes, stale entries are filtered out
-  * offline: a fake fetch that drops requests, edits on two devices merging after reconnect, `stale_op` rebase past the horizon
-  * batching and coalescing counts, atomic entries kept whole
-  * the 3-device property test of §19.9: random ops in random orders give the same merged state
+  * the read modes: hits, the version check, offline fallback
+  * offline edits on two installations merging after reconnect (a fake transport dropping requests)
+  * batching, coalescing, atomic entries kept whole
+  * a `stale_op` rebase past the horizon
+  * the 3-device property test of §19.9 (random ops, random orders, the same merged state)
 
 ### Rhythm
 1. Restart from main, log the step 7 plan line, commit, push, open a new PR.
 2. Build 7a on the user's go: the `spec:` commit, then the code commit.
 3. Log the 7a line, push, update the PR, confirm CI is green, stop for compaction.
-4. Plan 7b in detail, then build it the same way.
+4. 7b: restart from main, commit the 7b plan (`docs: milestone 5 step 7b plan`), open a new PR. Build it on the user's go (the `spec:` commit, then the code commit), log, push, confirm CI is green, stop.
+5. 7c the same way: plan in detail, then build.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
 * **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).

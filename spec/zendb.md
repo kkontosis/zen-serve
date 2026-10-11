@@ -584,7 +584,7 @@ A transaction can carry filesystem operations (spec/fs.md) next to its rows. The
 * **Clearing.** Its keys are cleared in pages, each one `clear_ranges` of at most `max_range_items` keys (api.md §6):
   * `("u"|"f"|"n"|"r", index_id)` for an index
   * `("t"|"o", table_id)` plus its indexes for a table
-* **CRDT tables** hold no KV rows: each page instead deletes the next live rows (a `row` operation with `alive: false` each, paged by `/v1/crdt/range`, the last object as the progress). The server purges them after the horizon (§19.5).
+* **CRDT tables** hold no KV rows: each page instead deletes the next live rows (a `row` operation with `alive: false` each, paged by `/v1/crdt/range`, the last object as the progress), and the `$ixrows` rows of every object of the page (§19.6). After the last page, its index entries are cleared in pages as above. The server purges the rows after the horizon (§19.5).
 * **Finishing.** The definition is removed in the last page's transaction.
 
 ## 9. Multiple tabs and processes (G16)
@@ -741,7 +741,7 @@ Every database has these tables, created with the DbRecord. They don't count as 
 | `$sched` | `[id]` | `at: int`, `kind: "emit" \| "gc"`, `topic?: [bytes]`, `key?: bytes` (the event key's bytes), `msg?: bytes` (CBOR Msg, for `emit`), `gc?: [[bytes]]` (for `gc`: paths of elements under `D`, each deleted with every key under it) | private on `at` |
 | `$sagas` | `[id]` | `saga: text`, `step: int`, `status: text`, `data: map`, `done: [int]`, `timeout?: bytes` (the `$sched` id of the pending timeout), `corr?: bytes` (the corr of the message in flight) | – |
 | `$inbox` | `[scope, id]` | `at: int`, `reply?: {type: text, body: any}` (the reply a dedup responder sends again) | – |
-| `$ixrows` | `[table_id, pk]` | `values: {index_id: value}` (the values last indexed) | – (§19.6) |
+| `$ixrows` | `[table_id, pk]` | `values: {text: [any]}` (the values last indexed, by index id in lowercase hex; an index the row is left out of has none) | – (§19.6) |
 
 ## 12. Patterns
 
@@ -1211,15 +1211,18 @@ The layout is keyspace.md §3.8: a row register (`co`), `lww` registers (`cw`), 
 
 ### 19.6 Indexes
 
-* **Kinds.** CRDT tables allow `fast`, `private`, `sealed` and `oblivious` indexes, never `unique`.
+* **Kinds.** CRDT tables allow `fast`, `private`, `sealed` and `oblivious` indexes, never `unique` (so never `none`).
 * **The indexer.** Writers don't maintain them, since the merged value is known only after the server merges. Instead:
-  * **Change topic.** A CRDT table with indexes must declare `changes` (§12.7). Every commit with operations on a row also appends a change event keyed by the pk; the class adds it.
-  * **Indexer group.** The **indexer** is a `per_key` consumer group `"$index"` on that topic, run by the owner (§9.2) like the scheduler. For each event it does one short transaction with the consume step:
+  * **Change topic.** A CRDT table with indexes must declare `changes` (§12.7): `createIndex` refuses one without (`bad_value`). Every commit with operations on a row also appends a change event keyed by the pk; the class adds it.
+  * **Indexer group.** The **indexer** is a `per_key` consumer group `"$index"` on that topic, starting at `earliest`, with up to 8 keys in flight, run by the owner (§9.2) like the scheduler. Tables sharing a change topic share the group. For each event it does one short transaction with the consume step:
     1. read the row's merged state
     2. read its `$ixrows` entry: the values it last indexed
-    3. update every index from the old values to the new ones
-    4. write `$ixrows`
-* **Freshness.** Indexes on CRDT tables are **eventually consistent**: they lag by the indexer's delay, and stop while no instance runs it. Queries always re-check their predicates on the fetched merged rows, so a stale entry never returns a wrong row. A row changed very recently may be missing from a result until it is indexed.
+    3. update every index that isn't `dropping` from the old values to the new ones (§5.5)
+    4. write `$ixrows` (delete it when the row is gone or in no index), keeping only those indexes' values: those of dropped indexes go then
+  * **Values of the wrong type.** The write already happened and can't be refused, so a row whose value doesn't fit an index's declared type is **left out of that index** (and has no value there in `$ixrows`). The class reports it as a warning.
+  * An event for a table that no longer exists, or isn't active, is consumed and skipped. An indexer starts when the class opens with the table's indexes in the catalog; a table that gains its first index while an instance is open is indexed by that instance from its next open.
+* **Backfill** (§8.2). A page of `/v1/crdt/range` from `built_to`; for each live row, the steps above for the building index only, **unless its `$ixrows` entry already holds a value for that index**: the indexer got there first and keeps it current. The `$ixrows` entries are in the page's read set, so an indexer commit on one of them re-runs the page. `built_to` is the last object of the page.
+* **Freshness.** Indexes on CRDT tables are **eventually consistent**: they lag by the indexer's delay, and stop while no instance runs it. Queries always re-check their predicates on the fetched merged rows, so a stale entry never returns a wrong row. A row changed very recently may be missing from a result until it is indexed, and results follow the index order of the last indexing.
 
 ### 19.7 Offline use
 

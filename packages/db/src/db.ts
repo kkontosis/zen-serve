@@ -37,6 +37,7 @@ import {
 import type { Value } from './cbor.js';
 import { DbError } from './errors.js';
 import type { Node } from './index/node.js';
+import { startIndexers } from './ixer.js';
 import { Keys } from './keys.js';
 import { type MigrationFn, migrate } from './migrate.js';
 import { encodeMsg, type Msg } from './msg.js';
@@ -94,6 +95,11 @@ export interface DbOptions {
   scheduler?: boolean;
   /** The scheduler's poll interval, lease and batch. */
   schedulerOptions?: SchedulerOptions;
+  /**
+   * `false`: don't run the indexer of CRDT tables in the owner (§19.6;
+   * default true). Their indexes then lag until an instance runs it.
+   */
+  indexer?: boolean;
 }
 
 /** Options of `serve` (§12.3). */
@@ -211,6 +217,12 @@ export class Db {
       const s = new Scheduler(db, opts.schedulerOptions);
       db.scheduler = s;
       db.unSched = db.onOwner(() => s.start());
+    }
+    if (opts.indexer !== false) {
+      startIndexers(
+        db,
+        [...db.catalog.values()].flatMap((e) => (e.record ? [e.record] : [])),
+      );
     }
     return db;
   }

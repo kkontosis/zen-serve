@@ -245,6 +245,36 @@ function planRange(
   return { ix, lo, hi, empty, reverse, ordered, covered: new Set([...eqs, ...ranges]) };
 }
 
+/**
+ * The rows of index candidates, by pk (undefined where none): stored rows
+ * by their keys, filling the row cache; CRDT rows merged (§19.6), with
+ * the transaction's own operations. An entry is written with its row, so
+ * a stored row is absent only mid-change (or, in long mode, deleted after
+ * the index was read); a CRDT row's entries lag behind it.
+ */
+async function fetchRows(
+  tx: DbTransaction,
+  t: TableRecord,
+  pks: Value[],
+): Promise<(Fields | undefined)[]> {
+  tx.live();
+  const tt = tx.table(t.name);
+  const els = pks.map((pk) => encode(pk));
+  if (t.merge === 'crdt') return tt.crdtRows(t, els);
+  const got = await tx.raw.getEntries(els.map((el) => tx.keys.row(t.id, el)));
+  const out: (Fields | undefined)[] = [];
+  for (const [i, e] of got.entries()) {
+    if (!e) {
+      out.push(undefined);
+      continue;
+    }
+    const r = await tt.decode(t, els[i]!, e.value);
+    tx.noteRow(e.key, e.version, r);
+    out.push(r.fields);
+  }
+  return out;
+}
+
 /** A query builder. Run it with `page()` or `all()`. */
 export class Query<T extends Fields = Fields> {
   private readonly conds: Cond[] = [];
@@ -297,7 +327,6 @@ export class Query<T extends Fields = Fields> {
     const bound = (fields: string[]) => fields.every((f) => eq.has(f) && eq.get(f) !== null);
     const keep = (r: Fields) => this.conds.every((c) => matches(r, c));
     const tt = tx.table(this.table);
-    if (t.merge === 'crdt' && !bound(t.pk)) return this.crdtScan(tx, t, keep);
 
     // 1–2. pk or unique equality: at most one row.
     let pk: Value | undefined;
@@ -324,6 +353,7 @@ export class Query<T extends Fields = Fields> {
     // 3. fast equality; 4. a range otherwise; 5. a table scan.
     const range = planRange(t, this.conds, this.order);
     const fast = usable(t).find((i) => i.kind === 'fast' && bound(i.fields.map(([f]) => f)));
+    if (t.merge === 'crdt' && !range && !fast) return this.crdtScan(tx, t, keep);
     let rows: { pk: Value; row: Fields; key?: Uint8Array }[];
     let path: string;
     let ordered = !this.order;
@@ -355,9 +385,9 @@ export class Query<T extends Fields = Fields> {
   }
 
   /**
-   * A CRDT table without a pk lookup (§19.4): its objects in pages of
-   * `/v1/crdt/range`, merged and filtered here. Order and paging as for a
-   * table scan; indexes come with the indexer.
+   * A CRDT table without a pk lookup or an index that fits (§19.4): its
+   * objects in pages of `/v1/crdt/range`, merged and filtered here. Order
+   * and paging as for a table scan.
    */
   private async crdtScan(
     tx: DbTransaction,
@@ -454,13 +484,10 @@ export class Query<T extends Fields = Fields> {
       if (last) begin = bytes.keyAfter(last.key);
       if (fast) {
         const pks = page.map((e) => entryPk(e.value));
-        const got = await tx.raw.getEntries(pks.map((p) => tx.keys.row(t.id, encode(p))));
+        const got = await fetchRows(tx, t, pks);
         for (let i = 0; i < pks.length && rows.length < want; i++) {
-          const e = got[i];
-          if (!e) continue; // an entry written with its row: absent only mid-change
-          const r = await tt.decode(t, encode(pks[i]!), e.value);
-          tx.noteRow(e.key, e.version, r);
-          if (keep(r.fields)) rows.push({ pk: pks[i]!, row: r.fields });
+          const r = got[i];
+          if (r && keep(r)) rows.push({ pk: pks[i]!, row: r });
         }
       } else {
         for (const e of page) {
@@ -499,7 +526,6 @@ export class Query<T extends Fields = Fields> {
     const ix = plan.ix;
     const keys = (ix.kind === 'private' ? privateScan : sealedScan)(tx, ix, lo, hi, plan.reverse);
     const dirs = ix.fields.map(([, , desc]) => ({ desc }));
-    const tt = tx.table(this.table);
     const want = this.want(ordered);
     const exact = this.conds.every((c) => plan.covered.has(c));
     for (;;) {
@@ -514,14 +540,14 @@ export class Query<T extends Fields = Fields> {
         batch.push({ key: r.value, pk: parts.length === 1 ? parts[0]! : parts });
       }
       if (!batch.length) break;
-      tx.live();
-      const got = await tx.raw.getEntries(batch.map((b) => tx.keys.row(t.id, encode(b.pk))));
+      const got = await fetchRows(
+        tx,
+        t,
+        batch.map((b) => b.pk),
+      );
       for (let i = 0; i < batch.length && rows.length < want; i++) {
-        const e = got[i];
-        if (!e) continue; // long mode: the row went after the index was read
-        const r = await tt.decode(t, encode(batch[i]!.pk), e.value);
-        tx.noteRow(e.key, e.version, r);
-        if (keep(r.fields)) rows.push({ ...batch[i]!, row: r.fields });
+        const r = got[i];
+        if (r && keep(r)) rows.push({ ...batch[i]!, row: r });
       }
       if (batch.length < n) break;
     }
