@@ -210,6 +210,15 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * 231 vitest tests in all.
 
   * **Replanned after 7a (merged, #21):** the rest of step 7 is 7b (the indexer, indexes on CRDT tables) and 7c (the offline queue, read modes with a thin `/v1/crdt/versions` check, the property test), a PR each. See Step 7.
+  * **7b** (the indexer, indexes on CRDT tables): done, PR #22. As planned, with these details for 7c:
+    * **Files:**
+      * `ixer.ts`: `reindex(tx, t, pk, pkEl, {only, row})` and `startIndexers(db, tables)` (one `$index` group per distinct change topic, started in `Db.open` after the migrations; `DbOptions.indexer: false` turns it off).
+      * `migrate.ts`: `createIndex` on a CRDT table needs `changes` and refuses `unique`; `backfillCrdt` pages `crdtRange` at the transaction's read version; `dropCrdtPage` also deletes `$ixrows` rows (`dropIxRows`, one `getEntries`), then clears the index ranges.
+      * `query.ts`: CRDT tables go through the planner; `fetchRows` fetches index candidates (`crdtRows` for CRDT tables); `crdtScan` runs only when no index fits.
+    * **`$ixrows` `values`** is keyed by the index id in hex text: CBOR map keys are text or unsigned integers (§1).
+    * **⚠️ Spec:** §19.6 (the indexer, wrong types left out, the backfill rule, freshness), §11.5 (`$ixrows` values), §8.3 (dropping a CRDT table clears `$ixrows` and its index entries).
+    * **Docs:** `docs/DB.md` §19 "Indexes on CRDT tables".
+    * **Tests:** `crdtindex.test.ts` (9): refusals, fast/private/sealed queries, merged counters from two installations, lag and re-check, resume after a stop, deletes and wrong types, backfills (also during writes with the indexer on), drops. The `unsupported` createIndex case left `crdt.test.ts`.
 
 ## Facts the work must respect (from the code survey)
 

@@ -14,9 +14,10 @@ import {
   type TableRecord,
 } from './catalog.js';
 import { decode, encode, type Value } from './cbor.js';
-import { type CrdtFieldType, checkCrdtServer, crdtRange, mergeState } from './crdt.js';
+import { type CrdtFieldType, checkCrdtServer, crdtRange, mergeState, viewOf } from './crdt.js';
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
+import { reindex } from './ixer.js';
 import { decodeRow, type Fields } from './row.js';
 import type { FieldType } from './sortkey.js';
 import { checkAppTable } from './system.js';
@@ -181,8 +182,9 @@ export class Migrator {
 
   /**
    * One page of dropping a CRDT table: delete its live rows (the server
-   * purges them after the horizon, §19.5), then its record. Returns the
-   * last object as the progress.
+   * purges them after the horizon, §19.5) and the `$ixrows` rows of its
+   * objects; then its index entries, then its record. Returns the last
+   * object as the progress.
    */
   private async dropCrdtPage(
     tx: DbTransaction,
@@ -192,12 +194,22 @@ export class Migrator {
     const size = Math.min(this.db.pageSize, 1000);
     const from = key ? bytes.keyAfter(key) : undefined;
     const { objects, more } = await crdtRange(this.db, t, from, size);
+    const pks: Value[] = [];
     for (const s of objects) {
-      if (!s.row?.alive) continue;
-      const pk = mergeState(this.db, t, s).pk!;
-      tx.crdt.setRow(t, pk, encode(pk), false);
+      const pk = mergeState(this.db, t, s).pk;
+      if (pk === undefined) continue;
+      pks.push(pk);
+      if (s.row?.alive) tx.crdt.setRow(t, pk, encode(pk), false);
     }
+    await dropIxRows(tx, t, pks);
     if (more && objects.length) return objects.at(-1)!.object;
+    if (
+      await clearPage(
+        tx,
+        t.indexes.flatMap((ix) => indexRanges(tx, ix)),
+      )
+    )
+      return false;
     tx.deleteTableRecord(t.name);
     return true;
   }
@@ -219,9 +231,12 @@ export class Migrator {
     return this.run(async (tx) => {
       const t = await tx.tableRecord(table);
       if (t.merge === 'crdt') {
-        if (opts.unique)
+        if (opts.unique) {
           throw new DbError('bad_value', 'CRDT tables have no unique indexes (§19.6)');
-        throw new DbError('unsupported', 'indexes on CRDT tables are not built yet');
+        }
+        if (!t.changes) {
+          throw new DbError('bad_value', `indexes on CRDT table ${table} need its change events`);
+        }
       }
       const ix = t.indexes.find((i) => i.name === name);
       if (!ix) {
@@ -240,6 +255,7 @@ export class Migrator {
         return false;
       }
       if (ix.state !== 'building') return true;
+      if (t.merge === 'crdt') return this.backfillCrdt(tx, t, ix);
       const [begin, end] = tx.keys.rows(t.id);
       const from = ix.builtTo ? bytes.keyAfter(ix.builtTo) : begin;
       const size = this.db.pageSize;
@@ -268,6 +284,30 @@ export class Migrator {
       tx.putTableRecord({ ...t, indexes: t.indexes.map((i) => (i === ix ? next : i)) });
       return done;
     });
+  }
+
+  /**
+   * One page of building an index on a CRDT table (§19.6): each live row
+   * of a page of `/v1/crdt/range`, unless the indexer got there first (it
+   * keeps that row current). Its `$ixrows` rows are in the read set, so a
+   * concurrent indexer commit re-runs the page.
+   */
+  private async backfillCrdt(tx: DbTransaction, t: TableRecord, ix: IndexDef): Promise<boolean> {
+    const size = Math.min(this.db.pageSize, 1000);
+    const from = ix.builtTo ? bytes.keyAfter(ix.builtTo) : undefined;
+    const { objects, more } = await crdtRange(this.db, t, from, size, tx.raw.readVersion);
+    for (const s of objects) {
+      const m = mergeState(this.db, t, s);
+      const row = viewOf(t, m);
+      if (!row) continue;
+      await reindex(tx, t, m.pk!, encode(m.pk!), { only: ix, row });
+    }
+    const done = !more || !objects.length;
+    const next: IndexDef = { ...ix, state: done ? 'active' : 'building' };
+    delete next.builtTo;
+    if (!done) next.builtTo = objects.at(-1)!.object;
+    tx.putTableRecord({ ...t, indexes: t.indexes.map((i) => (i === ix ? next : i)) });
+    return done;
   }
 
   /** Drop an index: mark it dropping, clear its entries in pages, remove it (§8.3). */
@@ -401,6 +441,20 @@ async function clearPage(
     return true;
   }
   return false;
+}
+
+/** Delete the `$ixrows` rows of these pks of a CRDT table (§8.3), in one read. */
+async function dropIxRows(tx: DbTransaction, t: TableRecord, pks: Value[]): Promise<void> {
+  if (!pks.length) return;
+  const ixt = await tx.tableRecord('$ixrows');
+  const els = pks.map((pk) => encode([t.id, pk]));
+  const got = await tx.raw.getEntries(els.map((el) => tx.keys.row(ixt.id, el)));
+  const tt = tx.table('$ixrows');
+  for (const [i, e] of got.entries()) {
+    if (!e) continue;
+    const r = decodeRow(e.value);
+    await tt.write(ixt, r.pk, els[i]!, { fields: {}, parts: r.parts ?? 0 }, undefined);
+  }
 }
 
 /**
