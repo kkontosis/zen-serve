@@ -646,6 +646,11 @@ record = u8 version (1) ‖ u8 layers (bit 0 device, bit 1 fs) ‖ body
   | `sealed/<ns>` | the index id | `{1: digest, 2: Blob}` (§5.7) |
 
   Counter totals never are (§19.7). The header of each fs unlocked with a local store is kept in store `fs/<fs id>` (docs/CLIENT.md): it lets the fs unlock offline, and is no less trusted than one fetched online (signed headers come in milestone 6). Its store can't have the fs layer, which needs the keys it unlocks.
+* **Credentials** (the vault, docs/CLIENT.md §10). An installation may keep what signs it in and unlocks its filesystems in store `vault/<name>` (`name` default `default`), so a worker or a restarted process needs no prompt. It is per installation, not per database: `Db.wipe` leaves it, and sign-out clears it. Two records, each `u8 version (1) ‖ …`, with `lp` a `u32` BE length:
+  * key `device`: `1 ‖ lp(identity public) ‖ device seed(32) ‖ lp(device cert)`. The device secret is rebuilt from the seed on use.
+  * key `session`: `1 ‖ lp(origin) ‖ lp(token) ‖ u64 BE expires_unix` (0: unknown). A token is sent only to the origin it was issued for.
+
+  The store can't have the fs layer (it holds what unlocks the fs), and needs the device layer unless the app states that plaintext is accepted. A record that doesn't open or parse reads as absent. Signing in resumes a stored session that hasn't expired, checked with one call; one the server refuses (401) falls back to a device sign-in, whose session is stored. When the server can't be reached, the stored session is returned, so the kept header (above) and the caches work offline.
 * **Writes behind.** Cache records are gathered and written every 100 ms and at close; a write lost to a crash only leaves the cache colder. Rows and CRDT states are loaded at open, up to their cache sizes (the rest is deleted); nodes and blobs are read on a miss. Every record is checked when used: rows and catalog records by their version (§7.7), CRDT states by theirs (§19.4), nodes against their id, blobs against the digest in the head.
 
 ---
