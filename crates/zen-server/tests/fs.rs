@@ -1506,6 +1506,49 @@ async fn paged_versions_round_trip_and_refusals() {
     assert!(info.features.iter().any(|f| f == "fs_pages"));
 }
 
+/// Sweep until exactly `want_pages` of `pages` and `want_chunks` of
+/// `chunks` exist, checking after every sweep that no page outlives a chunk
+/// it lists (pages are collected first). With a grace of 0 this can still
+/// take a few sweeps: on FoundationDB, commit versions can trail the clock
+/// the grace is measured with.
+async fn sweep_until(
+    h: &Harness,
+    a: &Dev,
+    pages: &[([u8; 16], Vec<[u8; 16]>)],
+    chunks: &[[u8; 16]],
+    want_pages: &[[u8; 16]],
+    want_chunks: &[[u8; 16]],
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        zen_server::sweep_once(&h.server.state).await.unwrap();
+        let mut done = true;
+        for (p, list) in pages {
+            let present = page_data(h, a, *p).await.is_some();
+            if present {
+                for c in list {
+                    assert!(
+                        chunk_exists(h, a, *c).await,
+                        "page {p:02x?} outlived chunk {c:02x?}"
+                    );
+                }
+            }
+            done &= present == want_pages.contains(p);
+        }
+        for c in chunks {
+            done &= chunk_exists(h, a, *c).await == want_chunks.contains(c);
+        }
+        if done {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "swept to pages {want_pages:02x?}, chunks {want_chunks:02x?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Pages shared between versions keep their chunks; replaced pages are
 /// collected first and their chunks one grace period later; a re-upload
 /// doesn't count a page's chunks twice; quota follows.
@@ -1516,7 +1559,6 @@ async fn shared_pages_and_gc_order() {
         c.limits.sweep_interval_secs = 3600; // swept by hand below
     })
     .await;
-    let st = &h.server.state;
     let n = id(1);
     ops(&h, &a, vec![mv(n, ROOT, zfs::hlc(now_ms(), 0), Some(b"f"))])
         .await
@@ -1547,40 +1589,24 @@ async fn shared_pages_and_gc_order() {
     .await
     .unwrap();
     let db = r.dots[0].to_vec();
-    let exists = |x: [u8; 16]| chunk_exists(&h, &a, x);
-    zen_server::sweep_once(st).await.unwrap();
-    // Pages: a2 and u go; a1 (shared) and b2 stay. c6 goes; c5, released
-    // by u in this sweep, waits for the next one.
-    assert_eq!(page_data(&h, &a, a2).await, None);
-    assert_eq!(page_data(&h, &a, u).await, None);
-    assert!(page_data(&h, &a, a1).await.is_some());
-    assert!(page_data(&h, &a, b2).await.is_some());
-    assert!(!exists(c[5]).await);
-    assert!(
-        exists(c[4]).await,
-        "a chunk released by a page waits a grace period"
-    );
-    zen_server::sweep_once(st).await.unwrap();
-    assert!(!exists(c[4]).await);
-    for &x in &c[..4] {
-        assert!(exists(x).await, "B reads fully");
-    }
-    // Re-uploading a1 restarts its grace without counting its chunks again.
+    let pages = [
+        (a1, c[..2].to_vec()),
+        (a2, c[2..3].to_vec()),
+        (b2, c[2..4].to_vec()),
+        (u, c[4..5].to_vec()),
+    ];
+    // a2 and u go, with c5 (only u listed it) and c6 (nothing did); a1
+    // (shared) and b2 stay, and B reads fully.
+    sweep_until(&h, &a, &pages, &c, &[a1, b2], &c[..4]).await;
+    // Re-uploading a1 restarts its grace without counting its chunks again:
+    // once B is replaced, every page and chunk goes.
     upload(&h, &a, vec![], vec![page_put(a1, &c[..2])], vec![])
         .await
         .unwrap();
     upload(&h, &a, vec![], vec![], vec![write(n, &[db], &[], b"vC")])
         .await
         .unwrap();
-    for _ in 0..3 {
-        zen_server::sweep_once(st).await.unwrap();
-    }
-    for p in [a1, b2] {
-        assert_eq!(page_data(&h, &a, p).await, None);
-    }
-    for &x in &c[..4] {
-        assert!(!exists(x).await, "every chunk released once per page");
-    }
+    sweep_until(&h, &a, &pages, &c, &[], &[]).await;
     assert_eq!(quota_bytes(&h).await, q0 + b"vC".len() as i64);
 }
 
@@ -1721,9 +1747,6 @@ async fn paged_gc_matches_reference() {
                 _ => {}
             }
         }
-        for _ in 0..4 {
-            zen_server::sweep_once(&h.server.state).await.unwrap();
-        }
         let mut want_pages = BTreeSet::new();
         let mut want_chunks = BTreeSet::new();
         for vs in live.values() {
@@ -1742,20 +1765,9 @@ async fn paged_gc_matches_reference() {
                 want_chunks.extend(list.iter().copied());
             }
         }
-        for (p, _) in &pages {
-            assert_eq!(
-                page_data(&h, &a, *p).await.is_some(),
-                want_pages.contains(p),
-                "seed {seed}: page {p:02x?}"
-            );
-        }
-        for c in &chunks {
-            assert_eq!(
-                chunk_exists(&h, &a, *c).await,
-                want_chunks.contains(c),
-                "seed {seed}: chunk {c:02x?}"
-            );
-        }
+        let want_pages: Vec<[u8; 16]> = want_pages.into_iter().collect();
+        let want_chunks: Vec<[u8; 16]> = want_chunks.into_iter().collect();
+        sweep_until(&h, &a, &pages, &chunks, &want_pages, &want_chunks).await;
         // Every live version still reads back as written.
         for (n, vs) in &live {
             let got = file(&h, &a, *n).await;

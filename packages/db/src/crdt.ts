@@ -435,7 +435,7 @@ export class CrdtWrites {
     if (ctrs.length) {
       release = await actorLock(db);
       try {
-        await this.loadTotals(state, ctrs, clock.actor);
+        await this.loadTotals(state, ctrs, clock);
       } catch (e) {
         release();
         throw e;
@@ -541,8 +541,9 @@ export class CrdtWrites {
   private async loadTotals(
     state: ActorState,
     ctrs: { r: RowOps; field: string }[],
-    actor: Uint8Array,
+    clock: TreeClock,
   ): Promise<void> {
+    const actor = clock.actor;
     const db = this.tx.db;
     const objects = new Map<string, Uint8Array>();
     const missing = new Map<string, bigint>();
@@ -558,6 +559,9 @@ export class CrdtWrites {
       for (const c of s.ctr ?? []) {
         const k = `${bytes.hex(s.object)}/${bytes.hex(c.field)}`;
         if (!bytes.equal(c.actor, actor) || !missing.has(k)) continue;
+        // Another tab of this installation may have ticked further: this
+        // commit's `seq` must be newer, or the server ignores it (§19.7).
+        clock.observe(c.seq);
         const total = plain(db.fs.keys.openCrdtValue(s.object, c.field, ZERO16, c.value)).value;
         missing.set(k, asBig(total));
       }

@@ -316,6 +316,9 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * the `fs.json` v2 keys, in `tests/vectors.rs`
       * `crates/zen-server/tests/fs.rs` +4: a round trip with refusals and the chain; shared pages, GC order, re-upload and quota; purge; a reference-model GC property test over three seeds. Three of them were checked to fail when page collection doesn't release chunks.
       * vitest: 301 tests
+    * **CI fixes on #27:**
+      * **FoundationDB:** with a grace of 0, the GC tests assumed a single sweep sees the latest commits. On FoundationDB, commit versions can trail the clock the grace is measured with. The tests now use `sweep_until`, which sweeps to the expected state and checks after every sweep that no page outlives a chunk it lists. Two mutations (no chunk release; pages not counting their chunks) were each checked to fail.
+      * **A 7d bug** (`crdtpersist` "two tabs … increment": 14, not 16, in about 1 run in 6). Two tabs share one counter actor but each has its own clock, so a tab's `seq` could be no newer than the other tab's last one, and the server ignored it as a re-send. `loadTotals` now observes the `seq` of the entries it reads (after the lock, which already forces the read). zendb.md §19.7 and DB.md were updated.
 
 ## Facts the work must respect (from the code survey)
 
