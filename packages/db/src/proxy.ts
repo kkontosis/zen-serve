@@ -2,6 +2,8 @@
 // tabs send it their subscriptions over a BroadcastChannel; it forwards log
 // events sealed (each tab opens them with its own topic keys) and ephemeral
 // messages opened. Transactions stay local in every tab.
+
+import type { BroadcastChannelLike } from '@zen/client';
 import {
   bytes,
   offsetAfterVersion,
@@ -21,15 +23,7 @@ import {
 import type { Db } from './db.js';
 import { DbError } from './errors.js';
 
-/** The part of `BroadcastChannel` the proxy uses. */
-export interface BroadcastChannelLike {
-  postMessage(message: unknown): void;
-  onmessage: ((ev: { data: unknown }) => void) | null;
-  close(): void;
-}
-
-/** Opens the channel of a database (default: `new BroadcastChannel(name)`). */
-export type ChannelFactory = (name: string) => BroadcastChannelLike;
+export type { BroadcastChannelLike, ChannelFactory } from '@zen/client';
 
 /** How long a tab waits for an owner to answer (ms). */
 const OWNER_WAIT = 10_000;

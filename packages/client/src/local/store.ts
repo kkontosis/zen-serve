@@ -17,6 +17,13 @@ export interface LocalStore {
    * the backend, never extractable.
    */
   deviceKey(): Promise<CryptoKey>;
+  /**
+   * Take an exclusive, cross-process lock `name` on this store, held until
+   * the returned function is called; a lock another live holder has gives
+   * `ZenError(0, 'locked')`. Only backends without Web Locks have it (Node
+   * disk); tabs use a Web Lock instead.
+   */
+  lock?(name: string): Promise<() => Promise<void>>;
   close(): void;
 }
 

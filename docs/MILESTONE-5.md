@@ -342,6 +342,21 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** zendb.md §9.3, the `vault/<name>` store and its two records.
     * **Docs:** `docs/CLIENT.md` §10 "Credentials (the vault)"; GAPS G15 partly done.
     * **Tests:** `packages/client/test/vault.test.ts` (14: three backends, resume with one call, offline with the kept header, offline with an expired or no session, an expiring session, a logged-out session, no device, the origin rule, refusals, a bad seed, tampering, unparsable records); the origin check and the 401 fallback were each checked to fail when removed. 330 vitest tests in all.
+* **Step 8** (`@zen/fs`, zen-mount): planned (see Step 8: sub-steps 8a, 8b and 8c, a PR each). PR #29 is merged, so the plan commit restarts the branch from main and opens a new PR, which 8a joins (#30).
+  * **8a** (the replica that reads): done, PR #30. As planned, with these details for 8b and 8c:
+    * **Client:** `src/local/tabs.ts` holds `Owner`, `LockManagerLike`, `BroadcastChannelLike`, `ChannelFactory`, `defaultLocks`, `defaultChannel` (moved from `@zen/db`, which re-exports them). `LocalStore.lock?(name)` (Node disk: `dir/<name>.lock` with the pid, `O_EXCL`; a dead pid's lock is taken over; `ZenError(0, 'locked')`). `Tree.nodeOf(state)` (public), `Tree.fetchVersions(node)` (wire bytes) and `Tree.openVersions(node, Versions)`: these replace the planned `versionCache` option, since only the replica knows a node's change offset.
+    * **`@zen/fs`** (`packages/fs`, wired like `@zen/db`; vitest alias, workspaces, `check`, CI typecheck):
+      * `store.ts`: `Records` (write-behind, 100 ms), `Content` (the tree's `chunkCache`/`pageCache`, use records, `evict(limit, keep)`), `replicaStores`.
+      * `replica.ts`: `openReplica(fs, tree, {local, cacheBytes, locks, channel, waitMs, owner})` → `Replica`: `sync()`, `onChange`, `isOwner`, `online`, `lookup`/`entries`/`nodeAt`/`node`, `versionsOf`, `stat`, `readdir(path, {withTypes})`, `readFile`, `read`, `createReadStream` (async, returns a `ReadableStream`), `readlink`, `listxattr`, `getxattr` (`no_attr`), `pin`/`unpin` (`idle()` waits for fetches), `evict()`, `status()`, `flush`, `close`, `Replica.wipe`. `conflictName` (copied from `packages/fuse`, which 8c switches over).
+      * `xattr.ts`: `encodeXattrs`/`decodeXattrs` (a CBOR map of text names to bytes; text values read as their UTF-8).
+      * Feed changes apply only when their offset is newer than the node's, so the long-poll and `sync()` may overlap. A `resync` in the long-poll restarts the loop with a full sync; the `full` record makes an interrupted one start again.
+      * Errors: `not_found` (404), `not_dir`, `is_dir`, `offline`, `no_attr`, `locked`.
+    * **Decisions beyond the plan:** `stat` of a file whose versions aren't kept fails `offline` (sizes live in manifests; pin what must stat offline); conflict copies of such a file don't show offline; listeners hear of changes before the store is written, other tabs after.
+    * **⚠️ Spec:** fs.md §11 (the replica), zendb.md §9.3 (the `zfs/…` stores).
+    * **Docs:** `docs/CLIENT.md` §8 "The local replica"; TECH_DEBT TD-FUSE-REPLICA progress.
+    * **Tests:** `packages/fs/test/replica.test.ts` (13: sync and the loop, restart from the cursor offline, a resync dropping a planted node, duplicate names and conflict copies, symlinks and xattrs, ranged reads of a paged file with counted calls, eviction with a pin, a pinned folder's new file, offline reopen and catch-up, the three stores (sealed, wipe), two tabs with handover, the Node lock and a stale one). Eviction keeping pins and the full-sync sweep were each checked to fail when removed. 343 vitest tests in all.
+    * **CI fix on #30:** `online` turned true only once a catch-up finished, so a node from the feed could show before it (the offline test, about 1 run in 2 on CI). Any feed batch now marks the replica online.
+    * **Also on #30 (user request):** `crates/zen-server/tests/dump.rs` `a_started_server_counts_as_empty` failed once on FoundationDB with `read version too old` at the `is_empty` check right after an import (the version jump its other reads already retry). That check now retries the same way.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2138,27 +2153,88 @@ Not changed here: `--vault <dir>` is step 8's (its constraints list). The vault'
 * CI green on the PR, then log the 7h line in both plan copies (step 7 done), stop for compaction. Step 8 is next.
 
 ## Step 8: `@zen/fs`, the local replica (DESIGN-3 §6, TD-FUSE-REPLICA)
-* **Model.** The node table and chunk store are kept current through `tree.changes`. Local ops are applied optimistically and queued while offline, then sent (with rebase).
-* **POSIX-ish API:** `readFile`, `writeFile` (changed chunks only), `readdir`, `stat`, `mkdir`, `rename`, `unlink`, `rmdir`, `symlink`/`readlink`, xattrs in sealed meta, conflict copies.
-* **Stores**, behind an interface:
-  * `memory`
-  * `node-disk`: a directory of sealed chunk files plus a node-table journal; no native deps
-  * `indexeddb`: browser
-  
-  At rest, everything stays sealed as on the server.
-* **`zen-mount`:**
-  * moves onto `@zen/fs`
-  * offline reads of cached files
-  * `--cache-dir` becomes real
-  * symlinks and xattrs
-  * writes of changed chunks only
-  * the existing mount tests stay green, plus offline and symlink tests
-* **TDs:** resolve TD-FUSE-REPLICA.
-* **Constraints from milestones 8–11** (added after 7e):
-  * **Layout:** the replica stores pages and sealed chunks as the server does (7f/7g), never plaintext. A resumable upload's state is kept on the local store.
-  * **Worker-safe core:** `@zen/fs` uses no DOM and no Node imports outside its Node store, so it runs in a service worker or a worker (M9). Reads include `createReadStream(path, {start, end})` → `ReadableStream`.
-  * **Content type:** a reserved xattr key in the sealed meta (spec'd in step 8's `spec:` commit), which M9 serves as `Content-Type`.
-  * **Vault:** `zen-mount` can sign in and unlock from the vault (7h), e.g. `--vault <dir>`.
+
+**Original outline.** A node table and chunk store kept current through `tree.changes`; local ops applied optimistically and queued offline, then sent with rebase; a POSIX-ish API (`readFile`, `writeFile` of changed chunks, `readdir`, `stat`, `mkdir`, `rename`, `unlink`, `rmdir`, `symlink`/`readlink`, xattrs, conflict copies); stores memory, Node disk, IndexedDB, sealed at rest; `zen-mount` on top (offline reads, a real `--cache-dir`, symlinks, xattrs, changed-chunk writes); TD-FUSE-REPLICA resolved. Constraints from milestones 8–11: pages and sealed chunks stored as on the server, never plaintext; a worker-safe core with `createReadStream`; a reserved content-type xattr; `zen-mount --vault`.
+
+**Context.** Step 7 (PRs #20–#29, merged) leaves the client with:
+* the tree API (`packages/client/src/tree.ts`): `get`, `children`, `changes` (long-poll, `resync`), `versions`, `read`/`readStream`, `writeFile`/`upload`/`writeOp` with `previous` chunk reuse, paged versions, `TreeBatch`, `send` with rebase, `ChunkCache`/`pageCache` hooks, `displayNames`
+* the sealed local store (`memoryLocalStore`, `nodeDiskLocalStore`, `indexedDbLocalStore`, `sealedStore`), the kept header and the vault
+* `@zen/db`'s owner election (`tabs.ts` `Owner`, `LockManagerLike`), tab channel and owner-only queue sender (7d), as the pattern for sharing one store
+
+There is no node table: zen-mount lists directories from the server, reads by chunk range, buffers whole files on write, and has no symlinks, xattrs, offline use or disk cache (`--cache-dir` is parsed and ignored).
+
+**User decisions:**
+* **Split:** 8a (the replica that reads), 8b (local writes), 8c (zen-mount on `@zen/fs`), a PR each.
+* **What is kept:** all nodes always (the node table syncs whole); content on demand, in a size-bounded LRU, with `pin` to keep files or folders offline.
+* **Sharing a store:** the owner (Web Lock) follows the feed and sends queued ops; other tabs read the shared store and queue their ops in it, notified over the tab channel. Without Web Locks (Node), one replica per store, held by a lock file in the Node disk store.
+
+**After compaction, re-read:** this section and the 7d/7e/7g/7h log lines; `spec/fs.md`; `spec/formats.md` §11; `packages/client/src/{tree,fs}.ts` and `local/*`; `packages/db/src/{tabs,proxy,crdtq,localq}.ts`; `packages/fuse/src/{mount,cli}.ts`; `packages/fuse/test/mount.test.ts`; `packages/client/test/{large,tree}.test.ts`.
+
+**Package.** `packages/fs` (`@zen/fs`), wired like `packages/db`: `package.json` (deps `@zen/client`, `@zen/wasm`), `tsconfig.json`, `tsconfig.test.json` (paths to the client sources), a vitest alias, the root workspaces and `check` script, and CI (typecheck; `npm run build -w @zen/client -w @zen/fs` before the fuse tests). The core imports no DOM and no Node modules (worker-safe, M9); Node pieces come from `@zen/client/node`.
+
+### 8a: the replica that reads
+
+#### Client changes (`@zen/client`)
+* **Owner election moves to the client:** `Owner`, `LockManagerLike` and `BroadcastChannelLike` move from `@zen/db` (`tabs.ts`, `proxy.ts`) to `packages/client/src/local/tabs.ts`, exported; `@zen/db` re-exports them, unchanged in behaviour.
+* **A store lock in Node:** `nodeDiskLocalStore(dir).lock(name) → release` takes `dir/<name>.lock` with `O_EXCL`, holding the pid; a lock whose pid is gone is taken over. `LocalStore.lock?` is optional; memory and IndexedDB don't have it.
+* **`TreeOptions.versionCache?: {get(node, changed), put(node, changed, bytes)}`:** `versions(node)` keeps the wire `Versions` bytes per node and change offset (manifests stay sealed), so versions read offline. It is used only when the caller knows the node's `changed` (the replica passes it).
+* **`Tree.nodeOf(state)`** (the private `node()`, made public): open a wire `NodeState` into a `TreeNode`, so a stored state opens the same way.
+
+#### `@zen/fs` files
+1. **`store.ts`, the replica's records** on a `SealedStore`, in stores named `zfs/<fs>/<tree hex>/<kind>`:
+   * `nodes`: node id → the wire `NodeState` (`zw.encodeNodeState`), as the server sends it: meta stays sealed under the fs keys, so the device layer (default) is a second layer.
+   * `sync`: `cursor` (the feed offset) and `epoch` (bumped on `resync`).
+   * `versions`: node ‖ changed → wire `Versions`.
+   * `chunks` and `pages`: id → sealed bytes, as on the server; `lru`: id → `{bytes, used}` (one record per chunk or page; a `bytes` total is kept in `sync`).
+   * `pins`: node id → 1.
+   * Writes go through a write-behind batcher (as `@zen/db`'s `LocalCache`: every 100 ms and at close).
+2. **`replica.ts`, `Replica`:**
+   * **`openReplica(tree, {local, cacheBytes = 1 GiB, locks, channel, waitMs = 25_000})`.** Loads every stored node into memory (the node table plus a `parent → children` index; about 300 B per node), then starts the owner election.
+   * **Sync (owner only):** `tree.changes(cursor, {waitMs})` in a loop. Each batch updates the in-memory table and the store (a purged node is removed with its versions; a node whose `changed` moved drops its old versions record), saves the cursor, and posts `nodes {ids}` on the tab channel. On `resync`, a full sync into a fresh epoch, then nodes not seen are removed. Network errors back off (1 s to 30 s) and set `online` false; `onChange(fn)` reports changed node ids, and `ready` resolves after the first catch-up (or at once offline, from the stored table).
+   * **Other tabs:** load the stored table, and reload the nodes named by `nodes` messages. A non-owner's reads of content fetch from the server themselves and put into the shared store (chunks are immutable, so writers never conflict).
+   * **Content on demand:** the replica gives the tree a `chunkCache`, `pageCache` and `versionCache` over the store. Each use updates `used` (in memory, flushed lazily). **Eviction** (owner only) runs when the total passes `cacheBytes`: oldest first, never a pinned node's current chunks and pages.
+   * **`pin(path, {recursive})` / `unpin`:** the owner fetches the current versions' chunks and pages of the pinned files (recursively for a folder, and of files added under it later) and keeps them current after each sync batch. `pinned(path)` and `status()` (`{online, cursor, nodes, cacheBytes, pinnedBytes, fetching}`).
+   * **Offline:** reads use the stored table and content. A read whose content isn't cached gives `ZenError(0, 'offline')`.
+3. **`paths.ts`, names and paths:**
+   * `resolve(path)` walks from `ROOT` by **display names** (`displayNames`, fs.md §8), so duplicate names have distinct paths (`foo (2).txt`); unreadable nodes appear by hex id. A node in `TRASH` or with no parent is not reachable.
+   * **Conflict copies:** a file with `versions > 1` lists its newest version under its name and every other one as `name (conflict <device8>-<n>).ext` (`conflictName`, moved from `packages/fuse`), read-only.
+4. **`api.ts`, reads (POSIX-ish):** `stat(path)` (`{type, mode, size, mtimeMs, node, versions}`), `readdir(path, {withTypes})`, `readFile(path)`, `read(path, offset, length)`, `createReadStream(path, {start, end})` → `ReadableStream`, `readlink(path)` (a symlink's content, UTF-8), `getxattr(path, name)` / `listxattr(path)` (the meta's CBOR xattrs map). Errors are `ZenError` with POSIX-like codes: `not_found` (ENOENT), `not_dir`, `is_dir`, `offline`.
+
+#### Tests (`packages/fs/test/`, their own servers)
+* **Sync:** a replica follows another session's creates, moves, renames, trash and writes (`until`); after a restart on the same store it resumes from the cursor (counted `changes` calls, no full sync); a forced `resync` (a cursor older than the trim horizon via a test limit, or a wrapped call returning 409) rebuilds and removes vanished nodes.
+* **Paths:** duplicate names, conflict copies (two concurrent writes), unreadable meta, trash.
+* **Content:** a read fetches only its chunks (counted); a second read costs no call; a paged file through `createReadStream` ranges; eviction keeps the total under `cacheBytes` (small value) and never drops pinned content; `pin` of a folder fetches new files added under it.
+* **Offline** (a wrapped `transport.call` throwing `network`): a reopened replica lists and reads cached and pinned files, an uncached file gives `offline`, `status().online` is false, and it catches up once back.
+* **Stores:** the same suite on memory, Node disk and IndexedDB (`describe.each`); records sit sealed (a chunk record equals the server's bytes inside the device layer; no plaintext name appears in the Node disk files).
+* **Sharing:** two tabs on one IndexedDB store (`FakeLocks`, `FakeBus`): only the owner calls `changes`; the other sees updates through the channel; closing the owner hands over. Node: a second `openReplica` on a locked disk store is refused; a stale lock (dead pid) is taken over.
+* **Client:** `kv`/`tree` tests for `versionCache` and `nodeOf`; `@zen/db`'s tests stay green after the move of `Owner`.
+
+#### Spec (⚠️ `spec:` commit)
+* fs.md §5 (or a new §11): the replica in brief: whole node table, content on demand, the stored records sealed as on the server.
+* zendb.md §9.3: the `zfs/…` stores in the table of stores.
+
+### 8b: local writes
+* **The write API:** `writeFile(path, data, {mode})` (changed chunks only: the replica keeps each cached version's `ChunkIndex` hashes, so `previous` reuse needs no download), `mkdir`, `rename` (`move` + name, or `rename` in place; replacing an existing target removes it first, POSIX-like), `unlink`, `rmdir` (`not_empty`), `symlink(target, path)`, `truncate`, `chmod`, `utimes`, `setxattr`/`removexattr`; `unlink` of a conflict copy resolves to the newest version (as zen-mount does now). Names are checked against display names (`exists`).
+* **File handles:** `open(path, flags) → FileHandle {read, write(buf, pos), truncate, flush, close}`. Writes go to dirty ranges over the base version; `flush` streams the new content (unchanged ranges read from the cache or server, chunk by chunk) through `upload` with `previous`, so only changed chunks are sealed and sent, and a large file is never held in memory.
+* **Optimistic apply and the queue:** each operation is applied at once to an overlay of the node table (reads see it), and stored as a queue entry in `zfs/…/queue` (the `PendingOp`, with its sealed meta, the move/meta `hlc` ticked **at queue time**, and for a write its `Upload` and `UploadState`). Offline, a write's sealed chunks and pages are kept in the store until sent (they count toward no LRU).
+* **Sending (owner only):** entries in order, batched up to the commit limits, through a stored `Transaction` and `tree.writeIn`, so a resend after a lost reply has the same `commit_id` (the inflight record of 7d). `stale_op` / `clock_skew` re-tick (as `Tree.rebase`); a `move` that the server skips (a cycle) is dropped from the overlay when the feed shows the node elsewhere. A write's `replaces` is the version it was based on: a concurrent write elsewhere leaves both as siblings (conflict copies), as fs.md §4 intends. Uploads of queued writes resume from their `UploadState` within `chunk_grace_secs`.
+* **Content type:** ⚠️ formats.md §11.2 reserves xattr keys starting with `zen.`; `zen.content_type` (text) is the content type, which `writeFile(path, data, {contentType})` sets and M9 serves.
+* **Tests:** each operation online and offline (a queue that survives a restart and is sent once, counted); two replicas editing one file offline → a conflict copy each sees; a move cycle made offline on two replicas resolves as the server decides; changed-chunk writes (a 1-byte edit in a 50-chunk file uploads one chunk); handles over a paged file; symlinks and xattrs round-trip; non-owner tabs queue through the owner.
+* **⚠️ Spec:** fs.md: queued local operations and their timestamps; formats.md §11.2 the `zen.` xattr keys.
+
+### 8c: zen-mount on `@zen/fs`
+* `mount(replica, mountpoint, opts)`: lookups, `getattr` and `readdir` from the in-memory node table (stable inode numbers from a node-id map), reads through the replica (cached), writes through `FileHandle`s (changed chunks only; no whole-file buffer), `symlink`/`readlink`, `setxattr`/`getxattr`/`listxattr`/`removexattr` (user namespace; `zen.*` mapped to `user.zen.*`), `chmod`/`utimens`/`chown` as now. Kernel caches are invalidated from `replica.onChange`.
+* **CLI:** `--cache-dir DIR` (a sealed Node disk store: the replica, its lock and the kept header), `--cache-size BYTES`, `--pin PATH` (repeatable), `--vault DIR` (sign in and unlock from the vault; `--save-device FILE` imports a `--device-key` JSON into it), `--offline-ok` (mount from the cache when the server is down).
+* **Tests:** the existing mount tests unchanged and green; symlinks and xattrs through the kernel; a warm restart with `--cache-dir` reads cached files with the server stopped; changed-chunk writes through the kernel (counted chunk uploads); `--vault` mounts with no secret given.
+* **Docs:** `docs/CLIENT.md` (the replica, zen-mount), TECH_DEBT: TD-FUSE-REPLICA resolved; the M8 upload-session note for resumes past the grace period.
+
+### Verification (each sub-step)
+* `npx biome check`; tsc for client (test), fuse, db (test), fs (test); `npx vitest run` three times; Rust unchanged unless a sub-step says otherwise.
+* CI green on the PR; the fuse tests run in CI (FUSE isn't in the session container).
+* **Disk:** about 4.5 GB free; `CARGO_INCREMENTAL=0` if Rust builds.
+
+### Rhythm
+One PR per sub-step, each from main once the previous one is merged: the plan commit (for 8a, this one), on the user's go the `spec:` commit then the code, log the line in both plan copies, push, confirm CI is green, stop for compaction. Step 9 (`@zen/loro`) follows 8c.
 
 ## Added features: milestones 8–11 (placeholders)
 

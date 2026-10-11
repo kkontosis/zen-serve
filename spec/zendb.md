@@ -646,6 +646,17 @@ record = u8 version (1) ‖ u8 layers (bit 0 device, bit 1 fs) ‖ body
   | `sealed/<ns>` | the index id | `{1: digest, 2: Blob}` (§5.7) |
 
   Counter totals never are (§19.7). The header of each fs unlocked with a local store is kept in store `fs/<fs id>` (docs/CLIENT.md): it lets the fs unlock offline, and is no less trusted than one fetched online (signed headers come in milestone 6). Its store can't have the fs layer, which needs the keys it unlocks.
+* **The fs replica** (fs.md §11). A replica of tree `t` of fs `f` keeps its records in stores `zfs/<f>/<hex t>/<kind>`, per installation like the vault (`Db.wipe` leaves them):
+
+  | Kind | Key | Record |
+  |---|---|---|
+  | `nodes` | the node id | the wire `NodeState` (meta sealed, kind 4) |
+  | `sync` | `cursor`, `full` | the feed cursor; `full` present while a full sync is unfinished |
+  | `versions` | node id ‖ change offset | the wire `Versions` of the node at that change (manifests sealed) |
+  | `chunks`, `pages` | the chunk or page id | its bytes as on the server (chunks sealed, kind 6) |
+  | `lru` | `c` or `p` ‖ id | `u64 BE bytes ‖ u64 BE last use (unix ms)` |
+  | `pins` | the node id | `u8 1` (recursive) or `u8 0` |
+
 * **Credentials** (the vault, docs/CLIENT.md §10). An installation may keep what signs it in and unlocks its filesystems in store `vault/<name>` (`name` default `default`), so a worker or a restarted process needs no prompt. It is per installation, not per database: `Db.wipe` leaves it, and sign-out clears it. Two records, each `u8 version (1) ‖ …`, with `lp` a `u32` BE length:
   * key `device`: `1 ‖ lp(identity public) ‖ device seed(32) ‖ lp(device cert)`. The device secret is rebuilt from the seed on use.
   * key `session`: `1 ‖ lp(origin) ‖ lp(token) ‖ u64 BE expires_unix` (0: unknown). A token is sent only to the origin it was issued for.

@@ -25,6 +25,21 @@ async fn everything(s: &dyn Storage) -> Vec<KeyValue> {
     panic!("storage kept failing");
 }
 
+/// `dump::is_empty`, retried like `everything` (right after an import's version jump).
+async fn is_empty(s: &dyn Storage) -> bool {
+    let too_old = zen_store::Error::TooOld.to_string();
+    for _ in 0..50 {
+        match dump::is_empty(s).await {
+            Ok(v) => return v,
+            Err(e) if e == too_old => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("storage kept failing");
+}
+
 async fn try_everything(s: &dyn Storage) -> zen_store::Result<Vec<KeyValue>> {
     let mut out = Vec::new();
     let mut from = Vec::new();
@@ -210,7 +225,7 @@ async fn a_started_server_counts_as_empty() {
     dump::import(store.as_ref(), std::fs::File::open(&file).unwrap(), false)
         .await
         .unwrap();
-    assert!(!dump::is_empty(store.as_ref()).await.unwrap());
+    assert!(!is_empty(store.as_ref()).await);
     assert_eq!(
         everything(store.as_ref()).await,
         everything(h.server.state.store.as_ref()).await

@@ -34,6 +34,14 @@ export {
 } from './local/sealed.js';
 export { type LocalStore, memoryLocalStore } from './local/store.js';
 export {
+  type BroadcastChannelLike,
+  type ChannelFactory,
+  defaultChannel,
+  defaultLocks,
+  type LockManagerLike,
+  Owner,
+} from './local/tabs.js';
+export {
   type CredentialVault,
   credentialVault,
   type StoredDevice,

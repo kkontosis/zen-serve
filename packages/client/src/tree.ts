@@ -13,6 +13,7 @@ import type {
   NodeState,
   PagePut,
   PageRef,
+  Versions,
 } from '@zen/wasm';
 import { compare, equal, hex, randomBytes } from './bytes.js';
 import type { Client } from './client.js';
@@ -338,7 +339,11 @@ export class Tree {
 
   // ------------------------------------------------------------ reading
 
-  private node(s: NodeState): TreeNode {
+  /**
+   * A node from its wire state (as the change feed or a replica's store
+   * gives it): observes its timestamps and opens its meta.
+   */
+  nodeOf(s: NodeState): TreeNode {
     this.clock.observe(s.move_hlc);
     this.clock.observe(s.meta_hlc);
     const n: TreeNode = { id: s.node, versions: s.versions, changed: s.changed, state: s };
@@ -362,7 +367,7 @@ export class Tree {
         tree: this.id,
         nodes: nodes.slice(i, i + MAX_GET_NODES),
       });
-      for (const s of r.nodes) found.set(hex(s.node), this.node(s));
+      for (const s of r.nodes) found.set(hex(s.node), this.nodeOf(s));
     }
     return nodes.map((n) => found.get(hex(n)));
   }
@@ -403,7 +408,7 @@ export class Tree {
           ...(opts.pageSize ? { limit: opts.pageSize } : {}),
         },
       );
-      for (const s of r.nodes) yield this.node(s);
+      for (const s of r.nodes) yield this.nodeOf(s);
       const last = r.nodes.at(-1);
       if (!r.more || !last) return;
       after = last.node;
@@ -452,7 +457,7 @@ export class Tree {
           changes: r.changes.map((c) => ({
             offset: c.offset,
             node: c.node,
-            ...(c.state ? { state: this.node(c.state) } : {}),
+            ...(c.state ? { state: this.nodeOf(c.state) } : {}),
           })),
           ...(after ? { cursor: after } : {}),
           more,
@@ -466,11 +471,20 @@ export class Tree {
 
   /** A node's content versions in dot order (siblings when more than one), manifests opened. */
   async versions(node: Uint8Array): Promise<FileVersion[]> {
-    const r = await this.session.call('/v1/fs/file/get', zw.encodeFileGet, zw.decodeVersions, {
+    return this.openVersions(node, zw.decodeVersions(await this.fetchVersions(node)));
+  }
+
+  /** A node's versions as the server sends them (wire `Versions`, manifests sealed). */
+  fetchVersions(node: Uint8Array): Promise<Uint8Array> {
+    return this.session.call('/v1/fs/file/get', zw.encodeFileGet, (b) => b, {
       fs: this.fs.id,
       tree: this.id,
       node,
     });
+  }
+
+  /** Open wire versions of `node` (from `fetchVersions`, or kept by a replica). */
+  openVersions(node: Uint8Array, r: Versions): FileVersion[] {
     return r.versions.map((v) => {
       const manifest = this.fs
         .keysFor(v.manifest)
