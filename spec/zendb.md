@@ -656,6 +656,9 @@ record = u8 version (1) ‖ u8 layers (bit 0 device, bit 1 fs) ‖ body
   | `chunks`, `pages` | the chunk or page id | its bytes as on the server (chunks sealed, kind 6) |
   | `lru` | `c` or `p` ‖ id | `u64 BE bytes ‖ u64 BE last use (unix ms)` |
   | `pins` | the node id | `u8 1` (recursive) or `u8 0` |
+  | `queue` | `e ‖ u64 BE seq ‖ 4 random bytes`, or `inflight` | a queued write entry, or the commit in flight (fs.md §11.1); JSON, bytes as `{"$b": base64url}`, integers past 2^53 as `{"$n": decimal}` |
+  | `index` | node id ‖ dot | a version's chunk index (chunk ids and SHA-256s; JSON as `queue`), for chunk reuse |
+  | `sync` | `info` | the server's `/v1/info`, for writes made offline |
 
 * **Credentials** (the vault, docs/CLIENT.md §10). An installation may keep what signs it in and unlocks its filesystems in store `vault/<name>` (`name` default `default`), so a worker or a restarted process needs no prompt. It is per installation, not per database: `Db.wipe` leaves it, and sign-out clears it. Two records, each `u8 version (1) ‖ …`, with `lp` a `u32` BE length:
   * key `device`: `1 ‖ lp(identity public) ‖ device seed(32) ‖ lp(device cert)`. The device secret is rebuilt from the seed on use.

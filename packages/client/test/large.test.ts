@@ -2,6 +2,7 @@
 // the fs file-key policy (formats.md §11.3–11.6, §12; fs.md §4.1–4.2). The
 // server's max_value_bytes is 2,048, so chunks are 1,984 bytes, a page
 // holds 127 ids and an inline manifest about 60.
+import type { ChunkPut, PagePut } from '@zen/wasm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   bytes,
@@ -401,5 +402,70 @@ describe('the file-key policy (fs.md §4.2)', () => {
     } finally {
       w.session.call = orig;
     }
+  });
+});
+
+describe('sealing without sending (Tree.seal), known chunks', () => {
+  it('seals into a sink, sends nothing, and the sunk content writes later', async () => {
+    const t = ufs.tree(Tree.newId());
+    const f = await t.create(ROOT, 'later.bin');
+    const data = random(200 * CS + 7); // paged: 2 pages
+    const chunks: ChunkPut[] = [];
+    const pages: PagePut[] = [];
+    const { result: u, count } = await calls(w.session, () =>
+      t.seal(f, data, {
+        sink: async (cs, ps) => {
+          chunks.push(...cs);
+          pages.push(...ps);
+        },
+      }),
+    );
+    expect(count.get('/v1/commit') ?? 0).toBe(0);
+    expect(u.commits).toBeGreaterThan(1);
+    expect(chunks.length).toBe(201);
+    expect(pages.length).toBe(2);
+    expect(u.pages.length).toBe(2);
+    // Upload the sunk content, then write it with explicit replaces.
+    for (let i = 0; i < chunks.length; i += 20) await t.send([], chunks.slice(i, i + 20));
+    await t.send([], [], pages);
+    await t.send([t.writeOpOf(u, [])]);
+    expect(equal(await t.readFile(f), data)).toBe(true);
+  });
+
+  it('takes known chunks over with no plaintext: one chunk and one page change', async () => {
+    const t = ufs.tree(Tree.newId());
+    const f = await t.create(ROOT, 'big.bin');
+    const data = random(300 * CS);
+    const w1 = await t.writeFile(f, data);
+    expect(w1.manifest.pages!.length).toBe(3);
+    const ix = w1.index;
+    const at = 150 * CS + 10; // chunk 150, page 1
+    const next = data.slice();
+    next[at]! ^= 0xff;
+    async function* src() {
+      for (let i = 0; i < ix.chunks.length; i++) {
+        if (i === 150) yield next.subarray(i * CS, (i + 1) * CS);
+        else yield { id: ix.chunks[i]!, hash: ix.hashes[i]!, size: CS };
+      }
+    }
+    const w2 = await t.writeFile(f, src(), { previous: ix, replaces: [w1.dot] });
+    expect(w2.uploaded).toBe(1);
+    expect(w2.pagesUploaded).toBe(1);
+    expect(equal(await t.readFile(f), next)).toBe(true);
+
+    // A known chunk not of `previous`, or mid-block, is refused.
+    const bad = async function* () {
+      yield { id: Tree.newId(), hash: new Uint8Array(32), size: CS };
+    };
+    await expect(t.writeFile(f, bad(), { previous: w2.index })).rejects.toMatchObject({
+      code: 'bad_value',
+    });
+    const mid = async function* () {
+      yield new Uint8Array(10);
+      yield { id: ix.chunks[1]!, hash: ix.hashes[1]!, size: CS };
+    };
+    await expect(t.writeFile(f, mid(), { previous: ix })).rejects.toMatchObject({
+      code: 'bad_value',
+    });
   });
 });
