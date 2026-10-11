@@ -13,6 +13,8 @@ pub const TOPIC_NAME: &str = "zen/v1/topic-name";
 pub const TOPIC_DATA: &str = "zen/v1/topic-data";
 /// KDF: per-(fs, epoch) AEAD key for filesystem meta, manifests and chunks.
 pub const FS_DATA: &str = "zen/v1/fs-data";
+/// KDF: AEAD key for the chunks of a version-2 file, from its file key.
+pub const FS_FILE: &str = "zen/v1/fs-file";
 /// KDF: step of a naming chain (KV elements and topic segments).
 pub const NAME_CHAIN: &str = "zen/v1/name-chain";
 /// KDF: step of the topic data-key chain.
@@ -51,6 +53,8 @@ pub const ACL_CHAIN: &str = "zen/v1/acl-chain";
 pub const RANGE_HASH: &str = "zen/v1/range-hash";
 /// Hash: per-tree chain over filesystem operations.
 pub const TREE_OP_CHAIN: &str = "zen/v1/tree-op-chain";
+/// Hash: digest of a chunk-list page of a paged file version.
+pub const FS_PAGE: &str = "zen/v1/fs-page";
 /// A passkey's credential-store id from its WebAuthn credential id.
 pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
 /// Hash: the secret of an OPAQUE export-key keyslot from the export key.
@@ -103,6 +107,8 @@ pub const SIG_TREE_CHECKPOINT: &str = "zen/v1/sig/tree-checkpoint";
 pub const SIG_PASSWORD_SESSION: &str = "zen/v1/sig/password-session";
 /// Signature purpose: zen-db signed root (authenticated tier, milestone 6).
 pub const SIG_DB_ROOT: &str = "zen/v1/sig/db-root";
+/// Signature purpose: a signed app bundle (reserved, milestone 11).
+pub const SIG_APP_BUNDLE: &str = "zen/v1/sig/app-bundle";
 
 /// Every label, for registry checks.
 pub const ALL: &[&str] = &[
@@ -112,6 +118,7 @@ pub const ALL: &[&str] = &[
     TOPIC_NAME,
     TOPIC_DATA,
     FS_DATA,
+    FS_FILE,
     NAME_CHAIN,
     TOPIC_DATA_CHAIN,
     EVENT_KEY,
@@ -131,6 +138,7 @@ pub const ALL: &[&str] = &[
     ACL_CHAIN,
     RANGE_HASH,
     TREE_OP_CHAIN,
+    FS_PAGE,
     PASSKEY_ID,
     OPAQUE_KEYSLOT,
     DB_PARTS_DIGEST,
@@ -155,6 +163,7 @@ pub const ALL: &[&str] = &[
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
     SIG_DB_ROOT,
+    SIG_APP_BUNDLE,
 ];
 
 /// Signature purposes accepted by [`crate::sig`].
@@ -169,4 +178,5 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
     SIG_DB_ROOT,
+    SIG_APP_BUNDLE,
 ];

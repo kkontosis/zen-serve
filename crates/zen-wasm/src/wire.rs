@@ -87,6 +87,7 @@ wire_fns! {
     zen_proto::DlqItems => "DlqItems", encode_dlq_items, decode_dlq_items, "encodeDlqItems", "decodeDlqItems";
     zen_proto::DlqOp => "DlqOp", encode_dlq_op, decode_dlq_op, "encodeDlqOp", "decodeDlqOp";
     zen_proto::ChunkPut => "ChunkPut", encode_chunk_put, decode_chunk_put, "encodeChunkPut", "decodeChunkPut";
+    zen_proto::PagePut => "PagePut", encode_page_put, decode_page_put, "encodePagePut", "decodePagePut";
     zen_proto::CrdtOp => "CrdtOp", encode_crdt_op, decode_crdt_op, "encodeCrdtOp", "decodeCrdtOp";
     zen_proto::NodeState => "NodeState", encode_node_state, decode_node_state, "encodeNodeState", "decodeNodeState";
     zen_proto::TreeList => "TreeList", encode_tree_list, decode_tree_list, "encodeTreeList", "decodeTreeList";
@@ -112,6 +113,9 @@ wire_fns! {
     zen_proto::ChunksGet => "ChunksGet", encode_chunks_get, decode_chunks_get, "encodeChunksGet", "decodeChunksGet";
     zen_proto::ChunkData => "ChunkData", encode_chunk_data, decode_chunk_data, "encodeChunkData", "decodeChunkData";
     zen_proto::Chunks => "Chunks", encode_chunks, decode_chunks, "encodeChunks", "decodeChunks";
+    zen_proto::PagesGet => "PagesGet", encode_pages_get, decode_pages_get, "encodePagesGet", "decodePagesGet";
+    zen_proto::PageData => "PageData", encode_page_data, decode_page_data, "encodePageData", "decodePageData";
+    zen_proto::Pages => "Pages", encode_pages, decode_pages, "encodePages", "decodePages";
     zen_proto::ClusterStatus => "ClusterStatus", encode_cluster_status, decode_cluster_status, "encodeClusterStatus", "decodeClusterStatus";
     zen_proto::Frame => "Frame", encode_frame, decode_frame, "encodeFrame", "decodeFrame";
     zen_proto::acl::AclDoc => "AclDoc", encode_acl_doc, decode_acl_doc, "encodeAclDoc", "decodeAclDoc";

@@ -407,6 +407,26 @@ pub fn chunk_gc_ptr(fs: u32, id: &[u8]) -> Vec<u8> {
     Key::new().str("cp").int(fs.into()).bytes(id).finish()
 }
 
+/// A chunk-list page (formats.md §11.6).
+pub fn page(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("pg").int(fs.into()).bytes(id).finish()
+}
+
+/// Page reference count.
+pub fn page_refs(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("pr").int(fs.into()).bytes(id).finish()
+}
+
+/// `("pz", fs)`: page GC candidates.
+pub fn page_gc(fs: u32) -> Key {
+    Key::new().str("pz").int(fs.into())
+}
+
+/// A page's newest GC candidate: `("pc", fs, page)` → `cvs(12)`.
+pub fn page_gc_ptr(fs: u32, id: &[u8]) -> Vec<u8> {
+    Key::new().str("pc").int(fs.into()).bytes(id).finish()
+}
+
 // ---- CRDT rows (keyspace.md §3.8)
 
 /// `("co", fs, object)`: row register.

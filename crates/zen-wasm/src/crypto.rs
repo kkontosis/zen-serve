@@ -50,6 +50,12 @@ const TS_TYPES: &str = r#"
 export interface NodeMeta { type: "dir" | "file" | "symlink"; name: string; mode: number; mtimeMs: number; xattrs?: Uint8Array }
 /** Plaintext file manifest (spec/formats.md §11.3). */
 export interface Manifest { size: number; chunkSize: number; chunks: Uint8Array[] }
+/** A page of a paged manifest: its id and digest (spec/formats.md §11.3, §11.6). */
+export interface PageRef { id: Uint8Array; digest: Uint8Array }
+/** Plaintext version-2 manifest (spec/formats.md §11.3): `chunks` (inline) or `pageSize` and `pages` (paged). */
+export interface ManifestV2 { version: 2; size: number; chunkSize: number; n: number; keyEpoch: number; fileKey: Uint8Array; chunks?: Uint8Array[]; pageSize?: number; pages?: PageRef[] }
+/** A manifest of either version, as `openAnyManifest` returns it. */
+export type AnyManifest = (Manifest & { version: 1 }) | ManifestV2;
 /** Plaintext event body (spec/formats.md §5). */
 export interface EventBody { sender: Uint8Array; hlc: bigint; causation: Uint8Array; payload: Uint8Array }
 /** The kind and key epoch in a sealed object's header. */
@@ -238,6 +244,102 @@ struct JsManifest {
     chunks: Vec<serde_bytes::ByteBuf>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsPageRef {
+    id: serde_bytes::ByteBuf,
+    digest: serde_bytes::ByteBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsManifestV2 {
+    version: u8,
+    size: f64,
+    chunk_size: u32,
+    n: f64,
+    key_epoch: u32,
+    file_key: serde_bytes::ByteBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunks: Option<Vec<serde_bytes::ByteBuf>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pages: Option<Vec<JsPageRef>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsManifestV1 {
+    version: u8,
+    size: f64,
+    chunk_size: u32,
+    chunks: Vec<serde_bytes::ByteBuf>,
+}
+
+fn byte_ids(v: &[zfs::Id]) -> Vec<serde_bytes::ByteBuf> {
+    v.iter()
+        .map(|c| serde_bytes::ByteBuf::from(c.to_vec()))
+        .collect()
+}
+
+impl JsManifestV2 {
+    fn to_core(&self) -> R<zfs::ManifestV2> {
+        if self.version != 2 {
+            return Err(js_err("not a version-2 manifest"));
+        }
+        let body = match (&self.chunks, self.page_size, &self.pages) {
+            (Some(c), None, None) => zfs::Body::Inline(c.iter().map(|c| arr(c)).collect::<R<_>>()?),
+            (None, Some(page_size), Some(p)) => zfs::Body::Paged {
+                page_size,
+                pages: p
+                    .iter()
+                    .map(|p| Ok((arr(&p.id)?, arr(&p.digest)?)))
+                    .collect::<R<_>>()?,
+            },
+            _ => return Err(js_err("a manifest has chunks, or pageSize and pages")),
+        };
+        Ok(zfs::ManifestV2 {
+            size: self.size as u64,
+            chunk_size: self.chunk_size,
+            n: self.n as u64,
+            key_epoch: self.key_epoch,
+            file_key: arr(&self.file_key)?,
+            body,
+        })
+    }
+
+    fn from_core(m: zfs::ManifestV2) -> Self {
+        let (chunks, page_size, pages) = match m.body {
+            zfs::Body::Inline(c) => (Some(byte_ids(&c)), None, None),
+            zfs::Body::Paged { page_size, pages } => (
+                None,
+                Some(page_size),
+                Some(
+                    pages
+                        .iter()
+                        .map(|(id, d)| JsPageRef {
+                            id: serde_bytes::ByteBuf::from(id.to_vec()),
+                            digest: serde_bytes::ByteBuf::from(d.to_vec()),
+                        })
+                        .collect(),
+                ),
+            ),
+        };
+        JsManifestV2 {
+            version: 2,
+            size: m.size as f64,
+            chunk_size: m.chunk_size,
+            n: m.n as f64,
+            key_epoch: m.key_epoch,
+            file_key: serde_bytes::ByteBuf::from(m.file_key.to_vec()),
+            chunks,
+            page_size,
+            pages,
+        }
+    }
+}
+
 fn key_token(t: Option<Vec<u8>>) -> R<Option<[u8; 16]>> {
     t.map(|t| arr(&t)).transpose()
 }
@@ -395,6 +497,33 @@ impl FsKeys {
                 .map(|c| serde_bytes::ByteBuf::from(c.to_vec()))
                 .collect(),
         })
+    }
+
+    /// Seal a version-2 manifest (spec/formats.md §11.3).
+    #[wasm_bindgen(js_name = sealManifestV2)]
+    pub fn seal_manifest_v2(
+        &self,
+        tree: &[u8],
+        node: &[u8],
+        #[wasm_bindgen(unchecked_param_type = "ManifestV2")] manifest: JsValue,
+    ) -> R<Vec<u8>> {
+        let m: JsManifestV2 = from_js(manifest)?;
+        let m = zfs::AnyManifest::V2(m.to_core()?);
+        zfs::seal_any_manifest(&self.0, &arr(tree)?, &arr(node)?, &m, &mut OsRng).map_err(core_err)
+    }
+
+    /// Open a manifest of either version; `version` tells which.
+    #[wasm_bindgen(js_name = openAnyManifest, unchecked_return_type = "AnyManifest")]
+    pub fn open_any_manifest(&self, tree: &[u8], node: &[u8], sealed: &[u8]) -> R<JsValue> {
+        match zfs::open_any_manifest(&self.0, &arr(tree)?, &arr(node)?, sealed).map_err(core_err)? {
+            zfs::AnyManifest::V1(m) => to_js(&JsManifestV1 {
+                version: 1,
+                size: m.size as f64,
+                chunk_size: m.chunk_size,
+                chunks: byte_ids(&m.chunks),
+            }),
+            zfs::AnyManifest::V2(m) => to_js(&JsManifestV2::from_core(m)),
+        }
     }
 
     /// Seal a chunk.
@@ -1018,6 +1147,96 @@ pub fn move_op_bytes(
 #[wasm_bindgen(js_name = metaOpBytes)]
 pub fn meta_op_bytes(fs: u32, tree: &[u8], node: &[u8], hlc: u64, meta: &[u8]) -> R<Vec<u8>> {
     Ok(zfs::meta_bytes(fs, &arr(tree)?, &arr(node)?, hlc, meta))
+}
+
+/// A fresh 32-byte file key (spec/formats.md §11.4).
+#[wasm_bindgen(js_name = newFileKey)]
+pub fn new_file_key() -> R<Vec<u8>> {
+    Ok(zfs::new_file_key(&mut OsRng).map_err(core_err)?.to_vec())
+}
+
+/// Seal a chunk of a version-2 file under its file key.
+#[wasm_bindgen(js_name = sealFileChunk)]
+pub fn seal_file_chunk(
+    fs: u32,
+    file_key: &[u8],
+    key_epoch: u32,
+    chunk_id: &[u8],
+    data: &[u8],
+) -> R<Vec<u8>> {
+    zfs::seal_file_chunk(
+        fs,
+        &arr(file_key)?,
+        key_epoch,
+        &arr(chunk_id)?,
+        data,
+        &mut OsRng,
+    )
+    .map_err(core_err)
+}
+
+/// Open a chunk of a version-2 file.
+#[wasm_bindgen(js_name = openFileChunk)]
+pub fn open_file_chunk(
+    fs: u32,
+    file_key: &[u8],
+    key_epoch: u32,
+    chunk_id: &[u8],
+    sealed: &[u8],
+) -> R<Vec<u8>> {
+    zfs::open_file_chunk(fs, &arr(file_key)?, key_epoch, &arr(chunk_id)?, sealed).map_err(core_err)
+}
+
+/// A page: `u32 n ‖ n × chunk_id` (spec/formats.md §11.6).
+#[wasm_bindgen(js_name = encodePage)]
+pub fn encode_page(chunks: Vec<js_sys::Uint8Array>) -> R<Vec<u8>> {
+    Ok(zfs::encode_page(&ids(chunks)?))
+}
+
+/// The chunk ids of a page.
+#[wasm_bindgen(js_name = decodePage)]
+pub fn decode_page(page: &[u8]) -> R<Vec<js_sys::Uint8Array>> {
+    Ok(zfs::decode_page(page)
+        .map_err(core_err)?
+        .iter()
+        .map(|c| js_sys::Uint8Array::from(&c[..]))
+        .collect())
+}
+
+/// `BLAKE3.derive_key("zen/v1/fs-page", page)`.
+#[wasm_bindgen(js_name = pageDigest)]
+pub fn page_digest(page: &[u8]) -> Vec<u8> {
+    zfs::page_digest(page).to_vec()
+}
+
+/// The most chunk ids a page holds within `max_value_bytes`.
+#[wasm_bindgen(js_name = pageCapacity)]
+pub fn page_capacity(max_value_bytes: u32) -> u32 {
+    zfs::page_capacity(max_value_bytes)
+}
+
+/// The canonical bytes of a `write` op with `pages` (`write_paged`).
+#[wasm_bindgen(js_name = writePagedOpBytes)]
+pub fn write_paged_op_bytes(
+    fs: u32,
+    tree: &[u8],
+    node: &[u8],
+    replaces: Vec<js_sys::Uint8Array>,
+    pages: Vec<js_sys::Uint8Array>,
+    manifest: &[u8],
+) -> R<Vec<u8>> {
+    let replaces: Vec<[u8; zfs::DOT_LEN]> = replaces
+        .into_iter()
+        .map(|d| arr(&d.to_vec()))
+        .collect::<R<_>>()?;
+    Ok(zfs::write_paged_bytes(
+        fs,
+        &arr(tree)?,
+        &arr(node)?,
+        &replaces,
+        &ids(pages)?,
+        manifest,
+    ))
 }
 
 /// The canonical bytes of a `write` op.

@@ -1427,6 +1427,10 @@ pub struct Commit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub chunks: Vec<ChunkPut>,
+    /// Chunk-list pages of paged file versions (spec/fs.md §4.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub pages: Vec<PagePut>,
     /// Filesystem operations (spec/fs.md §3, §4) and CRDT-row operations (api.md §13).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
@@ -2003,6 +2007,26 @@ pub struct ChunkPut {
     pub data: Vec<u8>,
 }
 
+/// A page upload in a commit (spec/formats.md §11.6).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct PagePut {
+    /// fs_id.
+    pub fs: u32,
+    /// Page id (16 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub id: Vec<u8>,
+    /// The page: `u32 n ‖ n × chunk_id`.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub data: Vec<u8>,
+}
+
 /// A filesystem or CRDT-row operation in a commit, tagged by `op` (spec/api.md §6, §13).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
@@ -2074,6 +2098,10 @@ pub enum CrdtOp {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(feature = "ts", tsify(optional))]
         chunks: Vec<ByteBuf>,
+        /// Page ids in file order, for a paged version (instead of `chunks`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
+        pages: Vec<ByteBuf>,
         /// Sealed manifest.
         #[serde(with = "serde_bytes")]
         #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
@@ -2730,8 +2758,12 @@ pub struct Version {
     #[serde(with = "serde_bytes")]
     #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub device: Vec<u8>,
-    /// Chunk ids in file order.
+    /// Chunk ids in file order (empty for a paged version).
     pub chunks: Vec<ByteBuf>,
+    /// Page ids in file order, for a paged version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub pages: Vec<ByteBuf>,
     /// Sealed manifest.
     #[serde(with = "serde_bytes")]
     #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
@@ -2794,6 +2826,50 @@ pub struct ChunkData {
 pub struct Chunks {
     /// Chunks in request order.
     pub chunks: Vec<ChunkData>,
+}
+
+/// `POST /v1/fs/pages/get` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct PagesGet {
+    /// fs_id.
+    pub fs: u32,
+    /// Page ids (at most 64).
+    pub ids: Vec<ByteBuf>,
+}
+
+/// One page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct PageData {
+    /// Page id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub id: Vec<u8>,
+    /// The page; absent = unknown.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub data: Option<Vec<u8>>,
+}
+
+/// `POST /v1/fs/pages/get` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct Pages {
+    /// Pages in request order.
+    pub pages: Vec<PageData>,
 }
 
 // ---------------------------------------------------------------- admin
@@ -3054,6 +3130,11 @@ mod tests {
                 id: vec![3; 16],
                 data: vec![4; 60],
             }],
+            pages: vec![PagePut {
+                fs: 1,
+                id: vec![8; 16],
+                data: vec![0, 0, 0, 1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+            }],
             crdt_ops: vec![
                 CrdtOp::Move {
                     fs: 1,
@@ -3069,6 +3150,16 @@ mod tests {
                     node: vec![2; 16],
                     replaces: vec![],
                     chunks: vec![ByteBuf::from(vec![3; 16])],
+                    pages: vec![],
+                    manifest: vec![6; 70],
+                },
+                CrdtOp::Write {
+                    fs: 1,
+                    tree: vec![1; 16],
+                    node: vec![7; 16],
+                    replaces: vec![],
+                    chunks: vec![],
+                    pages: vec![ByteBuf::from(vec![8; 16])],
                     manifest: vec![6; 70],
                 },
             ],

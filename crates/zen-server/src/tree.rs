@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use zen_core::fs::{self as zfs, Id, ROOT, TRASH, hlc_ms};
 use zen_proto::{
     ByteBuf, Change, Changes, ChunkData, ChunkPut, Chunks, ChunksGet, CrdtOp, FileGet, NodeState,
-    Nodes, TreeChain, TreeChanges, TreeChildren, TreeEntry, TreeGet, TreeList, TreeRef, Trees,
-    Version as FileVersion, Versions,
+    Nodes, PageData, PagePut, Pages, PagesGet, TreeChain, TreeChanges, TreeChildren, TreeEntry,
+    TreeGet, TreeList, TreeRef, Trees, Version as FileVersion, Versions,
 };
 use zen_store::tuple::{Elem, strinc, unpack_prefix};
 use zen_store::{Storage, Txn, VERSIONS_PER_SEC, Version, key_after, stamp_of};
@@ -198,33 +198,71 @@ impl Header {
     }
 }
 
-/// A content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest`.
-fn encode_version(dev: &[u8; 32], chunks: &[Id], manifest: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(36 + 16 * chunks.len() + manifest.len());
+/// A version's chunk list: inline, or the pages that hold it (fs.md §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Content {
+    Chunks(Vec<Id>),
+    Pages(Vec<Id>),
+}
+
+impl Content {
+    fn ids(&self) -> &[Id] {
+        match self {
+            Content::Chunks(c) | Content::Pages(c) => c,
+        }
+    }
+}
+
+/// The `u32` in place of an inline chunk count that marks a paged version.
+const PAGED: u32 = u32::MAX;
+
+/// A content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest`, or for a
+/// paged one `dev(32) ‖ u32 0xFFFFFFFF ‖ u32 m ‖ m × page ‖ manifest`.
+fn encode_version(dev: &[u8; 32], content: &Content, manifest: &[u8]) -> Vec<u8> {
+    let ids = content.ids();
+    let mut b = Vec::with_capacity(40 + 16 * ids.len() + manifest.len());
     b.extend_from_slice(dev);
-    b.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
-    for c in chunks {
+    if let Content::Pages(_) = content {
+        b.extend_from_slice(&PAGED.to_be_bytes());
+    }
+    b.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+    for c in ids {
         b.extend_from_slice(c);
     }
     b.extend_from_slice(manifest);
     b
 }
 
-fn decode_version(v: &[u8]) -> ApiResult<([u8; 32], Vec<Id>, Vec<u8>)> {
+fn decode_version(v: &[u8]) -> ApiResult<([u8; 32], Content, Vec<u8>)> {
     let bad = || internal("bad content version");
     if v.len() < 36 {
         return Err(bad());
     }
-    let n = u32::from_be_bytes(v[32..36].try_into().expect("4")) as usize;
-    let end = 36 + 16 * n;
+    let mut at = 32;
+    let mut n = u32::from_be_bytes(v[at..at + 4].try_into().expect("4"));
+    at += 4;
+    let paged = n == PAGED;
+    if paged {
+        if v.len() < at + 4 {
+            return Err(bad());
+        }
+        n = u32::from_be_bytes(v[at..at + 4].try_into().expect("4"));
+        at += 4;
+    }
+    let end = at + 16 * n as usize;
     if v.len() < end {
         return Err(bad());
     }
-    let chunks = v[36..end]
+    let ids = v[at..end]
         .chunks(16)
         .map(|c| c.try_into().expect("16"))
         .collect();
-    Ok((v[..32].try_into().expect("32"), chunks, v[end..].to_vec()))
+    let content = if paged {
+        Content::Pages(ids)
+    } else {
+        Content::Chunks(ids)
+    };
+    Ok((v[..32].try_into().expect("32"), content, v[end..].to_vec()))
 }
 
 /// The single 16-byte id element after `pfx_len` bytes of a key.
@@ -289,6 +327,33 @@ fn release_chunk(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
     gc_candidate(t, fs, chunk);
 }
 
+/// Make a page a GC candidate as of this commit (as [`gc_candidate`]).
+fn page_gc_candidate(t: &mut Box<dyn Txn>, fs: u32, page: &Id) {
+    let (p, s) = keys::page_gc(fs)
+        .vs_incomplete(0)
+        .bytes(page)
+        .finish_incomplete();
+    t.set_versionstamped_key(&p, &s, &[]);
+    t.set_versionstamped_value(&keys::page_gc_ptr(fs, page), &[], &[0, 0]);
+}
+
+/// Release a version's references: to its chunks, or to its pages.
+fn release_content(t: &mut Box<dyn Txn>, fs: u32, content: &Content) {
+    match content {
+        Content::Chunks(chunks) => {
+            for c in chunks {
+                release_chunk(t, fs, c);
+            }
+        }
+        Content::Pages(pages) => {
+            for p in pages {
+                t.atomic_add(&keys::page_refs(fs, p), -1);
+                page_gc_candidate(t, fs, p);
+            }
+        }
+    }
+}
+
 type NodeKey = (u32, Id, Id);
 
 /// Applies one commit's chunks and filesystem operations.
@@ -305,6 +370,7 @@ pub struct Engine<'a> {
     /// Trees with new moves: listed in the sweep index on flush.
     moved: BTreeSet<(u32, Id)>,
     new_chunks: HashSet<(u32, Id)>,
+    new_pages: HashSet<(u32, Id)>,
     /// Writes so far (the next write's dot index).
     pub writes: u16,
     /// Quota deltas per fs: (bytes, keys).
@@ -325,6 +391,7 @@ impl<'a> Engine<'a> {
             trees: BTreeMap::new(),
             moved: BTreeSet::new(),
             new_chunks: HashSet::new(),
+            new_pages: HashSet::new(),
             writes: 0,
             delta: HashMap::new(),
         }
@@ -602,7 +669,7 @@ impl<'a> Engine<'a> {
         t: &mut Box<dyn Txn>,
         k: NodeKey,
         replaces: &[ByteBuf],
-        chunks: &[Id],
+        content: &Content,
         manifest: &[u8],
     ) -> ApiResult<()> {
         let (fs, tree, node) = k;
@@ -620,17 +687,30 @@ impl<'a> Engine<'a> {
                 .finish();
             if let Some(v) = t.get(&key).await? {
                 t.clear(&key);
-                let (_, old_chunks, old_manifest) = decode_version(&v)?;
-                for c in &old_chunks {
-                    release_chunk(t, fs, c);
-                }
-                bytes -= (old_manifest.len() + 16 * old_chunks.len()) as i64;
+                let (_, old, old_manifest) = decode_version(&v)?;
+                release_content(t, fs, &old);
+                bytes -= (old_manifest.len() + 16 * old.ids().len()) as i64;
                 rec.versions = rec.versions.saturating_sub(1);
             }
         }
-        for c in chunks {
-            if !self.new_chunks.contains(&(fs, *c)) && t.get(&keys::chunk(fs, c)).await?.is_none() {
-                return Err(bad_request("unknown chunk"));
+        match content {
+            Content::Chunks(chunks) => {
+                for c in chunks {
+                    if !self.new_chunks.contains(&(fs, *c))
+                        && t.get(&keys::chunk(fs, c)).await?.is_none()
+                    {
+                        return Err(bad_request("unknown chunk"));
+                    }
+                }
+            }
+            Content::Pages(pages) => {
+                for p in pages {
+                    if !self.new_pages.contains(&(fs, *p))
+                        && t.get(&keys::page(fs, p)).await?.is_none()
+                    {
+                        return Err(bad_request("unknown page"));
+                    }
+                }
             }
         }
         let i = self.writes;
@@ -641,11 +721,20 @@ impl<'a> Engine<'a> {
         let (p, s) = keys::versions(fs, &tree, &node)
             .vs_incomplete(i)
             .finish_incomplete();
-        t.set_versionstamped_key(&p, &s, &encode_version(&self.device, chunks, manifest));
-        for c in chunks {
-            t.atomic_add(&keys::chunk_refs(fs, c), 1);
+        t.set_versionstamped_key(&p, &s, &encode_version(&self.device, content, manifest));
+        match content {
+            Content::Chunks(chunks) => {
+                for c in chunks {
+                    t.atomic_add(&keys::chunk_refs(fs, c), 1);
+                }
+            }
+            Content::Pages(pages) => {
+                for p in pages {
+                    t.atomic_add(&keys::page_refs(fs, p), 1);
+                }
+            }
         }
-        bytes += (manifest.len() + 16 * chunks.len()) as i64;
+        bytes += (manifest.len() + 16 * content.ids().len()) as i64;
         self.delta.entry(fs).or_default().0 += bytes;
         rec.versions += 1;
         self.put_node(k, rec);
@@ -668,6 +757,35 @@ impl<'a> Engine<'a> {
         // A (re-)upload starts the grace period (again).
         gc_candidate(t, c.fs, &id);
         self.new_chunks.insert((c.fs, id));
+        Ok(())
+    }
+
+    /// Store an uploaded page (idempotent for identical bytes). Its first
+    /// upload counts one reference to each chunk it lists (fs.md §4.1).
+    pub async fn put_page(&mut self, t: &mut Box<dyn Txn>, p: &PagePut) -> ApiResult<()> {
+        let id = id16(&p.id, "page id")?;
+        let chunks = zfs::decode_page(&p.data).map_err(|_| bad_request("malformed page"))?;
+        let key = keys::page(p.fs, &id);
+        match t.get(&key).await? {
+            Some(v) if v == p.data => {}
+            Some(_) => return Err(bad_request("page id already holds another page")),
+            None => {
+                for c in &chunks {
+                    if !self.new_chunks.contains(&(p.fs, *c))
+                        && t.get(&keys::chunk(p.fs, c)).await?.is_none()
+                    {
+                        return Err(bad_request("unknown chunk in page"));
+                    }
+                }
+                t.set(&key, &p.data);
+                for c in &chunks {
+                    t.atomic_add(&keys::chunk_refs(p.fs, c), 1);
+                }
+                self.delta.entry(p.fs).or_default().0 += p.data.len() as i64;
+            }
+        }
+        page_gc_candidate(t, p.fs, &id);
+        self.new_pages.insert((p.fs, id));
         Ok(())
     }
 
@@ -723,23 +841,43 @@ impl<'a> Engine<'a> {
                 node,
                 replaces,
                 chunks,
+                pages,
                 manifest,
             } => {
                 let (tree, node) = (id16(tree, "tree")?, id16(node, "node")?);
                 if node == ROOT || node == TRASH {
                     return Err(bad_request("ROOT and TRASH have no content"));
                 }
-                let chunks: Vec<Id> = chunks
-                    .iter()
-                    .map(|c| id16(c, "chunk id"))
-                    .collect::<ApiResult<_>>()?;
-                self.apply_write(t, (*fs, tree, node), replaces, &chunks, manifest)
+                if !chunks.is_empty() && !pages.is_empty() {
+                    return Err(bad_request("a write carries chunks or pages, not both"));
+                }
+                let content = if pages.is_empty() {
+                    Content::Chunks(
+                        chunks
+                            .iter()
+                            .map(|c| id16(c, "chunk id"))
+                            .collect::<ApiResult<_>>()?,
+                    )
+                } else {
+                    Content::Pages(
+                        pages
+                            .iter()
+                            .map(|p| id16(p, "page id"))
+                            .collect::<ApiResult<_>>()?,
+                    )
+                };
+                self.apply_write(t, (*fs, tree, node), replaces, &content, manifest)
                     .await?;
                 let dots: Vec<[u8; 12]> = replaces
                     .iter()
                     .map(|d| d[..].try_into().expect("checked"))
                     .collect();
-                let b = zfs::write_bytes(*fs, &tree, &node, &dots, &chunks, manifest);
+                let b = match &content {
+                    Content::Chunks(c) => zfs::write_bytes(*fs, &tree, &node, &dots, c, manifest),
+                    Content::Pages(p) => {
+                        zfs::write_paged_bytes(*fs, &tree, &node, &dots, p, manifest)
+                    }
+                };
                 self.chain(t, *fs, tree, &b).await
             }
             _ => Err(internal("not a filesystem operation")),
@@ -1066,11 +1204,17 @@ pub async fn file_get(
         let [Elem::Vs(dot)] = elems.as_slice() else {
             return Err(internal("bad version key"));
         };
-        let (device, chunks, manifest) = decode_version(&v)?;
+        let (device, content, manifest) = decode_version(&v)?;
+        let ids = |v: &[Id]| v.iter().map(|c| ByteBuf::from(c.to_vec())).collect();
+        let (chunks, pages) = match &content {
+            Content::Chunks(c) => (ids(c), Vec::new()),
+            Content::Pages(p) => (Vec::new(), ids(p)),
+        };
         versions.push(FileVersion {
             dot: dot.to_vec(),
             device: device.to_vec(),
-            chunks: chunks.iter().map(|c| ByteBuf::from(c.to_vec())).collect(),
+            chunks,
+            pages,
             manifest,
         });
     }
@@ -1100,6 +1244,28 @@ pub async fn chunks_get(
         });
     }
     Ok(Cbor(Chunks { chunks }))
+}
+
+/// `POST /v1/fs/pages/get`.
+pub async fn pages_get(
+    State(st): State<Shared>,
+    caller: Caller,
+    Cbor(req): Cbor<PagesGet>,
+) -> ApiResult<Cbor<Pages>> {
+    check_read(&st, &caller, req.fs)?;
+    if req.ids.len() > 64 {
+        return Err(too_large("at most 64 pages per request"));
+    }
+    let mut t = read_txn(&st, None).await?;
+    let mut pages = Vec::new();
+    for id in &req.ids {
+        let id = id16(id, "page id")?;
+        pages.push(PageData {
+            id: id.to_vec(),
+            data: t.snapshot_get(&keys::page(req.fs, &id)).await?,
+        });
+    }
+    Ok(Cbor(Pages { pages }))
 }
 
 // ------------------------------------------------------------------ sweeper
@@ -1142,6 +1308,13 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
             match page.last() {
                 Some((k, _)) if page.len() == 1000 => begin = key_after(k),
                 _ => break,
+            }
+        }
+        // Pages first: collecting one releases its chunks, which then wait
+        // a grace period of their own.
+        for _ in 0..100 {
+            if collect_pages(st, fs, &grace_cvs).await? == 0 {
+                break;
             }
         }
         for _ in 0..100 {
@@ -1598,11 +1771,9 @@ async fn purge_trash(
                 .get_range(&vpfx, &keys::end_of(&vpfx), 10_000, false)
                 .await?
             {
-                let (_, chunks, manifest) = decode_version(&v)?;
-                for c in &chunks {
-                    release_chunk(&mut t, fs, c);
-                }
-                bytes -= (manifest.len() + 16 * chunks.len()) as i64;
+                let (_, content, manifest) = decode_version(&v)?;
+                release_content(&mut t, fs, &content);
+                bytes -= (manifest.len() + 16 * content.ids().len()) as i64;
             }
             t.clear_range(&vpfx, &keys::end_of(&vpfx));
             bytes -= rec.meta.as_ref().map_or(0, |m| m.1.len()) as i64;
@@ -1694,6 +1865,61 @@ async fn collect_chunks(st: &Shared, fs: u32, before: &[u8; 12]) -> ApiResult<us
         }
         add_quota(&mut t, fs, bytes, 0);
         Ok(got.len())
+    })?;
+    Ok(n)
+}
+
+/// Delete unreferenced pages whose candidacy is older than the grace
+/// period, releasing their chunks; returns the candidates processed.
+async fn collect_pages(st: &Shared, fs: u32, before: &[u8; 12]) -> ApiResult<usize> {
+    let prefix = keys::page_gc(fs);
+    let pfx = prefix.clone().finish();
+    let end = prefix.vs(before).finish();
+    let (n, _) = txn_loop!(st.store, None, |t| {
+        let got = t.get_range(&pfx, &end, 100, false).await?;
+        let mut bytes = 0i64;
+        // A page releases up to ~5,600 chunks, three mutations each: stop
+        // once a transaction has released this many.
+        const RELEASE_BUDGET: usize = 20_000;
+        let mut released = 0;
+        let mut done = 0;
+        for (k, _) in &got {
+            if released >= RELEASE_BUDGET {
+                break;
+            }
+            done += 1;
+            t.clear(k);
+            let (elems, _) =
+                unpack_prefix(&k[pfx.len()..], 2).map_err(|_| internal("bad gc key"))?;
+            let [Elem::Vs(cvs), Elem::Bytes(p)] = elems.as_slice() else {
+                return Err(internal("bad gc key"));
+            };
+            // Only the page's newest candidate decides, as for chunks.
+            let ptr = t.get(&keys::page_gc_ptr(fs, p)).await?;
+            if ptr.is_some_and(|v| v[..] != cvs[..]) {
+                continue;
+            }
+            let refs = t
+                .get(&keys::page_refs(fs, p))
+                .await?
+                .map(|v| i64::from_le_bytes(v.try_into().unwrap_or_default()))
+                .unwrap_or(0);
+            if refs <= 0 {
+                if let Some(v) = t.get(&keys::page(fs, p)).await? {
+                    bytes -= v.len() as i64;
+                    t.clear(&keys::page(fs, p));
+                    let chunks = zfs::decode_page(&v).map_err(|_| internal("bad stored page"))?;
+                    released += chunks.len();
+                    for c in &chunks {
+                        release_chunk(&mut t, fs, c);
+                    }
+                }
+                t.clear(&keys::page_refs(fs, p));
+                t.clear(&keys::page_gc_ptr(fs, p));
+            }
+        }
+        add_quota(&mut t, fs, bytes, 0);
+        Ok(done)
     })?;
     Ok(n)
 }

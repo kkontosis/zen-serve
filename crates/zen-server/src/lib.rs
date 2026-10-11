@@ -73,6 +73,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             "static",
             "fs",
             "crdt_rows",
+            "fs_pages",
         ]
         .map(String::from)
         .to_vec(),
@@ -279,6 +280,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/fs/tree/chain", post(tree::tree_chain))
         .route("/v1/fs/file/get", post(tree::file_get))
         .route("/v1/fs/chunks/get", post(tree::chunks_get))
+        .route("/v1/fs/pages/get", post(tree::pages_get))
         .route("/v1/crdt/get", post(crdt::get))
         .route("/v1/crdt/range", post(crdt::range))
         .route("/v1/crdt/versions", post(crdt::versions))
