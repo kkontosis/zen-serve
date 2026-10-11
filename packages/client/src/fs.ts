@@ -2,8 +2,9 @@
 // (spec/formats.md §6, §12; api.md §4.4).
 import type { DeviceSecret, FsHeader, FsKeys } from '@zen/wasm';
 import { equal, utf8 } from './bytes.js';
-import { ZenError } from './errors.js';
+import { isCode, ZenError } from './errors.js';
 import { Kv, type Transaction, type TxnOptions, transaction } from './kv.js';
+import type { SealedStore } from './local/sealed.js';
 import { Topic } from './log.js';
 import type { Argon2, Session } from './session.js';
 import { Tree, type TreeOptions } from './tree.js';
@@ -34,6 +35,37 @@ export interface StoredHeader {
   version: Uint8Array;
 }
 
+/** Where `unlock({local})` keeps the header of fs `id` (zendb.md §9.3). */
+const headerStore = (id: number) => `fs/${id}`;
+const HEADER_KEY = utf8('header');
+const FS_LAYER = 2;
+
+/** The stored copy: `u32 len ‖ header ‖ version`. */
+function packHeader(header: Uint8Array, version: Uint8Array): Uint8Array {
+  const out = new Uint8Array(4 + header.length + version.length);
+  new DataView(out.buffer).setUint32(0, header.length);
+  out.set(header, 4);
+  out.set(version, 4 + header.length);
+  return out;
+}
+
+function unpackHeader(b: Uint8Array): { header: Uint8Array; version: Uint8Array } | undefined {
+  if (b.length < 4) return undefined;
+  const n = new DataView(b.buffer, b.byteOffset, b.byteLength).getUint32(0);
+  if (4 + n > b.length) return undefined;
+  return { header: b.subarray(4, 4 + n), version: b.subarray(4 + n) };
+}
+
+/** Options of `unlock` and `header`. */
+export interface HeaderOptions {
+  /**
+   * Keep the header on this local store, and fall back to it when the
+   * server can't be reached, so the fs unlocks offline. It can't have the
+   * fs layer, which needs the keys being unlocked.
+   */
+  local?: SealedStore;
+}
+
 /** A filesystem, before unlocking. */
 export class Fs {
   constructor(
@@ -41,18 +73,54 @@ export class Fs {
     readonly id: number,
   ) {}
 
-  /** The stored header, or undefined if the fs has none yet. */
-  async header(): Promise<StoredHeader | undefined> {
-    const r = await this.session.call('/v1/fs/header/get', zw.encodeHeaderGet, zw.decodeHeader, {
-      fs: this.id,
-    });
+  /**
+   * The stored header, or undefined if the fs has none yet. With `local`,
+   * the header is kept there, and read from there when the server can't be
+   * reached.
+   */
+  async header(opts: HeaderOptions = {}): Promise<StoredHeader | undefined> {
+    const local = opts.local;
+    if (local && local.layers & FS_LAYER) {
+      throw new TypeError(
+        'the header store cannot have the fs layer: it needs the keys it unlocks',
+      );
+    }
+    let r: { header?: Uint8Array; version?: Uint8Array };
+    try {
+      r = await this.session.call('/v1/fs/header/get', zw.encodeHeaderGet, zw.decodeHeader, {
+        fs: this.id,
+      });
+    } catch (e) {
+      if (!local || !isCode(e, 'network')) throw e;
+      // Offline: the copy kept at the last unlock.
+      const kept = await local.get(headerStore(this.id), HEADER_KEY);
+      const u = kept && unpackHeader(kept);
+      if (!u) throw e;
+      return this.decodeHeader(u.header, u.version);
+    }
     if (!r.header || !r.version) return undefined;
-    const header = zw.FsHeader.decode(r.header);
+    const stored = this.decodeHeader(r.header, r.version);
+    if (local) await this.keepHeader(local, r.header, r.version);
+    return stored;
+  }
+
+  private decodeHeader(bytes: Uint8Array, version: Uint8Array): StoredHeader {
+    const header = zw.FsHeader.decode(bytes);
     if (header.fsId !== this.id) {
       header.free();
       throw new ZenError(0, 'format', `header of fs ${header.fsId} served for fs ${this.id}`);
     }
-    return { header, version: r.version };
+    return { header, version: version.slice() };
+  }
+
+  /** @internal Keep a copy of the header for offline unlocks. */
+  async keepHeader(local: SealedStore, header: Uint8Array, version: Uint8Array): Promise<void> {
+    await local.put(headerStore(this.id), HEADER_KEY, packHeader(header, version));
+  }
+
+  /** Delete the header `unlock({local})` kept (at sign-out). */
+  async forget(local: SealedStore): Promise<void> {
+    await local.clear(headerStore(this.id));
   }
 
   /** Write the header (admins): `expect` is the version read, absent for a new header. */
@@ -78,9 +146,13 @@ export class Fs {
     return new UnlockedFs(this, keys, { header, version });
   }
 
-  /** Open a keyslot of the header and return the unlocked fs. */
-  async unlock(how?: Unlock): Promise<UnlockedFs> {
-    const stored = await this.header();
+  /**
+   * Open a keyslot of the header and return the unlocked fs. With
+   * `opts.local`, it works offline from the header kept at the last
+   * unlock (zendb.md §9.3).
+   */
+  async unlock(how?: Unlock, opts: HeaderOptions = {}): Promise<UnlockedFs> {
+    const stored = await this.header(opts);
     if (!stored) throw new ZenError(404, 'not_found', `fs ${this.id} has no header`);
     const keys = openHeader(stored.header, how ?? this.fromSession());
     if (!keys) {
@@ -88,7 +160,9 @@ export class Fs {
       throw new ZenError(0, 'decrypt', 'no keyslot opens with this secret');
     }
     if (keys.fsId !== this.id) throw new ZenError(0, 'format', 'a keyslot of another fs');
-    return new UnlockedFs(this, keys, stored);
+    const u = new UnlockedFs(this, keys, stored);
+    u.local = opts.local;
+    return u;
   }
 
   private fromSession(): Unlock {
@@ -155,6 +229,8 @@ export function prfSlotSalts(h: FsHeader): { credentialId: Uint8Array; prfSalt: 
  */
 export class UnlockedFs {
   private readonly epochs = new Map<number, FsKeys>();
+  /** @internal Where `unlock` keeps the header, refreshed when it changes. */
+  local: SealedStore | undefined;
   /** KV access (stored keys are PRF tokens of path elements). */
   readonly kv: Kv;
 
@@ -257,6 +333,7 @@ export class UnlockedFs {
       try {
         const version = await this.fs.putHeader(fresh.header, fresh.version);
         this.stored = { header: fresh.header, version };
+        if (this.local) await this.fs.keepHeader(this.local, fresh.header.encode(), version);
         return;
       } catch (e) {
         if (!(e instanceof ZenError && e.code === 'version_mismatch') || i >= attempts) throw e;

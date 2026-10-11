@@ -145,16 +145,30 @@ await db.transaction(async (tx) => {
 
 ## 7. Caches and coherence
 
-Every `Db` keeps four caches, all in memory only (§9.3; a persistent cache is TD-DB-PERSISTENT-CACHE):
+Every `Db` keeps five caches (with CRDT states, §19). In memory, and with `DbOptions.local` on the sealed local store too (docs/CLIENT.md §10), so a restart starts warm:
 * catalog records
 * private-index nodes, which never change (an LRU of 4,096)
 * sealed-index blobs, by digest
 * rows: an LRU of `rowCache` rows (default 1,024; 0 turns it off)
+* CRDT states (§19, read modes)
 
 **Coherence (§7.7).** A transaction that uses a cached record or row puts its version into the read set (an `expect`). A stale copy therefore makes the commit fail with `conflict`; the copy is dropped, and the transaction re-runs with fresh data. It never commits based on stale data.
 * **Read-only transactions** send no commit. Instead, the versions of the cached records they used are checked with one batched read before they return.
 * **Committed writes** drop their rows from the cache.
 * `db.stats` counts row-cache hits and misses.
+
+**Kept on the local store.** Records are written behind (gathered every 100 ms, and at `close()`, which resolves once they are written). Rows and CRDT states are loaded at open; nodes and blobs are read when missed in memory. Every kept record is checked when used, as above, so a row that changed while the app was closed costs one retry, and a record that doesn't open (tampered with, another key) is dropped with a warning. `persist: false` keeps the caches in memory only (the queue of CRDT writes stays on the store). `Db.wipe(local, ns)` deletes it all.
+
+**Offline.** A database opened with `local` once can open again offline, from the kept server info, DbRecord and catalog, as long as its schema is the app's (a due migration needs the server: the open fails with `offline`). `db.offline` says it did.
+```ts
+const local = sealedStore(indexedDbLocalStore('my-app'));
+const fs = await session.fs(1).unlock(how, { local });       // the kept header, offline
+const db = await Db.open(fs, 'app', { schema, migrations, local });
+await db.table<Item>('items').get(id, { read: 'cache' });     // a cached row, unchecked when offline
+```
+* **Transactional rows offline** only with the read mode `cache` (`get(pk, {read: 'cache'})`, `db.transaction(fn, {read: 'cache'})`): online it reads as usual; when the server can't be reached, a read-only transaction answers from the rows it has cached, which may be stale, and a row not cached is `offline`. Without it, offline reads of transactional rows fail with the network error. Writes and queries on transactional tables need the server.
+* **CRDT tables** read and queue writes offline as in §19.
+* **The clock** ticks from the device's wall clock until the server is reached; queued edits are re-stamped if the server refuses their time. Give the session a `ClockStore` to keep the HLC and the counter actor across restarts.
 
 ## 8. Tabs, the owner and the proxy
 

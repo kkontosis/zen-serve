@@ -206,10 +206,9 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-DB-PERSISTENT-CACHE
 
-* **Status:** open
-* **Context:** zen-db's caches (catalog records, rows, private-index nodes, sealed blobs, CRDT states) are kept in memory per `Db` instance (spec/zendb.md §9.3). A new page load starts cold, and offline reads need the zen-fs replica or CRDT tables. Since milestone 5 step 7d the sealed local store exists (§9.3: IndexedDB, Node disk, memory; device and fs layers) and the queue of CRDT writes lives on it; the caches move onto it in step 7e, which resolves this.
-* **Why deferred:** Milestone 5 decided on memory only. A persistent cache needs a key that never leaves the device (a non-extractable WebCrypto key, DESIGN-2 §4) and a way to evict entries, and the version checks of §7.7 make any cache safe to add later.
-* **What it would take:** An encrypted IndexedDB (browser) or file (Node) store behind the same LRUs, sealed with a device-local non-extractable key; versions kept with every entry so §7.7's `expect`s keep it coherent; an option to turn it on, a wipe on sign-out, and tests that a stale persistent entry causes a retry.
+* **Status:** resolved (milestone 5 step 7e)
+* **Context:** zen-db's caches (catalog records, rows, private-index nodes, sealed blobs, CRDT states) were kept in memory per `Db` instance (spec/zendb.md §9.3). A new page load started cold, and nothing opened offline.
+* **Resolution:** the sealed local store (step 7d: IndexedDB, Node disk, memory; a device layer under a non-extractable key, an optional fs layer) holds the queue of CRDT writes and, since step 7e, every cache, written behind and checked on use by version or content (§9.3, §7.7). `unlock({local})` and `Db.open` work offline from the kept header, info, DbRecord and catalog (§3.1). `persist: false` keeps the caches in memory; `Db.wipe` and `Fs.forget` clear them at sign-out.
 
 ## TD-DB-TAB-PROXY
 

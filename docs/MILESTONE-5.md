@@ -263,7 +263,21 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
       * `vectors.test.ts` +1 (local records).
       * `crdtpersist.test.ts` (10): a restart, a crash after a lost reply (the same `commit_id`, counted once), a crash before any send, three layer settings, another fs, `Db.wipe`, owner-only sending with handover, and two tabs of one installation incrementing at once. Both crash and counter tests were checked to fail without the change.
       * New dev dependency `fake-indexeddb` 6.2.5.
-  * **7e** (persisted caches, offline open): planned in detail (see Step 7, 7e). #24 is merged, so the plan commit restarts the branch from main and opens a new PR.
+  * **7e** (persisted caches, offline open): done, PR #25. **Step 7 is done.** As planned, with these details for step 8 on:
+    * **Client:** `Fs.header({local})` / `Fs.unlock(how, {local})` keep the header in store `fs/<fs id>` (key `header`: `u32 len ‖ header ‖ version`) and fall back to it on `network`; a store with the fs layer is refused; `Fs.forget(local)`; `UnlockedFs.local` refreshes the kept copy in `editHeader`. `HeaderOptions` is exported.
+    * **`@zen/db`:**
+      * `localcache.ts`: `LocalCache` (write-behind per store: `put`, `delete`, `clear`, `get` with pending writes first, `list`, `flush`) and the record codecs (rows, CRDT entries, tables, sealed blobs).
+      * `db.ts`: `DbOptions.persist`, `db.offline`, `db.flushLocal()`; `close()` now returns a promise that resolves once the caches are written. `open` falls back to the kept state on a `network` error anywhere in the online open (`/v1/info` goes through the client, not `session.call`). `openKept`, `keepOpen`, `loadLocal`, `keptNode` (checked with `IndexKeys.nodeId`), `keptSealed` (checked with `partsDigest`).
+      * `crdtcache.ts`: `CacheSink` (`sink.put` / `delete`), `restore`, `Entry` exported.
+      * `index/private.ts` reads kept nodes before the server; `index/sealed.ts` `readSealed` takes an async `cached`.
+      * `txn.ts`: in read mode `cache`, an offline read-only `finish` accepts its cached rows, and a row miss offline is `offline`. `Table.get(pk, {read})` passes the mode to its transaction.
+      * `localStores(ns)` lists `queue`, `db`, `rows`, `crdt`, `nodes`, `sealed`.
+    * **Decisions beyond the plan:**
+      * Offline, a default (strict) read of a cached transactional row fails with the `network` error, not `offline`.
+      * Kept rows are loaded in no particular order (no recency is stored); the excess over `rowCache` is deleted.
+    * **⚠️ Spec:** zendb.md §3.1 (opening offline), §7.7 (kept caches, `read: 'cache'`), §9.3 (the stores table, writes behind, checks on use, the fs header), §19.4.
+    * **Docs:** `docs/CLIENT.md` §4 (unlocking offline), `docs/DB.md` §7 (kept caches, offline), TECH_DEBT: TD-DB-PERSISTENT-CACHE resolved.
+    * **Tests:** `packages/client/test/unlock.test.ts` (5), `packages/db/test/dbpersist.test.ts` (9: a cold start offline, a due migration offline, nothing kept, a warm start (checked to fail without kept nodes and blobs), a stale kept row, CRDT `auto` after a restart, tampering, `persist: false`, wipe and forget). 300 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
