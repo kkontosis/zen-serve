@@ -357,6 +357,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Tests:** `packages/fs/test/replica.test.ts` (13: sync and the loop, restart from the cursor offline, a resync dropping a planted node, duplicate names and conflict copies, symlinks and xattrs, ranged reads of a paged file with counted calls, eviction with a pin, a pinned folder's new file, offline reopen and catch-up, the three stores (sealed, wipe), two tabs with handover, the Node lock and a stale one). Eviction keeping pins and the full-sync sweep were each checked to fail when removed. 343 vitest tests in all.
     * **CI fix on #30:** `online` turned true only once a catch-up finished, so a node from the feed could show before it (the offline test, about 1 run in 2 on CI). Any feed batch now marks the replica online.
     * **Also on #30 (user request):** `crates/zen-server/tests/dump.rs` `a_started_server_counts_as_empty` failed once on FoundationDB with `read version too old` at the `is_empty` check right after an import (the version jump its other reads already retry). That check now retries the same way.
+    * PR #30 merged.
+  * **8b** planned in detail (see "8b: local writes"); the plan commit restarts the branch from main and opens a new PR, which 8b joins.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2213,14 +2215,122 @@ There is no node table: zen-mount lists directories from the server, reads by ch
 * fs.md §5 (or a new §11): the replica in brief: whole node table, content on demand, the stored records sealed as on the server.
 * zendb.md §9.3: the `zfs/…` stores in the table of stores.
 
-### 8b: local writes
-* **The write API:** `writeFile(path, data, {mode})` (changed chunks only: the replica keeps each cached version's `ChunkIndex` hashes, so `previous` reuse needs no download), `mkdir`, `rename` (`move` + name, or `rename` in place; replacing an existing target removes it first, POSIX-like), `unlink`, `rmdir` (`not_empty`), `symlink(target, path)`, `truncate`, `chmod`, `utimes`, `setxattr`/`removexattr`; `unlink` of a conflict copy resolves to the newest version (as zen-mount does now). Names are checked against display names (`exists`).
-* **File handles:** `open(path, flags) → FileHandle {read, write(buf, pos), truncate, flush, close}`. Writes go to dirty ranges over the base version; `flush` streams the new content (unchanged ranges read from the cache or server, chunk by chunk) through `upload` with `previous`, so only changed chunks are sealed and sent, and a large file is never held in memory.
-* **Optimistic apply and the queue:** each operation is applied at once to an overlay of the node table (reads see it), and stored as a queue entry in `zfs/…/queue` (the `PendingOp`, with its sealed meta, the move/meta `hlc` ticked **at queue time**, and for a write its `Upload` and `UploadState`). Offline, a write's sealed chunks and pages are kept in the store until sent (they count toward no LRU).
-* **Sending (owner only):** entries in order, batched up to the commit limits, through a stored `Transaction` and `tree.writeIn`, so a resend after a lost reply has the same `commit_id` (the inflight record of 7d). `stale_op` / `clock_skew` re-tick (as `Tree.rebase`); a `move` that the server skips (a cycle) is dropped from the overlay when the feed shows the node elsewhere. A write's `replaces` is the version it was based on: a concurrent write elsewhere leaves both as siblings (conflict copies), as fs.md §4 intends. Uploads of queued writes resume from their `UploadState` within `chunk_grace_secs`.
-* **Content type:** ⚠️ formats.md §11.2 reserves xattr keys starting with `zen.`; `zen.content_type` (text) is the content type, which `writeFile(path, data, {contentType})` sets and M9 serves.
-* **Tests:** each operation online and offline (a queue that survives a restart and is sent once, counted); two replicas editing one file offline → a conflict copy each sees; a move cycle made offline on two replicas resolves as the server decides; changed-chunk writes (a 1-byte edit in a 50-chunk file uploads one chunk); handles over a paged file; symlinks and xattrs round-trip; non-owner tabs queue through the owner.
-* **⚠️ Spec:** fs.md: queued local operations and their timestamps; formats.md §11.2 the `zen.` xattr keys.
+### 8b: local writes (detailed plan)
+
+**Context.** 8a (PR #30) gives a replica that reads: the whole node table, content on demand, pins, offline reads, owner-only sync. Writes still go straight through `Tree`, so nothing can be written offline and a one-byte change to a large file costs a whole new upload. 8b adds writes to the replica:
+* applied at once to what the replica shows
+* queued and sent by the owner
+* sealed locally, so a write needs no network until it is sent, and a sent commit is never applied twice
+* uploading only changed chunks, without downloading or holding the whole file
+
+This is TypeScript only: the server already makes chunk and page re-uploads idempotent (`put_chunk`/`put_page` accept identical bytes).
+
+**After compaction, re-read:** this section and the 8a log line; `spec/fs.md` §3–4, §11; `spec/formats.md` §11.2; `packages/fs/src/{replica,store}.ts`; `packages/client/src/tree.ts` (`stage`, `writeFile`, `upload`, `writeOp`, `prepare`, `accept`, `rebase`, `resolve`, `TreeBatch`, `blocks`); `packages/db/src/crdtq.ts` (the inflight pattern of 7d); `packages/fs/test/{replica.test.ts,helpers.ts}`.
+
+**Branch/PR.** #30 merged first: restart from main, commit this plan (`docs: milestone 5 step 8b plan`), open a new PR.
+
+#### Client (`packages/client/src/tree.ts`)
+1. **Sealing without sending: `UploadOptions.sink?: (chunks: ChunkPut[], pages: PagePut[]) => Promise<void>`.** With a sink, `stage`'s flushes hand each batch of sealed chunks and pages to it instead of `sendCommit`. `Tree.seal(node, data, opts & {sink})` → `Upload` stages, then hands the last pending ones to the sink too. `commits` counts sink calls. `upload` and `writeFile` are unchanged.
+2. **Known chunks: `FileSource` items may be `KnownChunk {id, hash, size}`.** A known chunk is a chunk of the `previous` version taken over without its plaintext: `stage` pushes its id and hash with no sealing or hashing. It must start at a chunk boundary, and only the last item may be shorter than `chunkSize`. A known chunk must be under the same key as the new write, which holds when `previous` is the version it comes from (`bad_value` otherwise). `blocks()` passes known chunks through after a whole block.
+3. **Timestamps at queue time: `PendingOp` `move`/`meta` gain an optional `hlc`.** `prepare` uses it instead of a tick, and skips `clock.sync` when every op has one. `rebase` drops them, so a rebased op is ticked fresh.
+4. **`Tree.writeOpOf(u, replaces: Uint8Array[])`:** the write op of an upload with explicit replaces, so the caller can do it offline (no `versions` read).
+
+#### `@zen/fs`
+1. **`queue.ts`: the queue** (store `zfs/…/queue`, ⚠️ zendb.md §9.3):
+   * **Entries:** key `e ‖ u64 BE seq` → JSON, with bytes as base64url.
+     * `{seq, ops: PendingOp[], uploads?: [{node, chunks: id[], pages: id[]}]}`
+     * Sealed meta inside; `hlc` set at queue time.
+     * One API call is one entry (e.g. `rename` over an existing name is a trash move and a rename, together).
+   * **The inflight record:** key `inflight` → `{seqs, commit: zw.encodeCommit(...)}`.
+   * **Sealed content of queued writes** goes into the replica's `chunks`/`pages` stores, the same records the cache uses: chunks are identical whether made here or fetched. Eviction never drops what a queued entry lists.
+2. **The overlay** (`overlay.ts`): what the replica shows is the node table with the queue applied, in order.
+   * Each entry's ops rewrite copies of the nodes they touch:
+     * `move`: the parent, plus the meta when the op carries one
+     * `meta`: the meta
+     * `write`: a **local version**, a `FileVersion` built from the upload (its manifest and ids; `dot` all zeros; `local: true`) that replaces the versions its `replaces` lists
+   * The overlay is rebuilt whenever the queue changes; reads (`lookup`, `entries`, `stat`, `read…`) go through it.
+   * Reads of a local version find their chunks and pages in the store. An entry's nodes stay overlaid until it is sent **and** the next catch-up has brought the server's state (the owner calls `sync()` after each send).
+3. **The write API** (`Replica`). Each call checks against the overlay, then queues one entry. Names are checked against shown names: a taken name gives `exists`.
+   * `mkdir(path, {mode})`
+   * `writeFile(path, data, {mode, contentType, create = true})`:
+     * creates the file if missing
+     * seals through `tree.seal` with `previous` = the shown version's index (below), so unchanged chunks are reused
+     * `replaces` = the shown version's dot (a local version: the dots it replaced), so a concurrent write elsewhere stays a sibling (fs.md §4)
+   * `symlink(target, path)`
+   * `rename(from, to)`:
+     * same parent: a `meta` op with the new name; otherwise a `move` with the name
+     * an existing target is moved to `TRASH` in the same entry; a non-empty directory gives `not_empty`; a target that is a directory when the source isn't gives `is_dir`
+     * a conflict copy can't be renamed (`bad_value`)
+   * `unlink(path)`: a file to `TRASH`; a conflict copy resolves instead: a write keeping the newest version that replaces every current dot (as `Tree.resolve`, from the replica's versions)
+   * `rmdir(path)`: `not_empty` if it has visible children
+   * `truncate(path, len)`
+   * `chmod(path, mode)`, `utimes(path, mtimeMs)`, `setxattr(path, name, value)`, `removexattr(path, name)`: a `meta` op merging into the current meta (`encodeXattrs`)
+   * `contentType` sets the `zen.content_type` xattr
+   * **Returns** once the entry is stored (and the overlay updated), offline too. `{wait: true}` waits for the commit.
+4. **Chunk indexes for reuse** (store `zfs/…/index`, key node ‖ dot → `ChunkIndex` JSON):
+   * A version the replica writes keeps its index from the upload.
+   * Another version's index is computed on first need with `tree.chunkIndex(node, v)` (one streamed read) and kept; offline, without it, the write uploads every chunk.
+   * Local versions' indexes live in the overlay.
+5. **File handles: `open(path, flags) → FileHandle`.**
+   * **Flags:** `r`, `r+`, `w` (truncate), `a`; `create`, `exclusive`.
+   * **Methods:** `read(buf|len, pos)`, `write(data, pos)`, `truncate(len)`, `stat()`, `flush()`, `close()` (flushes).
+   * **Dirty chunks:** writes touch whole chunks: a chunk's base content is read (cached, or fetched) on first write, patched, and kept in a `Map<chunk index, Uint8Array>`. Memory is the dirty chunks only.
+   * **`flush`:** a `FileSource` of known chunks (unchanged ones, from the base index) and dirty chunk bytes, through `tree.seal`. Only dirty chunks are sealed and stored. Pages are reused where their slice is unchanged (as `stage` does with `previous`). Then one queue entry. A flush with nothing dirty queues nothing.
+   * **Writers in one replica:** the handle's base is the version shown when it opened. Two handles flushing one file queue two writes, the second replacing the first's local version (last flush wins, as a local POSIX file does).
+6. **Sending (owner only, `sender.ts`):**
+   * **Order:** entries in order. A batch packs whole entries up to the commit limits (`max_commit_ops`, `max_commit_bytes`, one write per node per commit).
+   * **Uploads first:** for each write in the batch, its chunks and pages are read from the store and sent in commits of their own (idempotent, so a resend after a crash is safe). Pages go after the chunks they list.
+   * **The commit:** `tree.prepare(ops)` → the commit (`commit_id` fixed), stored as the inflight record before the first send. On restart an inflight record is resent first, as is, until its outcome is known (7d's rule).
+   * **On success:** `accept`, remove the entries and inflight, `sync()`, drop the settled overlay, and resolve `wait`.
+   * **Errors:**
+     * `network`: keep the entries; back off from 250 ms to 30 s; woken by `online` and by new entries
+     * `stale_op` / `clock_skew`: `tree.rebase`, then rebuild with fresh ticks (a new inflight)
+     * `too_large`: split the batch; one entry too large fails
+     * any other error (`unknown node`, rights): the batch's entries fail. They are removed, `onError` hears of them, `wait` rejects, and the overlay drops them, so the server's state shows again.
+     * A `move` the server skips (a cycle, fs.md §3.2) is not an error: the next catch-up shows where the node really is.
+   * **Uploads past the grace period** (offline more than `chunk_grace_secs`): chunks are sent again from the store right before the commit, so they are never missing.
+   * **Other tabs:** they add entries to the shared store and post `queued` (the owner reloads and sends). The owner posts `sent {seqs}` and `failed {seqs, message}`. A tab's `wait` resolves from those messages.
+7. **`status()`** gains `queued` (entries) and `sending`. `flush()` (the queue's, renamed from 8a's store flush, which becomes internal) resolves when the queue is empty, and rejects offline.
+
+#### ⚠️ Spec (`spec:` commit)
+* **fs.md §11:** local writes:
+  * the overlay; queue-time timestamps and the rebase
+  * write `replaces` = the version shown, so concurrent writes stay siblings
+  * sealed content kept until sent, and re-sent before the commit
+  * the inflight commit with a fixed `commit_id`
+  * a failed entry is dropped, and the server's state shows
+* **formats.md §11.2:** xattr names starting with `zen.` are reserved; `zen.content_type` (text) is a node's media type.
+* **zendb.md §9.3:** the `queue` and `index` kinds of `zfs/…`.
+
+#### Docs
+* `docs/CLIENT.md` §8 "The local replica": writes, handles, offline, `flush`/`wait`, conflicts.
+* TECH_DEBT TD-FUSE-REPLICA progress (zen-mount in 8c).
+
+#### Tests (`packages/fs/test/writes.test.ts`; `packages/client/test/tree.test.ts` for the client part)
+* **Client:**
+  * `seal` with a sink sends nothing (calls counted), and the sunk chunks plus `writeOpOf` read back
+  * known chunks reuse ids with no plaintext (a paged file where one middle chunk changes: one chunk and one page new)
+  * a preset `hlc` is used; a rebase re-ticks it
+* **Each operation, online:** mkdir, writeFile (new and existing), symlink, rename (same parent, across, over a file, over an empty dir, over a non-empty dir → `not_empty`), unlink, rmdir, truncate, chmod/utimes, xattrs and content type. Another installation's `Tree` sees the result.
+* **Offline:**
+  * the same operations offline show at once (the overlay)
+  * the queue survives `close()` and a reopen on the same store
+  * once online it is sent once (counted commits; the server's versions)
+* **A lost reply:** the commit applied, the reply lost, then a crash and a reopen. The inflight record is resent with the same `commit_id`, and there is one version.
+* **Changed chunks only:** a 1-byte write through a handle in the middle of a 300-chunk paged file uploads one chunk and one page (counted `chunks`/`pages` in commits), and reads back equal. Offline too, then sent.
+* **Conflicts:** two replicas write one file offline; once both are sent, each shows the file and a conflict copy, and `unlink` of the copy resolves it everywhere.
+* **A move cycle offline:** replica A moves x under y, replica B moves y under x. The server keeps one move; both replicas end equal to the server.
+* **Failures:**
+  * an entry the server refuses (a write to a node purged meanwhile, or a read-only grant) is dropped, `onError` fires, and the replica shows the server's state
+  * `stale_op` past a short horizon (a test limit): rebased and applied
+* **Tabs:** a non-owner tab's writes are sent by the owner; its `wait` resolves; closing the owner hands sending over with nothing lost or sent twice.
+* **Eviction** never drops queued content (a tiny `cacheBytes`, offline writes, `evict()`, then send).
+* **Mutation checks:** the inflight resend and the eviction guard, each checked to fail when removed.
+
+#### Verification
+* `npx biome check`; tsc for client (test), fuse, db (test), fs (test); `npx vitest run` three times
+* CI green on the PR
+* Rust unchanged
 
 ### 8c: zen-mount on `@zen/fs`
 * `mount(replica, mountpoint, opts)`: lookups, `getattr` and `readdir` from the in-memory node table (stable inode numbers from a node-id map), reads through the replica (cached), writes through `FileHandle`s (changed chunks only; no whole-file buffer), `symlink`/`readlink`, `setxattr`/`getxattr`/`listxattr`/`removexattr` (user namespace; `zen.*` mapped to `user.zen.*`), `chmod`/`utimens`/`chown` as now. Kernel caches are invalidated from `replica.onChange`.
