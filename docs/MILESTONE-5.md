@@ -1439,7 +1439,7 @@ Step 7 builds the class side.
      * a non-extractable `CryptoKey`
      * `deviceKey(raw)` makes one and keeps it: in IndexedDB the CryptoKey itself (structured clone); in Node a random 32-byte key in `dir/device.key`, mode 0600, imported non-extractable; in memory, fresh per process
      * or the app passes its own (`device: CryptoKey`), or `device: false` turns the layer off
-   * **Failures:** a record that doesn't open (tampered, moved, another key) is treated as absent and deleted, with a warning. A store with neither layer is refused unless `plaintext: true` is passed (tests).
+   * **Failures:** a record that doesn't open (tampered, moved, another key) is treated as absent and deleted, with a warning. **No layer at all is the app's choice** (user decision): `{device: false, fs: false}` must come with `plaintext: true`, so it is never an accident. It fits a disk the OS already encrypts, data that isn't sensitive, or a trusted Node host. Docs say what it means: records sit in the clear, with no tamper check. Its records carry `layers = 0`; a store opened with layers reads them as absent (and the reverse), so a switch never mixes the two.
 3. **Exports:** `LocalStore`, `SealedStore`, `sealedStore`, `memoryLocalStore`, `indexedDbLocalStore`; `nodeDiskLocalStore` from `@zen/client/node`.
 
 #### `@zen/db`: the queue on the store
@@ -1448,15 +1448,20 @@ Step 7 builds the class side.
    * Before the first send of a batch, the queue stores an **inflight** record: the encoded Commit (`zw.encodeCommit`), with its `commit_id` and its entry ids.
    * `done` and `fail` remove it together with the entries; a rebuild (`conflict`, restamp, split) replaces it.
    * **At load:** an inflight record is resent first, as is, with the same `commit_id`, until its outcome is known: success settles its entries, a final error fails them, network keeps waiting. Its entries are not packed again until then.
-   * Counter totals are not stored. After a restart they are read again from the server (`loadTotals`), so a resent counter commit then does not double-count.
+   * **Counter totals are never stored** (user decision). The server's entry for this installation is the truth, and it is read when a send needs it (`loadTotals`). A stored total restored from a backup, or copied with the store, would be sent with a newer `seq` and roll the counter back. A resent counter commit can't double-count anyway: a `seq` that isn't newer is ignored.
    * `QueueStore` gains optional `putInflight(r)`, `loadInflight()` and `removeInflight()`; the memory store implements them too.
 3. **Owner-only sender.** With a store shared between tabs (IndexedDB), only the owner sends (`db.onOwner`), as consumers do.
    * Every tab writes its entries to the store and overlays the queue it has loaded.
    * A tab that queues an entry posts `queued` on the tab channel (§9.2, `proxy.ts`), and the owner reloads the store.
    * `flush()` in a non-owner waits until its own entries leave the store: a `sent` broadcast from the owner, or polling `pending` from the store.
    * Without locks (`locks: null`) every instance sends, as now.
-4. **Options:** `DbOptions.local?: SealedStore`. When given, the queue uses `localQueueStore(local, ns)` unless `crdtStore` overrides it; 7e's caches use the same store.
-5. **Wipe:** `Db.wipe(local, ns)` clears every store of a database (sign-out).
+4. **The installation's counter lock across tabs.** Tabs share one clock store, and so one installation (`actor`). Today the lock that orders its counter commits, and the totals, exist separately in each tab. Two tabs incrementing one counter directly can then both read total B and send B+1 and B+2, and the server keeps one of them.
+   * `stamp` takes a Web Lock `zen/actor/<actor hex>` (through `DbOptions.locks`), held from stamping to the commit's outcome: the same span as the in-memory lock, which it wraps.
+   * Taking the lock, a tab keeps its in-memory totals only if it held the lock last. A tab releasing the lock posts `actor {tab}` on the tab channel (§9.2), so each tab knows the last holder; otherwise it drops its totals and reads them from the server.
+   * Without Web Locks (Node, `locks: null`): the in-memory lock, as now.
+   * **Test:** two tabs (`FakeLocks` + `FakeBus`) incrementing one counter directly and concurrently: the total is the sum.
+5. **Options:** `DbOptions.local?: SealedStore`. When given, the queue uses `localQueueStore(local, ns)` unless `crdtStore` overrides it; 7e's caches use the same store.
+6. **Wipe:** `Db.wipe(local, ns)` clears every store of a database (sign-out).
 
 #### Spec (⚠️ `spec:` commit)
 * **formats.md §4:** kind 8, local records.
@@ -1478,7 +1483,7 @@ Step 7 builds the class side.
 * **Rust:** seal and open round-trip; a moved record (another store, key or fs) fails; the vectors.
 * **`packages/client/test/local.test.ts`:**
   * every backend: memory, Node disk in a temporary directory, IndexedDB through `fake-indexeddb` (a new dev dependency); put, get, list, delete, clear
-  * every layer combination round-trips
+  * every layer combination round-trips, `plaintext: true` included; neither layer without it is refused; records of one setting read as absent under another
   * a flipped byte, or a record copied to another key or store, reads as absent
   * the Node device key file has mode 0600, and a second open reuses it
   * a store without its device key reads nothing
