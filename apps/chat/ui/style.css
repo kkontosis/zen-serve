@@ -1,0 +1,90 @@
+body {
+  font:
+    15px / 1.4 system-ui,
+    sans-serif;
+  margin: 0;
+}
+#zen-status {
+  background: #eee;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+#zen-signin {
+  padding: 12px;
+  max-width: 640px;
+}
+#zen-signin input,
+#zen-signin button {
+  display: block;
+  margin: 6px 0;
+}
+.zen-error {
+  color: #b00;
+}
+#app {
+  display: flex;
+  gap: 16px;
+  padding: 12px;
+}
+aside {
+  width: 220px;
+  flex: none;
+}
+section {
+  flex: 1;
+  min-width: 0;
+}
+#rooms {
+  list-style: none;
+  padding: 0;
+}
+.room {
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.room.open {
+  background: #dde8ff;
+}
+.room small {
+  color: #666;
+}
+#messages {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  height: 60vh;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+.msg {
+  padding: 4px 8px;
+}
+.msg .reactions {
+  margin-left: 8px;
+}
+.react {
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.photo {
+  display: block;
+  max-width: 240px;
+  max-height: 180px;
+  margin-top: 4px;
+}
+#typing {
+  min-height: 1.4em;
+  color: #666;
+  font-style: italic;
+}
+#composer {
+  display: flex;
+  gap: 6px;
+}
+#msg-text {
+  flex: 1;
+}
