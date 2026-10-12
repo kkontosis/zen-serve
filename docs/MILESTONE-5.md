@@ -393,6 +393,17 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **8b fixes (⚠️ spec fs.md §11.1):** under load the replica could show a file's own write as a conflict copy of itself for a moment (one run in two to four of the fuse tests with other suites in parallel; it cascaded through the mount tests). Three windows: (1) the owner's feed brings the write back before the commit reply gives its dot: the sender now reports each batch (`SenderHost.sending`), and while it is in flight the files it writes hide server versions newer than the cursor at its first send (all of them when there is no cursor yet; `Replica.inFlight`, posted to tabs as `sending`); (2) `done()` recorded the dots, then awaited the store flush before rebuilding the overlay: the marker is now cleared only at that rebuild; (3) `versionsOf` read the overlay before awaiting the server versions: it reads it after. Tests in `writes.test.ts` (a held reply, with and without a cursor), each checked to fail without its part; windows 2 and 3 were found with logs and checked with 15 loaded runs. A batch resent after a restart whose commit had applied before the crash can still show double until its reply (the floor is the cursor at resend).
     * **Docs:** `docs/CLIENT.md` §9 rewritten; TD-FUSE-REPLICA resolved; `docs/MILESTONE-8.md` notes that queued writes already re-upload past `chunk_grace_secs`. CI builds `@zen/fs` before the tests.
     * **Tests:** `packages/fuse/test/mount.test.ts` (11): the existing ones on replicas, symlinks, xattrs (through `python3`), a 1-byte kernel write sending one chunk and one page, and the CLI over three runs (device key into the vault with a pin; the vault alone; the server down, refused without `--offline-ok`, mounted from the cache with it, an unread file `EIO`); `writes.test.ts` +2. 365 vitest tests in all.
+    * PR #32 merged (CI green on all 8 checks).
+* **Step 9** (`@zen/loro`): planned in detail (see "Step 9"). User decisions: doc + outbox kept on the local store; snapshots in a `$loro` system row; compaction by the owner at a threshold. PR #32 is merged, so the plan commit restarts the branch from main and opens a new PR, which step 9 joins.
+  * **Step 9** (`@zen/loro`): done, PR #33. As planned, with these details for step 10:
+    * **`packages/loro`** (`@zen/loro`, `loro-crdt` 1.16.3): `openLoro(db, name, {snapshotEvery, snapshotBytes, batchMs, keepMs})` → `LoroHandle` (`doc`, `topic`, `ready`, `online`, `pending`, `lastOffset`, `onChange`, `flush`, `compact`, `close`); `LORO_UPDATE`. It resolves once the kept state and the outbox are loaded; `ready` once the server was reached or found unreachable (the loader retries with backoff, woken by `flush`).
+    * **Merging:** a batch of local updates becomes one update with `export({mode: 'updates-in-range'})` over the spans `decodeImportBlobMeta` gives (merging in a fresh doc fails: later updates depend on ones already sent); updates that don't fit go one per emit. A batch is one commit, at most 256 KiB of updates; on `too_large` it goes one update per commit, and a single update too large is dropped with a warning.
+    * **`@zen/db`:** `$loro` in `SYSTEM_TABLES`; `appendMsg` and `openMessage` exported (the class's `zen.` type); `db.local`; `localStores(ns)` gains `loro`.
+    * **Decisions beyond the plan:** the outbox and kept state live in `loro/<ns>` even with `persist: false` (unsent edits are data, not cache); an explicit `compact()` of a too-large snapshot rejects with `too_large`.
+    * **Test note:** a commit whose reply is lost is replayed by the client with the same `commit_id` (`sendCommit`, 4 tries), so a duplicate event needs all 4 replies lost.
+    * **⚠️ Spec:** zendb.md §9.3 (`loro/<ns>`), §11.5 (`$loro`), new §20 (Part E).
+    * **Docs:** `docs/DB.md` §20, `docs/API.md` (the CRDT line), TECH_DEBT TD-LORO-LARGE-SNAPSHOT; CI typechecks `packages/loro/tsconfig.test.json`.
+    * **Tests:** `packages/loro/test/loro.test.ts` (9: two installations converge, snapshot plus a 10-event tail, offline across a restart on the Node disk store, resends after lost replies and a crash, two owners compacting at once, an explicit compaction and a load reading no events, wipe, a snapshot too large for a 64 KiB commit, tabs where only the owner compacts). The outbox write and the owner check were each checked to fail when removed. 374 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2569,13 +2580,69 @@ Order by dependency: 8 → 9 → 10 → 11. Milestone 6 (signed roots) comes bef
 7. 7f is built on the user's go.
 
 ## Step 9: `@zen/loro`, the Loro adapter (DESIGN-3 §0, §1)
-* Dependency: `loro-crdt`.
-* `zen.loro(db, path)`: a snapshot in a zen-db row, updates as events on a topic keyed by the document.
-  * **Load:** snapshot + `read(after snapshot offset)`.
-  * **Live:** `on` subscription.
-  * **Local edits:** `emit` of Loro updates.
-  * **Compaction:** periodic snapshots by a leader (DESIGN-2 §2.7).
-* **Tests:** two clients converge; offline edits; a snapshot plus a tail load.
+
+**Original outline:** dependency `loro-crdt`; `zen.loro(db, path)`: a snapshot in a zen-db row, updates as events on a topic keyed by the document. Load: snapshot + `read(after snapshot offset)`; live: `on`; local edits: `emit` of Loro updates; compaction: periodic snapshots by a leader (DESIGN-2 §2.7). Tests: two clients converge; offline edits; a snapshot plus a tail load.
+
+**Context.** Rich documents (text, lists, trees) merge on the client in Loro (DESIGN-3 §0, DESIGN-4 §2.7: rich text stays client-side in Loro). Step 10's kanban keeps each card's text as a Loro doc. The log carries opaque sealed updates, so the server sees neither content nor edit structure. One PR.
+
+**User decisions:**
+* **Offline:** the doc's state (with the offset it reached) and an outbox of local updates not yet emitted are kept on the sealed local store (`DbOptions.local`). A doc opens offline; offline edits survive restarts and are emitted once online. Resends are safe: Loro ignores updates it already has.
+* **Snapshot:** a new system table `$loro` (pk `name`), row `{name, offset, snapshot}`; large rows already split into parts, so up to about the commit limit (8 MB by default). A bigger snapshot keeps the old one and warns (TD-LORO-LARGE-SNAPSHOT).
+* **Compaction:** the owner of each open doc writes a snapshot after N updates (default 100) or M bytes (default 1 MiB) since the stored one, in a transaction that only moves the offset forward (no leader needed); plus `doc.compact()`.
+
+**After compaction, re-read:** this section; `spec/zendb.md` §9.2, §9.3, §10, §11.1, §11.5; `packages/db/src/{db,broker,msg,system,localq,localcache}.ts`; `packages/client/src/log.ts` (`Topic.read`); `packages/db/test/{broker,proxy,crdtpersist}.test.ts` (setup, `net`, `FakeLocks`, `FakeBus`); `packages/fs/package.json` and `tsconfig*.json` (the wiring pattern); `.github/workflows/ci.yml`.
+
+**Branch/PR.** #32 is merged: restart from main, commit this plan (`docs: milestone 5 step 9 plan`), open a new PR that step 9 joins.
+
+### Package
+`packages/loro` (`@zen/loro`), wired like `packages/fs`: `package.json` (deps `@zen/client`, `@zen/db`, `loro-crdt` pinned to `1.16.3`, the newest release older than two weeks), `tsconfig.json`, `tsconfig.test.json` (paths to the client and db sources), a vitest alias, the root workspaces and `check`, the CI typecheck. Worker-safe: no DOM or Node imports (`loro-crdt` resolves its own Node/browser build).
+
+### Design
+* **Names and topics.** A doc has a text `name` per database. Its topic is `db.topic('zen', 'loro', ns, name)` (one topic per doc, so loading is a plain tail read; `"zen"` is reserved for zen libraries, zendb.md §1). Messages are `zen.loro.update` with the Loro update bytes as the body (zen-db moves bodies over `max_envelope_bytes` to parts, §10.3).
+* **`openLoro(db, name, opts?) → LoroHandle`** (`zen.loro` in API.md):
+  * `doc: LoroDoc`; the app edits it and calls `doc.commit()` as usual.
+  * `ready` resolves once loaded; `online`; `pending` (outbox entries); `flush()` (resolves once the outbox is emitted; rejects `offline`); `compact()`; `onChange(fn)` (remote updates imported); `close()`.
+  * Options: `snapshotEvery` (updates, default 100), `snapshotBytes` (default 1 MiB), `batchMs` (default 50: local updates coalesced into one emit).
+* **Load:**
+  1. Kept state first (local store `loro/<ns>`, key `d<name>`: `{1: offset, 2: Loro snapshot}`), so a doc opens offline.
+  2. Online: read the `$loro` row; if its offset is newer than the kept one, import its snapshot.
+  3. Read the tail: `topic.read({after: offset})` in pages, each event opened with `openMessage` (exported from `@zen/db`) and imported in order; `offset` moves to each event read.
+  4. `db.on(topic, …, {after: offset})` for live events; offsets at or before the current one are skipped (the tail read and the subscription overlap).
+  5. Outbox entries (local store key `o<name>‖u64 seq`, the update bytes) are imported too (they may predate the kept snapshot) and the sender wakes.
+  * Offline: steps 2–4 fail with `network`; the doc is `ready` from kept state, and the loader retries with backoff (250 ms to 30 s, woken by `flush()`).
+* **Local edits:** `doc.subscribeLocalUpdates(bytes)` → put an outbox entry (stored before anything else), then the sender: entries coalesced per `batchMs` (Loro merges updates with `LoroDoc.importBatch` / export from the earlier version), one `db.emit` each, and deleted once emitted. Every tab of an installation sends its own outbox (a tab's edits are its own; duplicates are harmless).
+* **Kept state:** written behind (as `LocalCache`) after imports and edits settle: the snapshot and the offset of the last event imported. A crash loses at most the last few hundred ms of kept state, re-read from the tail.
+* **Compaction (owner only, `db.onOwner`):** after `snapshotEvery` events or `snapshotBytes` since the `$loro` row's offset, a transaction reads the row and, when its offset is older than the handle's, puts `{name, offset, snapshot}` with `doc.export({mode: 'snapshot'})` at the handle's offset. Every event at or before that offset is in the doc (they were imported in order), so a later load of snapshot + tail misses nothing; extra content in the snapshot (local edits not yet emitted) is harmless, they arrive again. A snapshot over the commit limit (`too_large`) keeps the old row, warns once, and stops snapshotting that doc (TD-LORO-LARGE-SNAPSHOT). Events before a snapshot stay in the log until retention exists (TD-LOG-RETENTION).
+* **Tabs:** the proxy (6c) already shares `on`; each tab holds its own `LoroDoc`. The local store's kept state is per database, so two tabs writing it race harmlessly (either snapshot is valid: offsets only move forward, writes keep the newer offset).
+* **`Db` changes:** `$loro` in `SYSTEM_TABLES` (created by `init`, as the others); export `openMessage`; a public `db.local` getter (the `SealedStore`, or undefined); `localStores(ns)` gains `loro/<ns>` so `Db.wipe` clears it.
+
+### ⚠️ Spec (`spec:` commit)
+* **zendb.md §11.5:** the `$loro` table.
+* **zendb.md new §20 "Loro documents":** the topic, the message type, load (snapshot + tail + live), the outbox and its idempotence, kept state, compaction (who, when, the forward-only offset, the size limit), what the server sees (nothing beyond event and row sizes and timing).
+* **zendb.md §9.3:** the `loro/<ns>` store and its records.
+
+### Docs
+* `docs/DB.md`: a "Loro documents" section (usage, offline, compaction, limits).
+* `docs/API.md` §CRDT line updated to the real call.
+* `spec/TECH_DEBT.md`: TD-LORO-LARGE-SNAPSHOT (snapshots over the commit limit: a zen-fs file instead of a row).
+
+### Tests (`packages/loro/test/loro.test.ts`, its own server)
+* **Converge:** two installations (separate sessions) open one doc; text and list edits on both, concurrently; both converge (`doc.toJSON()` equal) via live events.
+* **Snapshot + tail:** 250 edits with `snapshotEvery: 100` → a `$loro` row at a later offset; a fresh `Db` loads it with one row read and only the tail (counted `topic.read` events < 100) and equals the writer.
+* **Offline:** a `net` switch (as `crdtpersist`): edits offline show locally, survive `close()` and a reopen on the same disk store (kept state + outbox, opened with the server down), then are emitted once online; the other installation converges.
+* **Idempotence:** a crash after the emit but before the outbox delete (injected) → resent on reopen; the doc is unchanged on the other side (no duplicate text).
+* **Compaction race:** two owners (`locks: null`) compact concurrently; the row ends at the larger offset, and loading from it is complete.
+* **Large snapshot:** a low `max_commit_bytes` → `compact()` keeps the old row and warns.
+* **Tabs:** two `Db`s on one fs with `FakeLocks` + `FakeBus`: only the owner compacts; both converge.
+* **Wipe:** `Db.wipe` clears `loro/<ns>`.
+
+### Verification
+* `npx biome check`; tsc for client (test), fuse, db (test), fs (test), loro (test); `npx vitest run` three times.
+* CI green on the PR (the client job installs `loro-crdt`; check the run time).
+* Rust unchanged.
+
+### Rhythm
+On the user's go: the `spec:` commit, then the code commit; log the step 9 line in both plan copies; push, update the PR, confirm CI is green; stop for compaction. Step 10 (the apps) is next.
 
 ## Step 10: five small web apps (docs/EXAMPLES.md)
 * **Layout:** `apps/{kanban,chat,booking,checkout,ledger}`, plain TypeScript and DOM with no framework, bundled with esbuild (a new dev dependency).

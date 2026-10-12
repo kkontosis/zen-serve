@@ -19,7 +19,7 @@ import { DbError } from './errors.js';
 
 /** The stores of database `ns` in a local store (wiped together). */
 export const localStores = (ns: string) =>
-  ['queue', 'db', 'rows', 'crdt', 'nodes', 'sealed'].map((s) => `${s}/${ns}`);
+  ['queue', 'db', 'rows', 'crdt', 'nodes', 'sealed', 'loro'].map((s) => `${s}/${ns}`);
 
 const INFLIGHT = bytes.utf8('inflight');
 const entryKey = (id: string) => bytes.utf8(`e${id}`);

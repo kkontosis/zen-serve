@@ -896,6 +896,11 @@ export class Db {
     return this.stream;
   }
 
+  /** The local store the database keeps its state in (`DbOptions.local`), if any. */
+  get local(): SealedStore | undefined {
+    return this.opts.local;
+  }
+
   /** @internal This device's fingerprint (durable cursors are per device). */
   get device(): Uint8Array {
     return this.fs.session.deviceFp ?? new Uint8Array(32);

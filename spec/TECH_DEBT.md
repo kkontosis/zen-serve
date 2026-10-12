@@ -234,3 +234,10 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** It needs the tab proxy (TD-DB-TAB-PROXY) first, plus a worker bundle with the wasm module.
 * **What it would take:** A worker entry point that opens the `Db` and serves the proxy protocol, a page-side client that prefers it when `SharedWorker` exists, key handling (unlock material passed to the worker once), and browser tests.
 
+
+## TD-LORO-LARGE-SNAPSHOT
+
+* **Status:** open
+* **Context:** A Loro document's snapshot is a row of the `$loro` system table (spec/zendb.md §20.5). A row is split into parts, but it must fit one commit (`max_commit_bytes`, 8 MB by default). A larger snapshot keeps the old one, and the client stops compacting that document, so loads read ever more of the log.
+* **Why deferred:** Documents of the milestone 5 apps (card texts) stay far below the limit, and a file-backed snapshot needs the replica's write path, which landed only in step 8.
+* **What it would take:** Store a large snapshot as a zen-fs file (paged versions, uploaded in commits of its own), with the `$loro` row holding the file's node and version instead of the bytes; compaction then replaces the file's version; loads stream it.

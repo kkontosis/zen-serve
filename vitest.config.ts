@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
-// Node tests of @zen/client, @zen/fuse, @zen/db and @zen/fs against a spawned embedded zen-serve
+// Node tests of @zen/client, @zen/fuse, @zen/db, @zen/fs and @zen/loro against a spawned embedded zen-serve
 // (packages/client/src/testing/server.ts). Build first:
 //   cargo build -p zen-server && scripts/build-wasm.sh
 export default defineConfig({
@@ -12,6 +12,7 @@ export default defineConfig({
       '@zen/client': fileURLToPath(new URL('packages/client/src/index.ts', import.meta.url)),
       '@zen/db': fileURLToPath(new URL('packages/db/src/index.ts', import.meta.url)),
       '@zen/fs': fileURLToPath(new URL('packages/fs/src/index.ts', import.meta.url)),
+      '@zen/loro': fileURLToPath(new URL('packages/loro/src/index.ts', import.meta.url)),
     },
   },
   test: {

@@ -7,7 +7,8 @@
     "packages/client",
     "packages/fuse",
     "packages/db",
-    "packages/fs"
+    "packages/fs",
+    "packages/loro"
   ],
   "engines": {
     "node": ">=22"
@@ -15,7 +16,7 @@
   "scripts": {
     "build:wasm": "scripts/build-wasm.sh",
     "build": "npm run build --workspaces --if-present",
-    "check": "biome check packages && tsc -p packages/client --noEmit && tsc -p packages/db/tsconfig.test.json && tsc -p packages/fs/tsconfig.test.json",
+    "check": "biome check packages && tsc -p packages/client --noEmit && tsc -p packages/db/tsconfig.test.json && tsc -p packages/fs/tsconfig.test.json && tsc -p packages/loro/tsconfig.test.json",
     "test": "vitest run"
   },
   "devDependencies": {
