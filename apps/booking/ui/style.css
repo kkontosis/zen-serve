@@ -1,0 +1,47 @@
+body {
+  font:
+    15px / 1.4 system-ui,
+    sans-serif;
+  margin: 0;
+}
+#zen-status {
+  background: #eee;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+#app,
+#zen-signin {
+  padding: 12px;
+  max-width: 720px;
+}
+#zen-signin input,
+#zen-signin button {
+  display: block;
+  margin: 6px 0;
+}
+.zen-error {
+  color: #b00;
+}
+#slot-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+#slot-minutes {
+  width: 5em;
+}
+.resource ul {
+  list-style: none;
+  padding: 0;
+}
+.slot {
+  padding: 4px 0;
+  border-bottom: 1px solid #eee;
+}
+.slot .status {
+  font-weight: 600;
+}
+.slot .wait {
+  color: #666;
+  margin-right: 6px;
+}
