@@ -404,6 +404,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **⚠️ Spec:** zendb.md §9.3 (`loro/<ns>`), §11.5 (`$loro`), new §20 (Part E).
     * **Docs:** `docs/DB.md` §20, `docs/API.md` (the CRDT line), TECH_DEBT TD-LORO-LARGE-SNAPSHOT; CI typechecks `packages/loro/tsconfig.test.json`.
     * **Tests:** `packages/loro/test/loro.test.ts` (9: two installations converge, snapshot plus a 10-event tail, offline across a restart on the Node disk store, resends after lost replies and a crash, two owners compacting at once, an explicit compaction and a load reading no events, wipe, a snapshot too large for a 64 KiB commit, tabs where only the owner compacts). The outbox write and the owner check were each checked to fail when removed. 374 vitest tests in all.
+    * PR #33 merged (CI green on all 8 checks).
+* **Step 10** (five web apps): planned in detail (see "Step 10"). User decision: five parallel subagents, one per app, each in its own git worktree, after a shared foundation (10a); I merge and verify (10c). PR #33 is merged, so the plan commit restarts the branch from main and opens a new PR, which step 10 joins.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2645,19 +2647,193 @@ Order by dependency: 8 → 9 → 10 → 11. Milestone 6 (signed roots) comes bef
 On the user's go: the `spec:` commit, then the code commit; log the step 9 line in both plan copies; push, update the PR, confirm CI is green; stop for compaction. Step 10 (the apps) is next.
 
 ## Step 10: five small web apps (docs/EXAMPLES.md)
-* **Layout:** `apps/{kanban,chat,booking,checkout,ledger}`, plain TypeScript and DOM with no framework, bundled with esbuild (a new dev dependency).
-* **Serving:** each app is served as static files. In tests, a static server with zen-serve CORS, as in the M4 browser smoke test. They can be deployed into zen-serve's `/unencrypted`.
+
+**Original outline:**
+* **Layout:** `apps/{kanban,chat,booking,checkout,ledger}`, written in plain TypeScript and DOM with no framework, and bundled with esbuild (a new dev dependency).
+* **Serving:** static files.
 * **Sign-in:** password or passkey.
+* **Tests:**
+  * one Playwright test per app, following its "Milestone 5 demo"
+  * fault parts as vitest scenarios
 
-| App | Uses |
-|---|---|
-| Kanban | rows plus attachments in one commit; change events; drag; card text as a Loro doc; offline variant through CRDT fields |
-| Chat | `on` with resume; ephemeral typing; presence scatter-gather; photo files; reactions as a CRDT counter |
-| Booking | unique slot; waitlist `per_key` worker; reminders through the scheduler |
-| Checkout | saga across stock, payment and shipping workers, as Node scripts in `apps/checkout/workers/`, with a mock payment provider that checks idempotency keys |
-| Ledger | transfers with invariants; audit outbox; statement projection; paged history |
+**Context.**
+* **Already built.** Steps 5–9 (PRs #14–#33, merged) built every library the apps need: `@zen/db` (database, broker, CRDT tables, offline caches), `@zen/fs` (the replica), `@zen/loro`, and the client's local store and vault.
+* **Browser tests so far.** The only browser test is the M4 smoke test (`packages/client/browser/smoke.spec.ts`):
+  * zen-serve serves the page itself from `unencrypted_dir` at `/unencrypted/…` (same origin, so no CORS).
+  * The test copies the built client and the wasm glue next to the page, and rewrites the `@zen/wasm` import, since there is no bundler.
+* **Bundling.** No app has been bundled yet: `@zen/db`, `@zen/fs` and `loro-crdt` in a browser are untested.
 
-**Tests:** one Playwright end-to-end test per app, with two browser contexts where the demo needs them, following each app's "Milestone 5 demo" in EXAMPLES.md. The fault parts (killing workers, schedulers, tabs) run as vitest scenarios.
+**User decision:** the five apps are built by **five parallel subagents, each in its own git worktree**, one per app. I build the shared foundation first, so their work only touches `apps/<name>/`. I then merge, verify and push. Agents never push.
+
+**After compaction, re-read:**
+* this section
+* `docs/EXAMPLES.md` (whole)
+* `packages/client/browser/{smoke.spec.ts,smoke.js,index.html}` and `playwright.config.ts`
+* `packages/client/src/{wasm,client,acl}.ts`, `packages/client/src/testing/{server,index}.ts`
+* `docs/DB.md` (the API as built)
+* `vitest.config.ts`, `package.json`, `biome.json`, `.github/workflows/ci.yml` (client job)
+
+**Branch/PR.** PR #33 is merged, so:
+1. Restart the branch from main.
+2. Commit this plan (`docs: milestone 5 step 10 plan`) and open a new PR.
+3. The foundation, then one commit per app, join that PR.
+
+### 10a: the foundation (me, before the agents)
+
+Everything shared, so that the agents never touch a file outside `apps/<name>/`:
+
+1. **Bundling (`scripts/build-apps.mjs`, esbuild pinned to an exact version at least two weeks old).**
+   * For each `apps/<name>/ui/main.ts`: an ESM browser bundle `apps/<name>/dist/main.js`, plus `index.html` and the wasm files (`zen_wasm_bg.wasm`, and Loro's when used), copied next to it.
+   * The `@zen/*` packages resolve to their sources (aliases, as in vitest), and `node:*` imports are stubbed.
+   * `--watch` for development.
+   * `apps/*/dist/` is gitignored.
+   * **Risk retired here:** `@zen/client` (its `initWasm` Node branch), `@zen/db`, `@zen/fs` and `loro-crdt` (its `browser` build, which loads wasm through its own glue) load and run in Chromium. Proved by `apps/hello` (below).
+2. **`apps/shared/`**, imported by relative path, with no workspace package, so worktrees need no `npm install`:
+   * **`boot.ts` (browser):**
+     * `connect(location.origin)`
+     * a sign-in form: password (`signInPassword`), and passkey when available
+     * unlock with the fs passphrase
+     * the vault and an IndexedDB local store (`sealedStore(indexedDbLocalStore('zen-<app>'))`)
+     * `Db.open(fs, ns, {schema, migrations, local})`
+     * `window.app` exposed for Playwright
+     * a tiny DOM helper `h(tag, attrs, ...children)` and a status bar showing online/offline, the owner tab, and pending writes
+   * **`node.ts` (workers and vitest scenarios):** `signInWorker({url, deviceFile})` with a device key file, as zen-mount's `--device-key`, and the vault in a directory. It returns `{session, fs, open(ns, opts)}`.
+   * **`harness.ts`, for tests:**
+     * `startWorld({apps, grants})`: one zen-serve per test file, with `unencrypted_dir` = the built `apps/` tree. It claims, creates fs 1 with a passphrase slot, and adds the members each app asks for, with the grants listed in EXAMPLES.md (`appGrants(name)`, so the demos run with least privilege, not `fullGrants`). It returns `{url, origin, users: [{name, password, deviceFile}], passphrase, stop}`.
+     * `page(ctx, app, user)`: navigates to `/unencrypted/<app>/index.html`, signs in, and waits for `window.app.ready`.
+     * `kill(child)` / `spawnWorker(script, env)` for the Node workers.
+     * `until(fn)`, `net(session)` (the offline switch of earlier tests).
+   * **`fractional.ts`:** fractional position keys (a string strictly between two others), shared by kanban and anything ordered.
+3. **Wiring:**
+   * `apps/tsconfig.json` (DOM lib, paths to the package sources), and `npm run check` typechecks it
+   * biome includes `apps/`
+   * vitest `include` gains `apps/*/test/**/*.test.ts`
+   * `playwright.config.ts` gains a project with `testDir: 'apps'`, `testMatch: '*/e2e/*.spec.ts'`, and a `globalSetup` that runs `build-apps`
+   * root scripts `build:apps`, `test:apps`
+   * the CI client job runs `build:apps`; Playwright already runs
+4. **`apps/hello`:** a minimal app (sign in, a row, an emit and `on`, a Loro text) with one Playwright test.
+   * It proves the bundle, the shared boot and the harness end to end.
+   * It is the template the agents copy.
+   * It stays, as the smoke test of the app build.
+5. **`apps/README.md`:**
+   * the layout of an app: `ui/` (DOM), `src/` (app logic over `Db`, no DOM, so vitest can drive it), `test/` (vitest scenarios), `e2e/` (Playwright), `workers/` (Node, checkout only)
+   * how to build, serve (`zen-serve` with `unencrypted_dir`) and test
+   * the rules the agents follow (below)
+
+**Verification:** `npm run check`, `npx vitest run`, `npm run build:apps`, `npx playwright test` (smoke + hello), CI green. Commit `apps: the shared foundation and a hello app`.
+
+### 10b: five agents in parallel worktrees
+
+**Launch:** one message, five `Agent` calls (`subagent_type: general-purpose`, `isolation: "worktree"`, in the background), one per app.
+
+**Before launching,** commit 10a. Each worktree is created from the committed head. It then needs, as untracked symlinks to the main checkout:
+* `node_modules`
+* `target`, which holds the zen-serve binary that the harness spawns
+* `packages/zen-wasm/pkg`
+
+So no agent installs packages or builds Rust. Disk: about 4.4 GB is free, and worktrees of the sources are small.
+
+**Each agent's prompt** holds:
+* its app's section of EXAMPLES.md, verbatim, plus the "CRDT tables in the examples" variant where it applies
+* this plan's rules
+* the files to read (`apps/README.md`, `apps/hello`, `apps/shared`, `docs/DB.md`, `docs/CLIENT.md` §8 for chat/kanban files)
+* what to report back: the files, test counts, deviations from EXAMPLES.md, anything it needed from outside `apps/<name>/`
+
+**Rules for the agents:**
+* **Write only under `apps/<name>/`.** A needed change to a package, to `apps/shared` or to the wiring is reported, not made. I make it in the main checkout and tell the others if it matters.
+* No new dependencies. No changes to `package.json`, the lockfile, CI or the docs.
+* **Never push.** Commit in the worktree's branch, as one commit `apps: <name>` with the session's trailers, and do not merge.
+* The app logic lives in `src/` as functions over a `Db` (and an fs/replica where needed), so vitest drives the demo's invariants directly, and the UI stays thin.
+* Before reporting, run:
+  * `npx biome check apps/<name>`
+  * `npx tsc -p apps/tsconfig.json`
+  * `npx vitest run apps/<name>` three times
+  * `npx playwright test apps/<name>`
+* Report every flaky run, not just the last result.
+* Never `pkill -f`, since it would match other agents' processes. Kill only the PIDs the agent spawned.
+* `CARGO_INCREMENTAL=0` if anything Rust is touched (nothing should be).
+
+**The five apps.** Each implements its EXAMPLES.md section: schema, topics, transactions and grants. The UI is minimal but usable. The demo goes in the tests: the browser parts in Playwright, the fault parts in vitest.
+
+1. **`apps/kanban`:** boards, columns, cards.
+   * **Moves:** drag to move, with fractional `pos` and the private index `(column, pos)`.
+   * **Attachments:** uploaded with `tree.upload` before the transaction, then the row, the file op and the change event in one `tx.fs(tree).write` transaction.
+   * **Live updates:** through `cards.on`, and ephemeral "dragging…" cursors on `("board", id)`.
+   * **Card text** as a Loro document (`openLoro(db, 'card/<id>')`).
+   * **The offline variant:** a CRDT `cards` table (`title`/`text` `lww`, `labels` `set`, `votes` `counter`) with the indexer keeping `(column, pos)`, selectable by a URL flag.
+   * **Playwright** (two contexts):
+     * a drag and an attach in one context show in the other
+     * the card text merges
+   * **vitest:**
+     * a tab killed mid-upload leaves no card pointing at a missing file
+     * two concurrent moves of one card give one card
+     * offline edits of the CRDT variant merge field by field
+2. **`apps/chat`:** rooms, messages via `on(("chat", room), {after: receipt})`.
+   * **Receipts:** a durable cursor.
+   * **Typing:** ephemeral.
+   * **Presence:** scatter-gather `requestAll`.
+   * **Photos:** a file plus a `blobs` row in one transaction; a fast index on `blobs.room`.
+   * **Reactions:** a CRDT `counter` per emoji; membership a CRDT `set`.
+   * **Playwright** (three contexts):
+     * one goes offline (`context.setOffline`), the others send, and it comes back seeing every message once, in order
+     * typing shows and never reaches the log (read the topic)
+   * **vitest:**
+     * resume across restarts
+     * presence counts
+     * reactions summed across installations
+3. **`apps/booking`:** resources and slots (private `(resource, start)`).
+   * **Booking:** with unique `slot` (kind `none`) and a reminder via `schedule`.
+   * **Cancelling:** `cancel` plus `released`.
+   * **The waitlist:** a `per_key` consumer promoting from it.
+   * **Playwright:** book and cancel with the waitlist in two contexts.
+   * **vitest:**
+     * 20 concurrent bookings of one slot: exactly one succeeds, the rest get `unique_violation`
+     * a cancel promotes the waitlist head exactly once
+     * the scheduler leader killed before a reminder: another instance sends it late, once
+4. **`apps/checkout`:** the `checkout` saga (`reserve`, `pay`, `ship`, with compensations and timeouts).
+   * **Workers:** Node workers in `apps/checkout/workers/` (stock, payment, effects, shipping), run with `node --experimental-strip-types`, or bundled by the build script if that is simpler.
+   * **The payment provider:** a mock HTTP server, `workers/provider.ts`, that records charges by idempotency key and fails on request.
+   * **The UI:** places orders and shows their status (`orders` change events).
+   * **Playwright:** one order through, and a failing payment that releases stock.
+   * **vitest:**
+     * a payment worker killed after the provider call charges once
+     * 100 orders with workers killed at random: every saga ends `done` or `failed`, and stock and payments balance
+5. **`apps/ledger`:** accounts and transfers (balance never negative).
+   * **Entries:** private `(account, at desc)`, paged history.
+   * **Audit:** emits per transfer.
+   * **Statements:** a `sequential` projection.
+   * **The audit view:** a durable `on` with a cursor.
+   * **Playwright:** transfers in two contexts, and a paged history.
+   * **vitest:**
+     * many concurrent random transfers: the sum is constant, no balance is negative, statements equal the entries, one audit event per transfer
+     * the projection restarted mid-stream gives unchanged totals
+
+### 10c: integration (me)
+
+1. **Wait** for the five agents. Read each report, and review the diff of each worktree branch: correctness against EXAMPLES.md, no files outside `apps/<name>/`, no secrets or test shortcuts that hide failures.
+2. **Merge** each branch into `claude/brave-knuth-gk03mm` in order: kanban, chat, booking, checkout, ledger. The branches touch disjoint directories, so no conflicts are expected. Requests from agents for shared changes are made first, in their own commit.
+3. **Verify the whole:**
+   * `npm run check`
+   * `npx vitest run` three times (the full suite, with every app's server running in parallel)
+   * `npm run build:apps`
+   * `npx playwright test`
+   * Run time: CI's client job is about 3.5 minutes now. If the apps push it past about 15 minutes, split the apps into a job of their own (step 11 also checks).
+4. **Clean up** the worktrees (`git worktree remove`) once merged.
+5. **Docs:**
+   * `docs/EXAMPLES.md` gets a short "As built" note per app (how to run it, deviations)
+   * `README.md` gets a line on the apps
+   * Both plan copies get the 10a/10b/10c log lines.
+6. **Push**, update the PR, confirm CI is green, then stop for compaction. Step 11 (CI, docs, the outcome) is next.
+
+**Fallback:** an agent that fails or stalls is resumed with `SendMessage`, with its errors. Failing that, I finish the app myself. The others are not held back: each app is merged when it is ready.
+
+### Rhythm
+1. Restart from main, commit this plan, open a new PR, stop.
+2. On the user's go:
+   1. 10a: commit, verify, push, CI green.
+   2. 10b: launch the five agents.
+   3. 10c: merge, verify, log, push, CI green.
+   4. Stop for compaction.
 
 ## Step 11: CI, docs, outcome
 * **CI:**
