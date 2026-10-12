@@ -229,3 +229,36 @@ The server side of CRDT tables comes in milestone 5 (spec/zendb.md §19, `TD-CRD
 
 Slot booking, checkout and the ledger stay transactional: their invariants (one booking per slot, no negative balance) are exactly what CRDT tables give up.
 
+
+## As built (milestone 5)
+
+The five apps are in [`apps/`](../apps/) (layout, build and tests: [`apps/README.md`](../apps/README.md)). Each runs in Chromium from `apps/dist/<name>/` served by zen-serve's `unencrypted_dir`, signs in with a password and unlocks the fs with a passphrase. Its tests run with only the grants above (`apps/<name>/test/grants.ts`): vitest scenarios for the invariants and faults, Playwright specs for the demos in two or three browsers.
+
+* **Kanban** (`apps/kanban`):
+  * as specified, plus the Loro card text (`card/<id>`, `@zen/loro`); the row's `text` is a short description
+  * the change topic of `cards` is the table's default, under `("zen", "db", "kanban")`
+  * each card's directory is made when the card is, in the same commit
+  * the offline variant is a second table, `crdt_cards`, in the same database (`?crdt=1`): `column` and `pos` are `lww` too, patched together so a move wins or loses whole; it has no attachments, since a `lww` list would lose concurrent attaches
+  * a killed upload is a Node worker SIGKILLed mid-upload; its chunks are gone after the grace period
+* **Chat** (`apps/chat`):
+  * `rooms` is a CRDT table (name `lww`, `members` a set); `reactions` has four counter fields (like, love, laugh, party), since counter fields are declared
+  * a message body also carries the sender's display name and an optional photo (`blobs` id)
+  * presence: the request is an event on `("presence")`; each instance answers with an ephemeral reply (`db.reply(m, body, {ephemeral: true})`)
+  * Chromium's offline mode keeps an open WebSocket, so the page stops reading on `offline` and resumes from the last offset shown on `online`
+  * no private index (§2 lists none, though the table above ticks one)
+  * found TD-EPHEMERAL-SAME-DEVICE: two sessions of one device can drop each other's ephemeral messages
+* **Booking** (`apps/booking`):
+  * as specified; reminders and promotions are message types `reminder` and `promoted` on `("booking", "notify")`, keyed by slot
+  * a promotion consumes the event without booking when the slot was booked again meanwhile
+  * the reminder's id is kept in the booking row, which `cancel` cancels
+* **Checkout** (`apps/checkout`):
+  * the services run as Node workers (`apps/checkout/workers`), one member each: stock, payment, effects, shipping, a dedicated orchestrator, and a mock payment provider charging once per idempotency key
+  * `pay` is a `consume` that forwards the command (with its reply route) to `("shop", "effects", "charge")`; the effects worker records the payment and replies to the saga in one transaction. Refunds go through the effects worker too.
+  * stock commands are `per_key` by saga id (the saga keys every command by it); per-sku consistency comes from the transactions
+  * a participant checks that its command is still current and its timeout pending before acting; a charge made after its timeout is refunded (`voided`)
+  * the order's status is copied from the saga's state by a second group (`order-status`), one commit behind (TD-SAGA-HOOKS)
+  * consumers poll with `waitMs: 2000` (TD-CONSUME-CLAIM-WAKE); `$sched` is the contention point under load (TD-SCHED-HOTSPOT)
+* **Ledger** (`apps/ledger`):
+  * as specified, plus `accounts.at` (entry times strictly increase per account), `entries.transfer`, `statements.count`, an index on `accounts.owner`, and `statements` change events so other pages refresh
+  * the audit view keeps its read model in an `audit_view` table per device and reads the log from its start (TD-DB-ON-FROM-START)
+  * an overdraft is the transaction's result (its reads are still checked), then thrown as `LedgerError`; `transfer` retries with jitter when every attempt conflicts

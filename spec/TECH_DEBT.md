@@ -241,3 +241,41 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** A Loro document's snapshot is a row of the `$loro` system table (spec/zendb.md §20.5). A row is split into parts, but it must fit one commit (`max_commit_bytes`, 8 MB by default). A larger snapshot keeps the old one, and the client stops compacting that document, so loads read ever more of the log.
 * **Why deferred:** Documents of the milestone 5 apps (card texts) stay far below the limit, and a file-backed snapshot needs the replica's write path, which landed only in step 8.
 * **What it would take:** Store a large snapshot as a zen-fs file (paged versions, uploaded in commits of its own), with the `$loro` row holding the file's node and version instead of the bytes; compaction then replaces the file's version; loads stream it.
+
+## TD-EPHEMERAL-SAME-DEVICE
+
+* **Status:** open
+* **Context:** The stream drops an ephemeral message as a replay unless its HLC is newer than the last one seen from its sender device on that topic (`packages/client/src/stream.ts`, `openEphemeral`). Two sessions of one device keep separate clocks, so they can drop each other's ephemeral messages: presence replies and typing indicators get lost. Found by the chat app (milestone 5 step 10), whose test uses one device per instance.
+* **Why deferred:** Found while integrating the apps; one device per running instance is the normal case.
+* **What it would take:** Key the replay filter by sender session (an id in the ephemeral envelope), or share one clock store per device across its sessions, with a test of two sessions of one device exchanging ephemeral messages.
+
+## TD-SAGA-HOOKS
+
+* **Status:** open
+* **Context:** The checkout app (milestone 5 step 10) needed more from `db.saga` than it offers:
+  * a transition hook (`onTransition(row, tx)`), so the orchestrator writes app rows (the order's status) in the same commit. The app copies the state with a second consumer group instead, one commit behind.
+  * a participant-side check that its command is still current and its timeout pending, and an exported reply helper. The app reads `$sagas` and `$sched` and builds the reply itself; without the check, a step done after its timeout fired is never compensated.
+  * consumer options (`waitMs`, `maxAttempts`, `maxInflight`) passed through to the orchestrator's groups.
+* **Why deferred:** The app works around each; the API shape wants a second user before it is fixed.
+* **What it would take:** `SagaOptions.onTransition`, `saga.isCurrent(tx, msg)`, `tx.reply(msg, body, {error})` exported for consumers, `SagaOptions.consume`, and tests in `packages/db/test/saga.test.ts`; then the checkout app moves onto them.
+
+## TD-CONSUME-CLAIM-WAKE
+
+* **Status:** open
+* **Context:** A consumer waiting in a long poll (`next` / `deliveries`, `waitMs` default 25 s) isn't woken when a killed consumer's claims expire, so those messages wait for the poll to end. The checkout app sets `waitMs: 2000` on its groups.
+* **Why deferred:** Found while integrating the apps; a shorter `waitMs` works around it.
+* **What it would take:** The server wakes waiting polls of a group when a claim it holds expires (a watch on the claim index, or a timer at the earliest expiry), or the client defaults to a shorter wait; a test with a killed consumer and a waiting one.
+
+## TD-SCHED-HOTSPOT
+
+* **Status:** open
+* **Context:** `$sched.by_at` is one private index with one shard, and every schedule and cancel writes it. Every saga transition schedules or cancels a timeout, so concurrent sagas conflict on it (seen in the checkout app's 100-order test).
+* **Why deferred:** Correct as is; it costs retries under load.
+* **What it would take:** Shard `by_at` (`shards: K`, a merge in the scheduler's due-rows query, which already reads through the planner), measured in `docs/STATS.md`.
+
+## TD-DB-ON-FROM-START
+
+* **Status:** open
+* **Context:** A durable `on(..., {cursor})` with a new cursor starts at new events. To read a topic from its beginning (the ledger's audit view), an app passes `after: offsetAfterVersion(0n)` from `@zen/client`.
+* **Why deferred:** Minor; the workaround is one line.
+* **What it would take:** An `OnOptions.start: 'now' | 'earliest'` as consumer groups have, documented in docs/DB.md §11.
