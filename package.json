@@ -16,13 +16,16 @@
   "scripts": {
     "build:wasm": "scripts/build-wasm.sh",
     "build": "npm run build --workspaces --if-present",
-    "check": "biome check packages && tsc -p packages/client --noEmit && tsc -p packages/db/tsconfig.test.json && tsc -p packages/fs/tsconfig.test.json && tsc -p packages/loro/tsconfig.test.json",
-    "test": "vitest run"
+    "check": "biome check packages apps scripts && tsc -p packages/client --noEmit && tsc -p packages/db/tsconfig.test.json && tsc -p packages/fs/tsconfig.test.json && tsc -p packages/loro/tsconfig.test.json && tsc -p apps/tsconfig.json",
+    "test": "vitest run",
+    "build:apps": "node scripts/build-apps.mjs",
+    "test:apps": "vitest run apps && playwright test --project apps"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
     "@playwright/test": "1.56",
     "@types/node": "^22.20.5",
+    "esbuild": "0.28.2",
     "fake-indexeddb": "^6.2.5",
     "typescript": "^5.9.3",
     "undici": "^7.30.0",
