@@ -21,6 +21,7 @@ const DEFS: { name: string; pk: string[]; index?: Omit<IndexDef, 'id'> }[] = [
   { name: '$sagas', pk: ['id'] },
   { name: '$inbox', pk: ['scope', 'id'] },
   { name: '$ixrows', pk: ['table_id', 'pk'] },
+  { name: '$loro', pk: ['name'] },
 ];
 
 /** The names of the system tables. */

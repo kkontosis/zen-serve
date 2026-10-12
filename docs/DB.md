@@ -1,6 +1,6 @@
 # @zen/db
 
-`@zen/db` is a client-side database over zen-serve's encrypted KV ([`spec/zendb.md`](../spec/zendb.md) Part A). Rows, indexes and the catalog are sealed KV values under PRF-token keys. The server sees opaque keys and values, and the access pattern that each index kind leaks (§5.6 below). Sections 1–9 cover the database (Part A), sections 10–18 the broker (Part B). Section 19 covers CRDT tables (Part D).
+`@zen/db` is a client-side database over zen-serve's encrypted KV ([`spec/zendb.md`](../spec/zendb.md) Part A). Rows, indexes and the catalog are sealed KV values under PRF-token keys. The server sees opaque keys and values, and the access pattern that each index kind leaks (§5.6 below). Sections 1–9 cover the database (Part A), sections 10–18 the broker (Part B). Section 19 covers CRDT tables (Part D), section 20 Loro documents (`@zen/loro`).
 
 ## 1. Opening
 
@@ -430,3 +430,31 @@ CRDT reads keep the states they fetch in a cache (`DbOptions.crdtCache`, default
 * **`DbOptions.indexer: false`** keeps an instance from running the indexer (tests use it to make lag). An instance runs it for the tables that had indexes when it opened; migrations run at open, so that is the normal case.
 * **In tests**, wait for the indexer by polling a query (or `$ixrows`) until it shows the change.
 
+
+## 20. Loro documents
+
+`@zen/loro` keeps [Loro](https://loro.dev) documents (rich text, lists, maps, movable trees) in a database ([`spec/zendb.md`](../spec/zendb.md) §20). They merge on the client: the server stores sealed updates and snapshots, and sees neither the content nor what an edit did.
+
+```ts
+import { openLoro } from '@zen/loro';
+
+const card = await openLoro(db, `card/${id}`);   // db: an open Db
+await card.ready;                                // caught up (or offline)
+card.doc.getText('body').insert(0, 'Hello');
+card.doc.commit();                               // emitted shortly after
+card.onChange(() => render(card.doc.toJSON()));  // edits from elsewhere
+await card.flush();                              // optional: wait until emitted
+await card.close();
+```
+
+* **Where it lives.** Each document has its own topic, `("zen", "loro", ns, name)`, carrying `zen.loro.update` messages. The `$loro` system table holds a snapshot per document and the offset of the last event it covers.
+* **Loading.** The kept state on the device, then the `$loro` snapshot if it is newer, then the events after it, then live ones. `ready` resolves once that is done, or once the server couldn't be reached; the handle keeps trying with backoff (and on `flush()`). `online` tells which.
+* **Edits** are stored in an outbox before they are sent, gathered for `batchMs` (default 50 ms), merged into one update, and emitted in one commit. `pending` counts the unsent ones; `flush()` waits for them, and rejects with `offline` when the server can't be reached.
+* **Offline.** With `DbOptions.local`, the document's state and its outbox are kept in the store `loro/<ns>` (even with `persist: false`): a document opens offline, and edits made offline survive restarts and go out once online. Without a local store the outbox is in memory, so `flush()` before `close()`. `Db.wipe` clears it.
+* **Resends are harmless.** An edit sent twice (a crash or a lost reply between the commit and the outbox delete) is ignored by Loro the second time.
+* **Compaction.** The owner of each open database writes a snapshot to `$loro` after `snapshotEvery` events (default 100) or `snapshotBytes` of updates (default 1 MiB), and `compact()` writes one now. The offset only moves forward, so two writers never undo each other and no leader is needed.
+* **Limits.**
+  * A snapshot must fit one commit (`max_commit_bytes`, 8 MB by default). A larger one keeps the stored snapshot, warns once and stops compacting that document; loads then read more of the log (TD-LORO-LARGE-SNAPSHOT). `compact()` fails with `too_large`.
+  * A single update too large for a commit (a very large paste) can't be sent: it is dropped with a warning.
+  * Events stay in the log after a snapshot covers them (TD-LOG-RETENTION).
+* **Tabs.** Each tab has its own `LoroDoc` and sends its own edits; live events reach other tabs through the owner's stream (§9.2), and only the owner compacts.

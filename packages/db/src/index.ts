@@ -2,6 +2,7 @@
 // (spec/zendb.md, docs/DB.md).
 
 export {
+  appendMsg,
   attemptOf,
   type ChangeBody,
   type ConsumeOptions,
@@ -15,6 +16,7 @@ export {
   type OnOptions,
   OnSubscription,
   type OnTarget,
+  openMessage,
   type SourceSub,
   type StreamSource,
 } from './broker.js';

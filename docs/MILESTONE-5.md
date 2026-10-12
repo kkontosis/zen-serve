@@ -395,6 +395,15 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Tests:** `packages/fuse/test/mount.test.ts` (11): the existing ones on replicas, symlinks, xattrs (through `python3`), a 1-byte kernel write sending one chunk and one page, and the CLI over three runs (device key into the vault with a pin; the vault alone; the server down, refused without `--offline-ok`, mounted from the cache with it, an unread file `EIO`); `writes.test.ts` +2. 365 vitest tests in all.
     * PR #32 merged (CI green on all 8 checks).
 * **Step 9** (`@zen/loro`): planned in detail (see "Step 9"). User decisions: doc + outbox kept on the local store; snapshots in a `$loro` system row; compaction by the owner at a threshold. PR #32 is merged, so the plan commit restarts the branch from main and opens a new PR, which step 9 joins.
+  * **Step 9** (`@zen/loro`): done, PR #33. As planned, with these details for step 10:
+    * **`packages/loro`** (`@zen/loro`, `loro-crdt` 1.16.3): `openLoro(db, name, {snapshotEvery, snapshotBytes, batchMs, keepMs})` → `LoroHandle` (`doc`, `topic`, `ready`, `online`, `pending`, `lastOffset`, `onChange`, `flush`, `compact`, `close`); `LORO_UPDATE`. It resolves once the kept state and the outbox are loaded; `ready` once the server was reached or found unreachable (the loader retries with backoff, woken by `flush`).
+    * **Merging:** a batch of local updates becomes one update with `export({mode: 'updates-in-range'})` over the spans `decodeImportBlobMeta` gives (merging in a fresh doc fails: later updates depend on ones already sent); updates that don't fit go one per emit. A batch is one commit, at most 256 KiB of updates; on `too_large` it goes one update per commit, and a single update too large is dropped with a warning.
+    * **`@zen/db`:** `$loro` in `SYSTEM_TABLES`; `appendMsg` and `openMessage` exported (the class's `zen.` type); `db.local`; `localStores(ns)` gains `loro`.
+    * **Decisions beyond the plan:** the outbox and kept state live in `loro/<ns>` even with `persist: false` (unsent edits are data, not cache); an explicit `compact()` of a too-large snapshot rejects with `too_large`.
+    * **Test note:** a commit whose reply is lost is replayed by the client with the same `commit_id` (`sendCommit`, 4 tries), so a duplicate event needs all 4 replies lost.
+    * **⚠️ Spec:** zendb.md §9.3 (`loro/<ns>`), §11.5 (`$loro`), new §20 (Part E).
+    * **Docs:** `docs/DB.md` §20, `docs/API.md` (the CRDT line), TECH_DEBT TD-LORO-LARGE-SNAPSHOT; CI typechecks `packages/loro/tsconfig.test.json`.
+    * **Tests:** `packages/loro/test/loro.test.ts` (9: two installations converge, snapshot plus a 10-event tail, offline across a restart on the Node disk store, resends after lost replies and a crash, two owners compacting at once, an explicit compaction and a load reading no events, wipe, a snapshot too large for a 64 KiB commit, tabs where only the owner compacts). The outbox write and the owner check were each checked to fail when removed. 374 vitest tests in all.
 
 ## Facts the work must respect (from the code survey)
 

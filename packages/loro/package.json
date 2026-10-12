@@ -1,0 +1,25 @@
+{
+  "name": "@zen/loro",
+  "version": "0.1.0",
+  "description": "zen-loro: Loro documents on zen-db topics (spec/zendb.md §20)",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "@zen/client": "0.1.0",
+    "@zen/db": "0.1.0",
+    "loro-crdt": "1.16.3"
+  },
+  "sideEffects": false
+}

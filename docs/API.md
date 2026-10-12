@@ -124,7 +124,8 @@ await home.writeFile("notes.txt", bytes); await home.readdir("/");
 await home.transact(async (t) => { await t.rename("a", "b"); await t.writeFile("c", x); });
 
 // ---------- CRDT ----------
-const doc = await zen.loro("docs/shopping-list");       // snapshot in KV, updates on a topic
+const list = await openLoro(db, "shopping-list");      // @zen/loro: snapshot in a row, updates on a topic
+list.doc.getList("items").push("milk"); list.doc.commit();
 
 // ---------- admin ----------
 await zen.admin.keyslots.add({ webauthn }); await zen.admin.acl.grant(user, "/home/user", ["read"]);
