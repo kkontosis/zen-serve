@@ -34,7 +34,7 @@ cargo build -p zen-server && scripts/build-wasm.sh   # once
 npm run build:apps                 # apps/dist/<name>/ (bundles, WASM), workers/*.mjs
 node scripts/build-apps.mjs kanban --watch
 npx vitest run apps/<name>         # scenarios (the worker bundles must be built)
-npx playwright test --project apps # browser specs (builds the apps first)
+npx playwright test --project=apps # browser specs (builds the apps first)
 ```
 
 To try an app by hand, run zen-serve with `unencrypted_dir = "<repo>/apps/dist"` and open `http://localhost:<port>/unencrypted/<name>/index.html`. A member needs a password (`session.setPassword`) and the fs a passphrase slot; `startWorld` in `harness.ts` shows the set-up.
@@ -43,5 +43,5 @@ To try an app by hand, run zen-serve with `unencrypted_dir = "<repo>/apps/dist"`
 
 * Write only under `apps/<name>/`. A change needed in a package, in `apps/shared` or in the wiring is asked for, not made.
 * No new dependencies.
-* Before calling it done: `npx biome check apps/<name>`, `npx tsc -p apps/tsconfig.json`, `npx vitest run apps/<name>` three times, `npx playwright test apps/<name>`. Report every flaky run.
+* Before calling it done: `npx biome check apps/<name>`, `npx tsc -p apps/tsconfig.json`, `npx vitest run apps/<name>` three times, `npx playwright test --project=apps apps/<name>`. Report every flaky run.
 * Kill only the processes a test started (`WorkerProcess.kill`), never by name or pattern.
