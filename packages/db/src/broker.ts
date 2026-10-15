@@ -274,6 +274,11 @@ export interface OnOptions {
   /** Start after this offset: history first, then live. Default: new events only. */
   after?: Uint8Array;
   /**
+   * Where to start without `after` or a stored cursor: `now` (default, new
+   * events only) or `earliest` (the whole history, then live).
+   */
+  start?: 'now' | 'earliest';
+  /**
    * A durable cursor (`$cursors`, per device): the handler runs in a
    * transaction that advances it, so its database effects happen exactly
    * once per device and name.
@@ -295,6 +300,9 @@ export interface OnOptions {
 export type OnHandler<B = Value> = (msg: Message<B>, tx: DbTransaction) => unknown;
 
 const isTopic = (t: OnTarget): t is Topic => 'id' in t;
+
+/** The offset before every event. */
+const EARLIEST = new Uint8Array(12);
 
 /** An `on` subscription. */
 export class OnSubscription {
@@ -322,7 +330,7 @@ export class OnSubscription {
 
   /** @internal */
   async start(): Promise<void> {
-    let after = this.opts.after;
+    let after = this.opts.after ?? (this.opts.start === 'earliest' ? EARLIEST : undefined);
     if (this.opts.cursor !== undefined) {
       const row = await this.db.table('$cursors').get([this.db.device, this.opts.cursor]);
       if (row?.offset instanceof Uint8Array) after = row.offset;

@@ -65,7 +65,7 @@ const fs = await session.fs(1).unlock({ passphrase: 'open sesame' });
 * After an **OPAQUE** sign-in, or a **passkey** sign-in that asked for the PRF output (`prfSalts`, from `prfSlotSalts(header)`), `unlock()` with no argument opens the matching slot: one prompt signs in and unlocks.
 * **Admins** create the header (`fs(1).init(keys => [slots…])`) and change it: `addPassphrase`, `addRecovery` (returns the key, to show once), `addDevice`, `addPasskey`, `addOpaque`, `removeSlot`. Changes are compare-and-set on the header version, retried on a concurrent change. Members can't write the header yet (`TD-FS-HEADER-SELF-SLOT`): they prepare a slot and an admin adds it.
 * **Rotation** (`fs.rotate(keys => [new slots])`) starts a new epoch, removes every old slot and adds the new ones. Data sealed under older epochs stays readable through the epoch chain. A handle unlocked by a slot of an older epoch reads, but refuses to seal (`stale_slot`).
-* `fs.close()` zeroizes the keys. Keys and secrets live in WASM memory behind handles; free handles you created yourself (`.free()`).
+* `fs.close()` zeroizes the keys; using them afterwards throws `closed`. Keys and secrets live in WASM memory behind handles; free handles you created yourself (`.free()`).
 * **Offline.** `unlock(how, {local})` keeps the header on a local store (§10) and unlocks from it when the server can't be reached. The store can't have the fs layer (it needs the keys being unlocked): an app that wants the fs layer for its data uses two `sealedStore`s over one backend. `fs(1).forget(local)` deletes the kept header at sign-out. Offline, sign in by resuming the session the app kept (`client.resume(token)`); a resumed session holds no unlock material, so pass it to `unlock` explicitly.
 
 ## 5. KV and transactions
@@ -121,7 +121,7 @@ await stream.publish(topic, data);                        // ephemeral: not in t
 
 * Subscriptions survive dropped connections: the stream reconnects with backoff and resumes each subscription after the last offset it delivered, so nothing is lost or repeated. A subscription without `after` starts at the read version when it was made, for the same reason.
 * A prefix subscription (`{fs, prefix, topics}`) opens the events of the topics it is given; others arrive unopened (`opened: false`), since topic ids can't be turned back into paths.
-* Ephemeral messages are sealed like events, under a reserved key token, and carry the sender's HLC; receivers drop replays.
+* Ephemeral messages are sealed like events, under a reserved key token, and carry the sender's HLC and the publishing stream's id (12 random bytes, in the causation field); receivers drop replays per sender and stream (api.md §9.2), so two sessions of one device don't drop each other's messages.
 
 ## 8. The filesystem
 

@@ -481,6 +481,8 @@ export class CrdtQueue {
       try {
         tx = await this.build(batch);
       } catch (e) {
+        // Closed while building: the entries stay in the store for the next open.
+        if (this.closed) return;
         if (isNetwork(e)) {
           await this.offline(down++);
           continue;

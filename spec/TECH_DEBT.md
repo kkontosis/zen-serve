@@ -244,7 +244,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-EPHEMERAL-SAME-DEVICE
 
-* **Status:** open
+* **Status:** resolved, by the commits "spec: ephemeral replay checks per publishing stream" and "client, db: closes fence work in flight, ephemeral replays per stream, `on` from the start" (milestone 5 step 11): an ephemeral message carries its stream's id in the causation field, and receivers check replays per `(topic, sender, stream)` (api.md §9.2); test in `packages/client/test/stream.test.ts`.
 * **Context:** The stream drops an ephemeral message as a replay unless its HLC is newer than the last one seen from its sender device on that topic (`packages/client/src/stream.ts`, `openEphemeral`). Two sessions of one device keep separate clocks, so they can drop each other's ephemeral messages: presence replies and typing indicators get lost. Found by the chat app (milestone 5 step 10), whose test uses one device per instance.
 * **Why deferred:** Found while integrating the apps; one device per running instance is the normal case.
 * **What it would take:** Key the replay filter by sender session (an id in the ephemeral envelope), or share one clock store per device across its sessions, with a test of two sessions of one device exchanging ephemeral messages.
@@ -275,14 +275,14 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-DB-ON-FROM-START
 
-* **Status:** open
+* **Status:** resolved, by the commit "client, db: closes fence work in flight, ephemeral replays per stream, `on` from the start" (milestone 5 step 11): `OnOptions.start: 'now' | 'earliest'` (docs/DB.md §11); the ledger app uses it.
 * **Context:** A durable `on(..., {cursor})` with a new cursor starts at new events. To read a topic from its beginning (the ledger's audit view), an app passes `after: offsetAfterVersion(0n)` from `@zen/client`.
 * **Why deferred:** Minor; the workaround is one line.
 * **What it would take:** An `OnOptions.start: 'now' | 'earliest'` as consumer groups have, documented in docs/DB.md §11.
 
 ## TD-DB-CLOSE-INFLIGHT
 
-* **Status:** open
+* **Status:** resolved, by the commit "client, db: closes fence work in flight, ephemeral replays per stream, `on` from the start" (milestone 5 step 11): `Db.close()` waits (at most 5 s) for its running transactions and manual commits, which fail `DbError('closed')` at their next read or commit; calls after it fail `closed`; `UnlockedFs` keys throw `ZenError(0, 'closed')` after `close()`. Tests in `packages/db/test/txn.test.ts` and `packages/client/test/unlock.test.ts`.
 * **Context:** `Db.close()` and `UnlockedFs.close()` don't fence transactions in flight. A transaction still running after its fs is closed uses freed WASM keys and fails with WASM's `null pointer passed to rust` rather than a clear `closed` error. Seen in CI on milestone 5 step 10 (a chat test closed an fs while receipt writes it had started were still running; the test now waits for them).
 * **Why deferred:** Callers that await their own work never hit it; found while integrating the apps.
 * **What it would take:** `Db.close()` waits for (or rejects with `DbError('closed')`) its open transactions and handler runs; `UnlockedFs` checks a `closed` flag before using its keys and throws `ZenError(0, 'closed')`; a test closing during a transaction.

@@ -213,6 +213,8 @@ const NODE_CACHE = 4096;
 /** `importRows` batch sizes (§7.5). */
 const IMPORT_FIRST = 256;
 const IMPORT_MAX = 4096;
+/** How long `close` waits for running transactions. */
+const CLOSE_WAIT_MS = 5000;
 
 /** A cached row: its fields at `version` (§7.7). */
 interface CachedRow {
@@ -272,6 +274,9 @@ export class Db {
   /** Rows by stored key (hex), least recently used first. */
   private readonly rows = new Map<string, CachedRow>();
   private owner: Owner | undefined;
+  private shut = false;
+  /** Transactions running now: `close` waits for them before freeing the keys. */
+  private readonly running = new Set<Promise<unknown>>();
   /** The caches on the local store (§9.3), with `DbOptions.local`. */
   private readonly persisted:
     | { db: LocalCache; rows: LocalCache; crdt: LocalCache; nodes: LocalCache; sealed: LocalCache }
@@ -543,7 +548,15 @@ export class Db {
    * Run `fn` in a transaction and commit it (§7). It may run several times,
    * so it must have no side effects but through the transaction.
    */
-  async transaction<R>(fn: (tx: DbTransaction) => Promise<R>, opts: DbTxnOptions = {}): Promise<R> {
+  transaction<R>(fn: (tx: DbTransaction) => Promise<R>, opts: DbTxnOptions = {}): Promise<R> {
+    if (this.shut) return Promise.reject(new DbError('closed', 'the database is closed'));
+    return this.track(this.runTransaction(fn, opts));
+  }
+
+  private async runTransaction<R>(
+    fn: (tx: DbTransaction) => Promise<R>,
+    opts: DbTxnOptions,
+  ): Promise<R> {
     let last: DbTransaction | undefined;
     const read = opts.read ?? this.opts.crdtRead ?? 'auto';
     const queue = opts.queue ?? this.opts.crdtQueue ?? true;
@@ -613,6 +626,7 @@ export class Db {
    * automatic retry: `conflict` reaches the caller.
    */
   begin(opts: { mode?: 'short' | 'long'; consumes?: Delivered<unknown> } = {}): ManualTransaction {
+    this.checkOpen();
     const mode = opts.mode ?? 'short';
     if ((mode as string) === 'auto') {
       throw new DbError('bad_value', 'a manual transaction is short or long');
@@ -663,6 +677,24 @@ export class Db {
       }
     }
     return done;
+  }
+
+  /** Whether `close` was called. */
+  get closed(): boolean {
+    return this.shut;
+  }
+
+  /** @internal Throw `closed` after `close`. */
+  checkOpen(): void {
+    if (this.shut) throw new DbError('closed', 'the database is closed');
+  }
+
+  /** @internal Count `p` as running until it settles (`close` waits for it). */
+  track<P extends Promise<unknown>>(p: P): P {
+    this.running.add(p);
+    const done = () => this.running.delete(p);
+    p.then(done, done);
+    return p;
   }
 
   /** Whether this instance is the owner (§9.2). */
@@ -915,10 +947,14 @@ export class Db {
   }
 
   /**
-   * Free the database keys and caches, stop its consumers and
-   * subscriptions, and hand the owner role over.
+   * Stop its consumers and subscriptions, hand the owner role over, wait
+   * for the transactions still running (at most 5 s; they fail `closed` at
+   * their next read or commit), then free the database keys and caches.
+   * Resolves once the caches are written. Every later call fails `closed`.
    */
-  close(): Promise<void> {
+  async close(): Promise<void> {
+    if (this.shut) return;
+    this.shut = true;
     const flushed = this.flushLocal();
     this.unQueue?.();
     this.crdtQueue?.close();
@@ -935,6 +971,16 @@ export class Db {
     for (const t of this.topics.values()) t.close();
     this.topics.clear();
     this.owner?.close();
+    if (this.running.size) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.running]),
+        new Promise((r) => {
+          timer = setTimeout(r, CLOSE_WAIT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
     for (const k of this.ixKeys.values()) k.free();
     this.ixKeys.clear();
     for (const k of this.crdtKs.values()) k.free();
@@ -943,7 +989,7 @@ export class Db {
     this.nodes.clear();
     this.sealed.clear();
     this.keys.db.free();
-    return flushed;
+    await flushed;
   }
 
   // ------------------------------------------------------------ row cache

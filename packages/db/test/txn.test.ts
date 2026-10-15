@@ -448,3 +448,54 @@ describe('the owner (§9.2)', () => {
     expect(no.isOwner).toBe(false);
   });
 });
+
+describe('closing with work in flight', () => {
+  it('close waits for a running transaction, which fails `closed`, not on freed keys', async () => {
+    const db = await itemsDb(ns());
+    await db.table<Item>('items').insert({ id: 'a', v: 1, rank: 1 });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => {
+      entered = r;
+    });
+    const running = db.transaction(async (tx) => {
+      const t = tx.table<Item>('items');
+      await t.get('a');
+      entered();
+      await gate;
+      // The keys would be freed by now without the wait in close().
+      await t.update('a', (r) => ({ ...r, v: 2 }));
+    });
+    await inside;
+    let closed = false;
+    const closing = db.close().then(() => {
+      closed = true;
+    });
+    await sleep(50);
+    expect(closed).toBe(false);
+    expect(await code(db.transaction(async () => {}))).toBe('closed');
+    expect(() => db.begin()).toThrow(DbError);
+    release();
+    expect(await code(running)).toBe('closed');
+    await closing;
+    expect(closed).toBe(true);
+    expect(db.closed).toBe(true);
+    // Closing twice is harmless.
+    await db.close();
+  });
+
+  it('a manual commit in flight is waited for', async () => {
+    const db = await itemsDb(ns());
+    const tx = db.begin();
+    await tx.table<Item>('items').insert({ id: 'm', v: 1 });
+    const committed = tx.commit();
+    await db.close();
+    expect(await code(committed)).toBe('ok');
+    const again = await itemsDb(db.ns);
+    expect((await again.table<Item>('items').get('m'))?.v).toBe(1);
+    await again.close();
+  });
+});

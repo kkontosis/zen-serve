@@ -246,7 +246,7 @@ The five apps are in [`apps/`](../apps/) (layout, build and tests: [`apps/README
   * presence: the request is an event on `("presence")`; each instance answers with an ephemeral reply (`db.reply(m, body, {ephemeral: true})`)
   * Chromium's offline mode keeps an open WebSocket, so the page stops reading on `offline` and resumes from the last offset shown on `online`
   * no private index (§2 lists none, though the table above ticks one)
-  * found TD-EPHEMERAL-SAME-DEVICE: two sessions of one device can drop each other's ephemeral messages
+  * found TD-EPHEMERAL-SAME-DEVICE: two sessions of one device could drop each other's ephemeral messages (fixed in step 11: replays are checked per stream)
 * **Booking** (`apps/booking`):
   * as specified; reminders and promotions are message types `reminder` and `promoted` on `("booking", "notify")`, keyed by slot
   * a promotion consumes the event without booking when the slot was booked again meanwhile
@@ -260,5 +260,5 @@ The five apps are in [`apps/`](../apps/) (layout, build and tests: [`apps/README
   * consumers poll with `waitMs: 2000` (TD-CONSUME-CLAIM-WAKE); `$sched` is the contention point under load (TD-SCHED-HOTSPOT)
 * **Ledger** (`apps/ledger`):
   * as specified, plus `accounts.at` (entry times strictly increase per account), `entries.transfer`, `statements.count`, an index on `accounts.owner`, and `statements` change events so other pages refresh
-  * the audit view keeps its read model in an `audit_view` table per device and reads the log from its start (TD-DB-ON-FROM-START)
+  * the audit view keeps its read model in an `audit_view` table per device and reads the log from its start (`start: 'earliest'`, added in step 11 for TD-DB-ON-FROM-START)
   * an overdraft is the transaction's result (its reads are still checked), then thrown as `LedgerError`; `transfer` retries with jitter when every attempt conflicts

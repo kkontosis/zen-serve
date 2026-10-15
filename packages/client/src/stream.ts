@@ -1,6 +1,6 @@
 // The WebSocket stream: subscriptions and ephemeral messages (spec/api.md §9).
 import type { Frame } from '@zen/wasm';
-import { concat, fromB64url, hex, utf8 } from './bytes.js';
+import { concat, fromB64url, hex, randomBytes, utf8 } from './bytes.js';
 import { ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
 import type { Topic, TopicEvent } from './log.js';
@@ -153,7 +153,7 @@ interface SubState {
   sub: Subscription<any>;
   /** Settles on the first `ok` or `err`. */
   started?: { ok: () => void; fail: (e: ZenError) => void };
-  /** `esub`: the newest hlc per sender and topic (replay protection, G21). */
+  /** `esub`: the newest hlc per topic, sender and stream (replay protection, api.md §9.2). */
   seen?: Map<string, bigint>;
 }
 
@@ -181,6 +181,11 @@ export class Stream {
   private nextId = 1;
   private closed = false;
   private reconnecting: Promise<void> | undefined;
+  /**
+   * This stream's id, sent in the causation field of its ephemeral
+   * messages, so receivers check replays per stream (api.md §9.2).
+   */
+  private readonly streamId = randomBytes(12);
 
   private constructor(
     readonly session: Session,
@@ -385,8 +390,8 @@ export class Stream {
       this.report(e instanceof ZenError ? e : new ZenError(0, 'decrypt', String(e)));
       return undefined;
     }
-    // A replayed message has an hlc its sender already used.
-    const k = hex(concat(f.topic, body.sender));
+    // A replayed message has an hlc its sending stream already used.
+    const k = hex(concat(f.topic, body.sender, body.causation));
     const last = s.seen!.get(k);
     if (last !== undefined && body.hlc <= last) return undefined;
     s.seen!.set(k, body.hlc);
@@ -475,12 +480,13 @@ export class Stream {
    * Publish an ephemeral message (§9.1): not stored in the log, delivered to
    * current subscribers only. It is sealed as an event body of the topic
    * under a reserved key token, so only holders of the topic key read it,
-   * and its hlc lets receivers drop replays. A refusal (`quota` when over
+   * and its hlc lets receivers drop replays (per sending stream, whose id
+   * rides in the causation field, api.md §9.2). A refusal (`quota` when over
    * the per-device rate) arrives through `onError`.
    */
   async publish(topic: Topic, data: Uint8Array): Promise<void> {
     await this.ready();
-    const sealed = topic.seal(topic.ephemeralToken(), data);
+    const sealed = topic.seal(topic.ephemeralToken(), data, this.streamId);
     if (!this.send({ op: 'epub', fs: topic.fs.id, topic: topic.id, data: sealed })) {
       throw new ZenError(0, 'network', 'the stream is not connected');
     }

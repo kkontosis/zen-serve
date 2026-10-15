@@ -32,7 +32,7 @@ const db = await Db.open(fs, 'shop', {        // fs: an UnlockedFs (docs/CLIENT.
 
   Paged steps (backfills, transforms, drops) record their progress, so a step that was interrupted resumes where it stopped. Two clients running the same step conflict page by page, and only one advances each page.
 * `pageSize` (default 256) sets the rows per migration page. `warn` receives warnings such as table scans.
-* `db.close()` frees the keys and caches, and hands the owner role over (§8).
+* `db.close()` stops the consumers and subscriptions, hands the owner role over (§8), waits for the transactions still running (at most 5 s), then frees the keys and caches. A running transaction fails `closed` at its next read or commit, and every call after `close()` fails `closed` (`db.closed` tells). `UnlockedFs.close()` likewise makes its keys throw `closed` rather than touch freed memory: close the databases first.
 
 ## 2. Tables and rows
 
@@ -198,7 +198,7 @@ In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lo
 | `corrupt` | a stored value that fails its checks |
 | `format` | an unknown format, integrity level or index kind |
 | `building` | a unique index whose backfill found duplicates |
-| `closed` | a manual transaction used after `commit` or `abort`; a request pending when the database closed |
+| `closed` | the database was closed (a call after `close()`, or a transaction still running); a manual transaction used after `commit` or `abort`; a request pending when the database closed |
 | `poisoned` | a message that doesn't decode, or whose body parts are gone |
 | `timeout` | a request without a reply in time; no owner tab answering |
 | `unsupported` | a CRDT table on a server without `"crdt_rows"` |
@@ -231,11 +231,13 @@ await db.emit(orders, 'order.note', 'hi');                      // a transaction
 ```ts
 const sub = await db.on(orders, (msg) => render(msg.body));                 // from now
 await db.on(orders, (msg) => …, { after: offset });                          // history, then live
+await db.on(orders, (msg) => …, { start: 'earliest' });                      // the whole history, then live
 await db.on(orders, async (msg, tx) => { … }, { cursor: 'projection' });     // durable
 await db.on({ prefix: db.topic('shop'), topics: [orders, payments] }, …);
 ```
 
 * **Plain:** every event while the subscription runs, in order. A handler's throw is reported and skipped.
+* **Where it starts:** `after` an offset; else, for a durable subscription, after its stored cursor; else at `start`: `now` (default, new events only) or `earliest` (the topic's whole history).
 * **Durable (`cursor`):** the handler runs in a transaction that advances a `$cursors` row, so its database effects happen exactly once per device and cursor name. `batch` events share a transaction. A throw stops the subscription (`sub.active`); a restart retries from the cursor.
 * **A dropped connection** resumes from the last offset received: nothing missed, nothing repeated.
 

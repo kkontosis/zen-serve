@@ -135,10 +135,11 @@ export class DbTransaction implements IndexTx {
 
   /**
    * @internal Called before every read and at `finish`: the short phase of
-   * `auto` switches to long once its time is up; a closed manual
-   * transaction refuses.
+   * `auto` switches to long once its time is up; a closed database or
+   * manual transaction refuses.
    */
   live(): void {
+    this.db.checkOpen();
     if (this.deadline !== undefined && Date.now() > this.deadline) throw new SwitchToLong();
   }
 
@@ -1036,11 +1037,20 @@ export class ManualTransaction extends DbTransaction {
 
   override live(): void {
     if (this.closed) throw new DbError('closed', 'the transaction was committed or aborted');
+    this.db.checkOpen();
   }
 
   /** Commit; undefined if there was nothing to send. Afterwards the transaction is closed. */
-  async commit(): Promise<CommitResult | undefined> {
-    this.live();
+  commit(): Promise<CommitResult | undefined> {
+    try {
+      this.live();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return this.db.track(this.send());
+  }
+
+  private async send(): Promise<CommitResult | undefined> {
     try {
       await this.finish();
       return await commitTransaction(this.raw);
