@@ -109,9 +109,13 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 
 | Artifact | Size |
 |---|---|
-| `zen_wasm_bg.wasm` (release, LTO, no wasm-opt) | **1.86 MB**, 525 KB gzipped |
-| WASM JS glue and declarations | 265 KB and 92 KB |
-| `@zen/client` npm package (compiled TS) | 78 KB packed, 330 KB unpacked |
+| `zen_wasm_bg.wasm` (release, LTO, no wasm-opt) | **2.14 MB**, 589 KB gzipped (1.86 MB at milestone 4; the growth is zen-db's keyed primitives, CRDT rows and paged files) |
+| WASM JS glue and declarations | 311 KB and 109 KB |
+| `@zen/client` npm package (compiled TS) | 112 KB packed, 475 KB unpacked |
+| `@zen/db` | 171 KB packed, 783 KB unpacked |
+| `@zen/fs` | 46 KB packed, 217 KB unpacked |
+| `@zen/loro` | 11 KB packed, 45 KB unpacked; `loro-crdt`'s own WASM is 3.27 MB, 1.08 MB gzipped |
+| An app bundle (`apps/dist/kanban/main.js`: client, db, fs and Loro glue, esbuild, not minified) | 959 KB, 163 KB gzipped, plus the two WASM files |
 
 ## 5. Timings
 
@@ -127,8 +131,9 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 | CI per push (cached): `rust`, `pure-rust`, `fdb` jobs | 2–4.5 min each, in parallel |
 | FoundationDB suite, after building | ~1–2 min (each test file 3–12 s; `dump.rs` ~10 s because of a deliberate cluster recovery) |
 | WASM module release build (`scripts/build-wasm.sh`), dependencies cached | ~60 s |
-| Client tests: 60 Node tests in 8 files (`npx vitest run`, a server per file, FUSE mounts included) | ~6 s |
-| Browser smoke test (`npx playwright test`) | ~3 s |
+| TypeScript tests: 417 tests in 38 files (`npx vitest run`: client, db, fs, loro, fuse and the apps, a server per file; FUSE mounts skip without `/dev/fuse`) | ~70 s |
+| Browser tests (`npx playwright test`: the smoke test and 12 app specs, after `npm run build:apps`) | ~25 s |
+| CI `client` job (wasm build, `npm ci`, typechecks, vitest with FUSE, the app build, Playwright) | ~5.5 min |
 | FoundationDB cluster start (`zen-serve init`) to Healthy | ~10–20 s |
 | `scripts/install-fdb.sh` | ~20–40 s (download and unpack) |
 | Clean build of the workspace with tests, from nothing | about 10–15 min (estimate) |
@@ -155,3 +160,50 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 | FoundationDB version clock on an idle cluster | advances in steps of up to ~2 s: leases and sweeper ages measured in versions can lag that much |
 | FoundationDB recovery (after `advance_version`, a dead process, a full disk) | seconds; transactions in flight get `commit_unknown` or `too_old` and are retried |
 | Trash purge and chunk GC | minutes to days by design: horizon 7 days, grace 24 h, sweeper every 60 s |
+
+### 5.4 zen-db costs (measured)
+
+`ZEN_BENCH=1 npx vitest run packages/db/test/bench.test.ts packages/loro/test/bench.test.ts` (opt-in, not in CI), against a local zen-serve on the embedded backend, 4 cores, one client process. Times are medians of 20 runs (5 to 10 for the slower ones), from the call to its result, so they include the round trips to the local server. Commit ops and bytes are what the step sent in `/v1/commit` (ops: KV writes, range clears, appends, consume steps, CRDT ops). The index lines insert one row into a table already holding 1,000 rows; the query lines read a table of 1,000 rows.
+
+| What | ms | Commit ops | Commit bytes |
+|---|---|---|---|
+| Row insert (small) | 4.0 | 1 | 601 |
+| Row update | 2.8 | 1 | 477 |
+| Row get, cached (one version check in the commit) | 2.3 | – | – |
+| Row get, not cached | 2.5 | – | – |
+| Padded row insert | 4.4 | 1 | 840 |
+| Row insert of 200 KB (parts) | 8.5 | 4 | 201,188 |
+| Row get of 200 KB, not cached | 6.5 | – | – |
+| Insert, no index | 3.5 | 1 | 601 |
+| Insert, unique index | 4.7 | 2 | 982 |
+| Insert, fast index | 3.9 | 2 | 786 |
+| Insert, private index (fanout 64, 1 shard) | 5.2 | 6 | 4,609 |
+| Insert, private index (4 shards) | 5.2 | 6 | 3,907 |
+| Insert, private index (2 decoys) | 5.8 | 10 | 11,327 |
+| Insert, sealed index | 5.3 | 3 | 90,112 |
+| Get by pk | 1.7 | – | – |
+| Unique equality | 1.9 | – | – |
+| Fast equality | 3.0 | – | – |
+| Private range, a page of 20 | 3.9 | – | – |
+| Sealed range, a page of 20 | 4.1 | – | – |
+| Scan of 1,000 rows with a filter (no index) | 54 | – | – |
+| `emit` in a commit of its own | 2.2 | 1 | 217 |
+| `emit` → `on` handler, latency | 25 | – | – |
+| `consume`, sequential | 4.9 per message (about 200/s) | – | – |
+| `consume`, per_key (8 in flight) | 2.5 per message (about 400/s) | – | – |
+| `request` → reply (as an event) | 6.0 | 3 | 631 |
+| A schedule delivered after its `at` | 10 | – | – |
+| CRDT insert, waiting for its commit | 14.6 | 6 | 2,184 |
+| CRDT patch, queued (resolves once stored) | 0.1 | – | – |
+| CRDT patch / incr / add / remove, waiting for the commit | 14–15 | 3–4 | 1,159–1,422 |
+| CRDT get: cache hit / expired (a version check) / not cached | 1.2 / 1.8 / 2.0 | – | – |
+| CRDT indexer: a patch until an index query finds it | 25 | – | – |
+| Loro: a local edit until another installation imports it | 4.2 | – | – |
+| Loro: open from a snapshot plus a 100-event tail | 11.7 | – | – |
+
+Reading it:
+* **Indexes.** A unique or fast index adds one write. A private index rewrites its path of nodes (here two levels) and the root, about 4 KB per insert; decoys double that. A sealed index rewrites its whole blob, padded to a power-of-two number of parts: 90 KB per insert even at 1,000 rows, so it suits small or rarely written tables.
+* **Queries.** Index reads cost one to three round trips; a scan reads every row, so an unindexed filter on 1,000 rows is about 15 times a range page.
+* **CRDT writes** are queued: they resolve in microseconds, and the queue sends them after `crdtBatchMs` (10 ms by default), which is most of the 14 ms "waiting" figure. Their commits carry the change event too.
+* **The broker.** The emit-to-handler latency is a commit plus the stream's watch wake-up. `per_key` with 8 handlers in flight doubles sequential throughput, from one client.
+* These are single-client numbers against a local server: they show relative costs and the round trips, not the throughput of a server under load.
