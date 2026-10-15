@@ -413,6 +413,8 @@ The app targets are in `docs/EXAMPLES.md`. Milestone 5 (DESIGN-3 §6) builds:
     * **Found:** TD-EPHEMERAL-SAME-DEVICE, TD-SAGA-HOOKS, TD-CONSUME-CLAIM-WAKE, TD-SCHED-HOTSPOT, TD-DB-ON-FROM-START (spec/TECH_DEBT.md). Deviations per app are in docs/EXAMPLES.md "As built".
     * **CI fix on #34:** one `client` run failed with every test passing but two unhandled rejections (`null pointer passed to rust`) from the chat restart test: its display handler fired receipt writes without awaiting them, and the restart closed the fs (freeing its WASM keys) while some still ran. The test now waits for them before each restart. The library side (closing doesn't fence transactions in flight) is TD-DB-CLOSE-INFLIGHT.
     * **Step 11 must:** check the client job's run time with the apps (split if past ~15 minutes); README's package table still lacks `@zen/fs` and `@zen/loro` and calls the broker "to come".
+    * PR #34 merged (CI green on `00b5c1a`). **Step 10 is done.** Step 11 starts from main: restart the branch, plan it, open a new PR.
+* **Step 11** (library fixes, measurements, docs, outcome): planned in detail (see "Step 11": 11a, 11b, 11c in one PR). User decisions: fix TD-DB-CLOSE-INFLIGHT, TD-EPHEMERAL-SAME-DEVICE and TD-DB-ON-FROM-START; measure with a committed opt-in bench (`ZEN_BENCH=1`). The plan commit restarts the branch from main and opens a new PR.
 
 ## Facts the work must respect (from the code survey)
 
@@ -2842,20 +2844,106 @@ So no agent installs packages or builds Rust. Disk: about 4.4 GB is free, and wo
    3. 10c: merge, verify, log, push, CI green.
    4. Stop for compaction.
 
-## Step 11: CI, docs, outcome
-* **CI:**
-  * the `rust` job covers CRDT rows on both backends (the existing fdb job)
-  * the `client` job builds and tests `@zen/db`, `@zen/fs` and `@zen/loro`, the apps' bundles, and Playwright for all apps
-  * check run time; split jobs if it passes ~15 minutes
-* **Docs:**
-  * `docs/DB.md`: usage guide of the `Db` class
-  * `docs/CLIENT.md`: fs replica, zen-mount, Loro
-  * `docs/STATS.md`: wasm size, prolly and sealed costs, broker latencies, CRDT row costs
-  * `spec/OPS.md` pitfalls; README
-* **TECH_DEBT:**
-  * resolve TD-CRDT-ROWS-SERVER and TD-FUSE-REPLICA
-  * add TD-DB-OBLIVIOUS-INDEX, plus anything deferred
-* **Wrap-up:** the Outcome section, then a PR.
+## Step 11: three library fixes, measurements, docs, outcome (detailed plan)
+
+**Context.** Steps 1–10 (PRs #12–#34, all merged) built everything milestone 5 promised. Step 11 closes the milestone:
+* three small library gaps the apps found
+* measured numbers in `docs/STATS.md`
+* docs that match the code
+* the Outcome section
+
+**Original outline:** CI run time (split if past ~15 min), docs (DB.md, CLIENT.md, STATS.md, OPS.md, README), TECH_DEBT bookkeeping, the Outcome.
+
+**User decisions:**
+* **Measurements:** a committed bench, opt-in (`ZEN_BENCH=1`), not run in CI.
+* **Fixes:** TD-DB-CLOSE-INFLIGHT, TD-EPHEMERAL-SAME-DEVICE and TD-DB-ON-FROM-START are fixed here. The other new TDs (TD-SAGA-HOOKS, TD-CONSUME-CLAIM-WAKE, TD-SCHED-HOTSPOT) stay open.
+
+**Already true (survey):**
+* **CI:** the `client` job with the apps takes about 5.5 min (`00b5c1a`), far from the 15-minute threshold, so no split.
+* **Tech-debt bookkeeping:** done step by step. TD-CRDT-ROWS-SERVER, TD-FUSE-REPLICA, TD-DB-PERSISTENT-CACHE, TD-DB-TAB-PROXY and TD-FS-LARGE-FILES are resolved; TD-DB-OBLIVIOUS-INDEX exists.
+* **Stale docs:**
+  * README: the `@zen/db` row says "the broker and CRDT tables to come"; `@zen/fs` and `@zen/loro` have no rows; milestone 5 is "in progress".
+  * `docs/STATS.md` §4.1 gives the wasm as 1.86 MB (now about 2.14 MB); §5.1 gives 60 client tests in about 6 s (now 412 in about 65 s).
+  * `docs/CLIENT.md` doesn't point to Loro (DB.md §20).
+
+**After compaction, re-read:** this section; the step 10 log; `packages/client/src/{stream,fs,log}.ts`; `packages/db/src/{db,txn,broker}.ts`; `docs/STATS.md`; `spec/TECH_DEBT.md` (the last seven entries); `spec/api.md` §9; README; the Outcome section of `docs/MILESTONE-4.md` (its shape).
+
+**Branch/PR.** #34 is merged: restart from main (`9cefe83`), commit this plan (`docs: milestone 5 step 11 plan`, syncing `docs/MILESTONE-5.md` with the "PR #34 merged" line), open a new PR.
+
+### 11a: three library fixes
+
+1. **TD-DB-CLOSE-INFLIGHT** (`@zen/client` `fs.ts`, `@zen/db` `db.ts`, `txn.ts`):
+   * **`UnlockedFs`:** a `closed` flag set by `close()`. `keys`, `keysAt` and `sealKeys` then throw `ZenError(0, 'closed', 'the fs is closed')`, never touching freed WASM keys.
+   * **`Db`:**
+     * a `closed` flag; `transaction`, `begin`, `emit` and table calls after `close()` throw `DbError('closed')`
+     * `DbTransaction.live()` checks it, so a running transaction stops at its next read or its `finish`
+     * open transactions are tracked (a `Set` of their promises in `Db.transaction` and `ManualTransaction`)
+   * **`close()`:** stops the background work as now, then awaits the open transactions (`allSettled`, bounded at 5 s), then frees the keys. It still resolves once the caches are written.
+   * **Tests:**
+     * `txn.test.ts`: a transaction blocked in `fn`, `close()`, then the transaction rejects with `DbError('closed')` (not a WASM error), and `close()` resolves after it.
+     * `kv.test.ts` (or `unlock.test.ts`): an fs used after `close()` gives `closed`.
+     * Each is checked to fail without the change.
+2. **TD-EPHEMERAL-SAME-DEVICE** (⚠️ spec, `@zen/client` `stream.ts`, `log.ts`):
+   * An ephemeral body carries a per-stream random 12-byte **session id** in its `causation` field. Causation is unused for ephemeral messages, so the wire and seal formats don't change.
+   * Receivers keep the replay check per `(topic, sender, session id)` instead of `(topic, sender)`.
+   * Messages from an older client (all-zero causation) keep today's behaviour.
+   * **Spec:** api.md §9 (the replay rule), plus the G21 note in GAPS.
+   * **Test** (`stream.test.ts`): two sessions of one device publish to a topic a third session subscribes to; each message arrives once. A replayed sealed message is still dropped. Checked to fail without the change.
+   * The chat test may then use one device for two instances again; not required.
+3. **TD-DB-ON-FROM-START** (`@zen/db` `broker.ts`):
+   * `OnOptions.start?: 'now' | 'earliest'`. `earliest` means `after` = 12 zero bytes (as the inbox does). An explicit `after`, or a stored cursor, takes precedence.
+   * **Test** (`broker.test.ts`): a durable `on` with a new cursor and `start: 'earliest'` sees events emitted before it.
+   * **Ledger app:** `apps/ledger/src/ledger.ts` drops its `offsetAfterVersion(0n)` workaround.
+4. **Docs:**
+   * `docs/DB.md`: `close()` and in-flight transactions in §1, the `closed` error, `start` in §11.
+   * `docs/CLIENT.md` §7: ephemeral replay per session.
+   * `spec/TECH_DEBT.md`: the three marked resolved.
+   * The chat test's `settle()` stays (still correct); the "As built" notes in EXAMPLES.md for chat and ledger are updated.
+
+### 11b: measurements (`packages/db/test/bench.test.ts`, opt-in)
+
+`describe.skipIf(!process.env.ZEN_BENCH)`, its own server, printing a table (median of N runs, plus commit ops and bytes taken from `/v1/commit` requests through a wrapped `session.call`):
+
+| What | Measured |
+|---|---|
+| rows | insert, get (cold, cached), update; a padded and a parted row |
+| one index write, per kind | unique, fast, private (fanout 64; shards 1 and 4; decoys 2), sealed: commit ops and bytes, ms |
+| queries | pk, unique, fast equality, a private range page of 20, a sealed range; at 1,000 rows |
+| broker | emit → `on` latency; `consume` throughput (sequential, per_key); request/reply round trip; a schedule's lateness |
+| CRDT rows | patch, incr, add/remove (queued and direct), get (auto cache hit, version check, miss); indexer lag for one change |
+| Loro | an update's emit-to-import latency; load from a snapshot plus a 100-event tail |
+| sizes | `zen_wasm_bg.wasm` (and gzipped); an app bundle (`apps/dist/kanban/main.js`) |
+
+* Run once locally (`ZEN_BENCH=1 npx vitest run packages/db/test/bench.test.ts`), embedded backend, 4 cores.
+* The numbers go into `docs/STATS.md` as a new section, "zen-db costs (measured)", with the command to re-measure.
+* Also in STATS: §4.1 (wasm and the package sizes), §5.1 (the test counts and times; CI client job about 5.5 min).
+
+### 11c: docs and the outcome
+
+* **README:**
+  * the package table: `@zen/db` (the database, the broker, CRDT tables), new rows for `@zen/fs` and `@zen/loro`
+  * status: milestone 5 done
+* **`docs/CLIENT.md`:** a pointer to DB.md §20 for Loro (the replica and zen-mount sections are current since step 8).
+* **`spec/OPS.md`:** a short "TypeScript tests" pitfalls list:
+  * a test server per file
+  * `--project=apps`
+  * build the apps before their vitest run
+  * never close a database with work in flight (fixed now, but the habit stays)
+  * kill only spawned PIDs
+* **`docs/MILESTONE-5.md`:** an **Outcome** section in the M4 shape: done, the differences from the plan (the decisions logged per step, condensed), the tests (counts per package, times), and the new and resolved tech debt. README links it.
+* **Spec:** only the 11a ephemeral rule.
+
+### Verification
+* `npm run check`; `npx vitest run` three times; `npx playwright test` (smoke and apps); `ZEN_BENCH=1` bench once.
+* Rust is unchanged (no build).
+* CI green on the PR.
+
+### Rhythm
+1. Restart from main, commit the plan, open a new PR, stop.
+2. On the user's go:
+   * 11a: the `spec:` commit, then the code commit
+   * 11b, 11c: a docs commit each
+3. Log the step 11 line in both plan copies (milestone 5 done), push, confirm CI green, stop.
 
 ## Commits (push after each green step)
 1. plan doc
