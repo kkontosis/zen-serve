@@ -1,0 +1,55 @@
+body {
+  font:
+    15px / 1.4 system-ui,
+    sans-serif;
+  margin: 0;
+}
+#zen-status {
+  background: #eee;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+#app,
+#zen-signin {
+  padding: 12px;
+  max-width: 720px;
+}
+#zen-signin input,
+#zen-signin button {
+  display: block;
+  margin: 6px 0;
+}
+.zen-error {
+  color: #b00;
+}
+table {
+  border-collapse: collapse;
+}
+td,
+th {
+  padding: 2px 10px;
+  text-align: left;
+}
+td.balance {
+  text-align: right;
+}
+#app form,
+.row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 6px 0;
+}
+#history,
+#audit {
+  padding-left: 18px;
+}
+.entry span {
+  margin-right: 12px;
+}
+.amount {
+  display: inline-block;
+  min-width: 48px;
+  text-align: right;
+}

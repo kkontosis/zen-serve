@@ -1,0 +1,18 @@
+{
+  "extends": "../packages/client/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "..",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "paths": {
+      "@zen/client": ["../packages/client/src/index.ts"],
+      "@zen/client/node": ["../packages/client/src/node.ts"],
+      "@zen/db": ["../packages/db/src/index.ts"],
+      "@zen/fs": ["../packages/fs/src/index.ts"],
+      "@zen/loro": ["../packages/loro/src/index.ts"]
+    }
+  },
+  "include": ["*/src", "*/ui", "*/test", "*/e2e", "*/workers", "shared"],
+  "exclude": ["dist"]
+}

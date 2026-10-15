@@ -1,11 +1,16 @@
 import { defineConfig } from '@playwright/test';
 
-// Browser smoke tests of @zen/client (packages/client/browser). Build first:
+// Browser tests. Build first:
 //   cargo build -p zen-server && scripts/build-wasm.sh && npm run build -w @zen/client
+// * smoke: @zen/client in Chromium (packages/client/browser)
+// * apps: the example apps (apps/*/e2e), bundled by the global setup
 export default defineConfig({
-  testDir: 'packages/client/browser',
-  testMatch: '*.spec.ts',
   timeout: 120_000,
   use: { browserName: 'chromium', headless: true },
   reporter: 'list',
+  projects: [
+    { name: 'smoke', testDir: 'packages/client/browser', testMatch: '*.spec.ts' },
+    { name: 'apps', testDir: 'apps', testMatch: '*/e2e/*.spec.ts' },
+  ],
+  globalSetup: './scripts/playwright-setup.ts',
 });

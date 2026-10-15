@@ -1,0 +1,45 @@
+body {
+  font:
+    15px / 1.4 system-ui,
+    sans-serif;
+  margin: 0;
+}
+#zen-status {
+  background: #eee;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+#app,
+#zen-signin {
+  padding: 12px;
+  max-width: 640px;
+}
+#zen-signin input,
+#zen-signin button {
+  display: block;
+  margin: 6px 0;
+}
+.zen-error {
+  color: #b00;
+}
+#stock td,
+#stock th {
+  padding: 2px 10px 2px 0;
+  text-align: left;
+}
+.qty {
+  width: 4em;
+}
+#order-form {
+  margin: 10px 0;
+}
+#orders .status {
+  font-weight: 600;
+}
+#orders .done .status {
+  color: #070;
+}
+#orders .failed .status,
+#orders .stuck .status {
+  color: #b00;
+}

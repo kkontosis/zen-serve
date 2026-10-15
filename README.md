@@ -24,6 +24,7 @@ Building blocks:
 | [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
 | [`packages/client`](packages/client) | `@zen/client`: the TypeScript client library, Node and browsers ([`docs/CLIENT.md`](docs/CLIENT.md)) |
 | [`packages/db`](packages/db) | `@zen/db`: the client-side database (tables, indexes, queries, transactions; the broker and CRDT tables to come) ([`docs/DB.md`](docs/DB.md)) |
+| [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger) and `hello`, on `@zen/db`, `@zen/fs` and `@zen/loro` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
 
