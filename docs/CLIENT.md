@@ -2,7 +2,7 @@
 
 The TypeScript client of zen-serve, for Node 22+ and browsers (`packages/client`). Every format and algorithm runs in the WASM build of zen-core (`crates/zen-wasm`, `@zen/wasm`), and so does the CBOR wire encoding, through zen-proto: the client and the server share one definition of every byte. The server only ever sees ciphertext and opaque ids.
 
-`zen-mount`, a FUSE mount of a zen-serve filesystem, is in [§9](#9-zen-mount).
+`zen-mount`, a FUSE mount of a zen-serve filesystem, is in [§9](#9-zen-mount). The packages on top of the client have their own docs: `@zen/db` (tables, indexes, transactions, the broker, CRDT tables) in [DB.md](DB.md), `@zen/loro` (Loro documents on a topic, with snapshots and offline edits) in [DB.md §20](DB.md#20-loro-documents), and `@zen/fs` (the local replica) in [§8](#8-the-filesystem) below.
 
 ## 1. Building
 

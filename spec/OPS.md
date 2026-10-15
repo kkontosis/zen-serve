@@ -24,6 +24,7 @@ Pitfalls:
 |---|---|---|
 | The WASM module | `scripts/build-wasm.sh` | the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` at the Cargo.lock version |
 | `@zen/client` | `npm ci && npm run build -w @zen/client` | Node 22 |
+| `@zen/db`, `@zen/fs`, `@zen/loro` | `npm run build -w @zen/db` (and so on); tests and apps use the sources, except the zen-mount CLI test, which runs the built `@zen/client` and `@zen/fs` |
 | `zen-mount` | `npm run build -w @zen/fuse` | `libfuse-dev`, `pkg-config` and a C compiler when `npm ci` runs (`@cocalc/fuse-native` compiles against libfuse 2); `fusermount` to mount |
 
 Pitfalls:
@@ -32,6 +33,22 @@ Pitfalls:
 * **The client tests spawn `target/debug/zen-serve`** (or `$ZEN_SERVE_BIN`): build it first, after server changes too.
 * **`npm ci` without libfuse 2** skips `@cocalc/fuse-native` (an optional dependency): everything but `zen-mount` works, and its tests skip.
 * **A FUSE mount left behind** by a killed process: `fusermount -u <dir>`.
+
+### 1.2 TypeScript tests
+
+| You want | Command |
+|---|---|
+| Every Node test | `npx vitest run` (the apps' scenarios need `npm run build:apps` first: their workers run from `apps/dist`) |
+| One file | `npx vitest run packages/db/test/txn.test.ts` |
+| The browser tests | `npx playwright test` (builds the apps first); one project: `--project=apps` |
+| The measurements | `ZEN_BENCH=1 npx vitest run packages/db/test/bench.test.ts packages/loro/test/bench.test.ts` (docs/STATS.md §5.4) |
+
+Pitfalls:
+* **A server per test file.** Each file spawns its own zen-serve in `beforeAll`; tests in one file share it, so give each test its own database name or topic.
+* **`--project=apps`, with the `=`.** In the spaced form Playwright takes the next argument as another project name.
+* **Await your own work before closing.** `Db.close()` waits up to 5 s for running transactions, which then fail `closed`; a test that fires writes without awaiting them sees those failures. Keep the promises and await them (`Promise.allSettled`) before a restart.
+* **Poll with a deadline** (`until`), never a fixed sleep: consumers, the indexer and the stream run in the background.
+* **Kill only the processes you spawned** (app workers, servers), by PID, never `pkill -f`.
 
 ## 2. What fills the disk
 
