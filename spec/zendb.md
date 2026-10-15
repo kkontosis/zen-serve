@@ -774,7 +774,7 @@ So any chain of handled messages can be followed back to its first cause.
 
 ### 11.4 Ephemeral messages
 
-`publishEphemeral(topic, type, body)` and `onEphemeral(topic, handler)` use `epub`/`esub` (api.md §9) with the M4 sealing: a reserved key token, with HLC replay checks (G21).
+`publishEphemeral(topic, type, body)` and `onEphemeral(topic, handler)` use `epub`/`esub` (api.md §9) with the M4 sealing: a reserved key token, with HLC replay checks per sender and publishing stream (api.md §9.2, G21).
 * They are never stored, never part of a transaction, and rate-limited per device (api.md §9.1).
 * They suit presence and typing indicators.
 

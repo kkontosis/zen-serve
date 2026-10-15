@@ -159,7 +159,7 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 | G18 | **TLS for family self-hosting.** | Built-in ACME (Let's Encrypt) in zen-serve. TLS between FoundationDB nodes on by default when there's more than one node. |
 | G19 | **Logs and metrics leak metadata** (tokens, ids, timing). | Logging policy: no key or topic tokens in logs, only aggregate metrics. Debug logging is opt-in. |
 | G20 | **Clocks:** HLC clamp and ACME rely on server time. | Warn on startup on large skew. Leases use commit versions, so they're unaffected. |
-| G21 | **Ephemeral pub/sub authenticity.** | Same AEAD under the topic key, plus a sequence number to block replays within a session. |
+| G21 | **Ephemeral pub/sub authenticity.** | Same AEAD under the topic key, plus a sequence number to block replays within a session. **Done (milestones 4 and 5):** sealed as event bodies under the topic key; receivers drop replays by hlc per sender and publishing stream (api.md §9.2). |
 | G22 | **Upgrades of the bundled FoundationDB.** | Pin a 7.3.x version. Use the multi-version client for rolling upgrades. `zen-serve upgrade` orchestrates it. |
 | G23 | **Testing strategy.** | Cross-language test vectors. Property tests for CRDT convergence (random op orders → same state). Run the server in FoundationDB's simulation where possible, plus fault injection in Jepsen style for leases, cursors and idempotency. |
 | G24 | **Terminology drift:** "volume", "filesystem" and "fs" are used for the same thing. | A glossary in `spec/`. **fs** = the encrypted namespace, with its own keys and ACL. "Volume" is retired. |

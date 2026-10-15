@@ -542,7 +542,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 
 * Consumer delivery is not pushed over the stream: `/v1/consume/next` with `wait_ms` long-polls instead (§8.3).
 * Watches only wake a subscription. The data always comes from a range read after the subscription's cursor, so reconnecting with the last received `offset` loses nothing.
-* Ephemeral data should be sealed by the client with the topic key plus a sequence number (G21). The server forwards it as opaque bytes.
+* Ephemeral data is sealed by the client as an event body of the topic under a reserved key token (formats.md §5), so only holders of the topic key read it. The server forwards it as opaque bytes. Receivers drop replays by its hlc (§9.2, G21).
 
 ### 9.1 Ephemeral messages across nodes
 
@@ -554,6 +554,10 @@ Ephemeral messages pass through a short-lived ring in storage (keyspace.md §3.5
 * Both values are advertised in `/v1/info` `limits` (§2), so a client can pace itself.
 * A publish over the limit is refused with `quota` and not delivered. The client waits and retries, or drops the message.
 * The buckets are kept in each node's memory, per device. A device that publishes through several nodes of a cluster gets the limit on each, so the cluster-wide limit is the per-node limit times the number of nodes. A node restart refills them.
+
+### 9.2 Replays of ephemeral messages
+
+A receiver keeps the newest hlc it accepted per `(topic, sender, stream id)`, where the stream id is the body's `causation_id` (formats.md §5: 12 random bytes per publishing stream, or empty from older clients). A message whose hlc is not newer is a replay and is dropped. Two sessions of one device have different stream ids, so neither drops the other's messages, though they share the sender and their hlcs interleave. The check holds for one subscription; a new subscription accepts any message the server still forwards, within `ephemeral_ttl_secs`.
 
 ## 10. Static files
 

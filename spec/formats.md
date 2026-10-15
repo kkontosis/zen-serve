@@ -104,6 +104,7 @@ u8 body_version = 1 ‖ sender_fp[32] ‖ u64(hlc) ‖ lp(causation_id) ‖ payl
 * `sender_fp` is the sending device's id.
 * `hlc` is a hybrid logical clock.
 * `causation_id` is empty when there's no causing event. Otherwise the transaction layer fills it with the consumed event's id, `topic_id ‖ offset` (zendb.md §10.2).
+* In an ephemeral message (api.md §9), which no event causes, `causation_id` holds the publishing stream's id instead: 12 random bytes chosen once per stream (a connection, kept across reconnects). Receivers use it to tell apart two sessions of one device (api.md §9.2). An empty one is valid (older clients).
 
 ## 6. Keyslots
 
