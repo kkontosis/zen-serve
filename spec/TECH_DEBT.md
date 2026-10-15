@@ -279,3 +279,10 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** A durable `on(..., {cursor})` with a new cursor starts at new events. To read a topic from its beginning (the ledger's audit view), an app passes `after: offsetAfterVersion(0n)` from `@zen/client`.
 * **Why deferred:** Minor; the workaround is one line.
 * **What it would take:** An `OnOptions.start: 'now' | 'earliest'` as consumer groups have, documented in docs/DB.md §11.
+
+## TD-DB-CLOSE-INFLIGHT
+
+* **Status:** open
+* **Context:** `Db.close()` and `UnlockedFs.close()` don't fence transactions in flight. A transaction still running after its fs is closed uses freed WASM keys and fails with WASM's `null pointer passed to rust` rather than a clear `closed` error. Seen in CI on milestone 5 step 10 (a chat test closed an fs while receipt writes it had started were still running; the test now waits for them).
+* **Why deferred:** Callers that await their own work never hit it; found while integrating the apps.
+* **What it would take:** `Db.close()` waits for (or rejects with `DbError('closed')`) its open transactions and handler runs; `UnlockedFs` checks a `closed` flag before using its keys and throws `ZenError(0, 'closed')`; a test closing during a transaction.

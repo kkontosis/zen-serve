@@ -113,10 +113,16 @@ describe('messages', () => {
     const room = newRoom();
     const seen: string[] = [];
     const offsets: string[] = [];
+    // Receipt writes run behind the display; a restart waits for them, so no
+    // transaction is left running on a closed fs.
+    const pending = new Set<Promise<unknown>>();
+    const settle = () => Promise.allSettled([...pending]);
     const show = (db: Db) => (m: ChatMsg) => {
       seen.push(m.text);
       offsets.push(bytes.hex(m.offset));
-      void markRead(db, room, m.offset);
+      const p = markRead(db, room, m.offset);
+      pending.add(p);
+      void p.finally(() => pending.delete(p)).catch(() => {});
     };
     let sub = await readRoom(b.db, room, show(b.db));
     for (let i = 1; i <= 5; i++) await sendMessage(a.db, room, 'alice', `m${i}`);
@@ -128,6 +134,7 @@ describe('messages', () => {
       'the receipt of the fifth',
     );
     await sub.close();
+    await settle();
     await signOut(b);
     // Bob's device is off: Alice goes on.
     for (let i = 6; i <= 10; i++) await sendMessage(a.db, room, 'alice', `m${i}`);
@@ -140,6 +147,7 @@ describe('messages', () => {
     await sleep(300);
     expect(seen).toEqual(Array.from({ length: 11 }, (_, i) => `m${i + 1}`));
     await sub.close();
+    await settle();
     await signOut(a);
     await signOut(b);
   });
