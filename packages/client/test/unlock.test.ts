@@ -94,4 +94,17 @@ describe('unlock offline (§9.3)', () => {
       u.close();
     }
   });
+
+  it('a closed fs refuses its keys with `closed`', async () => {
+    const u = await w.session.fs(1).unlock({ device: w.admin.device });
+    expect(u.closed).toBe(false);
+    u.close();
+    expect(u.closed).toBe(true);
+    expect(() => u.keys).toThrow(expect.objectContaining({ code: 'closed' }));
+    expect(() => u.sealKeys()).toThrow(expect.objectContaining({ code: 'closed' }));
+    expect(() => u.keysAt(u.header.currentEpoch)).toThrow(
+      expect.objectContaining({ code: 'closed' }),
+    );
+    await expect(u.kv.get(['probe'])).rejects.toMatchObject({ code: 'closed' });
+  });
 });

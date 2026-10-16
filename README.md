@@ -9,7 +9,7 @@ Building blocks:
 * an **event log** with exactly-once append and sequential, per-key and single-leader consumers
 * a **filesystem whose tree and file versions the server merges as CRDTs**, on ciphertext
 * plaintext **`/unencrypted`** static serving for the app bootstrap
-* specified, built in milestone 5: **zen-db and an in-app broker** in one client class, where rows, messages and files commit in one transaction ([`spec/zendb.md`](spec/zendb.md))
+* **zen-db and an in-app broker** in one client class, where rows, messages and files commit in one transaction, with CRDT tables the server merges, a local filesystem replica that works offline, and Loro documents ([`spec/zendb.md`](spec/zendb.md), [`docs/DB.md`](docs/DB.md))
 
 ## Repository layout
 
@@ -23,7 +23,9 @@ Building blocks:
 | [`crates/zen-server`](crates/zen-server) | The `zen-serve` binary: auth, signed ACL, KV, commit, event log, consumer groups, WebSocket stream, static files, FoundationDB supervisor, backup/export |
 | [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
 | [`packages/client`](packages/client) | `@zen/client`: the TypeScript client library, Node and browsers ([`docs/CLIENT.md`](docs/CLIENT.md)) |
-| [`packages/db`](packages/db) | `@zen/db`: the client-side database (tables, indexes, queries, transactions; the broker and CRDT tables to come) ([`docs/DB.md`](docs/DB.md)) |
+| [`packages/db`](packages/db) | `@zen/db`: the client-side database (tables, indexes, queries, transactions), the in-app broker (`on`, consumers, scheduler, request/reply, sagas) and CRDT tables, with offline caches ([`docs/DB.md`](docs/DB.md)) |
+| [`packages/fs`](packages/fs) | `@zen/fs`: a local replica of a filesystem tree (the node table, content on demand, offline writes), under `zen-mount` too ([`docs/CLIENT.md`](docs/CLIENT.md) §8) |
+| [`packages/loro`](packages/loro) | `@zen/loro`: [Loro](https://loro.dev) documents kept on a topic, with snapshots and offline edits ([`docs/DB.md`](docs/DB.md) §20) |
 | [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger) and `hello`, on `@zen/db`, `@zen/fs` and `@zen/loro` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
@@ -36,7 +38,7 @@ Building blocks:
 * Milestone 3.5 (server-merged CRDT filesystem, [`spec/fs.md`](spec/fs.md), [`docs/MILESTONE-3.5.md`](docs/MILESTONE-3.5.md)): done on the server side.
 * Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
 * Milestone 4.5 (zen-db and the in-app broker, specs only, [`spec/zendb.md`](spec/zendb.md), [`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): done.
-* Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md)): in progress.
+* Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
 
 ## Building
 

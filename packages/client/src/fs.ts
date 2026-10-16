@@ -229,6 +229,8 @@ export function prfSlotSalts(h: FsHeader): { credentialId: Uint8Array; prfSalt: 
  */
 export class UnlockedFs {
   private readonly epochs = new Map<number, FsKeys>();
+  private shut = false;
+  private readonly epoch: number;
   /** @internal Where `unlock` keeps the header, refreshed when it changes. */
   local: SealedStore | undefined;
   /** KV access (stored keys are PRF tokens of path elements). */
@@ -236,12 +238,23 @@ export class UnlockedFs {
 
   constructor(
     readonly fs: Fs,
-    /** The keys the slot opened. */
-    readonly keys: FsKeys,
+    private readonly slotKeys: FsKeys,
     private stored: StoredHeader,
   ) {
-    this.epochs.set(keys.epoch, keys);
+    this.epoch = slotKeys.epoch;
+    this.epochs.set(this.epoch, slotKeys);
     this.kv = new Kv(this);
+  }
+
+  /** The keys the slot opened. After `close` it throws `closed`. */
+  get keys(): FsKeys {
+    if (this.shut) throw new ZenError(0, 'closed', 'the fs is closed');
+    return this.slotKeys;
+  }
+
+  /** Whether `close` was called. */
+  get closed(): boolean {
+    return this.shut;
   }
 
   get id(): number {
@@ -262,7 +275,7 @@ export class UnlockedFs {
    * epoch. A stale slot (an older epoch) only reads (formats.md §12).
    */
   get writable(): boolean {
-    return this.keys.epoch === this.stored.header.currentEpoch;
+    return this.epoch === this.stored.header.currentEpoch;
   }
 
   /**
@@ -288,18 +301,20 @@ export class UnlockedFs {
 
   /** The keys to seal new data with. Throws for a stale slot. */
   sealKeys(): FsKeys {
+    const keys = this.keys;
     if (!this.writable) {
       throw new ZenError(
         0,
         'stale_slot',
-        `keyslot wraps epoch ${this.keys.epoch}; the fs is at ${this.stored.header.currentEpoch}`,
+        `keyslot wraps epoch ${this.epoch}; the fs is at ${this.stored.header.currentEpoch}`,
       );
     }
-    return this.keys;
+    return keys;
   }
 
   /** The keys of `epoch` (walking the chain back). Newer epochs need a new unlock. */
   keysAt(epoch: number): FsKeys {
+    if (this.shut) throw new ZenError(0, 'closed', 'the fs is closed');
     const k = this.epochs.get(epoch);
     if (k) return k;
     if (epoch > this.keys.epoch) {
@@ -319,8 +334,9 @@ export class UnlockedFs {
     return this.keysAt(zw.peekSealed(sealed).epoch);
   }
 
-  /** Zeroize every key. */
+  /** Zeroize every key. Later uses of them throw `closed`. */
   close(): void {
+    this.shut = true;
     for (const k of this.epochs.values()) k.free();
     this.epochs.clear();
   }

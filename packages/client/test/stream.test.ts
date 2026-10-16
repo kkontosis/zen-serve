@@ -19,6 +19,7 @@ let w: World;
 let ufs: UnlockedFs;
 let bob: Session;
 let bobFs: UnlockedFs;
+let recoveryKey: Uint8Array;
 
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
 
@@ -44,7 +45,6 @@ const payloads = (evs: StreamEvent[]) => evs.map((e) => (e.opened ? text(e.paylo
 
 beforeAll(async () => {
   w = await world();
-  let recoveryKey!: Uint8Array;
   ufs = await w.session.fs(1).init((k) => {
     const r = zw.createRecoverySlot(k);
     recoveryKey = r.recoveryKey;
@@ -173,6 +173,38 @@ describe('stream', () => {
     expect(errors).toEqual([]);
     sa.close();
     sb.close();
+  });
+
+  it('two sessions of one device are told apart; a replay is still dropped', async () => {
+    // A second session of the admin's device, with a clock 20 s ahead: its
+    // hlcs are all newer than the first session's (api.md §9.2).
+    const other = await w.client.signInDevice(w.admin);
+    other.clock.observe(zw.hlc(Date.now() + 20_000, 0));
+    const otherFs = await other.fs(1).unlock({ recoveryKey });
+    const s1 = await w.session.stream();
+    const s2 = await other.stream();
+    const sb = await bob.stream();
+    const sub = await sb.subscribeEphemeral(bobFs.topic('two-sessions'));
+    const it = sub[Symbol.asyncIterator]();
+    await s2.publish(otherFs.topic('two-sessions'), utf8('ahead'));
+    expect(text((await take(it, 1))[0]!.data)).toBe('ahead');
+    // Same device, an older hlc, another stream: delivered.
+    await s1.publish(ufs.topic('two-sessions'), utf8('behind'));
+    const [m] = await take(it, 1);
+    expect(text(m!.data)).toBe('behind');
+    expect(m!.sender).toEqual(w.session.deviceFp);
+    // The same sealed message sent twice arrives once.
+    const t = ufs.topic('two-sessions');
+    const sealed = t.seal(t.ephemeralToken(), utf8('once'), new Uint8Array(12).fill(7));
+    const raw = s1 as unknown as { send(f: unknown): boolean };
+    for (let i = 0; i < 2; i++) raw.send({ op: 'epub', fs: 1, topic: t.id, data: sealed });
+    await s1.publish(t, utf8('after'));
+    const got = await take(it, 2);
+    expect(got.map((x) => text(x.data))).toEqual(['once', 'after']);
+    s1.close();
+    s2.close();
+    sb.close();
+    otherFs.close();
   });
 
   it('a closed stream ends its subscriptions', async () => {

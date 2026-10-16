@@ -3,7 +3,7 @@
 // audit event per transfer in the same commit (the outbox), a statement
 // projection fed by the entries' change events (exactly once per entry),
 // and a per-device audit view kept by a durable `on`.
-import { isCode, offsetAfterVersion, type Topic } from '@zen/client';
+import { isCode, type Topic } from '@zen/client';
 import type {
   ChangeBody,
   ConsumerHandle,
@@ -365,7 +365,7 @@ export function runAuditView(
     },
     {
       cursor: 'audit-view',
-      after: offsetAfterVersion(0n),
+      start: 'earliest',
       ...(o.onError ? { onError: o.onError } : {}),
     },
   );

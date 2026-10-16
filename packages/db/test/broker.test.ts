@@ -265,6 +265,34 @@ describe('on (§11.2)', () => {
     again.close();
   });
 
+  it("start: 'earliest' reads the whole history; a stored cursor wins", async () => {
+    const name = ns();
+    const db = await shop(name);
+    const t = db.topic('earliest', name);
+    for (let i = 1; i <= 3; i++) await db.emit(t, 'n', i);
+    const handler = async (m: Message<number>, tx: DbTransaction) => {
+      await tx.table('log').insert({ id: `n${m.body}` });
+    };
+    const sub = await db.on<number>(t, handler, { cursor: 'e1', start: 'earliest' });
+    await db.emit(t, 'n', 4);
+    await until(async () => (await logRows(db)).length === 4);
+    await sub.close();
+    // Reopened, the cursor (after 4) wins over `earliest`: nothing again.
+    await db.emit(t, 'n', 5);
+    const sub2 = await db.on<number>(t, handler, { cursor: 'e1', start: 'earliest' });
+    await until(async () => (await logRows(db)).length === 5);
+    await sleep(100);
+    expect((await logRows(db)).length).toBe(5);
+    // A plain subscription with `earliest` sees every event too.
+    const plain: number[] = [];
+    const sub3 = await db.on<number>(t, (m) => void plain.push(m.body), { start: 'earliest' });
+    await until(() => plain.length === 5);
+    expect(plain).toEqual([1, 2, 3, 4, 5]);
+    await sub2.close();
+    await sub3.close();
+    await db.close();
+  });
+
   it('a prefix delivers the topics under it', async () => {
     const db = await shop(ns());
     const p = db.topic('pre', db.ns);
