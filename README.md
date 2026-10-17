@@ -39,6 +39,7 @@ Building blocks:
 * Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
 * Milestone 4.5 (zen-db and the in-app broker, specs only, [`spec/zendb.md`](spec/zendb.md), [`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): done.
 * Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
+* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md)): planned, next.
 
 ## Building
 
