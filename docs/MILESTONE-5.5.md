@@ -132,7 +132,208 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `cargo check -p zen-tls-rustcrypto --target wasm32-unknown-unknown`, also with `test-utils`
     * `cargo tree -p zen-server --no-default-features -i ring` is empty
     * `npx vitest run apps/echo packages/client/test/mtls.test.ts` against the rebuilt binary (6 tests)
-  * Next: CI on PR #43; then plan step 5.5.7 (the TLS engine, native) after it merges.
+  * CI green on PR #43's head (all 8 checks); merged.
+* **Step 5.5.7** (the TLS engine, native): done, PR #44. Restarted from main after PR #43 merged. Commits: `docs: milestone 5.5 step 7 plan`; `spec: the TLS engine (svc.md §7.1)`; `tls: TLS 1.2 suites and a record API in zen-tls-rustcrypto`; `svc: the TLS engine (crates/zen-svc), native`; the docs and this log.
+  * As planned, plus details settled while building:
+    * The 1.2 AES-GCM explicit-nonce prefix is drawn for each batch of records the engine sends (a write, a close, an alert), not once per connection, and isn't in the state. With the record IV `salt ‖ prefix ‖ 0⁴` XOR the sequence number, the explicit nonce is the prefix and the low 32 bits of the sequence number. svc.md §7.1 and §12 say "per batch".
+    * The handshake feeds rustls one record at a time. A header rustls would refuse (unknown type, too long) is handed over alone, so it fails at once instead of waiting for a body.
+    * After a handshake error the engine drops rustls's input buffer and takes the alert rustls queued. Re-parsing the bad bytes would make rustls send a second fatal alert, which it debug-asserts against.
+    * `UnbufferedServerConnection` has no SNI accessor: a per-connection certificate resolver records the client's server name, next to the per-connection key log.
+    * `Conn::restore(config, state)` takes the config (the test-only key-limit knob lives there). `Session::restore` and `Conn::from(Session)` exist too; `Conn::session()` gives the `Clone`able session.
+    * A peer's KeyUpdate requests are answered once per input call, in that call's output.
+    * `Progress.truncated` is false while the engine holds back records because of the plaintext bound.
+    * The test certificates are `zen_tls_rustcrypto::testing` (feature `test-utils`, rcgen on RustCrypto keys), so zen-svc needs no rcgen of its own.
+    * `record` also has in-place opens (`open13_in_place`, `open12_in_place`), which the provider's decrypters use. `RecordKey` is `Clone`.
+    * OpenSSL findings:
+      * In 1.2 the certificate's curve must be among the client's groups (RFC 8422 §5.1), so the 1.2 `s_client` runs use `-groups X25519:P-256` and `P-256`.
+      * `s_client` takes a stdin read that starts with Q, R, k or K as a command, so the large-transfer test sends digits.
+      * OpenSSL 3.0 takes `Options = -ExtendedMasterSecret` from `OPENSSL_CONF`, so the EMS refusal is tested against OpenSSL itself.
+      * OpenSSL answers the engine's `no_renegotiation` warning with a fatal `handshake_failure`; the test checks exactly that.
+  * Verified:
+    * `cargo fmt --all --check`; clippy `--all-targets -D warnings` default, `--no-default-features` and `--all-features`; clippy on zen-svc and zen-tls-rustcrypto for wasm32
+    * `cargo test -p zen-tls-rustcrypto --all-features` (14 unit tests, including RFC 8448 and independent known answers, and 3 handshake tests)
+    * `cargo test -p zen-svc` 3× (23 rustls-client tests and 6 `s_client` tests)
+    * zen-server `tests/tls.rs` and `tests/mtls.rs`, default (14 and 8) and `--no-default-features` (10 and 8), alone and built together with zen-svc (rustls's `tls12` unified)
+    * `cargo check -p zen-svc --target wasm32-unknown-unknown`; `cargo tree -p zen-svc -e normal -i ring` is empty
+  * **CI fix:** on head 73404e6 the `rust` job (both runs) and one `pure-rust` run failed `crates/zen-svc/tests/openssl.rs` `s_client_large_lines` at `assert!(c.stdout.contains(&want))`. Commit `svc: s_client tests wait for the echo before closing stdin`.
+    * The assertions before it passed: the engine received all 120,002 bytes and echoed them. Only `s_client`'s stdout was short.
+    * Root cause, a race in the test: the `s_client` helper closed stdin 300 ms after the last line, and `s_client` shuts the connection down as soon as it reads EOF on stdin, dropping echo still in flight. 300 ms was enough for 120 KB locally, not on the CI runners.
+    * The failure didn't reproduce locally, even on one loaded CPU. The mechanism was confirmed against OpenSSL directly: with a Python TLS echo server that waits 1 s, `s_client` with stdin closed after 0.3 s printed no echo, and with stdin open for 2 s it did.
+    * Fix: a thread reads `s_client`'s stdout as it arrives, and the helper keeps stdin open until stdout holds `wait_for` (or 30 s pass). The data tests pass their expected echo; the renegotiation and no-EMS tests pass `None`.
+    * Verified: clippy on zen-svc; `cargo test -p zen-svc --test openssl` 5×, and 3 rounds of three copies at once.
+
+## Step 5.5.7 in detail: the TLS engine (`crates/zen-svc`, native)
+
+A sans-IO TLS server for relayed services:
+* The handshake runs through rustls's unbuffered server.
+* After the handshake, the engine's own record layer takes over, and its state serializes to bytes. A successor handler restores it at any record boundary and continues the live connection.
+
+This step is native only. The wasm build, the JS glue and `tls()` in `@zen/svc` come in 5.5.8. Normative behaviour goes into spec/svc.md §7.1 (the `spec:` commit).
+
+**Commits:**
+1. `docs: milestone 5.5 step 7 plan`
+2. `spec: the TLS engine (svc.md §7.1)`
+3. `tls: TLS 1.2 suites and a record API in zen-tls-rustcrypto`
+4. `svc: the TLS engine (crates/zen-svc), native`
+5. the docs and the log
+
+### Facts from the survey (rustls 0.23.45)
+* **`UnbufferedServerConnection::process_tls_records(&mut buf) → {discard, state}`.**
+  * Handshake fragments are reassembled in place in the caller's buffer.
+  * rustls's own buffers are `received_plaintext` (app data decrypted after the handshake), `sendable_tls`, and the read and write sequence numbers.
+  * `is_handshaking()` turns false once the client Finished is verified (1.3). App data in the same flight then arrives as `ReadTraffic` before the first `WriteTraffic`.
+* **`dangerous_into_kernel_connection`:**
+  * It needs `enable_secret_extraction`, a finished handshake and an empty `sendable_tls`.
+  * It does **not** check `received_plaintext`, so the engine drains `ReadTraffic` first.
+  * It returns `ExtractedSecrets {tx: (seq, ConnectionTrafficSecrets), rx}`: key and IV only, not the traffic secrets.
+  * For 1.2 GCM the IV is the 4-byte salt followed by 8 bytes of rustls's "extra" key block.
+* **TLS 1.3 traffic secrets** come only from `KeyLog` (`CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0`), which is called with the `client_random`. KeyUpdate needs them: `HKDF-Expand-Label(secret, "traffic upd", "", Hash.len)`, then `"key"` and `"iv"`.
+* **Resumption off:** `send_tls13_tickets = 0`, `NoServerSessionStorage`, the default ticketer (never issues tickets). `max_early_data_size` and `send_half_rtt_data` already default to off.
+* **TLS 1.2:**
+  * It needs rustls's `tls12` feature, a `Tls12CipherSuite` (`PrfUsingHmac`, `Tls12AeadAlgorithm` with `KeyBlockShape`), and `require_ems` (default false outside FIPS).
+  * ring's GCM explicit nonce is `extra XOR seq`. The record AAD is `seq ‖ type ‖ version ‖ len`.
+* **`AeadKey`** can only be built from outside rustls as a 32-byte key (`with_length` is crate-private). So the engine can't build the provider's AES-128 encrypters through rustls's traits. Hence a byte-level record API in zen-tls-rustcrypto (below).
+* **Limits:** GCM's confidentiality limit is `1 << 24` records per key, ChaCha has none. At the limit, 1.3 rekeys and 1.2 closes.
+* zen-server's listener pins TLS 1.3 (`tls/mod.rs:128`), so turning on `tls12` changes nothing there.
+* OpenSSL 3.0.13 is installed locally, and on CI's ubuntu runners. Its `s_client` has `-tls1_2`/`-tls1_3`, `-ciphersuites`/`-cipher`, `-groups`, and the interactive `k`/`K` key-update commands. It has no X25519MLKEM768 (3.5+).
+
+### zen-tls-rustcrypto
+* **Feature `tls12`** (turns on `rustls/tls12`):
+  * Suites `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `…_AES_256_GCM_SHA384` and `…_CHACHA20_POLY1305_SHA256`. Only ECDSA suites, since this provider signs ECDSA and Ed25519 but not RSA (TD-TLS-RSA-SERVER-KEY).
+  * `provider_tls12()` gives the 1.3 suites plus these. `provider()` is unchanged, so zen-server stays on 1.3.
+  * The groups are as today. The hybrid already refuses 1.2 (`usable_for_version`).
+* **The 1.2 GCM explicit nonce** is a random 32-bit prefix followed by the low 32 bits of the sequence number.
+  * Within a connection it is unique by construction: GCM closes before `2^24` records.
+  * Under a state rollback (TD-SVC-STATE-ROLLBACK) a replayed sequence number repeats a nonce only with probability `2^-32` per record. svc.md §12 now says this instead of "random 64-bit".
+  * ChaCha20-Poly1305 1.2 is RFC 7905 (`iv XOR seq`).
+* **A byte-level record API** (`pub mod record`), shared by the provider's encrypters and the engine:
+  * `Aead` (`Aes128Gcm`, `Aes256Gcm`, `Chacha20Poly1305`) and `RecordKey::new(aead, key: &[u8], iv: &[u8])` (zeroized on drop).
+  * `seal13(seq, typ, plain) → record` and `open13(seq, record) → (typ, plain)`, with the inner content type and zero padding.
+  * `seal12(seq, typ, plain)` and `open12(seq, typ, record)`.
+  * `expand_label(hash, secret, label, ctx, len)` (HKDF-Expand-Label).
+  * The provider's `Sealer`/`Opener` (1.3) and the new 1.2 ones call it, so rustls's handshake records and the engine's records come from the same code.
+* **Tests:**
+  * the existing ones
+  * RFC 8448 known answers for `expand_label` (traffic key and IV) and for a 1.3 record
+  * 1.2 round trips and tamper checks
+  * the 1.2 nonce layout
+  * 1.2 handshakes between this provider and itself (rustls client and server, every suite and group)
+
+### `crates/zen-svc` (new; `tls` module)
+* **Dependencies:** rustls (`std`, `tls12`), zen-tls-rustcrypto (`tls12`), ciborium, serde, zeroize. Dev-dependencies: rcgen (certificates in tests).
+* **`tls::Config::new(chain: Vec<CertificateDer>, key: PrivateKeyDer, opts)`** (`alpn`, versions; both on by default). The base `ServerConfig`:
+  * `provider_tls12()`; versions 1.3 and 1.2; no client auth
+  * `require_ems = true`; `enable_secret_extraction = true`
+  * `send_tls13_tickets = 0`; `NoServerSessionStorage`
+  * The default time provider, which works on wasm32 thanks to step 6's web-time.
+* **`tls::Conn`**, one per connection:
+  * **`Conn::new(&Config)`**
+    * Clones the base config with a per-connection `KeyLog` that captures the two 1.3 traffic secrets.
+    * Starts an `UnbufferedServerConnection`.
+  * **`Conn::restore(state: &[u8])`** rebuilds an established connection. A handshaking connection has no state: `state()` is `None` until the handshake is done.
+  * **`input(&mut self, buf: &[u8], eof: bool) → Progress`**, where `Progress` has:
+    * `consumed`: input bytes processed, always at a record boundary, which is the step's input ack
+    * `out`: bytes to send (handshake flights, alerts, a KeyUpdate answer)
+    * `established`: true on the call that finished the handshake (the step that sets `resumable`)
+    * `peer_closed` (close_notify), `truncated` (EOF without close_notify), and `error` (a fatal alert was queued in `out`; the connection is closed)
+  * **Plaintext:**
+    * `plaintext()` gives what was decrypted and not yet consumed; `consume(n)` consumes it.
+    * The unconsumed plaintext is kept in the state. The engine stops decrypting (and acking) once it holds 16 KiB, so the state stays under about 33 KiB.
+  * **`write(&mut self, data) → Vec<u8>`** splits `data` into records of up to 16 KiB.
+    * 1.3 rekeys itself before the confidentiality limit.
+    * 1.2 sends close_notify there and refuses further writes.
+    * A test-only `Config` knob lowers the limit.
+  * **`key_update(&mut self, request_peer: bool) → Vec<u8>`** (1.3 only).
+  * **`close(&mut self) → Vec<u8>`** sends close_notify.
+  * **`state(&self) → Option<Vec<u8>>`.**
+  * The established `Session` is `Clone`, so a runtime can run a step on a copy and drop it if the commit fails (5.5.8).
+* **The handshake:**
+  * The engine drives rustls's states: `EncodeTlsData` into `out`, `TransmitTlsData` then `done()`, and `ReadTraffic` drained into the plaintext buffer.
+  * Once `is_handshaking()` is false, nothing is queued, and the plaintext is drained, it calls `dangerous_into_kernel_connection`:
+    * 1.3: key and IV are re-derived from the captured traffic secrets and must equal the extracted ones. A mismatch is an internal error (fail closed, abort). The sequence numbers come from the extraction.
+    * 1.2: key and salt come from the extraction.
+  * The rest of the buffer then goes through the engine's own record layer in the same call.
+  * Mid-handshake, `input` isn't idempotent: rustls has moved on. A runtime keeps a handshake step's `Progress` until it commits, and re-sends it on a retry (5.5.8). A `cursor_moved` or unknown commit during the handshake aborts the connection.
+* **The record layer:**
+  * **Header and length checks:** the 5-byte header; ciphertext at most `2^14 + 256` (1.3) or `2^14 + 2048` (1.2), else `record_overflow`.
+  * **Decrypt failures** get `bad_record_mac`.
+  * **1.3 inner types:**
+    * application data → plaintext
+    * handshake → KeyUpdate only (it updates rx, and answers with our own KeyUpdate when the peer requests one); any other handshake message → `unexpected_message`
+    * close_notify → `peer_closed`; user_canceled is ignored; other warning alerts are `decode_error`, as in rustls; fatal alerts end the connection
+    * ChangeCipherSpec → `unexpected_message`
+  * **1.2:** a handshake record (renegotiation) gets a `no_renegotiation` warning, as rustls does, and is otherwise ignored.
+  * **Errors** queue an encrypted fatal alert and close.
+  * **An incomplete record** waits for more input. At EOF it is `truncated`.
+* **State** (`engine_state`, CBOR, svc.md §7.1):
+  ```
+  {v: 1, ver: 0x0304|0x0303, suite: u16,
+   tx: {seq, secret (1.3) | key + iv (1.2)}, rx: {…},
+   plain: bytes, sni?: text, alpn?: bytes,
+   flags: peer_closed | sent_close | closed}
+  ```
+  * Keys are zeroized on drop.
+  * Restoring a state checks the version, the suite and the field lengths. A bad state is refused, and the runtime releases with close.
+
+### spec/svc.md §7.1 (`spec:`)
+* **Versions and suites:** versions 1.3 and 1.2; the 1.2 suites are ECDHE AEAD only and require EMS.
+* **Refused:** no tickets, resumption, early data or renegotiation, no post-handshake authentication, no client certificates. A 1.3 post-handshake message other than KeyUpdate gets `unexpected_message`.
+* **When it becomes resumable:** once the handshake is done. A connection mid-handshake is not resumable.
+* **Acks:** input is acked at record boundaries, and the unconsumed plaintext (≤ 16 KiB plus one record) is carried in the state.
+* **Limits:** at the GCM confidentiality limit, 1.3 sends KeyUpdate and 1.2 sends close_notify.
+* **The 1.2 GCM explicit nonce:** the prefix and sequence-number rule above.
+* **The `engine_state` layout** above; a version it doesn't know is refused.
+* **§12** gets the new nonce wording.
+
+### Tests (`crates/zen-svc/tests/tls.rs`, native)
+* **A pump drives the engine the way a handler would:**
+  * After every `input` call it serializes the state, drops the `Conn` and restores it. So **every record boundary is a takeover point**.
+  * Variants feed whole flights, one record at a time, and one byte at a time.
+* **rustls clients** on `provider_tls12()`, with certificates from rcgen on RustCrypto keys (P-256, P-384, Ed25519):
+  * 1.3 with every suite and group, and 1.2 with every suite, on X25519 and P-256
+  * an echo of 1 MB both ways, with the transcript checked
+  * a second connection gets a full handshake (no tickets)
+* **openssl `s_client`** against a TCP listener whose thread drives the engine (restoring at every read):
+  * `-tls1_3` with each `-ciphersuites`, and `-tls1_2` with each `-cipher`
+  * `-groups X25519` and `P-256`
+  * data both ways
+  * `k` and `K` (client KeyUpdate, with and without a requested update)
+  * a 1.2 `R` (renegotiation) refused without the engine breaking
+  * The tests need `openssl` and say so if it's missing.
+* **KeyUpdate:**
+  * from the client: rustls `refresh_traffic_keys` if 0.23.45 has it on `ClientConnection`, and openssl `k`/`K`
+  * from the server: `key_update(true)` and `key_update(false)`
+  * automatic, at a lowered limit, in 1.3; 1.2 closes there
+* **Cross-check:** for every 1.3 suite, the keys derived from the captured secrets equal `into_kernel_connection`'s, at the switch and after each KeyUpdate. The latter is checked against a client-side session built from the same secrets.
+* **Malformed input**, with a deterministic generator over established transcripts: bit flips, truncation, length fields, bad types, oversized records, a handshake message that isn't KeyUpdate, a ChangeCipherSpec. Each case ends in progress or a specific alert, never a panic, and the state stays restorable or the connection is closed.
+* **Refusals:**
+  * no early data accepted
+  * a 1.2 client without EMS is refused: openssl with `Options = -ExtendedMasterSecret` through `OPENSSL_CONF`, if 3.0 takes it, otherwise a rustls-level check that `require_ems` is set
+  * an RSA server key is refused by `Config::new`
+* **State:** a state round trip, refusal of unknown versions and bad lengths, and a state size bound with 16 KiB of plaintext held.
+
+### CI
+* `rust` job: `cargo check -p zen-svc --target wasm32-unknown-unknown`.
+* The tests run in `cargo test --all` (rust) and in `pure-rust` (`--no-default-features`); both runners have openssl.
+
+### Docs
+* README crates table: `crates/zen-svc`.
+* TECH_DEBT: **TD-SVC-TLS-HANDSHAKE-RESUME** (a handshake in progress dies with its handler, and the connection is aborted), created here rather than in 5.5.14.
+* The provider-review entry notes that the hybrid isn't tested against OpenSSL (3.0 has no ML-KEM).
+* The log in both plan copies.
+
+### Out of scope
+* the wasm build, the JS time provider (not needed after step 6), and `tls()` in `@zen/svc` (5.5.8)
+* client certificates for relayed services; SNI-based certificate selection (one chain per `Config`); RSA server keys (TD-TLS-RSA-SERVER-KEY)
+* X25519MLKEM768 against an independent peer (OpenSSL 3.5 isn't on the runners)
+
+### Verification
+* `cargo fmt --check`; clippy `--all-targets -D warnings`: default, `--no-default-features`, `--all-features`
+* `cargo test -p zen-tls-rustcrypto --all-features`; `cargo test -p zen-svc` 3×
+* zen-server `tests/tls.rs` and `tests/mtls.rs` (default and `--no-default-features`), since the provider's 1.3 encrypters move onto the record API
+* `cargo check -p zen-svc -p zen-tls-rustcrypto --target wasm32-unknown-unknown`
+* `cargo tree -p zen-svc -i ring` is empty
+* CI green on the PR
 
 ## Step 5.5.6 in detail: the shared TLS provider crate
 

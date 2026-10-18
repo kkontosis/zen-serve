@@ -4,8 +4,12 @@
 //! (`tls::provider`, where this crate is `tls::rustcrypto`); with it, its
 //! X25519MLKEM768 group serves the ring provider too (`tls::ring`).
 //!
-//! * **TLS 1.3 only**, with `TLS_AES_128_GCM_SHA256`,
+//! * **TLS 1.3** ([`provider`]), with `TLS_AES_128_GCM_SHA256`,
 //!   `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256`.
+//! * **TLS 1.2 as well** ([`provider_tls12`], feature `tls12`): the
+//!   `TLS_ECDHE_ECDSA_WITH_*` suites with AES-128-GCM, AES-256-GCM and
+//!   ChaCha20-Poly1305. For zen-svc's TLS engine (svc.md §7.1); zen-server
+//!   stays on 1.3.
 //! * **Key exchange**, preferred first: the post-quantum hybrid
 //!   `X25519MLKEM768` (draft-ietf-tls-ecdhe-mlkem), then `X25519` and
 //!   `secp256r1`.
@@ -20,15 +24,28 @@
 //!
 //! The glue follows rustls's own providers; the primitives are RustCrypto's.
 //!
-//! [`rsakey`] is the RSA public-key policy, shared with zen-server's
-//! passkeys (auth.md §7) and its ring provider.
+//! [`record`] is the record protection at the byte level, which the
+//! provider's encrypters and zen-svc's record layer share. [`rsakey`] is
+//! the RSA public-key policy, shared with zen-server's passkeys (auth.md
+//! §7) and its ring provider.
 
+pub mod record;
 pub mod rsakey;
+#[cfg(feature = "test-utils")]
+pub mod testing;
+#[cfg(feature = "tls12")]
+mod tls12;
 
-use aes_gcm::aead::{AeadInOut, KeyInit};
+use record::{RecordKey, TAG_LEN};
+#[cfg(feature = "tls12")]
+pub use tls12::{
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, provider_tls12,
+};
+
 use rustls::crypto::cipher::{
     AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter, MessageEncrypter,
-    Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm,
+    OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, Tls13AeadAlgorithm,
     UnsupportedOperationError, make_tls13_aad,
 };
 use rustls::crypto::tls13::HkdfUsingHmac;
@@ -178,7 +195,7 @@ pub static TLS13_AES_128_GCM_SHA256: SupportedCipherSuite =
             confidentiality_limit: 1 << 24,
         },
         hkdf_provider: &HkdfUsingHmac(&HmacSha256),
-        aead_alg: &Aead::<aes_gcm::Aes128Gcm>(Kind::Aes128Gcm, PhantomData),
+        aead_alg: &Aead13(record::Aead::Aes128Gcm),
         quic: None,
     });
 
@@ -191,7 +208,7 @@ pub static TLS13_AES_256_GCM_SHA384: SupportedCipherSuite =
             confidentiality_limit: 1 << 24,
         },
         hkdf_provider: &HkdfUsingHmac(&HmacSha384),
-        aead_alg: &Aead::<aes_gcm::Aes256Gcm>(Kind::Aes256Gcm, PhantomData),
+        aead_alg: &Aead13(record::Aead::Aes256Gcm),
         quic: None,
     });
 
@@ -204,39 +221,44 @@ pub static TLS13_CHACHA20_POLY1305_SHA256: SupportedCipherSuite =
             confidentiality_limit: u64::MAX,
         },
         hkdf_provider: &HkdfUsingHmac(&HmacSha256),
-        aead_alg: &Aead::<chacha20poly1305::ChaCha20Poly1305>(Kind::Chacha20Poly1305, PhantomData),
+        aead_alg: &Aead13(record::Aead::Chacha20Poly1305),
         quic: None,
     });
 
-#[derive(Clone, Copy)]
-enum Kind {
-    Aes128Gcm,
-    Aes256Gcm,
-    Chacha20Poly1305,
+/// The TLS 1.3 AEADs, on [`record`].
+struct Aead13(record::Aead);
+
+fn record_key(aead: record::Aead, key: &AeadKey, iv: &[u8]) -> RecordKey {
+    RecordKey::new(aead, key.as_ref(), iv).expect("rustls passes the key block's lengths")
 }
 
-/// All three AEADs have 12-byte nonces and 16-byte tags.
-const TAG_LEN: usize = 16;
+fn traffic_secrets(aead: record::Aead, key: AeadKey, iv: Iv) -> ConnectionTrafficSecrets {
+    match aead {
+        record::Aead::Aes128Gcm => ConnectionTrafficSecrets::Aes128Gcm { key, iv },
+        record::Aead::Aes256Gcm => ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+        record::Aead::Chacha20Poly1305 => ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
+    }
+}
 
-struct Aead<A>(Kind, PhantomData<fn() -> A>);
+fn record_error(e: record::RecordError) -> Error {
+    match e {
+        record::RecordError::RecordOverflow => Error::PeerSentOversizedRecord,
+        record::RecordError::NoContentType => PeerMisbehaved::IllegalTlsInnerPlaintext.into(),
+        record::RecordError::BadRecordMac | record::RecordError::Malformed => Error::DecryptError,
+    }
+}
 
-impl<A: KeyInit + AeadInOut + Send + Sync + 'static> Tls13AeadAlgorithm for Aead<A> {
+impl Tls13AeadAlgorithm for Aead13 {
     fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
-        Box::new(Sealer {
-            key: A::new_from_slice(key.as_ref()).expect("rustls passes key_len() bytes"),
-            iv,
-        })
+        Box::new(Sealer(record_key(self.0, &key, iv.as_ref())))
     }
 
     fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
-        Box::new(Opener {
-            key: A::new_from_slice(key.as_ref()).expect("rustls passes key_len() bytes"),
-            iv,
-        })
+        Box::new(Opener(record_key(self.0, &key, iv.as_ref())))
     }
 
     fn key_len(&self) -> usize {
-        A::key_size()
+        self.0.key_len()
     }
 
     fn extract_keys(
@@ -244,29 +266,15 @@ impl<A: KeyInit + AeadInOut + Send + Sync + 'static> Tls13AeadAlgorithm for Aead
         key: AeadKey,
         iv: Iv,
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
-        Ok(match self.0 {
-            Kind::Aes128Gcm => ConnectionTrafficSecrets::Aes128Gcm { key, iv },
-            Kind::Aes256Gcm => ConnectionTrafficSecrets::Aes256Gcm { key, iv },
-            Kind::Chacha20Poly1305 => ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
-        })
+        Ok(traffic_secrets(self.0, key, iv))
     }
 }
 
-struct Sealer<A> {
-    key: A,
-    iv: Iv,
-}
+struct Sealer(RecordKey);
 
-struct Opener<A> {
-    key: A,
-    iv: Iv,
-}
+struct Opener(RecordKey);
 
-fn nonce<A: AeadInOut>(iv: &Iv, seq: u64) -> aes_gcm::aead::Nonce<A> {
-    aes_gcm::aead::Nonce::<A>::try_from(&Nonce::new(iv, seq).0[..]).expect("12-byte nonces")
-}
-
-impl<A: AeadInOut + Send + Sync> MessageEncrypter for Sealer<A> {
+impl MessageEncrypter for Sealer {
     fn encrypt(
         &mut self,
         msg: OutboundPlainMessage<'_>,
@@ -278,9 +286,8 @@ impl<A: AeadInOut + Send + Sync> MessageEncrypter for Sealer<A> {
         payload.extend_from_slice(&msg.typ.to_array());
         let aad = make_tls13_aad(total_len);
         let tag = self
-            .key
-            .encrypt_inout_detached(&nonce::<A>(&self.iv, seq), &aad, payload.as_mut().into())
-            .map_err(|_| Error::EncryptError)?;
+            .0
+            .seal_detached(&self.0.nonce(seq), &aad, payload.as_mut());
         payload.extend_from_slice(&tag);
         // TLS 1.3 records carry the legacy version 0x0303 (RFC 8446 §5.1).
         Ok(OutboundOpaqueMessage::new(
@@ -295,23 +302,21 @@ impl<A: AeadInOut + Send + Sync> MessageEncrypter for Sealer<A> {
     }
 }
 
-impl<A: AeadInOut + Send + Sync> MessageDecrypter for Opener<A> {
+impl MessageDecrypter for Opener {
     fn decrypt<'a>(
         &mut self,
         mut msg: InboundOpaqueMessage<'a>,
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error> {
-        let payload = &mut msg.payload;
-        let len = payload.len();
-        let plain_len = len.checked_sub(TAG_LEN).ok_or(Error::DecryptError)?;
-        let aad = make_tls13_aad(len);
-        let (body, tag) = payload.split_at_mut(plain_len);
-        let tag = aes_gcm::aead::Tag::<A>::try_from(&*tag).map_err(|_| Error::DecryptError)?;
-        self.key
-            .decrypt_inout_detached(&nonce::<A>(&self.iv, seq), &aad, body.into(), &tag)
-            .map_err(|_| Error::DecryptError)?;
-        payload.truncate(plain_len);
-        msg.into_tls13_unpadded_message()
+        let aad = make_tls13_aad(msg.payload.len());
+        let (typ, len) = self
+            .0
+            .open13_in_place(seq, &aad, &mut msg.payload)
+            .map_err(record_error)?;
+        msg.payload.truncate(len);
+        msg.typ = ContentType::from(typ);
+        msg.version = ProtocolVersion::TLSv1_3;
+        Ok(msg.into_plain_message())
     }
 }
 
@@ -956,18 +961,11 @@ mod tests {
         assert!(X25519.start().unwrap().complete(&[0; 32]).is_err());
     }
 
-    fn round_trip<A: KeyInit + AeadInOut + Send + Sync + 'static>() {
+    fn round_trip(aead: record::Aead) {
         use rustls::crypto::cipher::OutboundChunks;
-        let key = || A::new_from_slice(&[7u8; 32][..A::key_size()]).unwrap();
-        let iv = || Iv::from([9; 12]);
-        let mut enc = Sealer {
-            key: key(),
-            iv: iv(),
-        };
-        let mut dec = Opener {
-            key: key(),
-            iv: iv(),
-        };
+        let key = || RecordKey::new(aead, &[7u8; 32][..aead.key_len()], &[9; 12]).unwrap();
+        let mut enc = Sealer(key());
+        let mut dec = Opener(key());
         let plain = OutboundPlainMessage {
             typ: ContentType::ApplicationData,
             version: ProtocolVersion::TLSv1_3,
@@ -975,6 +973,11 @@ mod tests {
         };
         let mut bytes = enc.encrypt(plain, 3).unwrap().encode();
         assert_eq!(bytes.len(), 5 + 5 + 1 + TAG_LEN);
+        // The engine's record layer opens what rustls's encrypter sealed.
+        assert_eq!(
+            key().open13(3, &bytes).unwrap(),
+            (record::APPLICATION_DATA, b"hello".to_vec())
+        );
         let mut tampered = bytes.clone();
         let msg = |b: &mut Vec<u8>| -> Vec<u8> { b[5..].to_vec() };
         let mut body = msg(&mut bytes);
@@ -992,10 +995,7 @@ mod tests {
         assert_eq!(got.typ, ContentType::ApplicationData);
         tampered[7] ^= 1;
         let mut body = msg(&mut tampered);
-        let mut dec = Opener {
-            key: key(),
-            iv: iv(),
-        };
+        let mut dec = Opener(key());
         let r = dec.decrypt(
             InboundOpaqueMessage::new(
                 ContentType::ApplicationData,
@@ -1005,6 +1005,19 @@ mod tests {
             3,
         );
         assert!(r.is_err());
+        // And rustls's decrypter opens the engine's records.
+        let mut body = key().seal13(4, record::HANDSHAKE, b"hi")[5..].to_vec();
+        let got = Opener(key())
+            .decrypt(
+                InboundOpaqueMessage::new(
+                    ContentType::ApplicationData,
+                    ProtocolVersion::TLSv1_2,
+                    &mut body,
+                ),
+                4,
+            )
+            .unwrap();
+        assert_eq!((got.typ, got.payload), (ContentType::Handshake, &b"hi"[..]));
     }
 
     fn unhex(s: &str) -> Vec<u8> {
@@ -1137,8 +1150,8 @@ mod tests {
 
     #[test]
     fn aeads_round_trip() {
-        round_trip::<aes_gcm::Aes128Gcm>();
-        round_trip::<aes_gcm::Aes256Gcm>();
-        round_trip::<chacha20poly1305::ChaCha20Poly1305>();
+        round_trip(record::Aead::Aes128Gcm);
+        round_trip(record::Aead::Aes256Gcm);
+        round_trip(record::Aead::Chacha20Poly1305);
     }
 }
