@@ -20,7 +20,8 @@ Building blocks:
 | [`crates/zen-core`](crates/zen-core) | Client-side crypto core (Rust, native + `wasm32`) |
 | [`crates/zen-proto`](crates/zen-proto) | Wire types of the API (CBOR), shared by server and clients (native + `wasm32`) |
 | [`crates/zen-store`](crates/zen-store) | Storage trait with FoundationDB semantics, tuple encoding, embedded `redb` backend, FoundationDB backend (feature `fdb`) |
-| [`crates/zen-tls-rustcrypto`](crates/zen-tls-rustcrypto) | A rustls crypto provider on RustCrypto (pure Rust, native + `wasm32`) and the RSA key policy, for the server's native TLS and the relayed services' TLS |
+| [`crates/zen-tls-rustcrypto`](crates/zen-tls-rustcrypto) | A rustls crypto provider on RustCrypto (pure Rust, native + `wasm32`; TLS 1.2 suites behind `tls12`), its record protection at the byte level, and the RSA key policy, for the server's native TLS and the relayed services' TLS |
+| [`crates/zen-svc`](crates/zen-svc) | Protocol engines of relayed services (sans-IO, native + `wasm32`): the TLS 1.3/1.2 server whose state another handler restores at any record boundary ([`spec/svc.md`](spec/svc.md) §7.1) |
 | [`crates/zen-server`](crates/zen-server) | The `zen-serve` binary: auth, signed ACL, KV, commit, event log, consumer groups, WebSocket stream, static files, FoundationDB supervisor, backup/export |
 | [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
 | [`packages/client`](packages/client) | `@zen/client`: the TypeScript client library, Node and browsers ([`docs/CLIENT.md`](docs/CLIENT.md)) |
