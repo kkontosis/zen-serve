@@ -36,6 +36,10 @@ const C_FIN = 2;
 const C_CLOSE = 4;
 const C_ABORT = 8;
 const C_RESUMABLE = 16;
+const C_UNSEAL = 32;
+
+/** The tag a sealed input chunk carries (formats.md §13.3). */
+const CHUNK_TAG = 16;
 
 /** The bytes a sealed record adds to its raw bytes, with room to spare (api.md §14.5). */
 const RECORD_ROOM = 130;
@@ -66,6 +70,12 @@ export interface ServeOptions<S = RawStep> {
   onError?: (e: unknown, conn?: Uint8Array) => void;
   /** Options of each step's transaction. */
   txn?: DbTxnOptions;
+  /**
+   * The 32-byte decapsulation seed of the service's sealed inbox (svc.md
+   * §9), which the app keeps sealed in the fs. Needed when the service has
+   * an `inbox`: without it, its connections are released with `close`.
+   */
+  inbox?: Uint8Array;
 }
 
 const pause = (ms: number, signal?: AbortSignal) =>
@@ -109,6 +119,8 @@ interface Conn<S> {
   layer: LayerConn<S>;
   /** A step prepared and not committed yet (reused when it runs again). */
   prep: Step0 | undefined;
+  /** The key of its sealed input, on a service with an inbox. */
+  inbox: zw.InboxKey | undefined;
 }
 
 /** A prepared step, with the input it was prepared from. */
@@ -202,7 +214,7 @@ export class ServeHandle<S = RawStep> {
     await this.sub?.close().catch(() => {});
     this.stream?.close();
     if (this.lease) await this.svc.releaseLease(this.lease).catch(() => {});
-    for (const c of this.held.values()) c.layer.free();
+    for (const c of this.held.values()) free(c);
     this.held.clear();
     this.engine?.close();
     this.engine = undefined;
@@ -331,7 +343,7 @@ export class ServeHandle<S = RawStep> {
     );
     for (const c of this.held.values()) {
       c.gone = true;
-      c.layer.free();
+      free(c);
     }
     this.held.clear();
     this.lease = undefined;
@@ -416,6 +428,7 @@ export class ServeHandle<S = RawStep> {
       reveals: Promise.resolve(),
       layer: this.engine!.conn(),
       prep: undefined,
+      inbox: undefined,
     };
     this.held.set(key, conn);
     try {
@@ -452,6 +465,22 @@ export class ServeHandle<S = RawStep> {
     conn.input.advance(c.in_acked);
     if (conn.input.base !== c.in_acked) conn.input = new Input(c.in_acked);
     if (conn.seenTo < c.in_acked) conn.seenTo = c.in_acked;
+    if (c.inbox_ct && !conn.inbox) {
+      if (!this.opts.inbox) {
+        throw new ZenError(
+          0,
+          'inbox',
+          'the service seals its input: serve() needs its inbox seed (`inbox`)',
+        );
+      }
+      conn.inbox = zw.InboxKey.decaps(
+        this.opts.inbox,
+        c.inbox_ct,
+        this.db.fs.id,
+        this.svc.id,
+        conn.conn,
+      );
+    }
     if (c.state) {
       const pt = this.svc.keysFor(c.state).openState(conn.conn, c.in_acked, c.out_head, c.state);
       const st = decodeState(pt);
@@ -490,7 +519,7 @@ export class ServeHandle<S = RawStep> {
   /** Release a connection (with `close`: abort it) and forget it. */
   private async giveUp(conn: Conn<S>, close: boolean): Promise<void> {
     conn.gone = true;
-    conn.layer.free();
+    free(conn);
     this.held.delete(conn.key);
     const lease = this.lease;
     if (lease) {
@@ -503,7 +532,7 @@ export class ServeHandle<S = RawStep> {
 
   private forget(conn: Conn<S>): void {
     conn.gone = true;
-    conn.layer.free();
+    free(conn);
     if (this.held.get(conn.key) === conn) this.held.delete(conn.key);
     if (this.ctl) void this.claim(this.ctl.signal);
   }
@@ -523,7 +552,7 @@ export class ServeHandle<S = RawStep> {
       // pushes repeat bytes and may start a little before the claim's
       // `in_acked`: the bound is on the span. A chunk dropped here leaves a
       // gap, which `repair` reads again.
-      const end = p.off + BigInt(p.data.length);
+      const end = p.off + BigInt(p.data.length - (p.sealed ? CHUNK_TAG : 0));
       let e = this.early.get(key);
       if (!e) {
         e = { at: Date.now(), lo: p.off, hi: end, chunks: [] };
@@ -543,17 +572,23 @@ export class ServeHandle<S = RawStep> {
   }
 
   private input(conn: Conn<S>, p: Extract<SvcPush, { type: 'input' }>): void {
+    if (conn.gone) return;
+    let data = p.data;
     if (p.sealed) {
-      this.report(
-        new ZenError(0, 'unsupported', 'sealed input (an inbox) is not supported yet'),
-        conn.conn,
-      );
-      void this.giveUp(conn, true);
-      return;
+      // Opened at its offset: a chunk moved elsewhere doesn't open (svc.md §9).
+      try {
+        if (!conn.inbox)
+          throw new ZenError(0, 'inbox', 'sealed input on a connection without inbox_ct');
+        data = conn.inbox.openChunk(p.off, p.data);
+      } catch (e) {
+        this.report(e, conn.conn);
+        void this.giveUp(conn, true);
+        return;
+      }
     }
     conn.at = Date.now();
-    if (p.data.length) conn.input.add(p.off, p.data);
-    if (p.flags & C_EOF && p.data.length === 0) conn.eofAt = p.off;
+    if (data.length) conn.input.add(p.off, data);
+    if (p.flags & C_EOF && data.length === 0) conn.eofAt = p.off;
     if (conn.input.pending === 0) conn.gapAt = 0;
     else if (!conn.gapAt) conn.gapAt = Date.now();
   }
@@ -810,14 +845,17 @@ export class ServeHandle<S = RawStep> {
     const changed = !sameState(app, conn.app) || f.engineChanged;
     // TLS: resumable once the handshake is done, with the state it gives.
     const firstResumable = info.resume && resumable && !(conn.flags & C_RESUMABLE);
+    // Sent once: it is sticky on the server.
+    const unseal = f.unseal === true && !(conn.flags & C_UNSEAL);
     const needState = conn.hasState || app !== null || f.engineState !== null;
     const sealState = needState && (moved || changed || !conn.hasState);
     const flags =
       (f.endFlag === SVC_FIN ? C_FIN : 0) |
       (f.endFlag === SVC_CLOSE ? C_CLOSE : 0) |
       (f.endFlag === SVC_ABORT ? C_ABORT : 0) |
-      (firstResumable ? C_RESUMABLE : 0);
-    if (!(moved || out.length || sealState || firstResumable)) {
+      (firstResumable ? C_RESUMABLE : 0) |
+      (unseal ? C_UNSEAL : 0);
+    if (!(moved || out.length || sealState || firstResumable || unseal)) {
       return {
         step: undefined,
         reveals,
@@ -852,6 +890,7 @@ export class ServeHandle<S = RawStep> {
           }
         : {}),
       ...(firstResumable ? { resumable: true } : {}),
+      ...(unseal ? { unseal: true } : {}),
     };
     return { step, reveals, inTo, outHead: off, app, sealed: sealState, flags };
   }
@@ -889,6 +928,13 @@ export class ServeHandle<S = RawStep> {
       }),
     );
   }
+}
+
+/** Free what a connection holds in WASM. */
+function free<S>(c: Conn<S>): void {
+  c.layer.free();
+  c.inbox?.free();
+  c.inbox = undefined;
 }
 
 function sameState(a: Uint8Array | null, b: Uint8Array | null): boolean {

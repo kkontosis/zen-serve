@@ -257,6 +257,7 @@ class TlsConn implements LayerConn<RawStep> {
         engineChanged: state !== null && !this.same(state),
         // Records held back behind the plaintext: the handler made room.
         again: p.held && s.acked > 0,
+        unseal: s.unsealed,
       };
     } finally {
       c.free();
