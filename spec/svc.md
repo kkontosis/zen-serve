@@ -147,7 +147,7 @@ The whole state is at most `max_value_bytes`. An engine that must queue output (
 
 * A handler seals the state and the escrows under the newest epoch it holds; `key_epoch` is in the sealed header (formats.md §4).
 * A handler that holds the fs keys walks the epoch chain (formats.md §2) to open older states.
-* **A delegated worker** that holds only the service's topic keys can't walk the chain, so its delegation carries `D_svc` for the current epoch and the one before. A successor that can't open a state's epoch aborts the connection.
+* **A delegated worker** that holds only the service's keys can't walk the chain, so its delegation carries `K_svc` (or the topic keys `D_svc`) for the current epoch and the one before. A successor that can't open a state's epoch aborts the connection (`/v1/svc/release` with `close`).
 * **A rotation doesn't protect live sessions.** A TLS connection's traffic secrets are in its state, and TLS 1.3's key update is derived from them. Handlers SHOULD close TLS connections whose state is sealed under an epoch older than the current one, and SHOULD rekey SSH connections in that case (a fresh key exchange, which needs no old secret).
 
 ## 9. Sealed inbox

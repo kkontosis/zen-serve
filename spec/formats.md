@@ -68,7 +68,8 @@ off  len  field
   2    1  kind           1 = KV value, 2 = event, 3 = epoch-chain record,
                          4 = fs node meta, 5 = fs manifest, 6 = fs chunk,
                          7 = CRDT value (zendb.md §19),
-                         8 = local record (zendb.md §9.3)
+                         8 = local record (zendb.md §9.3),
+                         9 = svc state, 10 = svc output key (§13)
   3    1  reserved       = 0
   4    4  key_epoch      u32
   8   24  nonce          random per seal
@@ -89,8 +90,11 @@ Total = 48 + plaintext length.
 | 6 fs chunk | `zen/v1/aad/fs-chunk` | `u32(fs) ‖ chunk_id(16)` | filesystem AEAD key of `key_epoch` (a version-1 manifest), or the file's chunk key (a version-2 manifest, §11.4) |
 | 7 CRDT value | `zen/v1/aad/crdt-value` | `u32(fs) ‖ lp(object) ‖ field(16) ‖ elem(16)` (zendb.md §19.2) | KV AEAD key of `key_epoch` |
 | 8 local record | `zen/v1/aad/local` | `u32(fs) ‖ lp(store) ‖ lp(record_key)` (zendb.md §9.3) | KV AEAD key of `key_epoch` |
+| 9 svc state | `zen/v1/aad/svc-state` | `u32(fs) ‖ lp(svc) ‖ conn(16) ‖ u64(in_acked) ‖ u64(out_head)`, the cursors after the step that wrote it (svc.md §4) | service key `K_svc` of `key_epoch` (§13) |
+| 10 svc output key | `zen/v1/aad/svc-key` | `u32(fs) ‖ lp(svc) ‖ conn(16) ‖ u64(off)`, the record's output offset | service key `K_svc` of `key_epoch` (§13) |
 
 * A value moved to another key or fs, or an event moved to another topic or event key, fails authentication. So does a local record moved to another store, record key or fs.
+* A state (kind 9) paired with other cursors, or an output key (kind 10) moved to another record, connection or service, fails authentication.
 * Local records (kind 8) never reach the server: they are the fs layer of a device's local store (zendb.md §9.3).
 * Clients read `key_epoch` from the header to pick the right epoch keys before decrypting.
 * **Native block-device blocks** are KV values (DESIGN-3 §1). There's no separate block format, and the layout in DESIGN.md §2.4 is superseded.
@@ -428,3 +432,62 @@ lp(policy)                         version 2 only
 A signed header (by an admin, chained like the ACL) is planned with the authenticated tier (milestone 6).
 
 Vectors: `test-vectors/header.json`. The ACL encoding (§9) has vectors too: `test-vectors/acl.json`.
+
+## 13. Relayed services (svc.md)
+
+`svc` is the service id (a topic id), `conn` the 16-byte connection id. The **service key** of epoch `e` is
+
+```
+K_svc = KDF("zen/v1/svc-aead", D_svc, "")        D_svc: the topic data key of svc at epoch e (§3.3)
+```
+
+It seals the state (kind 9, §4) and the output-key escrows (kind 10). The state's plaintext is defined in svc.md §7.
+
+### 13.1 Output record
+
+What a step appends to a connection's output (api.md §14.5), stored verbatim at its output offset `off`:
+
+```
+sealed record (flags & 4 = 0):  u8 version = 1 ‖ u8 flags ‖ key_hash(32) ‖ escrow(80) ‖ body
+plain record  (flags & 4 = 4):  u8 version = 1 ‖ u8 flags ‖ raw
+
+key_hash = BLAKE3.derive_key("zen/v1/svc-reveal", k_r)
+escrow   = kind-10 sealed object (§4) of k_r, under K_svc
+body     = ChaCha20-Poly1305(k_r, nonce = 12 zero bytes,
+                             aad = "zen/v1/aad/svc-out" ‖ 0x00 ‖ u32(fs) ‖ lp(svc) ‖ conn ‖ u64(off) ‖ u8(flags),
+                             raw)                                   (raw ‖ 16-byte tag)
+```
+
+* **Flags:** 1 FIN after this record, 2 close after it, 4 plain, 8 abort when the writer reaches it. Other bits are zero. At most one of FIN, close and abort is set.
+* **The record key `k_r`** is 32 random bytes, fresh for every record of every commit attempt. It encrypts exactly one message, which is why the nonce can be zero. It is never derived from the offset: a rebuilt step must get new keys (svc.md §5).
+* **Raw length.** A sealed record's raw length is `len − 130`, and a plain record's is `len − 2`. It advances `out_head`, and the next record's `off` is this `off` plus it.
+* **Empty records.** A record whose raw length is 0 carries FIN, close or abort.
+* **Plain records** belong only to services with `resume: false`, and sealed records only to the others.
+
+### 13.2 Reveal
+
+To release a sealed record, a handler sends `k_r` (api.md §14.7). The server accepts it only if both hold:
+1. `BLAKE3.derive_key("zen/v1/svc-reveal", k_r) = key_hash`
+2. the body opens under `k_r` with the AAD above
+
+The first check makes the key commit to the record (Poly1305 alone doesn't bind the key). The second catches a malformed record before the writer reaches it. A handler that has no `k_r` in memory gets it by opening the escrow under `K_svc` of the escrow's `key_epoch`, with context `u32(fs) ‖ lp(svc) ‖ conn ‖ u64(off)`.
+
+### 13.3 Sealed inbox
+
+* **The inbox key pair.** The service's `inbox` key is the X-Wing (draft-connolly-cfrg-xwing-kem) key pair whose 32-byte decapsulation seed is chosen at random by the admin and kept sealed in the fs. The public key (1,216 bytes) goes in the service configuration.
+* **Per connection.** The owning node encapsulates once: `(ct, ss) = X-Wing.Encaps(inbox_pk)`. It stores `ct` (1,120 bytes) in the connection record (keyspace.md §3.9) and derives
+
+  ```
+  K_in = KDF("zen/v1/svc-inbox", ss, u32(fs) ‖ lp(svc) ‖ conn)
+  ```
+
+* **A sealed chunk.** Input at plaintext offset `off` is sealed as
+
+  ```
+  ChaCha20-Poly1305(K_in, nonce = u32(0) ‖ u64(off), aad = "zen/v1/aad/svc-in" ‖ 0x00, data)
+  ```
+
+  and stored as `u8 1 ‖ ciphertext ‖ tag`. A plain chunk is `u8 0 ‖ data`. Offsets and `in_head` count plaintext bytes, and chunks don't overlap, so each nonce encrypts one chunk. A batch resent after `commit_unknown` reuses its offset only with the same bytes (svc.md §3).
+* **Opening.** A handler decapsulates `ct` with its seed, derives `K_in`, and opens each chunk at its offset. It checks that consecutive chunks are contiguous, so a dropped or reordered chunk fails.
+
+Vectors: `test-vectors/svc.json`.
