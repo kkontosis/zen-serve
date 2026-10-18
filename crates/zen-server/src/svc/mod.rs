@@ -7,12 +7,16 @@
 //! * [`node`]: the node lease and the node's work queue
 //! * [`reap`]: reaping connections, ending leases, the sweeper
 //! * [`api`]: the `/v1/svc/*` endpoints
+//! * [`step`]: the `svc` commit step
+//! * [`reveal`]: releasing output records by their keys
 
 pub mod api;
 pub mod conn;
 pub mod listen;
 pub mod node;
 pub mod reap;
+pub mod reveal;
+pub mod step;
 
 use crate::config::{Config, ServiceConfig};
 use crate::error::{ApiResult, claim_lost, conn_closed, internal};
@@ -41,6 +45,8 @@ pub const RA_CLOSE: u8 = 2;
 pub const RA_ABORT: u8 = 4;
 /// A step made the connection resumable.
 pub const RA_RESUMABLE: u8 = 8;
+/// A step turned input sealing off.
+pub const RA_UNSEAL: u8 = 16;
 /// `rh` flag: the peer sent FIN.
 pub const RH_EOF: u8 = 1;
 
@@ -57,7 +63,7 @@ pub const NODE_LEASE_SECS: u64 = 10;
 /// A command for a local connection task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cmd {
-    /// Something changed: re-check the window (and, later, output).
+    /// Something changed: re-check the window and the output.
     Wake,
     /// Reset the socket and reap the connection.
     Abort,
@@ -504,7 +510,7 @@ pub async fn claim_of(
             .as_deref(),
     );
     let state = t.get(&keys::conn("rs", fs, svc, conn)).await?;
-    let pending = pending(t, fs, svc, conn, written_to, ra.out_head).await?;
+    let pending = pending(t, fs, svc, conn, written_to).await?;
     Ok(SvcClaim {
         conn: conn.to_vec(),
         token,
@@ -526,22 +532,19 @@ pub fn flags(rh_flags: u8, ra_flags: u8) -> u8 {
     (rh_flags & RH_EOF) | (ra_flags << 1)
 }
 
-/// The escrows of committed records in `[written_to, out_head)` whose key
-/// is not revealed, in offset order.
+/// The escrows of committed records from `written_to` whose key is not
+/// revealed, in offset order. An empty record that ends the output sits at
+/// `out_head` itself.
 async fn pending(
     t: &mut Box<dyn Txn>,
     fs: u32,
     svc: &[u8],
     conn: &Id,
     written_to: u64,
-    out_head: u64,
 ) -> ApiResult<Vec<SvcPending>> {
-    if written_to >= out_head {
-        return Ok(Vec::new());
-    }
     let ro = keys::conn_key("ro", fs, svc, conn);
     let begin = ro.clone().int(written_to as i64).finish();
-    let end = ro.int(out_head as i64).finish();
+    let end = keys::end_of(&ro.finish());
     let recs = t.get_range(&begin, &end, 100_000, false).await?;
     let mut out = Vec::new();
     for (k, v) in recs {
