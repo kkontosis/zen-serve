@@ -7,6 +7,7 @@ import { Kv, type Transaction, type TxnOptions, transaction } from './kv.js';
 import type { SealedStore } from './local/sealed.js';
 import { Topic } from './log.js';
 import type { Argon2, Session } from './session.js';
+import { Service } from './svc.js';
 import { Tree, type TreeOptions } from './tree.js';
 import { zw } from './wasm.js';
 
@@ -349,6 +350,11 @@ export class UnlockedFs {
   /** A topic by path (`log.ts`). */
   topic(...path: (string | Uint8Array)[]): Topic {
     return new Topic(this, path);
+  }
+
+  /** A relayed service by its topic path, e.g. `service('svc', 'echo')` (`svc.ts`). */
+  service(...path: (string | Uint8Array)[]): Service {
+    return new Service(this, this.topic(...path));
   }
 
   /** A filesystem tree by id (`tree.ts`). */

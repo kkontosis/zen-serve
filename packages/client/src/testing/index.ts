@@ -5,7 +5,9 @@ export { type TestUser, testUser } from './fixtures.js';
 export {
   freePort,
   type ServerOptions,
+  type ServiceSpec,
   serverBinary,
+  serviceToml,
   spawnServer,
   startIn,
   type TestServer,

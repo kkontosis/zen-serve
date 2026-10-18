@@ -40,6 +40,8 @@ export interface TestServer {
   stop(): Promise<void>;
   /** Stop the process, keeping the data (for a restart). */
   kill(): Promise<void>;
+  /** Stop the process and start it again on the same data and port, with `opts` merged in. */
+  restart(opts?: ServerOptions): Promise<TestServer>;
   /** The server's log so far. */
   log(): Promise<string>;
 }
@@ -55,6 +57,37 @@ function table(name: string | undefined, kv: Record<string, unknown> | undefined
     ([k, v]) => `${k} = ${toml(v as string | number | boolean | string[])}`,
   );
   return `${name ? `[${name}]\n` : ''}${lines.join('\n')}\n`;
+}
+
+/** A relayed service to configure (spec/svc.md §2): a `tcp` service on `port`. */
+export interface ServiceSpec {
+  name: string;
+  fs: number;
+  /** The service id: the topic id of its path. */
+  id: Uint8Array;
+  port: number;
+  resume?: boolean;
+  /** Other `[[service]]` settings (`window`, `accept_wait_ms`, …). */
+  more?: Record<string, number | boolean | string>;
+}
+
+/** The `[[service]]` tables of `services`, for `ServerOptions.extra`. */
+export function serviceToml(services: ServiceSpec[]): string {
+  return services
+    .map((s) => {
+      const id = [...s.id].map((b) => b.toString(16).padStart(2, '0')).join('');
+      const kv = {
+        name: s.name,
+        fs: s.fs,
+        id,
+        mode: 'tcp',
+        listen: `127.0.0.1:${s.port}`,
+        ...(s.resume === false ? { resume: false } : {}),
+        ...s.more,
+      };
+      return `[[service]]\n${table(undefined, kv)}`;
+    })
+    .join('\n');
 }
 
 /** A free TCP port on 127.0.0.1. */
@@ -151,6 +184,10 @@ export async function startIn(dataDir: string, opts: ServerOptions = {}): Promis
     claimToken,
     kill,
     log,
+    async restart(more: ServerOptions = {}) {
+      await kill();
+      return startIn(dataDir, { ...opts, ...more, port });
+    },
     async stop() {
       await kill();
       await rm(dataDir, { recursive: true, force: true });

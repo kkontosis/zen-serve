@@ -55,6 +55,27 @@ export interface EphemeralMessage {
   data: Uint8Array;
 }
 
+/**
+ * What a service subscription pushes (api.md §14.10): input of a connection
+ * held under the lease, or word that the service's ready queue changed.
+ * After a reconnection the input is pushed again from each connection's
+ * `in_acked`, so a receiver dedupes by offset.
+ */
+export type SvcPush =
+  | {
+      type: 'input';
+      conn: Uint8Array;
+      /** The chunk's input offset. */
+      off: bigint;
+      /** The chunk; empty for the EOF. */
+      data: Uint8Array;
+      /** Sealed by the inbox (formats.md §13.3). */
+      sealed: boolean;
+      /** EOF (1) | step flags << 1, as in a claim. */
+      flags: number;
+    }
+  | { type: 'ready' };
+
 /** Options of `subscribe`. */
 export interface SubscribeOptions<T> {
   /** Start strictly after this offset (history, then live). Default: events committed from now on. */
@@ -142,9 +163,9 @@ export class Subscription<T> implements AsyncIterable<T> {
 }
 
 interface SubState {
-  kind: 'sub' | 'esub';
+  kind: 'sub' | 'esub' | 'svc';
   fs: number;
-  target: { topic: Uint8Array } | { prefix: Uint8Array };
+  target: { topic: Uint8Array } | { prefix: Uint8Array } | { svc: Uint8Array; lease: Uint8Array };
   /** Topics that can open what arrives, by hex id. */
   topics: Map<string, Topic>;
   /** `sub`: the last offset received (or the start). */
@@ -324,7 +345,9 @@ export class Stream {
   }
 
   private sendSub(id: number, s: SubState): void {
-    if (s.kind === 'sub') {
+    if ('svc' in s.target) {
+      this.send({ op: 'svc_sub', id, fs: s.fs, ...s.target });
+    } else if (s.kind === 'sub') {
       this.send({ op: 'sub', id, fs: s.fs, ...s.target, ...(s.cursor ? { after: s.cursor } : {}) });
     } else {
       this.send({ op: 'esub', id, fs: s.fs, ...s.target });
@@ -370,6 +393,25 @@ export class Stream {
         if (s?.kind !== 'esub') return;
         const m = this.openEphemeral(s, f);
         if (m) s.sub.push(m);
+        return;
+      }
+      case 'svc_in': {
+        const s = this.subs.get(f.id);
+        if (s?.kind !== 'svc') return;
+        s.sub.push({
+          type: 'input',
+          conn: f.conn,
+          off: f.off,
+          data: f.data,
+          sealed: f.sealed,
+          flags: f.flags,
+        } satisfies SvcPush);
+        return;
+      }
+      case 'svc_ready': {
+        const s = this.subs.get(f.id);
+        if (s?.kind !== 'svc') return;
+        s.sub.push({ type: 'ready' } satisfies SvcPush);
         return;
       }
       default:
@@ -422,12 +464,12 @@ export class Stream {
   }
 
   private async start<T>(
-    kind: 'sub' | 'esub',
-    target: StreamTarget,
+    kind: 'sub' | 'esub' | 'svc',
+    target: StreamTarget | Pick<SubState, 'fs' | 'target' | 'topics'>,
     opts: SubscribeOptions<T>,
   ): Promise<Subscription<T>> {
     await this.ready();
-    const base = this.resolveTarget(target);
+    const base = 'target' in target ? target : this.resolveTarget(target);
     const id = this.nextId++;
     const sub = new Subscription<T>(this, id, opts);
     const s: SubState = { kind, ...base, sub };
@@ -436,7 +478,7 @@ export class Stream {
       // the server pick its head: the cursor is then known from the start,
       // and a reconnection before the first event still misses nothing.
       s.cursor = opts.after ?? offsetAfterVersion(await this.session.readVersion());
-    } else {
+    } else if (kind === 'esub') {
       s.seen = new Map();
     }
     const started = new Promise<void>((ok, fail) => {
@@ -465,6 +507,24 @@ export class Stream {
     opts: Omit<SubscribeOptions<EphemeralMessage>, 'after'> = {},
   ): Promise<Subscription<EphemeralMessage>> {
     return this.start('esub', target, opts);
+  }
+
+  /**
+   * Have the input of the connections held under a handler lease pushed
+   * (api.md §14.10), and wake-ups when the service's ready queue changes.
+   * Resolves once the server accepted it; it ends with an error
+   * (`not_leader`) when the lease ends. After a reconnection it is sent
+   * again: input is pushed again from each connection's `in_acked`, and a
+   * `ready` follows if connections are queued.
+   */
+  subscribeSvc(
+    fs: UnlockedFs | number,
+    svc: Uint8Array,
+    lease: Uint8Array,
+    opts: Omit<SubscribeOptions<SvcPush>, 'after'> = {},
+  ): Promise<Subscription<SvcPush>> {
+    const fsId = typeof fs === 'number' ? fs : fs.id;
+    return this.start('svc', { fs: fsId, target: { svc, lease }, topics: new Map() }, opts);
   }
 
   /** Stop a subscription. */
