@@ -2217,6 +2217,7 @@ version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
+ "web-time",
  "zeroize",
 ]
 
@@ -3259,6 +3260,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3503,7 +3514,6 @@ dependencies = [
 name = "zen-server"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "axum",
  "base64 0.23.1",
  "blake3",
@@ -3514,10 +3524,8 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.4.3",
- "hmac 0.13.0",
  "include_dir",
  "mime_guess",
- "ml-kem",
  "nix",
  "p256",
  "p384",
@@ -3537,11 +3545,11 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "x25519-dalek",
  "zen-core",
  "zen-proto",
  "zen-server",
  "zen-store",
+ "zen-tls-rustcrypto",
 ]
 
 [[package]]
@@ -3556,6 +3564,28 @@ dependencies = [
  "tokio",
  "tracing",
  "zen-store",
+]
+
+[[package]]
+name = "zen-tls-rustcrypto"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "blake3",
+ "chacha20poly1305",
+ "ecdsa",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "ml-kem",
+ "p256",
+ "p384",
+ "rsa",
+ "rustls",
+ "rustls-pki-types",
+ "sha2 0.11.0",
+ "x25519-dalek",
+ "zen-tls-rustcrypto",
 ]
 
 [[package]]

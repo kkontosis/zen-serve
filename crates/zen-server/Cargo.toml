@@ -24,8 +24,9 @@ fdb = ["zen-store/fdb", "dep:nix"]
 # code instead of its SIMD assembly. Use with `--no-default-features`
 # (without ring); ring needs a C compiler regardless (spec/operations.md §8.4).
 pure = ["blake3/pure"]
-# A software WebAuthn authenticator (`webauthn::soft`), for tests.
-test-utils = []
+# A software WebAuthn authenticator (`webauthn::soft`) and the RSA test
+# helpers (`rsakey::testing`), for tests.
+test-utils = ["zen-tls-rustcrypto/test-utils"]
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -44,21 +45,20 @@ mime_guess = "2"
 # rsa release for this RustCrypto generation (signature 3, sha2 0.11,
 # crypto-bigint 0.7) is not out yet. Pinned exactly, so that a newer RC
 # can't change behaviour unnoticed; only public-key verification is used.
+# The same pin as in zen-tls-rustcrypto, which holds the key policy.
 rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["sha2"] }
 # WebAuthn (spec/auth.md §7): ES256 verification, pure Rust.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
-# Native TLS and client certificates (spec/auth.md §10): rustls with a
-# crypto provider of our own on RustCrypto (`tls::rustcrypto`), pure Rust,
-# or ring's (`tls::ring`, feature `ring`) with our hybrid key exchange.
-aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+# The sealed OPAQUE login state (`opaque`).
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
-hmac = "0.13"
-ml-kem = { version = "0.3", default-features = false, features = ["zeroize"] }
-p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+# Native TLS and client certificates (spec/auth.md §10): rustls with a
+# crypto provider of our own on RustCrypto (`tls::rustcrypto`, the
+# zen-tls-rustcrypto crate), pure Rust, or ring's (`tls::ring`, feature
+# `ring`) with our hybrid key exchange.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false }
-x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+zen-tls-rustcrypto = { path = "../zen-tls-rustcrypto" }
 serde = { version = "1", features = ["derive"] }
 sha2 = { version = "0.11", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "process", "io-util"] }
@@ -76,6 +76,7 @@ zen-store = { path = "../zen-store" }
 nix = { version = "0.30", default-features = false, features = ["signal"], optional = true }
 
 [dev-dependencies]
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tempfile = "3"

@@ -1,8 +1,8 @@
 //! A rustls [`CryptoProvider`] on RustCrypto: pure Rust, no C or assembly
-//! files, the same crate generation as the rest of the server. The
-//! provider of builds without the `ring` feature ([`super::provider`]);
-//! with it, its X25519MLKEM768 group serves the ring provider too
-//! ([`super::ring`]).
+//! files, the same crate generation as the rest of zen-serve, and it builds
+//! for wasm32. zen-server's provider in builds without the `ring` feature
+//! (`tls::provider`, where this crate is `tls::rustcrypto`); with it, its
+//! X25519MLKEM768 group serves the ring provider too (`tls::ring`).
 //!
 //! * **TLS 1.3 only**, with `TLS_AES_128_GCM_SHA256`,
 //!   `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256`.
@@ -19,6 +19,11 @@
 //!   `TD-TLS-RSA-SERVER-KEY`). The ring provider signs with RSA.
 //!
 //! The glue follows rustls's own providers; the primitives are RustCrypto's.
+//!
+//! [`rsakey`] is the RSA public-key policy, shared with zen-server's
+//! passkeys (auth.md §7) and its ring provider.
+
+pub mod rsakey;
 
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use rustls::crypto::cipher::{
@@ -954,7 +959,7 @@ mod tests {
     fn round_trip<A: KeyInit + AeadInOut + Send + Sync + 'static>() {
         use rustls::crypto::cipher::OutboundChunks;
         let key = || A::new_from_slice(&[7u8; 32][..A::key_size()]).unwrap();
-        let iv = || Iv::new([9; 12]);
+        let iv = || Iv::from([9; 12]);
         let mut enc = Sealer {
             key: key(),
             iv: iv(),
@@ -1054,7 +1059,7 @@ mod tests {
         use crate::rsakey::testing::{OsRng, public_der};
         use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _, Signer as _};
         use rsa::{pkcs1v15, pss};
-        let k = crate::webauthn::soft::rsa_key(7, 2048);
+        let k = crate::rsakey::testing::rsa_key(7, 2048);
         let public = public_der(&k.to_public_key());
         let msg = b"the transcript";
         let sign = |alg: &RsaVerify, m: &[u8]| -> Vec<u8> {
@@ -1102,7 +1107,7 @@ mod tests {
             }
         }
         // A key below 2048 bits is refused even with a valid signature.
-        let small = crate::webauthn::soft::rsa_key(7, 1024);
+        let small = crate::rsakey::testing::rsa_key(7, 1024);
         let sig = pkcs1v15::SigningKey::<Sha256>::new(small.clone()).sign(msg);
         let small_der = public_der(&small.to_public_key());
         assert!(
@@ -1114,7 +1119,7 @@ mod tests {
 
     #[test]
     fn rsa_private_keys_are_refused() {
-        let k = crate::webauthn::soft::rsa_key(7, 2048);
+        let k = crate::rsakey::testing::rsa_key(7, 2048);
         for der in [
             PrivateKeyDer::Pkcs1(crate::rsakey::testing::private_der(&k).into()),
             PrivateKeyDer::Pkcs8(crate::rsakey::testing::pkcs8_der(&k).into()),

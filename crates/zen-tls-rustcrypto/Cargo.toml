@@ -1,0 +1,43 @@
+[package]
+name = "zen-tls-rustcrypto"
+version = "0.1.0"
+description = "zen-serve: a rustls crypto provider on RustCrypto (pure Rust, builds for wasm32), and the RSA key policy"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# `rsakey::testing`: RSA test helpers and deterministic test keys.
+test-utils = ["dep:blake3"]
+
+[dependencies]
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+ecdsa = { version = "0.17", default-features = false, features = ["der"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["pkcs8"] }
+getrandom = "0.4"
+hmac = "0.13"
+ml-kem = { version = "0.3", default-features = false, features = ["zeroize"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
+# RSA verification (certificates, handshakes) and the key policy, pure
+# Rust. A release candidate: the rsa release for this RustCrypto
+# generation (signature 3, sha2 0.11, crypto-bigint 0.7) is not out yet.
+# Pinned exactly, so that a newer RC can't change behaviour unnoticed; only
+# public-key operations are used outside tests (`TD-TLS-RSA-SERVER-KEY`).
+rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["sha2"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+sha2 = { version = "0.11", default-features = false }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+# The deterministic RNG of `rsakey::testing::rsa_key` (test-utils).
+blake3 = { version = "1.8", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# rustls's `std` feature reads the clock (`UnixTime::now`); in a browser or
+# Node that is JavaScript's (web-time).
+rustls-pki-types = { version = "1", features = ["web"] }
+
+[dev-dependencies]
+zen-tls-rustcrypto = { path = ".", features = ["test-utils"] }

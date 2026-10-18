@@ -25,7 +25,6 @@ pub mod opaque;
 pub mod origin;
 pub mod passkey;
 pub mod password;
-pub mod rsakey;
 pub mod state;
 pub mod statics;
 pub mod stream;
@@ -37,6 +36,9 @@ pub mod token;
 pub mod tree;
 mod txn;
 pub mod webauthn;
+
+/// The RSA key policy (zen-tls-rustcrypto's), for passkeys and TLS keys.
+pub use zen_tls_rustcrypto::rsakey;
 
 use crate::cbor::Cbor;
 use crate::config::Config;
