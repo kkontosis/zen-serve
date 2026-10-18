@@ -1,7 +1,9 @@
 #!/bin/sh
-# Build the WASM module of @zen/client: crates/zen-wasm compiled for
-# wasm32, then wasm-bindgen's JS glue and TypeScript declarations into
-# packages/zen-wasm/pkg (git-ignored).
+# Build the WASM modules: crates/zen-wasm (@zen/client's core) and
+# crates/zen-svc-wasm (@zen/svc's protocol engines, loaded only by services
+# that use them), compiled for wasm32, then wasm-bindgen's JS glue and
+# TypeScript declarations into packages/zen-wasm/pkg and
+# packages/svc-wasm/pkg (git-ignored).
 #
 #   scripts/build-wasm.sh [--dev]
 #
@@ -24,11 +26,19 @@ if [ "$want" != "$have" ]; then
   exit 1
 fi
 
-cargo build -p zen-wasm --target wasm32-unknown-unknown --profile "$profile"
 dir=$profile
 [ "$profile" = dev ] && dir=debug
-out=packages/zen-wasm/pkg
-rm -rf "$out"
-wasm-bindgen --target web --out-dir "$out" --out-name zen_wasm \
-  "target/wasm32-unknown-unknown/$dir/zen_wasm.wasm"
-ls -l "$out"/zen_wasm_bg.wasm | awk '{printf "zen_wasm_bg.wasm: %d bytes\n", $5}'
+
+# build <crate> <package dir>
+build() {
+  name=$(echo "$1" | tr - _)
+  cargo build -p "$1" --target wasm32-unknown-unknown --profile "$profile"
+  out=packages/$2/pkg
+  rm -rf "$out"
+  wasm-bindgen --target web --out-dir "$out" --out-name "$name" \
+    "target/wasm32-unknown-unknown/$dir/$name.wasm"
+  ls -l "$out/${name}_bg.wasm" | awk -v n="$name" '{printf "%s_bg.wasm: %d bytes\n", n, $5}'
+}
+
+build zen-wasm zen-wasm
+build zen-svc-wasm svc-wasm

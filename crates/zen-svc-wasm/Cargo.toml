@@ -1,0 +1,17 @@
+[package]
+name = "zen-svc-wasm"
+version = "0.1.0"
+description = "zen-serve WASM bindings for @zen/svc: the protocol engines of relayed services (zen-svc)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+wasm-bindgen = "=0.2.129"
+zen-svc = { path = "../zen-svc" }

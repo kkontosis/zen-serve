@@ -3584,6 +3584,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zen-svc-wasm"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "rustls",
+ "wasm-bindgen",
+ "zen-svc",
+]
+
+[[package]]
 name = "zen-tls-rustcrypto"
 version = "0.1.0"
 dependencies = [

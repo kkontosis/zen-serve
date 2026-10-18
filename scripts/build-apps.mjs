@@ -31,6 +31,7 @@ const alias = {
 // WASM files a bundle fetches relative to its own URL (`new URL(…, import.meta.url)`).
 const wasm = [
   { from: src('zen-wasm/pkg/zen_wasm_bg.wasm'), when: 'zen-wasm/pkg/zen_wasm.js' },
+  { from: src('svc-wasm/pkg/zen_svc_wasm_bg.wasm'), when: 'svc-wasm/pkg/zen_svc_wasm.js' },
   {
     from: join(root, 'node_modules/loro-crdt/browser/loro_wasm_bg.wasm'),
     when: 'loro-crdt/browser/',
@@ -106,7 +107,7 @@ async function main() {
           logLevel: 'warning',
           alias,
           // Packages from node_modules load from there (the WASM finds its file).
-          external: ['node:*', '@zen/wasm', 'loro-crdt'],
+          external: ['node:*', '@zen/wasm', '@zen/svc-wasm', 'loro-crdt'],
         }),
       );
     }

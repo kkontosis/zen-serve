@@ -7,6 +7,7 @@
       "scripts/*.mjs",
       "scripts/*.ts",
       "!packages/zen-wasm/pkg",
+      "!packages/svc-wasm/pkg",
       "!**/dist",
       "!**/node_modules"
     ]
