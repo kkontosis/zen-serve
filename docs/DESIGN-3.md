@@ -244,6 +244,7 @@ The server never sees names (namespaces, tables, columns, topics, paths), keys, 
 4. `@zen/client` (TS + WASM): KV, transactions, Log, leader consumer, keyslot admin, filesystem operations, and the `zen-mount` FUSE CLI ([`docs/MILESTONE-4.md`](MILESTONE-4.md)).
 4.5. zen-db and the embedded broker client, specs only: one class for CRUD, events and transactions, with app examples and proof-of-concept targets ([`docs/MILESTONE-4.5.md`](MILESTONE-4.5.md)).
 5. zen-db and the broker as specified in [`spec/zendb.md`](../spec/zendb.md), with the app examples of [`docs/EXAMPLES.md`](EXAMPLES.md); the server side of zen-db CRDT tables (server-merged `lww`, `counter` and `set` row fields, zendb.md §19, moved forward from 7); zen-fs client (local replica, POSIX-ish API over the CRDT filesystem), Loro adapter ([`docs/MILESTONE-5.md`](MILESTONE-5.md)).
+5.5. **Relayed services**: zen-serve as a blind TCP relay for SSH, SMTP, IMAP and TLS services whose handlers run on member clients, each protocol step committed with the handler's zen-db rows, and a dead handler taken over mid-connection ([`docs/MILESTONE-5.5.md`](MILESTONE-5.5.md)). Built before 6.
 6. Authenticated-namespace Merkle tree, `zen-ublk`. (Ephemeral pub/sub shipped in milestone 2–3.)
 7. Later: `fips` suite, ORAM, more server CRDT types beyond zen-db rows (CRDT tables moved to 5).
 8. Large files, the rest: upload sessions, page repacking, multi-GiB performance ([`docs/MILESTONE-8.md`](MILESTONE-8.md)). The paged layout and per-file keys moved forward into milestone 5 (step 7f/7g).
