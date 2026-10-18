@@ -323,10 +323,26 @@ export class Typing {
   }
 }
 
-/** Call `fn` with the name of each member typing in a room, from now on. */
-export function onTyping(db: Db, room: string, fn: (from: string) => void): Promise<SourceSub> {
+/** How long a typing indicator shows after it arrives. */
+export const TYPING_SHOW_MS = 3000;
+
+/**
+ * Call `fn` with the name of each member typing in a room, from now on.
+ * An indicator sent more than `maxAgeMs` ago (by its sender's clock,
+ * against this session's corrected clock) is dropped: one that arrives
+ * late, after a reconnect, would show a member typing who no longer is.
+ */
+export function onTyping(
+  db: Db,
+  room: string,
+  fn: (from: string) => void,
+  maxAgeMs = TYPING_SHOW_MS,
+): Promise<SourceSub> {
   return db.onEphemeral<TypingBody>(typingTopic(db, room), (m: EphemeralMsg<TypingBody>) => {
-    if (m.type === 'typing' && typeof m.body?.from === 'string') fn(m.body.from);
+    if (m.type !== 'typing' || typeof m.body?.from !== 'string') return;
+    const sentMs = Number(m.hlc >> 16n);
+    if (db.fs.session.clock.now() - sentMs > maxAgeMs) return;
+    fn(m.body.from);
   });
 }
 

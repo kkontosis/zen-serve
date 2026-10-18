@@ -13,3 +13,4 @@ export {
   startIn,
   type TestServer,
 } from './server.js';
+export { runSsh, type SshRun, type TestSshKeys, testSshKeys } from './ssh.js';

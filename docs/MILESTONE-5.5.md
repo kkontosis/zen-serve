@@ -223,6 +223,239 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * `tests/openssh.rs` (10) against OpenSSH 9.6 (apt): both ciphers, RSA keys with SHA-2 and SHA-1 refused, an unauthorized key, 10 MB `cat` with `RekeyLimit=1M` (about 20 client rekeys), server rekeys, a 20 MB download, a shell, a subsystem, an exit status, 7-byte steps, keys read and fingerprinted as `ssh-keygen` does, and Terrapin through an injecting proxy
       * the TLS tests unchanged
     * Against OpenSSH 10.6p1 built with `scripts/build-openssh.sh`: `tests/openssh.rs` and `tests/openssh_pq.rs` (the hybrid with both ciphers, a 1 MB `cat` with rekeys both ways)
+  * CI green on PR #46's heads 08641d2 and 145c9b8 (all 10 checks, `openssh-pq` included: the OpenSSH build took 36 s); merged.
+  * The PR merged before the switch to on-demand was pushed. So that commit, `ci: the OpenSSH-from-source job runs on demand only`, is the second commit of step 5.5.10's plan PR.
+* **Step 5.5.10** (the `ssh()` layer): done, PR #47. Restarted from main after PR #46 merged. Commits: `docs: milestone 5.5 step 10 plan`; `ci: the OpenSSH-from-source job runs on demand only`; `svc: the SSH engine for wasm (@zen/svc-wasm)`; `svc: layers make their handler's step; the ssh() layer`; `apps: echo over SSH, and a git-upload-pack stub`; the docs and this log. No `spec:` commit: svc.md §7.2 already says what the runtime does, the window rule included.
+  * As planned, plus details settled while building:
+    * **The engine's `Progress` gains `held`:** reading stopped with complete input left, because a question waits for its answer or unread data or held replies reached their bound. The layer's `again` rule uses it. Without it, any partial packet left over would look the same as input held back. `tests/ssh.rs` checks it.
+    * **The binding** gives the client's `exec` command as bytes; `SshStep`'s events decode it as UTF-8. `SshConfig.hostKeyLine` and `SshConn.ciphers` were added for tests. The module loader moved to `packages/svc/src/wasm.ts`.
+    * **Layers open with the service's settings.** `Layer.open(info)` gets `/v1/svc/info`, which the SSH window default needs. So `serve()` reads the info before opening the layer (and before the stream). A bad host key or certificate is still one `onError`, with nothing claimed.
+    * **`serve()` has two overloads.** One takes a layer and infers the step type from it; one has no layer and gives `RawStep`. A single generic signature inferred `unknown` for an untyped handler without a layer.
+    * **`Live.dispose()`** frees an attempt's engine when the handler throws, as well as after `finish()`.
+    * **`SshStep`:**
+      * A question the handler leaves unanswered is refused at the end of the step. A client waiting for an answer would otherwise wait for input that never comes.
+      * The handler isn't called once the engine has ended. The client's DISCONNECT (how OpenSSH ends every session) isn't reported as an error; a protocol error is.
+    * **Room per step:** `out_window`, minus the engine's own output from the input, minus 1,024 bytes kept for window adjusts, EOF, exit and CLOSE. Each write is offered 32,768/32,832 of what is left, the packet overhead.
+    * **Test helpers:** `testSshKeys()` and `runSsh()` are in `@zen/client/testing`. `known_hosts` names the host key by `HostKeyAlias`, so one file serves any port.
+    * **The echo app:**
+      * schema 3 adds `ssh_keys`, keyed by `(user, fingerprint)`; the fingerprint is computed with WebCrypto in `schema.ts`, so the Playwright spec needs no WASM
+      * the host key is the `certs` row `ssh` (`key` the PEM, `chain` the public line)
+      * a shell runs `lines`; a subsystem exits 127
+      * output the client's window doesn't take is kept in the channel's state, hex
+      * the git stub advertises protocol v0 (git sends `GIT_PROTOCOL` through `env`, which the engine refuses, so v0 it is)
+    * **A layer-level test** (`packages/svc/test/sshlayer.test.ts`) drives `ssh()` as `serve()` does, without a server, against OpenSSH. It checks each step's output against a 64 KiB `out_window` and that cut steps run again (a 3 MB download), held input is read after acks (2 MB `cat` with rekeys), and an unanswered question is refused.
+    * The in-process git test runs `git` with `execFile`, not `execFileSync`: a blocked event loop starves the handler, and the relay closes the connection after `accept_wait_ms`.
+    * **Sizes:** `zen_svc_wasm_bg.wasm` is 1.23 MB, 465 KB gzipped (1.05 MB and 403 KB with TLS alone); glue 44 KB.
+    * **Measured locally:** 50 MB through `cat` across two kills, with rekeys every 4 MB, in about 50 s.
+  * Verified:
+    * `cargo fmt --all --check`; clippy on zen-svc and zen-svc-wasm `--all-targets -D warnings` (default, `--no-default-features`, and zen-svc `--all-features`), and zen-svc-wasm for wasm32
+    * `cargo test -p zen-svc --test ssh` (18, with the `held` checks)
+    * `scripts/build-wasm.sh`, `--dev` and release
+    * `npm run check`
+    * `npx vitest run` 3×, 479 tests each (7 skipped: the opt-in benches). Runs 1 and 2 passed every test. This includes `packages/svc/test/sshwasm.test.ts` (5), `sshlayer.test.ts` (4) and `apps/echo/test/ssh.test.ts` (5).
+    * Run 3 had one failure, not in this step's code: `packages/db/test/patterns.test.ts` "retry 'delay': attempts 1..max, then the class DLQ with the same id".
+      * `ZenError: decrypt` in `Topic.open` while the test read back topic `t`'s events (the retry copies).
+      * The test then passed 6 times alone and 6 times as the whole file, three copies at once.
+      * This step changes nothing in `@zen/db` or `@zen/client` but the test helpers. Not investigated further: watch CI for it.
+    * `npx playwright test apps/echo` (3 specs, the SSH case included)
+    * `cargo test -p zen-svc`: 11 unit, `openssh.rs` 10, `openssl.rs` 6, `ssh.rs` 18, `tls.rs` 23
+  * CI on PR #47's head 6c2b32a: `rust`, `pure-rust` and `fdb` are green in both runs. `openssh-pq` was skipped, as it now should be. The push run's `client` is green; the pull-request run's `client` failed.
+  * Vitest passed in that run, the SSH tests included. Playwright passed 14 of 16 specs, the echo SSH case included. The 2 failures are both in `apps/chat/e2e/chat.spec.ts`:
+    * "typing reaches the others…": Carol's `#typing` read "alice, bob typing…" for a while, then "" once Bob's indicator expired, instead of "bob typing…".
+    * "a reaction shows on every page" timed out: it runs on the same pages after that failure. A consequence, not its own failure.
+  * CI fix done (below): commit `apps: chat: a typing indicator older than its display time is ignored`.
+    * The unit test passes with the existing typing test: `apps/chat` vitest, 9 tests.
+    * `npx playwright test apps/chat` passed 5 times; `npm run check` passes.
+    * The test's age bound is a minute below zero, so it doesn't depend on how the two clocks compare.
+  * Next: confirm CI green on the fix's push.
+
+### CI fix: a stale typing indicator in the chat app
+
+**Root cause.**
+1. In the spec's first test Carol's context goes offline while Alice and Bob talk. `send()` fills the composer, so each message also publishes a typing indicator.
+2. The server never replays ephemeral messages (`eph.rs` tails from the newest entry). Chromium's offline emulation holds the frames of the open WebSocket instead of dropping them. So Alice's indicator from the offline period reaches Carol when she comes back.
+3. The second test starts within the 3 s an indicator is shown, so Carol shows Alice as typing next to Bob.
+4. The chat UI (`apps/chat/ui/main.ts` `showTyping`) shows any indicator for 3 s from its arrival, however old it is. That is a real bug: a device back online shows stale "typing" lines.
+
+The push run passed because the overlap depends on timing. Nothing here is from this step's changes.
+
+**Fix** (commit `apps: chat: a typing indicator older than its display time is ignored`):
+* `onTyping(db, room, fn, maxAgeMs = 3000)` in `apps/chat/src/chat.ts` drops a message whose sender's time is too old:
+  * the sender's time is `m.hlc >> 16n`, Unix ms (formats.md §11.1)
+  * "too old" is more than `maxAgeMs` behind the corrected clock, `db.fs.session.clock.now()` (`packages/client/src/clock.ts`)
+  * `EphemeralMsg` already carries `hlc` (`packages/db/src/broker.ts`)
+* The UI's 3 s display time becomes a shared constant, `TYPING_SHOW_MS`, used both there and as the default `maxAgeMs`.
+* Unit test in `apps/chat/test/chat.test.ts`:
+  * an indicator published, then received through `onTyping` with `maxAgeMs: 0` after a 50 ms wait, is dropped
+  * a fresh one is passed on
+  * the existing typing test is unchanged
+
+**Verify:**
+* the chat unit tests
+* `npx playwright test apps/chat` 5×
+* `npm run check`
+* push, then CI green on both `client` runs
+
+After that: log the CI result in both plan copies, push, stop for compaction.
+
+## Step 5.5.10 in detail: `ssh()` in `@zen/svc`
+
+Handlers serve SSH. The 5.5.9 engine is built into `@zen/svc-wasm`, and `@zen/svc` gains an `ssh()` layer. An SSH session isn't one byte stream: it has authentication and channels. So the layer gives its handler an `SshStep` rather than a `RawStep`, and `serve()` becomes generic over the step type. The echo app gains an SSH service with:
+* `cat` (the bulk test), `lines` (the line echo, with rows), and `exit <code>`
+* a `git-upload-pack` stub, for the git-transport demo
+
+A handler killed at any point (mid-transfer, mid-rekey, mid-key-exchange) is resumed by another.
+
+**Commits:**
+1. `docs: milestone 5.5 step 10 plan` (also logs step 5.5.9's CI and merge)
+2. `ci: the OpenSSH-from-source job runs on demand only`: `workflow_dispatch:` in the triggers and `if: github.event_name == 'workflow_dispatch'` on `openssh-pq`. Already decided in 5.5.9 and validated there. It goes in now, with the plan, so ordinary builds stop building OpenSSH.
+3. `svc: the SSH engine for wasm (@zen/svc-wasm)`
+4. `svc: layers make their handler's step; the ssh() layer`
+5. `apps: echo over SSH, and a git-upload-pack stub`
+6. the docs and the log
+
+### Facts from the survey
+* **The runtime (`packages/svc/src/serve.ts`):**
+  * The runtime builds the handler's `Step` (a `RawStep`) itself.
+  * The layer turns `HandlerOut {acked, writes, endFlag}` into bytes in `finish(p, h)`; `committed(p, f, h)` follows.
+  * `p.held && h.acked > 0` makes the step due again.
+  * `p.call` gates the handler; `room(p, outWindow)` bounds its writes.
+  * The handler type is fixed: `ServeOptions.handler: RawHandler`.
+* **`crates/zen-svc-wasm/src/lib.rs`** (332 lines): TLS bindings. They build objects with `js_sys` and type them through `unchecked_return_type` and a `typescript_custom_section`. Errors are `ZenTlsError` with a code as the message.
+* **The echo app:**
+  * `workers/handler.ts` picks the layer by `ECHO_LAYER` (`raw`, `tls`, `mirror`).
+  * The world harness passes `[[service]]` settings through `WorldService.more` (so `window = 1048576` for SSH).
+  * `testCerts` makes TLS certificates with the openssl CLI.
+* **Tools:** git 2.43 is here and on the runners. OpenSSH 9.6 is installed in the `rust` and `pure-rust` jobs, not yet in `client`.
+
+### `@zen/svc-wasm`: the SSH bindings (`crates/zen-svc-wasm/src/ssh.rs`)
+Errors are `ZenSshError`, codes `config`, `key`, `state`, `closed`, `no_channel`, `channel_ended`, `not_asked`.
+* `new SshConfig(hostKeyPem, opts?)`:
+  * the host key is OpenSSH's unencrypted Ed25519 PEM
+  * `opts`: `{window?, rekeyBytes?, rekeySecs?, kex?: string[], ciphers?: string[], software?}`
+* `sshHostKeyLine(pem) → string`, for `known_hosts`.
+* `sshPublicKey(line) → {algorithm, fingerprint, blob}`, for an application's `authorized_keys`.
+* **`SshConn`:**
+  * `SshConn.start(config, now)` and `SshConn.restore(config, state)`. `now` is Unix seconds.
+  * The greeting (version line and KEXINIT) comes out of the first `input`.
+  * `input(buf, eof, now) → {consumed, out, events, peerClosed, error?: {code, reason?, detail}}`:
+    * events: `{type: 'authorize' | 'open' | 'exec' | 'shell' | 'subsystem' | 'data' | 'eof' | 'close', ch?, command?, name?, …}`
+    * error codes: `protocol` (we sent DISCONNECT, with its reason) and `disconnected` (the client did)
+  * `pendingAuthorize() → {user, key: {algorithm, fingerprint, blob}, signed} | undefined` and `authorize(ok) → out`.
+  * Channels:
+    * `channels() → [{ch, request, eof, closed, unread, queued, peerWindow}]`
+    * `channelData(ch)` and `consume(ch, n) → out`
+    * `write(ch, data)` and `writeStderr(ch, data) → {taken, out}`
+    * `exitStatus(ch, code)`, `eof(ch)` and `close(ch) → out`
+  * `rekey()`, `disconnect(reason, message)`, `state()`.
+  * Getters: `user`, `ended`, `inKex`, `kexes`.
+* **Its own tests (`packages/svc/test/sshwasm.test.ts`, no zen server):**
+  * A Node TCP server drives the binding, restoring it from its state at every read, with OpenSSH's `ssh` as the client: exec, `cat` of 1 MB with `RekeyLimit=256K`, a refused key, and the error codes.
+  * The tests need `ssh` and say so if it's missing.
+
+### `@zen/svc`: layers make their handler's step, and `ssh()`
+* **Generalize the layer (`layer.ts`):**
+  * `Layer<S>` and `LayerConn<S>` gain `open(p, ctx) → Live<S>`, where:
+    * `ctx = {conn, peer, state, finSent, outWindow}`
+    * `Live<S> = {view: S, app(): Uint8Array | null, finish(): Finished}`
+  * `finish` and `committed` take the live step instead of `HandlerOut`.
+  * `Finished` gains `again`: the step is due again at once. It replaces the runtime's `p.held && h.acked > 0`.
+  * The raw `Step` moves out of `serve.ts` into `layer.ts`. `raw()` and `tls()` wrap it as before: `RawStep` and its behaviour don't change.
+* **Make `serve` generic:** `serve<S = RawStep>(db, opts: ServeOptions<S>)`, with `layer?: Layer<S>` and `handler: (c: S, tx) => …`. Existing callers compile unchanged.
+* **`ssh({hostKey, window?, rekeyBytes?, rekeySecs?, wasm?}): Layer<SshStep>`:**
+  * engine name `ssh`; resumable from the first step; never fragile
+  * The layer's `window` defaults to `(service window − 64 KiB) / 10`, from `/v1/svc/info`, as svc.md §7.2 says. `open()` gets the service info for this.
+* **What the handler sees:**
+  ```ts
+  interface SshStep {
+    readonly conn: Uint8Array; readonly peer: SvcPeer;
+    state: Uint8Array | null;               // the application's, as RawStep's
+    readonly user: string | null;           // once authenticated
+    readonly question: SshQuestion | null;  // {user, key: {algorithm, fingerprint, blob}, signed}
+    answer(ok: boolean): void;
+    readonly events: SshEvent[];            // this step's: open, exec (command), shell, subsystem (name), data, eof, close
+    readonly channels: SshChannel[];
+    channel(id: number): SshChannel | undefined;
+    disconnect(message?: string): void;
+  }
+  interface SshChannel {
+    readonly id: number; readonly request: 'exec' | 'shell' | 'subsystem' | null;
+    readonly eof: boolean; readonly closed: boolean;
+    readonly data: Uint8Array;              // unread
+    ack(n: number): void;
+    write(d: Uint8Array | string): number;  // bytes taken (the window, the queue, out_window)
+    stderr(d: Uint8Array | string): number;
+    exit(code: number): void; end(): void; close(): void;
+  }
+  ```
+* **How a step runs:**
+  * `prepare` (outside the transaction) restores the committed state, feeds the input, and keeps:
+    * `consumed`, `out` and the events
+    * the state after the input
+    * whether reading was held back
+  * The engine is restored again for each transaction attempt, so every step is also a takeover test.
+  * The handler runs on every step: a window adjust carries no event, but lets a writer go on.
+  * `again` is set when:
+    * reading was held back and the handler consumed, or answered a question
+    * a write was cut short by `out_window` (not by the peer's window)
+  * Writes are cut to the step's room, `out_window` minus the packet overhead.
+  * An engine error sends its output (the DISCONNECT) and closes, as TLS's alerts do. An ended engine closes the connection.
+* **Unit tests** (`packages/svc/test/sshstep.test.ts`): the `again` and room rules, on recorded `Prepared` values, if they separate cleanly; otherwise in the app tests.
+
+### `apps/echo` over SSH
+* **`src/schema.ts`:** schema 3 adds `ssh_keys` (user, key line), and the host key goes into `certs` under `ssh`.
+  * `src/ssh.ts`: `sshLayer(db)`, and `sshEcho`, the handler:
+    * authorizes a key when a `ssh_keys` row of that user has its blob
+    * keeps each channel's command in the application state, since the engine gives it once
+    * commands:
+      * `cat`: mirror until EOF, then exit 0
+      * `lines`: each line becomes `<n>: line` and a `lines` row, as echo
+      * `exit <n>`: `bye` on stderr, then status n
+      * `git-upload-pack '<path>'`: a v0 ref advertisement for `HEAD` and `refs/heads/main` (a fixed id, with capabilities), then exit 0 at the client's flush
+      * anything else: exit 127
+* **`workers/handler.ts`:** `ECHO_LAYER=ssh` (service `echo-ssh`).
+* **Test keys:** the host and user keys come from `ssh-keygen` in a test helper (`testSshKeys()` in `@zen/client/testing`, beside `testCerts`).
+* **Vitest (`apps/echo/test/ssh.test.ts`).** The services use `window = 1048576`, and the clients are OpenSSH `ssh` with a `known_hosts` file and `StrictHostKeyChecking=yes`.
+  1. **In process:**
+     * `lines` over stdin: the replies and the rows
+     * `exit 3`: the status and `bye`
+     * a key not in `ssh_keys`: `Permission denied (publickey)`
+  2. **50 MB across two kills:**
+     * `cat` of 50 MB of random bytes to a worker, with `RekeyLimit=4M`, so rekeys cross takeovers
+     * the worker is SIGKILLed twice, and the SHA-256 of what came back equals what was sent
+     * the test reports the workers' output on failure
+  3. **A takeover mid-key-exchange:**
+     * A TCP proxy forwards the client's version line and KEXINIT, then holds the rest until the worker has committed that step (its state shows a key exchange in progress) and is killed.
+     * The successor computes the reply, and the `exec` completes.
+  4. **git:** `git ls-remote ssh://test@127.0.0.1:<port>/repo.git`, with `GIT_SSH_COMMAND` carrying the options, prints the stub's two refs.
+* **Playwright (`apps/echo/e2e/echo.spec.ts`):** an SSH case. Alice's tab serves `echo-ssh`, and a Node-spawned `ssh … lines` gets `1: …`. This checks the browser's module loading with the SSH code.
+
+### CI
+* The `client` job installs `openssh-client` (vitest and Playwright use `ssh`). git is already there.
+* Nothing else: the bindings are in the module `scripts/build-wasm.sh` already builds.
+
+### Docs
+* `docs/CLIENT.md` §11:
+  * `ssh()` and `SshStep`
+  * the host key and authorized keys in the app's tables
+  * the window rule
+  * what a takeover keeps: everything, from the first step
+* `apps/README.md`: echo over SSH, and the git demo.
+* `docs/STATS.md` §4.1: the module's new size.
+* The log in both plan copies.
+
+### Out of scope
+* `tcp-auth` and `zen-connect` (5.5.11)
+* real git (milestone 10)
+* host-key rotation
+* a PTY (TD-SVC-SSH-SCOPE)
+
+### Verification
+* `cargo fmt --check`; clippy on zen-svc-wasm (native, `--no-default-features`, wasm32); `scripts/build-wasm.sh` release and `--dev`
+* `npm run check`; `npx vitest run` 3×; `npx playwright test`
+* `cargo test -p zen-svc` once (unchanged)
+* CI green on the PR (without `openssh-pq`, now on demand)
+
 ## Step 5.5.9 in detail: the SSH engine (`crates/zen-svc`, native)
 
 A sans-IO SSH server whose whole state serializes at every packet boundary, mid key exchange included. A successor handler continues the live session at any point. So unlike TLS, an SSH connection is resumable from its first step.

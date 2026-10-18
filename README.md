@@ -23,13 +23,13 @@ Building blocks:
 | [`crates/zen-tls-rustcrypto`](crates/zen-tls-rustcrypto) | A rustls crypto provider on RustCrypto (pure Rust, native + `wasm32`; TLS 1.2 suites behind `tls12`), its record protection at the byte level, and the RSA key policy, for the server's native TLS and the relayed services' TLS |
 | [`crates/zen-svc`](crates/zen-svc) | Protocol engines of relayed services (sans-IO, native + `wasm32`): the TLS 1.3/1.2 server whose state another handler restores at any record boundary, and the SSH server whose state it restores at any packet boundary, key exchanges included ([`spec/svc.md`](spec/svc.md) §7.1, §7.2) |
 | [`crates/zen-server`](crates/zen-server) | The `zen-serve` binary: auth, signed ACL, KV, commit, event log, consumer groups, WebSocket stream, static files, FoundationDB supervisor, backup/export |
-| [`crates/zen-svc-wasm`](crates/zen-svc-wasm) | WASM bindings of zen-svc's TLS engine, a second module loaded only by services that use `tls()` (`@zen/svc-wasm`, built into [`packages/svc-wasm`](packages/svc-wasm)) |
+| [`crates/zen-svc-wasm`](crates/zen-svc-wasm) | WASM bindings of zen-svc's TLS and SSH engines, a second module loaded only by services that use `tls()` or `ssh()` (`@zen/svc-wasm`, built into [`packages/svc-wasm`](packages/svc-wasm)) |
 | [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
 | [`packages/client`](packages/client) | `@zen/client`: the TypeScript client library, Node and browsers ([`docs/CLIENT.md`](docs/CLIENT.md)) |
 | [`packages/db`](packages/db) | `@zen/db`: the client-side database (tables, indexes, queries, transactions), the in-app broker (`on`, consumers, scheduler, request/reply, sagas) and CRDT tables, with offline caches ([`docs/DB.md`](docs/DB.md)) |
 | [`packages/fs`](packages/fs) | `@zen/fs`: a local replica of a filesystem tree (the node table, content on demand, offline writes), under `zen-mount` too ([`docs/CLIENT.md`](docs/CLIENT.md) §8) |
 | [`packages/loro`](packages/loro) | `@zen/loro`: [Loro](https://loro.dev) documents kept on a topic, with snapshots and offline edits ([`docs/DB.md`](docs/DB.md) §20) |
-| [`packages/svc`](packages/svc) | `@zen/svc`: handlers of relayed TCP services, each step in one transaction with the handler's writes, raw or behind `tls()` ([`spec/svc.md`](spec/svc.md), [`docs/CLIENT.md`](docs/CLIENT.md) §11) |
+| [`packages/svc`](packages/svc) | `@zen/svc`: handlers of relayed TCP services, each step in one transaction with the handler's writes, raw, behind `tls()` or behind `ssh()` ([`spec/svc.md`](spec/svc.md), [`docs/CLIENT.md`](docs/CLIENT.md) §11) |
 | [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger), `hello`, and `echo` (a relayed line service), on `@zen/db`, `@zen/fs`, `@zen/loro` and `@zen/svc` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
@@ -43,7 +43,7 @@ Building blocks:
 * Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
 * Milestone 4.5 (zen-db and the in-app broker, specs only, [`spec/zendb.md`](spec/zendb.md), [`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): done.
 * Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
-* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md)): in progress. Done: the spec, the server relay, stream push, `@zen/svc` with raw handlers, the TLS engine and the `tls()` layer (steps 1–8).
+* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md)): in progress. Done: the spec, the server relay, stream push, `@zen/svc` with raw handlers, the TLS engine and the `tls()` layer, the SSH engine and the `ssh()` layer (steps 1–10).
 
 ## Building
 

@@ -6,7 +6,7 @@ import { connect, type TLSSocket } from 'node:tls';
 import type { TlsConfig, TlsConn, TlsProgress } from '@zen/svc-wasm';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { type TestCerts, testCerts } from '../../client/src/testing/index.js';
-import { loadSvcWasm } from '../src/tls.js';
+import { loadSvcWasm } from '../src/wasm.js';
 
 type SW = Awaited<ReturnType<typeof loadSvcWasm>>;
 let sw: SW;

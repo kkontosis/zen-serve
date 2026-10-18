@@ -296,12 +296,12 @@ fn a_question_survives_a_restore() {
     let mut c = Client::new(copts(Kex::Curve25519, Cipher::Chacha20Poly1305));
     c.input(&out).unwrap();
     let mut buf = Vec::new();
-    let step = |conn: &mut Conn, c: &mut Client, buf: &mut Vec<u8>| -> Vec<Event> {
+    let step = |conn: &mut Conn, c: &mut Client, buf: &mut Vec<u8>| -> (Vec<Event>, bool) {
         buf.extend(c.take_out());
         let p = conn.input(buf, false, now());
         buf.drain(..p.consumed);
         c.input(&p.out).unwrap();
-        p.events
+        (p.events, p.held)
     };
     for _ in 0..4 {
         step(&mut conn, &mut c, &mut buf);
@@ -311,7 +311,8 @@ fn a_question_survives_a_restore() {
     c.send(&msg::userauth_ed25519(&sid, "test", &user(), true));
     // Pipelined behind the question: not read until it is answered.
     c.send(&msg::channel_open(0, 1 << 20, 32_768));
-    let ev = step(&mut conn, &mut c, &mut buf);
+    let (ev, held) = step(&mut conn, &mut c, &mut buf);
+    assert!(held);
     let q = match &ev[..] {
         [Event::Authorize(a)] => a.clone(),
         e => panic!("{e:?}"),
@@ -326,8 +327,9 @@ fn a_question_survives_a_restore() {
     let got: Vec<Msg> = c.input(&o).unwrap().iter().map(|m| parse(m)).collect();
     assert_eq!(got, [Msg::AuthSuccess]);
     assert_eq!(conn.authorize(true), Err(Error::NotAsked));
-    let ev = step(&mut conn, &mut c, &mut buf);
+    let (ev, held) = step(&mut conn, &mut c, &mut buf);
     assert_eq!(ev, [Event::ChannelOpen { ch: 0 }]);
+    assert!(!held);
     assert_eq!(conn.user(), Some("test"));
 }
 
@@ -351,8 +353,12 @@ fn the_read_bound_holds_back_input() {
     let input = p.c.take_out();
     let r = c.input(&input, false, now());
     assert!(r.consumed < input.len());
+    assert!(r.held);
     assert!(c.channel_data(0).len() <= UNREAD_MAX);
     assert_eq!(c.channel_data(0).len(), 30_000);
+    // Nothing consumed: input again holds back as before.
+    let again = c.input(&input[r.consumed..], false, now());
+    assert_eq!((again.consumed, again.held), (0, true));
     // Consuming lets reading go on.
     let mut rest = input[r.consumed..].to_vec();
     let mut total = 30_000;
@@ -360,6 +366,7 @@ fn the_read_bound_holds_back_input() {
         c.consume(0, c.channel_data(0).len()).unwrap();
         let r = c.input(&rest, false, now());
         assert!(r.consumed > 0);
+        assert_eq!(r.held, r.consumed < rest.len());
         rest.drain(..r.consumed);
         total += c.channel_data(0).len();
         assert!(c.channel_data(0).len() <= UNREAD_MAX);

@@ -239,6 +239,27 @@ describe('typing and presence', () => {
     await signOut(b);
   });
 
+  it('a typing indicator older than its display time is dropped', async () => {
+    const [a, b] = [await signIn('alice'), await signIn('bob')];
+    const room = newRoom();
+    const fresh: string[] = [];
+    const strict: string[] = [];
+    const subs = [
+      await onTyping(b.db, room, (from) => fresh.push(from)),
+      // A bound a minute below zero: every indicator counts as too old,
+      // whatever the two clocks say.
+      await onTyping(b.db, room, (from) => strict.push(from), -60_000),
+    ];
+    expect(await new Typing(a.db, room, 'alice', 1000).notify()).toBe(true);
+    await until(() => fresh.length === 1, 15_000, 'the indicator');
+    await sleep(300);
+    expect(fresh).toEqual(['alice']);
+    expect(strict).toEqual([]);
+    for (const s of subs) await s.close();
+    await signOut(a);
+    await signOut(b);
+  });
+
   it("who's online: every running instance answers, and a closed one no longer", async () => {
     // Four devices. (Two sessions of one device would not do: the stream
     // drops an ephemeral message whose sender's clock is not past the last

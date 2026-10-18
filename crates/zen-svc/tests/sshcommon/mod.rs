@@ -286,6 +286,7 @@ impl Driver {
             events,
             peer_closed,
             error,
+            ..
         } = c.input(&self.buf[..n], eof, now());
         self.buf.drain(..consumed);
         self.shown = n - consumed;

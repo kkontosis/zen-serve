@@ -1,6 +1,7 @@
-//! WASM bindings for `@zen/svc` (docs/MILESTONE-5.5.md, step 8): the TLS
-//! engine of zen-svc (svc.md §7.1), as a second module that only services
-//! using `tls()` load.
+//! WASM bindings for `@zen/svc` (docs/MILESTONE-5.5.md, steps 8 and 10):
+//! the TLS and SSH engines of zen-svc (svc.md §7.1, §7.2), as a second
+//! module that only services using `tls()` or `ssh()` load. The SSH
+//! bindings are in [`ssh`].
 //!
 //! * [`TlsConfig`]: a certificate chain and its key, and the TLS options.
 //! * [`TlsConn`]: one connection. During the handshake it lives in memory
@@ -19,6 +20,8 @@ use rustls::{CipherSuite, ProtocolVersion};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use zen_svc::tls::{self, Error};
+
+mod ssh;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &str = r#"
