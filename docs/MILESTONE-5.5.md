@@ -162,8 +162,33 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * Fix: a thread reads `s_client`'s stdout as it arrives, and the helper keeps stdin open until stdout holds `wait_for` (or 30 s pass). The data tests pass their expected echo; the renegotiation and no-EMS tests pass `None`.
     * Verified: clippy on zen-svc; `cargo test -p zen-svc --test openssl` 5×, and 3 rounds of three copies at once.
   * CI green on PR #44's head (all 8 checks); merged.
-* **Step 5.5.8** (`@zen/svc-wasm` and the `tls()` layer): planned. Restarted from main after PR #44 merged; the plan is below.
-  * Next: on "go", the code (no `spec:` commit expected).
+* **Step 5.5.8** (`@zen/svc-wasm` and the `tls()` layer): done, PR #45. Restarted from main after PR #44 merged. Commits: `docs: milestone 5.5 step 8 plan`; `svc: the TLS engine for wasm (crates/zen-svc-wasm, @zen/svc-wasm)`; `svc: the tls() layer in @zen/svc`; `apps: echo over TLS`; `svc: early input is bounded by its span, and a gap is read again`; the docs and this log. No `spec:` commit: svc.md §7.1 already says what the runtime does.
+  * As planned, plus details settled while building:
+    * wasm-bindgen exports no constants, so the binding has `plainHeld()`. `ZenTlsError`'s message is its code, with the details in `detail`. A connection's failure in `input` is `{code, alert?, detail}`, with the codes `tls`, `alert_sent`, `alert_received` and `internal` besides the thrown ones. `version` is `TLSv1.3` or `TLSv1.2`, and `suite` the IANA name (rustls's `TLS13_…` becomes `TLS_…`), so both compare with Node's `getCipher().standardName`.
+    * The layer interface (`packages/svc/src/layer.ts`): `prepare` (outside the transaction), `finish` (inside, may run again), `committed`, `room` (how much plaintext a step may write so its records fit `out_window`). The prepared step is kept until it commits, for established connections too, so a `window` retry or a conflict reuses it.
+    * The handler runs on the step that finishes the handshake even without plaintext, so a server-first protocol (IMAPS, SMTPS) can greet; then on new plaintext, or an EOF it hasn't seen. After its own FIN, an EOF with nothing to read doesn't call it.
+    * A claim of a TLS connection with no state whose cursors moved (a handshake begun elsewhere) is released with `close`, like a state that doesn't restore.
+    * In TLS 1.2 a write that reaches the key's record limit closes the connection (close_notify, then close).
+    * `serve()` opens the layer before anything else: a bad certificate is one `onError` (`ZenTlsError: config`), and nothing is claimed.
+    * `testCerts(kind)` is in `@zen/client/testing` rather than `apps/shared`, so the svc package's tests use it too.
+    * The echo app: `serveEcho(db, opts)` takes any `ServeOptions` (handler and layer); `tlsLayer(db, name)` reads a `certs` row; the worker takes `ECHO_LAYER` = `raw`, `tls` or `mirror`. The Playwright case puts the certificate through a Node session of Alice, and the tab reads it.
+    * Node's TLS client takes 1.3 suites in `ciphers` (there is no `ciphersuites` option), and `secureConnect` fires before the engine has read the client's Finished, so the in-memory tests wait for the engine. Node has no client KeyUpdate API: the binding tests send the server's KeyUpdate both ways; client KeyUpdates were tested against `s_client` natively in 5.5.7.
+    * Sizes (release, no wasm-opt): `zen_svc_wasm_bg.wasm` 1.05 MB, 403 KB gzipped; `zen_wasm_bg.wasm` is now 2.42 MB, 645 KB gzipped (STATS §4.1 said 2.14 MB).
+    * Measured locally: 20 MB through `mirror-tls` with two kills in about 14 s.
+    * **A runtime bug from 5.5.5, found by the 20 MB test:**
+      * In one of three full vitest runs, the transfer stalled after the first kill, at about 36%, with no error on either side.
+      * Reproduced about once in ten with three copies of the test running at once. The workers' debug output showed the successor dropping a pushed chunk before its claim response arrived. Input pushed early was kept up to `window` bytes, counted as the sum of the chunks. But pushes repeat bytes and here started 352 bytes before the claim's `in_acked`, so the sum passed 256 KiB with a full input window. The dropped chunk left a gap no later push filled.
+      * Raw handlers had the same bug; their takeover tests never had a full window at the kill.
+      * Fix: the early buffer is bounded by the offsets it spans (twice the window), and input that has waited past a gap for over a second is read again with `/v1/svc/read`.
+      * After the fix, 46 runs of three copies at once all passed. Two more runs failed only because the copies rebuilt `apps/dist/echo` at the same moment.
+      * The test now times out its sender and reports the workers' output.
+  * Verified:
+    * `cargo fmt --all --check`; clippy on zen-svc-wasm, `--all-targets -D warnings`, default and `--no-default-features`, and for wasm32; `cargo test -p zen-svc-wasm`
+    * `scripts/build-wasm.sh`, release and `--dev`
+    * `npm run check`
+    * `npx vitest run` 3× after the fix: 458 passed each time; the 7 skipped are the opt-in benches. This includes `packages/svc/test/tlswasm.test.ts` (15 tests) and `apps/echo/test/tls.test.ts` (6 tests).
+    * `npx playwright test`: smoke and apps, 15 specs, including the TLS case in `apps/echo/e2e/echo.spec.ts`
+    * `cargo test -p zen-svc` (unchanged: 23 and 6 tests)
 
 ## Step 5.5.8 in detail: `@zen/svc-wasm` and the `tls()` layer
 
