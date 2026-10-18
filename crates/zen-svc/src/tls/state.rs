@@ -2,16 +2,13 @@
 
 use super::session::{CLOSED, Dir, PEER_CLOSED, PLAIN_HELD, SENT_CLOSE, Session, Suite};
 use super::{Config, Error};
+use crate::cbor::{Fields, text};
 use ciborium::Value;
 use rustls::ProtocolVersion;
 use zen_tls_rustcrypto::record::MAX_PLAIN;
 use zeroize::Zeroizing;
 
 const VERSION: u64 = 1;
-
-fn text(s: &str) -> Value {
-    Value::Text(s.to_owned())
-}
 
 fn dir_value(d: &Dir, tls13: bool) -> Value {
     let mut m = vec![(text("seq"), Value::Integer(d.seq.into()))];
@@ -44,12 +41,8 @@ impl Session {
             m.push((text("alpn"), Value::Bytes(alpn.clone())));
         }
         m.push((text("flags"), Value::Integer(self.flags.into())));
-        let v = Value::Map(m);
-        let mut out = Vec::new();
-        ciborium::into_writer(&v, &mut out).expect("CBOR to a Vec");
-        // The map held copies of the keys.
-        zeroize_value(v);
-        out
+        // The map holds copies of the keys; `encode` zeroizes it.
+        crate::cbor::encode(Value::Map(m))
     }
 
     /// Rebuilds a session from [`Session::state`]. Anything unexpected is
@@ -108,85 +101,4 @@ fn dir(suite: Suite, v: Value) -> Result<Dir, Error> {
     };
     m.done()?;
     Ok(d)
-}
-
-/// Drops a CBOR value; its byte strings are zeroized first.
-fn zeroize_value(v: Value) {
-    match v {
-        Value::Bytes(mut b) => zeroize::Zeroize::zeroize(&mut b),
-        Value::Map(m) => m.into_iter().for_each(|(k, v)| {
-            zeroize_value(k);
-            zeroize_value(v)
-        }),
-        Value::Array(a) => a.into_iter().for_each(zeroize_value),
-        _ => {}
-    }
-}
-
-/// A CBOR map's fields, taken one by one; [`Fields::done`] refuses any
-/// left over.
-struct Fields(Vec<(String, Value)>);
-
-impl Drop for Fields {
-    fn drop(&mut self) {
-        std::mem::take(&mut self.0)
-            .into_iter()
-            .for_each(|(_, v)| zeroize_value(v));
-    }
-}
-
-impl Fields {
-    fn new(v: Value) -> Result<Fields, Error> {
-        let Value::Map(m) = v else {
-            zeroize_value(v);
-            return Err(Error::BadState("not a map"));
-        };
-        let mut out = Fields(Vec::with_capacity(m.len()));
-        for (k, v) in m {
-            let Value::Text(k) = k else {
-                zeroize_value(v);
-                return Err(Error::BadState("a key that isn't text"));
-            };
-            if out.0.iter().any(|(x, _)| *x == k) {
-                zeroize_value(v);
-                return Err(Error::BadState("a repeated key"));
-            }
-            out.0.push((k, v));
-        }
-        Ok(out)
-    }
-
-    fn opt(&mut self, k: &str) -> Option<Value> {
-        let i = self.0.iter().position(|(x, _)| x == k)?;
-        Some(self.0.swap_remove(i).1)
-    }
-
-    fn take(&mut self, k: &str) -> Result<Value, Error> {
-        self.opt(k).ok_or(Error::BadState("a missing field"))
-    }
-
-    fn uint(&mut self, k: &str) -> Result<u64, Error> {
-        match self.take(k)? {
-            Value::Integer(i) => u64::try_from(i).map_err(|_| Error::BadState("not a uint")),
-            _ => Err(Error::BadState("not a uint")),
-        }
-    }
-
-    fn bytes(&mut self, k: &str) -> Result<Vec<u8>, Error> {
-        match self.take(k)? {
-            Value::Bytes(b) => Ok(b),
-            v => {
-                zeroize_value(v);
-                Err(Error::BadState("not bytes"))
-            }
-        }
-    }
-
-    fn done(&mut self) -> Result<(), Error> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::BadState("an unknown field"))
-        }
-    }
 }

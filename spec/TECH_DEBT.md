@@ -301,3 +301,17 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** The TLS engine (svc.md §7.1) has no state until the handshake is done: rustls's handshake state can't be serialized. A handler that dies mid-handshake leaves a connection that isn't resumable, so the server aborts it (svc.md §6), and the client retries. A handshake step isn't idempotent either: its retry must re-send the same output, and an unknown outcome aborts the connection.
 * **Why deferred:** A handshake takes one or two round trips, so the window is small, and TLS clients reconnect. Serializing the handshake means running it in our own code (as the SSH engine does) or rustls exposing its handshake state.
 * **What it would take:** A handshake whose state serializes after each flight: either our own TLS server handshake (key schedule, transcript hash, ServerHello to Finished, both versions) checked against rustls and OpenSSL, or an upstream rustls API. Then `resumable` from the first step, as for SSH.
+
+## TD-SVC-SSH-SCOPE
+
+* **Status:** open
+* **Context:** The SSH engine (svc.md §7.2) is the subset that OpenSSH clients and git need: `publickey` authentication with Ed25519 and RSA (SHA-2) user keys, `session` channels with `exec`, `shell` and `subsystem`, and one Ed25519 host key. It has no password or keyboard-interactive authentication, no PTY (`pty-req` is refused, so interactive shells get no terminal), no port or agent forwarding, no X11, no ECDSA or security-key (`sk-…`) user keys, no certificates, no `publickey-hostbound`, no host-key rotation (`hostkeys-00@openssh.com`), and no `sntrup761x25519-sha512`.
+* **Why deferred:** Each one is more protocol and state to get right and keep resumable, and none is needed for git over SSH or command services. Password authentication would also put a secret through the application on every login.
+* **What it would take:** Per feature: the messages, their state fields (svc.md §7.2's layout gains them), and OpenSSH tests. A PTY needs `pty-req` and `window-change` to reach the application, and an application that emulates a terminal.
+
+## TD-SVC-SSH-PQ-CI
+
+* **Status:** open
+* **Context:** The runners' OpenSSH (Ubuntu 24.04: 9.6) has no `mlkem768x25519-sha256`, which came with 9.9. CI's `openssh-pq` job builds OpenSSH 10.6p1 from source (`scripts/build-openssh.sh`) and runs the SSH engine's OpenSSH tests against it, the hybrid's included (`crates/zen-svc/tests/openssh_pq.rs`). It ran on every push of milestone 5.5 step 9's PR and passed, and now runs only when started by hand (`workflow_dispatch`), so ordinary builds don't spend a minute building OpenSSH. Every build still tests the hybrid against the crate's own test client (`tests/ssh.rs`), which shares the engine's code.
+* **Why deferred:** Building OpenSSH on every push costs time for a check that changes only when the engine's key exchange does.
+* **What it would take:** Install the runners' `openssh-client` in the Rust jobs and drop the `#[ignore]` once `ubuntu-latest` ships OpenSSH 9.9 or later; until then, start the job by hand after changing `crates/zen-svc/src/ssh/kex.rs` or `cipher.rs`.

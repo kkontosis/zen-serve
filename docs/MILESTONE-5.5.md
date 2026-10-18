@@ -194,31 +194,195 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * Playwright maps `@zen/svc` to its sources through `apps/tsconfig.json`. Imports inside `packages/svc/src` resolve against that package's own tsconfig, which has no paths, so `@zen/db` resolves to its build. CI doesn't build `@zen/db`; locally a stale build hid this.
     * Fix: the database parts (`NS`, `DB_OPTIONS`, `Line`, `Cert`, `putCert`) move to `apps/echo/src/schema.ts`. `echo.ts` re-exports them, and the spec imports `schema.ts`.
     * Verified with the local `packages/db/dist` moved aside, as in CI. The error reproduced before the fix; after it, `npx playwright test` (15) passed, and so did `npx vitest run apps/echo` (11) and `npm run check`.
+  * CI green on PR #45's head (all 8 checks); merged.
+* **Step 5.5.9** (the SSH engine, native): done, PR #46. Restarted from main after PR #45 merged. Commits: `docs: milestone 5.5 step 9 plan`; `spec: the SSH engine (svc.md §7.2)`; `svc: the SSH engine (crates/zen-svc), native`; `ci: OpenSSH from source for the hybrid key exchange`; the docs and this log; `ci: the OpenSSH-from-source job runs on demand only`.
+  * Decided with the user: implement `mlkem768x25519-sha256` too. OpenSSH has it only from 9.9, and Ubuntu 24.04 (here and on the runners) ships 9.6. So a CI job builds OpenSSH 10.6p1 from source to test the hybrid against it. Once that job has passed on the PR, it is switched to run on demand only.
+  * As planned, plus details settled while building (all in svc.md §7.2):
+    * **Bounds, sized to the state budget.** The plan's per-channel figures would allow 10 × 32 KiB of queued output, beyond `max_value_bytes`. So the bounds are across channels:
+      * Unread data: at most 32,768 bytes. A packet is read only when nothing is unread, or when what is unread plus the packet's length stays within that.
+      * Queued output: at most 16,384 bytes, in at most 64 pieces.
+      * Held replies during the server's own key exchange: at most 32 messages and 4,096 bytes.
+      * A full state measured about 47 KB; the OpenSSH transfers peaked at about 34 KB.
+    * **Packets up to 35,000 bytes** (RFC 4253 §6.1's minimum), not 256 KiB: a packet larger than the relay's input window could never be read. The client's KEXINIT is limited to 8,192 bytes.
+    * **A server rekey behind unread data.** From its KEXINIT to its NEWKEYS the server holds its output. An application whose writes are full then stops consuming, and the read bound stops reading, while the client's KEXINIT and init sit behind channel data in the input: a deadlock. So when reading is held back during its own key exchange, the engine decrypts ahead through the input it was given, without consuming it. It handles the client's KEXINIT and init there, replies, sends NEWKEYS, and skips those two sequence numbers when in-order reading reaches them (`kex.ahead` in the state). The OpenSSH server-rekey test goes through this path (4 of its 6 rekeys).
+    * **The channel window** is an engine option, `window`, default 98,304 bytes (the plan said 2 MiB). That read-ahead needs the client's data in flight to fit the relay's input window, so the channels' windows together, plus 64 KiB, should fit the service's `window`. 10 × 98,304 + 64 KiB is about 1 MiB, the window SSH services should use; 5.5.10's layer derives the option from the service.
+    * **Only the request kind is kept** for each channel's exec, shell or subsystem. The command or subsystem name reaches the application once, in its event, so a long command doesn't stay in the state.
+    * Other details:
+      * Without strict kex, an unexpected message during a key exchange gets UNIMPLEMENTED, as OpenSSH does.
+      * The state counts completed key exchanges (`kexes`).
+      * A wrong guess (`first_kex_packet_follows`) skips the client's next packet, in order and in the read-ahead alike.
+    * **The test client** (`ssh::client`, feature `test-utils`) is built on the engine's own wire, cipher and kex code, and checks the host-key signature. It holds its own messages during its key exchange, as RFC 4253 §7.1 requires.
+    * The engines' strict CBOR reading (`Fields`) moves from `tls/state.rs` to a shared `cbor` module.
+  * Verified:
+    * `cargo fmt --all --check`
+    * clippy `--all-targets -D warnings` on the workspace, default and `--no-default-features`; on zen-svc with `--all-features`, and for wasm32
+    * `cargo check -p zen-svc-wasm --target wasm32-unknown-unknown`; `cargo tree -p zen-svc -e normal -i ring` is empty
+    * `cargo test -p zen-svc` 3×:
+      * 11 unit tests
+      * `tests/ssh.rs` (18): sessions in whole reads and one byte at a time for every method and cipher, strict kex both ways, a wrong guess, the auth limit, a question across a restore, the read and write bounds, rekeys from either side, channel refusals, 300 malformed messages, bit flips, the version line, the state's checks
+      * `tests/openssh.rs` (10) against OpenSSH 9.6 (apt): both ciphers, RSA keys with SHA-2 and SHA-1 refused, an unauthorized key, 10 MB `cat` with `RekeyLimit=1M` (about 20 client rekeys), server rekeys, a 20 MB download, a shell, a subsystem, an exit status, 7-byte steps, keys read and fingerprinted as `ssh-keygen` does, and Terrapin through an injecting proxy
+      * the TLS tests unchanged
+    * Against OpenSSH 10.6p1 built with `scripts/build-openssh.sh`: `tests/openssh.rs` and `tests/openssh_pq.rs` (the hybrid with both ciphers, a 1 MB `cat` with rekeys both ways)
+## Step 5.5.9 in detail: the SSH engine (`crates/zen-svc`, native)
 
-## Step 5.5.8 CI fix: the echo e2e spec must not load `@zen/svc`
+A sans-IO SSH server whose whole state serializes at every packet boundary, mid key exchange included. A successor handler continues the live session at any point. So unlike TLS, an SSH connection is resumable from its first step.
 
-**Failure:** both `client` runs on head a041fc4. Vitest passed, then Playwright stopped before running any test:
-`Cannot find module '…/node_modules/@zen/db/dist/index.js' imported from …/packages/svc/src/state.ts`.
-The other 6 checks are green.
+This step is native only. The wasm binding and `ssh()` in `@zen/svc` come in 5.5.10. Normative behaviour goes into spec/svc.md §7.2 (the `spec:` commit).
 
-**Root cause:**
-1. The TLS case added to `apps/echo/e2e/echo.spec.ts` imports `DB_OPTIONS, NS, putCert` from `../src/echo.js`, which imports `@zen/svc`.
-2. Playwright maps `@zen/svc` to its sources through `apps/tsconfig.json`'s paths. But the imports inside `packages/svc/src/*` resolve against `packages/svc/tsconfig.json`, which has no paths. So `@zen/db` goes to `node_modules/@zen/db/dist`.
-3. CI builds only `@zen/client` and `@zen/fs`, so that file doesn't exist there.
-4. Locally a stale `packages/db/dist` exists, so it passed.
+**Commits:**
+1. `docs: milestone 5.5 step 9 plan` (also logs step 5.5.8's CI and merge)
+2. `spec: the SSH engine (svc.md §7.2)`
+3. `svc: the SSH engine (crates/zen-svc), native`
+4. `ci: OpenSSH from source for the hybrid key exchange`
+5. the docs and the log
+6. `ci: the OpenSSH-from-source job runs on demand only`, pushed after commit 4's job is green on the PR (the user's instruction)
 
-(chat.spec imports `@zen/db` from a file under `apps/`, where the paths apply.)
+### Facts from the survey
+* **OpenSSH here and on CI:** no `ssh` is installed locally; apt has `openssh-client` 9.6p1. Ubuntu runners ship 9.6.
+  * 9.6 has `curve25519-sha256`, `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`, strict kex and EXT_INFO. It has no `mlkem768x25519-sha256`, which came in 9.9.
+* **Building OpenSSH from source:**
+  * cdn.openbsd.org and ftp.openbsd.org are blocked here, but `git clone --depth 1 --branch V_10_6_P1 https://github.com/openssh/openssh-portable` works. That tag is commit `a8c72b842423f0774f542d3c2197247c3dd28d74`.
+  * `autoreconf -i && ./configure && make ssh ssh-keygen` takes about 10 s on 4 cores, with OpenSSL 3.0 and zlib from the system (`libssl-dev`, `zlib1g-dev`).
+  * Its `ssh -Q kex` lists `mlkem768x25519-sha256`, and `ssh -Q cipher` both of our ciphers.
+* **Crates already in the workspace (pure Rust, build for wasm32):**
+  * chacha20 0.10 (feature `legacy`: `ChaCha20Legacy`, the 64-bit nonce openssh's cipher uses), poly1305 0.9, aes-gcm 0.11
+  * x25519-dalek 3, ml-kem 0.3, ed25519-dalek 3, sha2 0.11, base64 0.22
+  * rsa `=0.10.0-rc.18`, and `zen_tls_rustcrypto::rsakey::from_components(n, e)`, which applies the key policy (2048–4096 bits, e ≥ 65537) to an `ssh-rsa` blob's e and n as they are
+* **The state budget:** the whole sealed state is at most `max_value_bytes` = 90,000 (svc.md §7). The engine's buffers must stay well under that, with room for the app's state.
 
-**Fix (one commit, `apps: the echo e2e spec doesn't load @zen/svc`):**
-* Move `NS`, `DB_OPTIONS`, `Cert` and `putCert` out of `apps/echo/src/echo.ts` into a new `apps/echo/src/schema.ts`. That module imports only `@zen/db` types, so nothing from `@zen/svc`.
-* `echo.ts` re-exports them, so the UI, worker and tests are unchanged.
-* `echo.spec.ts` imports from `../src/schema.js`.
+### spec/svc.md §7.2 (`spec:`)
+* **Algorithms:**
+  * kex: `mlkem768x25519-sha256`, `curve25519-sha256` (and its `@libssh.org` alias)
+  * host key: `ssh-ed25519`
+  * ciphers: `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`; compression `none`
+  * MACs are listed (`hmac-sha2-256-etm@openssh.com`) but never used: both ciphers are AEAD, and OpenSSH doesn't negotiate a MAC for an AEAD cipher
+  * user keys: `ssh-ed25519`, and `rsa-sha2-256`/`rsa-sha2-512` on `ssh-rsa` keys within the key policy. `ssh-rsa` with SHA-1 is refused.
+* **Strict kex** (`kex-strict-s-v00@openssh.com`, Terrapin, CVE-2023-48795), when the client offers `kex-strict-c-v00@openssh.com`:
+  * the client's first packet must be KEXINIT
+  * any other message during the initial kex disconnects
+  * sequence numbers reset to 0 at each NEWKEYS, in each direction
+* **EXT_INFO:** after the first NEWKEYS when the client offers `ext-info-c`, with `server-sig-algs` = `ssh-ed25519,rsa-sha2-256,rsa-sha2-512`.
+* **Authentication:**
+  * `publickey` only, with `none` answered by a FAILURE that lists it
+  * a query without a signature gets PK_OK if the app authorizes the key
+  * a signed request is verified first (over the session id, as RFC 4252 §7), then authorized by the app
+  * at most 20 attempts, then disconnect
+* **Connection:**
+  * only `session` channels, at most 10 open
+  * `exec`, `shell` and `subsystem` once per channel; `pty-req`, `env`, `x11-req`, `auth-agent-req` and other requests get FAILURE when a reply is wanted
+  * global requests get REQUEST_FAILURE; port forwarding is refused
+  * `exit-status`, EOF and CLOSE, and stderr as extended data type 1
+* **Rekey:** on the client's KEXINIT at any time, and by the server after 1 GiB in either direction or one hour since the last kex. While a kex is in progress, the app's output waits in the engine.
+* **Bounds:**
+  * the engine stops reading packets once 32 KiB of channel data is unread by the app (its input acks stop there, as TLS does at 16 KiB)
+  * a write takes at most what fits the peer's window plus a 32 KiB queue, and returns how much it took; the app keeps the rest (in its state, or by not acking its own input)
+  * the advertised channel window is 2 MiB, with a maximum packet of 32,768; packets up to 256 KiB are accepted
+* **When it becomes resumable:** from the first step. Everything persists: the version strings, both KEXINITs during a kex, keys and sequence numbers, the next keys waiting for the client's NEWKEYS, the auth state (an authorization in progress included), the channels with their windows and buffers, and the rekey counters. The server's ephemeral kex secrets never persist: the reply is computed in the step that receives the client's kex message.
+* **The `engine_state` layout** (CBOR, versioned); a version it doesn't know is refused.
 
-**Verify:**
-* Reproduce CI first: move the local `packages/db/dist` aside. Confirm `npx playwright test apps/echo` fails with the same error, then passes with the fix. Restore the dist afterwards.
-* `npm run check`; `npx vitest run apps/echo`; `npx playwright test` (all 15).
-* Push. CI must be green on all 8 checks.
-* Log the CI fix and "CI green" in both plan copies (`cp`), push, stop for compaction.
+### `crates/zen-svc` (`ssh` module)
+* **Dependencies:** those above (chacha20 with `legacy`, poly1305, aes-gcm, x25519-dalek, ml-kem, ed25519-dalek, sha2, base64, rsa, the rsakey policy). All are already in Cargo.lock.
+* **Files:**
+  * `ssh/mod.rs`: `Config`, `Conn`, `Event`, `Error`, `Progress`
+  * `ssh/wire.rs`: SSH encodings (string, mpint, name-list) with strict decoding
+  * `ssh/cipher.rs`: the two packet protections
+  * `ssh/kex.rs`: KEXINIT negotiation, both kex methods, the exchange hash, key derivation (RFC 4253 §7.2), the host key signature
+  * `ssh/keys.rs`: `HostKey` and `PublicKey`
+  * `ssh/auth.rs`, `ssh/channel.rs`
+  * `ssh/state.rs`: the CBOR state
+* **The packet protections:**
+  * **chacha20-poly1305@openssh.com:** a 64-byte key, of which the main key is the first 32 bytes and the header key the last 32. The nonce is the sequence number. The length is encrypted with the header key. The Poly1305 key is the main key's block 0, and the payload is encrypted from block 1. The tag covers the encrypted length and payload.
+  * **aes256-gcm@openssh.com:** the length in the clear as AAD, and a 12-byte IV of 4 fixed bytes plus an 8-byte invocation counter incremented per packet (kept in the state); padding to 16.
+* **The kex methods:**
+  * `curve25519-sha256`: K as an mpint (RFC 8731).
+  * `mlkem768x25519-sha256` (draft-ietf-sshm-mlkem-hybrid-kex):
+    * the client's C_INIT is the ML-KEM-768 encapsulation key (1184 bytes) followed by its X25519 key
+    * the server's S_REPLY is the ciphertext (1088 bytes) followed by its X25519 key
+    * K = SHA-256(ML-KEM shared secret ‖ X25519 shared secret), as a string
+  * Both refuse an all-zero X25519 result.
+* **Keys:**
+  * `HostKey::from_openssh(pem)` reads an unencrypted `openssh-key-v1` Ed25519 key, as `ssh-keygen -t ed25519 -N ''` writes it. Also `HostKey::from_seed(&[u8; 32])` and `public_line()` (for `known_hosts`).
+  * `PublicKey::from_line("ssh-ed25519 AAAA… comment")` and `from_blob`, `fingerprint()` (`SHA256:…`, as `ssh-keygen -l`), equality on the blob: what an app needs to check an `authorized_keys` list.
+* **API:**
+  ```rust
+  Config::new(host_key, Options { kex, ciphers, rekey_bytes, rekey_secs, software /* "zen" */ })
+  Conn::new(&config, now_secs) -> (Conn, Vec<u8>)  // version line + KEXINIT: the server speaks first
+  Conn::restore(&config, state) -> Conn
+  conn.input(buf, eof, now_secs) -> Progress { consumed, out, events, peer_closed, error }
+  // events: Authorize { user, key: PublicKey, signed }, ChannelOpen { ch },
+  //         Exec { ch, command } | Shell { ch } | Subsystem { ch, name },
+  //         Data { ch } (read with channel_data/consume), Eof { ch }, Close { ch }
+  conn.authorize(accept) -> Vec<u8>       // answers a pending Authorize; input stops until then
+  conn.channel_data(ch) -> &[u8]; conn.consume(ch, n)   // sends WINDOW_ADJUST as the window drains
+  conn.write(ch, data) / write_stderr(ch, data) -> (taken, out)
+  conn.exit_status(ch, code), conn.eof(ch), conn.close(ch), conn.rekey(), conn.disconnect(reason, msg)
+  conn.state() -> Vec<u8>
+  ```
+  * A pending `Authorize` is in the state, so a successor asks its app again.
+  * Protocol errors send DISCONNECT with the RFC 4253 reason code and end the connection, like TLS's fatal alerts.
+  * A test-only `Options` knob lowers the rekey thresholds.
+* **The version exchange:**
+  * we send `SSH-2.0-zen` (configurable software name)
+  * we accept a client line `SSH-2.0-…` or `SSH-1.99-…` of at most 255 bytes, after at most 20 other lines
+  * the version strings go into every exchange hash, so they stay in the state
+
+### Tests
+* **The harness** (`tests/common`, extended), driving the engine the way a handler does:
+  * after every `input`, it serializes the state, drops the connection and restores it, so every packet boundary is a takeover point, mid-kex included
+  * variants feed whole reads, one packet at a time, and one byte at a time
+  * a small app on top: `echo <text>`, `cat` (stdin to stdout until EOF), `big <n>` (n bytes out), `exit <code>` (with stderr), a `test-sub` subsystem, and a line-echo shell
+  * the authorized keys are the test's Ed25519 and RSA keys
+* **`tests/openssh.rs`, against OpenSSH (`ssh` on PATH, or `ZEN_TEST_SSH`):**
+  * The listener thread drives the engine and restores it at every read.
+  * The client runs with `-T`, `UserKnownHostsFile` holding our host key and `StrictHostKeyChecking=yes`, so the host key signature is checked.
+  1. exec with an Ed25519 user key, for each cipher on `curve25519-sha256`: the stdout and the exit status
+  2. RSA user keys with `rsa-sha2-256` and `rsa-sha2-512`. Refused: an unauthorized key, and `ssh-rsa` (SHA-1) only (`Permission denied (publickey)`).
+  3. `cat` of 10 MB with `-o RekeyLimit=1M` (about ten client rekeys), checked by SHA-256
+  4. server-initiated rekeys during a 5 MB transfer, with the lowered threshold
+  5. `big 20M` (window adjusts from the client)
+  6. the shell over stdin; `ssh -s … test-sub`; a non-zero exit status with stderr
+  7. **Terrapin:**
+     * a proxy injects an SSH_MSG_IGNORE into the client's stream during the initial kex, and `ssh` fails with our DISCONNECT
+     * a raw client sending IGNORE before its KEXINIT is disconnected under strict kex
+     * the same IGNORE is accepted without strict kex
+* **`tests/openssh_pq.rs`:** the same exec and a 1 MB `cat` on `mlkem768x25519-sha256`.
+  * Marked `#[ignore = "needs OpenSSH 9.9+ (ZEN_TEST_SSH)"]`, since the system `ssh` can't run it.
+  * Runs with `ZEN_TEST_SSH=… cargo test -p zen-svc --test openssh_pq -- --ignored`: here against the 10.6p1 build, and in CI's dedicated job.
+* **`tests/ssh.rs`, engine-level:**
+  * malformed input from a deterministic generator over real transcripts (bit flips, lengths, truncation, bad padding, unknown messages): a DISCONNECT or progress, never a panic, and the state stays restorable or the connection ends
+  * the strict-kex rules
+  * the auth attempt limit
+  * a pending `Authorize` across a restore
+  * the read bound (32 KiB unread stops reading)
+  * the write bound and the queue across a closed window
+  * `HostKey`/`PublicKey` parsing against `ssh-keygen` output
+  * a state round trip; refusal of unknown versions and bad lengths; a state-size bound with full buffers (well under 90,000)
+
+### CI
+* `rust` and `pure-rust` jobs: `sudo apt-get install -y openssh-client` (already on the runners; this makes it explicit). `cargo test --all` then runs `tests/openssh.rs`.
+* **New job `openssh-pq`:**
+  * `scripts/build-openssh.sh <prefix>`: clone tag `V_10_6_P1` with depth 1, check the commit `a8c72b84…`, then `autoreconf`, `configure`, `make ssh ssh-keygen`
+  * cached by version with `actions/cache`
+  * then `ZEN_TEST_SSH=<prefix>/ssh cargo test -p zen-svc --test openssh_pq -- --ignored`
+* **After it passes on the PR** (the user's instruction): commit 6 adds `workflow_dispatch:` to the workflow's triggers and `if: github.event_name == 'workflow_dispatch'` to the job. Ongoing builds then skip it; it runs when started by hand. CI is confirmed green after that push too.
+* `rust` job's wasm32 check: zen-svc already builds for wasm32; the new dependencies must too.
+
+### Docs
+* README crates table: `crates/zen-svc` gains the SSH engine.
+* TECH_DEBT:
+  * **TD-SVC-SSH-SCOPE:** no password or keyboard-interactive auth, no PTY, no port or agent forwarding, no ECDSA or security-key (`sk-…`) user keys, no `publickey-hostbound`
+  * **TD-SVC-SSH-PQ-CI:** the hybrid kex is tested against OpenSSH only on demand, until the runners' OpenSSH has it
+* The log in both plan copies.
+
+### Out of scope
+* the wasm build and `ssh()` in `@zen/svc`, the git-transport demo and the takeover tests across handler kills (5.5.10)
+* host-key rotation and certificates; `sntrup761x25519-sha512`
+
+### Verification
+* `cargo fmt --check`; clippy `--all-targets -D warnings`: default, `--no-default-features`, `--all-features`; clippy on zen-svc for wasm32
+* `cargo test -p zen-svc` 3× with OpenSSH 9.6 (apt), and the `openssh_pq` tests with the 10.6p1 build, here
+* `cargo tree -p zen-svc -e normal -i ring` is empty
+* CI green on the PR, with `openssh-pq` green before commit 6, and again after it
 
 ## Step 5.5.8 in detail: `@zen/svc-wasm` and the `tls()` layer
 

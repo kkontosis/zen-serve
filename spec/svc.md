@@ -196,6 +196,95 @@ dir = { seq: uint,            // the next record's sequence number
 * A state whose `v`, `ver` or `suite` the engine doesn't know, or whose fields have the wrong lengths, is refused; the runtime then releases the connection with `close`.
 * Keys are in the state, so a rotation doesn't protect a live TLS connection (§8).
 
+### 7.2 The SSH engine
+
+The SSH engine (`engine: "ssh"`) is an SSH-2 server (RFC 4251–4254) in the handler. It is its own implementation, without a library's hidden state, so its whole state serializes at every packet boundary, a key exchange in progress included.
+
+**Algorithms.**
+* Key exchange: `mlkem768x25519-sha256` (draft-ietf-sshm-mlkem-hybrid-kex) and `curve25519-sha256` (RFC 8731, also under its old name `curve25519-sha256@libssh.org`).
+* Host key: `ssh-ed25519` (RFC 8709). One host key per service.
+* Ciphers: `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`, both AEAD. Compression: `none`.
+* MACs: `hmac-sha2-256-etm@openssh.com` and `hmac-sha2-256` are offered so that negotiation succeeds, but never used: with an AEAD cipher there is no MAC.
+* User keys: `ssh-ed25519`, and `ssh-rsa` keys signing with `rsa-sha2-256` or `rsa-sha2-512` (RFC 8332), within the RSA key policy (a 2,048 to 4,096-bit modulus, an odd exponent of at least 65,537). `ssh-rsa` signatures (SHA-1) are refused, and so are other key types.
+
+**The version exchange.** The engine sends `SSH-2.0-<software>` (default `zen`) and its first KEXINIT at once: the server speaks first. It accepts a client line `SSH-2.0-…` or `SSH-1.99-…` of at most 255 bytes with its CR LF (a bare LF is accepted too), after at most 20 other lines, which are ignored. The two version lines go into every exchange hash, so they stay in the state.
+
+**Packets.**
+* The binary packet protocol of RFC 4253 §6, with padding to 8 bytes (none and chacha20-poly1305) or 16 (aes256-gcm), at least 4 bytes of it. Padding is random.
+* `chacha20-poly1305@openssh.com`: a 64-byte key; the first 32 bytes are the main key and the last 32 the header key. The nonce is the packet sequence number (64 bits, big-endian). The length is encrypted with the header key; the Poly1305 key is the first 32 bytes of the main key's block 0, and the payload is encrypted from block 1. The tag covers the encrypted length and payload.
+* `aes256-gcm@openssh.com` (RFC 5647 with OpenSSH's names): a 32-byte key and a 12-byte IV, the last 8 bytes of which count packets (big-endian, incremented after each). The length is sent in the clear as additional data.
+* A packet longer than 35,000 bytes (RFC 4253 §6.1's minimum), with less than 4 bytes of padding, with the wrong alignment or with an empty payload ends the connection (`PROTOCOL_ERROR`); one that doesn't authenticate ends it with `MAC_ERROR`.
+
+**Key exchange.**
+* KEXINIT negotiation as RFC 4253 §7.1. A client KEXINIT larger than 8,192 bytes is refused. A wrong guess (`first_kex_packet_follows`) makes the engine ignore the client's next packet.
+* `curve25519-sha256`: the shared secret K is encoded as an mpint. `mlkem768x25519-sha256`: the client's init is its ML-KEM-768 encapsulation key (1,184 bytes) followed by its X25519 key (32); the server's reply is the ML-KEM ciphertext (1,088 bytes) followed by its X25519 key; K = SHA-256(ML-KEM shared secret ‖ X25519 shared secret), encoded as a string. Both refuse an all-zero X25519 result.
+* The exchange hash and the keys are those of RFC 4253 §7.2 and §8 with SHA-256. The first exchange hash is the session id.
+* **The server's ephemeral secrets never persist.** The engine computes its reply in the step that receives the client's init and forgets them; what persists is the new keys, the session id, and the client's keys waiting for its NEWKEYS.
+* **Strict key exchange** (`kex-strict-s-v00@openssh.com`, against CVE-2023-48795) is on when the client's first KEXINIT offers `kex-strict-c-v00@openssh.com`. Then the client's KEXINIT must be its first packet; any message other than KEXINIT, the kex method's and NEWKEYS during the first key exchange ends the connection; and each direction's sequence number restarts at 0 after every NEWKEYS, in that direction. Without strict kex, IGNORE, DEBUG and UNIMPLEMENTED are accepted anywhere, and other unexpected messages during a key exchange get UNIMPLEMENTED.
+* **EXT_INFO** (RFC 8308): right after its first NEWKEYS, if the client's first KEXINIT offers `ext-info-c`, the engine sends `server-sig-algs` = `ssh-ed25519,rsa-sha2-256,rsa-sha2-512`.
+* **Rekeying.** A client KEXINIT starts a new key exchange at any time after the first. The engine starts one itself after 2^30 bytes in either direction, 2^31 packets, or an hour (the defaults) since the last one ended. From its KEXINIT to its NEWKEYS it sends only transport and key-exchange messages; other output waits in the state (below).
+* **A key exchange the server started, behind unread data.** While the engine waits for the client's key-exchange messages and its input is held back by the read bound (below), it decrypts ahead through the input it was given, without consuming it, and processes the client's KEXINIT and init there. It then replies and sends NEWKEYS, remembering the two sequence numbers it handled; when in-order processing reaches them, the two packets are skipped. So output held during the key exchange never waits on input that waits on that output.
+
+**Authentication** (RFC 4252), after the client's `ssh-userauth` service request:
+* Only `publickey`. A `none` request, another method, a key the engine doesn't support, or a user name longer than 256 bytes gets USERAUTH_FAILURE listing `publickey`.
+* A request without a signature asks the application whether the key may log in as the user: if so the answer is USERAUTH_PK_OK, else FAILURE.
+* A signed request is verified first, over the session id as RFC 4252 §7 says; a bad signature gets FAILURE without asking. Then the application is asked: USERAUTH_SUCCESS or FAILURE.
+* While the application hasn't answered, the engine reads no further input; the question is in the state, so a successor asks its own application.
+* After 20 requests without success the engine ends the connection (`NO_MORE_AUTH_METHODS_AVAILABLE`). Requests after success are ignored.
+
+**Connection** (RFC 4254), after authentication:
+* Only `session` channels, at most 10 open at once; others are refused (`UNKNOWN_CHANNEL_TYPE`, or `RESOURCE_SHORTAGE` at the limit). Global requests get REQUEST_FAILURE when a reply is wanted, so no forwarding.
+* Each channel takes one `exec`, `shell` or `subsystem` request; the command or subsystem name reaches the application once, with the request, and the engine keeps only which request it was. A second one, and `pty-req`, `env`, `x11-req`, `auth-agent-req@openssh.com` or any other request, gets CHANNEL_FAILURE when a reply is wanted.
+* The application writes standard output, and standard error as extended data of type 1; it sends `exit-status`, EOF and CLOSE. A CLOSE from the client is answered with CLOSE, and what was queued for that channel is dropped. Extended data from the client is discarded.
+* Every channel is offered the window `window` (an engine option, default 98,304 bytes) and a maximum packet of 32,768 bytes; data beyond either ends the connection. The engine sends WINDOW_ADJUST once the application has consumed half the window. The channels' windows together, plus 64 KiB, should fit the service's `window` (§2), so that a client's data in flight and its key-exchange messages fit the relay's input at once: 10 × 98,304 + 65,536 is about 1 MiB, the window SSH services should use.
+
+**Bounds.** The state holds at most:
+* **Unread channel data:** 32,768 bytes across channels. The engine reads a packet only when nothing is unread, or when what is unread plus the packet's length stays within 32,768; otherwise it stops there, and its input ack with it (as TLS does at 16,384, §7.1).
+* **Queued output:** 16,384 bytes across channels, in at most 64 pieces (a piece is a run of one channel's data or standard error). A write takes what fits the peer's window now, plus what fits the queue, and says how much it took; the application keeps the rest, in its own state or by not acking its own input. The queue drains as the peer adjusts its window and after a key exchange.
+* **Other held messages:** while the engine's own key exchange is in progress, the replies it can't send yet (authentication answers, channel confirmations and replies), at most 32 messages and 4,096 bytes; with that much held, it reads no further input until the key exchange is done.
+* So an `engine_state` stays under 64 KiB, leaving room in `max_value_bytes` for the application's state.
+
+**Resumable from the first step.** Nothing in the engine is lost between packets, so the first step sets `resumable`, and a successor continues at any point: during the version exchange, during a key exchange or a rekey, during authentication, or mid-channel.
+
+**Errors.** A protocol violation sends DISCONNECT with RFC 4253 §11.1's reason code (`PROTOCOL_ERROR`, `KEY_EXCHANGE_FAILED`, `MAC_ERROR`, `SERVICE_NOT_AVAILABLE`, `PROTOCOL_VERSION_NOT_SUPPORTED`, `NO_MORE_AUTH_METHODS_AVAILABLE`) and ends the connection; the runtime closes it after sending that output. A DISCONNECT from the client, or its EOF, ends it too. An unknown message type gets UNIMPLEMENTED.
+
+**`engine_state`.** A CBOR map; unknown fields are refused:
+```
+{ v: 1,
+  vs: bytes,                  // the server's version line, without CR LF
+  vc?: bytes,                 // the client's, once received
+  lines: uint,                // lines ignored before it
+  sid?: bytes,                // the session id, after the first key exchange
+  strict: bool,               // strict key exchange
+  tx: dir, rx: dir,           // the server's sending and receiving directions
+  rx_next?: keys,             // the client's next keys, until its NEWKEYS
+  kex?: kex,                  // a key exchange in progress
+  kex_at: uint,               // when the last one ended (Unix seconds)
+  kexes: uint,                // key exchanges completed
+  auth: { state: uint,        // 0 before the service request, 1 accepted, 2 authenticated
+          tries: uint, user?: text,
+          ask?: { user: text, alg: text, key: bytes, signed: bool } },
+  ch: [chan],
+  held: [bytes],              // messages waiting for the server's NEWKEYS
+  flags: uint }               // 1 the peer ended, 2 the engine ended
+dir  = { keys?: keys, seq: uint, bytes: uint, packets: uint }   // bytes and packets since the keys were set
+keys = { c: uint,             // 1 chacha20-poly1305, 2 aes256-gcm
+         key: bytes,          // 64 or 32 bytes
+         iv?: bytes }         // aes256-gcm: 12 bytes, its counter included
+kex  = { ours?: bytes, theirs?: bytes,   // the KEXINIT payloads, until the reply
+         alg?: uint, c2s?: uint, s2c?: uint,  // negotiated: 1 mlkem768x25519, 2 curve25519; ciphers as keys.c
+         replied: bool, skip: bool,       // skip: ignore the client's next packet (a wrong guess)
+         ahead?: [uint, uint] }           // sequence numbers handled ahead of order
+chan = { id: uint, peer: uint, peer_window: uint, peer_max: uint,
+         window: uint,        // what the client may still send
+         unread: bytes,
+         queue: [[uint, bytes]],          // 0 data, 1 standard error
+         req?: uint,                      // 1 exec, 2 shell, 3 subsystem (the command or name is in the event only)
+         exit?: uint, flags: uint }       // 1 EOF in, 2 CLOSE in, 4 EOF wanted, 8 EOF sent, 16 CLOSE wanted, 32 CLOSE sent
+```
+* A state whose `v` the engine doesn't know, or whose fields have the wrong types or lengths or exceed the bounds above, is refused; the runtime then releases the connection with `close`.
+* Keys are in the state, so a rotation doesn't protect a live SSH session (§8); a handler can rekey it.
+
 ## 8. Epochs and delegation
 
 * A handler seals the state and the escrows under the newest epoch it holds; `key_epoch` is in the sealed header (formats.md §4).

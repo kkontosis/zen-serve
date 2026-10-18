@@ -3576,9 +3576,19 @@ dependencies = [
 name = "zen-svc"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
+ "chacha20",
  "ciborium",
+ "ed25519-dalek",
  "getrandom 0.4.3",
+ "ml-kem",
+ "poly1305",
+ "rsa",
  "rustls",
+ "sha2 0.11.0",
+ "x25519-dalek",
+ "zen-svc",
  "zen-tls-rustcrypto",
  "zeroize",
 ]

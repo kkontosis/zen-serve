@@ -21,6 +21,11 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      # The SSH engine's tests run against OpenSSH (crates/zen-svc/tests).
+      - name: OpenSSH client
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q openssh-client
       - name: Test
         run: cargo test --all
       - name: wasm32 check
@@ -43,6 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: OpenSSH client
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q openssh-client
       - name: Test (no default features)
         run: cargo test --all --no-default-features
       # With blake3's portable code too, nothing calls a C compiler.
@@ -51,6 +60,29 @@ jobs:
           CC: "false"
           CXX: "false"
         run: cargo check -p zen-server --no-default-features --features pure
+
+  # The SSH engine against OpenSSH built from source (10.6p1): the hybrid
+  # key exchange mlkem768x25519-sha256, which the runners' OpenSSH (9.6)
+  # doesn't have, and the rest of the OpenSSH tests on a newer release.
+  openssh-pq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/openssh
+          key: openssh-${{ runner.os }}-${{ hashFiles('scripts/build-openssh.sh') }}
+      - name: Build OpenSSH
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q autoconf libssl-dev zlib1g-dev
+          scripts/build-openssh.sh "$HOME/openssh"
+      - name: Test against it
+        run: |
+          export ZEN_TEST_SSH="$HOME/openssh/ssh"
+          cargo test -p zen-svc --test openssh --test openssh_pq -- --include-ignored
 
   # The FoundationDB backend, the supervisor and every server test against
   # a real cluster that zen-serve itself starts.
