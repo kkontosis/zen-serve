@@ -127,6 +127,7 @@ jobs:
           npx tsc -p packages/db/tsconfig.test.json
           npx tsc -p packages/fs/tsconfig.test.json
           npx tsc -p packages/loro/tsconfig.test.json
+          npx tsc -p packages/svc/tsconfig.test.json
           npx tsc -p apps/tsconfig.json
       - name: Test (Node)
         run: npx vitest run
