@@ -1,0 +1,20 @@
+[package]
+name = "zen-svc"
+version = "0.1.0"
+description = "zen-serve: protocol engines for relayed services (svc.md §7): sans-IO, serializable at record boundaries, native and wasm32"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ciborium = "0.2"
+getrandom = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+zen-tls-rustcrypto = { path = "../zen-tls-rustcrypto", features = ["tls12"] }
+zeroize = "1.8"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+zen-tls-rustcrypto = { path = "../zen-tls-rustcrypto", features = ["tls12", "test-utils"] }

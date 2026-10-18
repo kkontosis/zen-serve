@@ -124,6 +124,7 @@ impl fmt::Display for BadLength {
 
 impl std::error::Error for BadLength {}
 
+#[derive(Clone)]
 enum Cipher {
     Aes128(Box<aes_gcm::Aes128Gcm>),
     Aes256(Box<aes_gcm::Aes256Gcm>),
@@ -132,6 +133,7 @@ enum Cipher {
 
 /// One direction's record key and IV. The ciphers zeroize their keys on
 /// drop, and so does the IV.
+#[derive(Clone)]
 pub struct RecordKey {
     aead: Aead,
     cipher: Cipher,
