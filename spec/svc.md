@@ -104,7 +104,7 @@ A step is one entry of a commit's `svc` list (api.md §14.5): `{fs, svc, conn, t
 Then it applies:
 * **Input.** Chunks wholly below `in_to` are cleared. A chunk that spans `in_to` stays, and its start becomes `in_cleared`. The server finds it with a snapshot reverse read of one key below `in_to`; chunks are immutable, so that read can't be stale.
 * **Cursors.** `ra` gets the new `in_acked = in_to`, `in_cleared`, `out_head` (advanced by the records' raw lengths), the state length, and the flags. FIN, close and abort come from the records; `resumable` and `unseal` are sticky once set.
-* **Records.** Each is stored at its offset: the first at `out_from`, each next one after the raw bytes of the one before.
+* **Records.** Each is stored at its offset: the first at `out_from`, each next one after the raw bytes of the one before. An empty record (FIN, close or abort alone) has no bytes, so it sits at the new `out_head` itself; it is released like any other record, and stays stored until the connection is reaped.
 * **State.** `rs` is replaced when `state` is present.
 * **Quota.** The fs byte counter changes by the output's raw bytes, minus the input cleared, plus the change in state length.
 * **Wake-ups.** The owning node's doorbell `rn` rings, with a work entry `rnq` for the connection, because new records or a moved `in_acked` may unblock it.
