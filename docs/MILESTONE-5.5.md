@@ -116,7 +116,67 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx vitest run` 3× (437 tests, all passed each time), including the new `packages/client/test/svcvectors.test.ts` and `svc.test.ts`, `packages/svc/test/input.test.ts` and `apps/echo/test/echo.test.ts`
     * `npx playwright test` (smoke and apps, 14 specs), including `apps/echo/e2e/echo.spec.ts`
     * `cargo test -p zen-server --test svc` (24 tests; the server is unchanged)
-  * Next: step 5.5.6 (the shared TLS provider crate): plan it in detail on "go", after the PR merges.
+  * CI green on PR #42's head (all 8 checks); merged.
+* **Step 5.5.6** (the shared TLS provider crate): planned. Restarted from main after PR #42 merged; the plan is below.
+  * Next: on "go", the code.
+
+## Step 5.5.6 in detail: the shared TLS provider crate
+
+The TLS engine (5.5.7, native; 5.5.8, wasm) needs a rustls crypto provider that builds for wasm32 with no C compiler. zen-server already has one: `crates/zen-server/src/tls/rustcrypto.rs` (RustCrypto primitives, TLS 1.3, X25519MLKEM768/X25519/P-256, ECDSA/Ed25519/RSA verification, ECDSA/Ed25519 signing), which uses the RSA key policy in `src/rsakey.rs`. This step moves both into a crate of their own, `crates/zen-tls-rustcrypto`, so the engine can depend on them without zen-server. It is a move: **no behaviour changes**, and the server's TLS and mTLS tests stay as they are.
+
+**Commits:**
+1. `docs: milestone 5.5 step 6 plan`
+2. `tls: the RustCrypto rustls provider in its own crate (zen-tls-rustcrypto)`
+3. the docs and the log
+
+There's no `spec:` commit: no behaviour or format changes.
+
+### The crate
+* `crates/zen-tls-rustcrypto/`, a workspace member:
+  * `src/lib.rs` is the provider (`git mv` of `tls/rustcrypto.rs`, so its history follows): `provider()`, the suites, the groups (`X25519`, `SECP256R1`, `X25519MLKEM768`), verification, `Keys`.
+  * `src/rsakey.rs` is the key policy (`git mv` of `src/rsakey.rs`), as `pub mod rsakey`.
+* **Dependencies:** what those files use, moved from zen-server's manifest with the same versions and features:
+  * rustls (`std`), aes-gcm, chacha20poly1305, hmac, sha2, x25519-dalek, p256, p384, ml-kem, ed25519-dalek, ecdsa
+  * `rsa` (still pinned `=0.10.0-rc.18`, with its comment)
+  * getrandom 0.4, with `wasm_js` on wasm32, as in zen-core
+  * zen-server keeps the ones it uses itself (p256 and rsa for WebAuthn, and so on).
+* **Feature `test-utils`:** `rsakey::testing` (`OsRng`, `public_der`, `private_der`, `pkcs8_der`). It also gains `rsa_key(seed, bits)`, the deterministic test key, moved from `webauthn::soft::rsa_key` together with its `XofRng` (blake3), with the same derivation label so the keys don't change. `webauthn::soft::rsa_key` calls it.
+* **Its own tests:** the provider's unit tests move with it. They used `crate::webauthn::soft::rsa_key`, and now use `rsakey::testing::rsa_key`.
+
+### zen-server
+* `Cargo.toml`: depends on `zen-tls-rustcrypto`; feature `test-utils` turns on `zen-tls-rustcrypto/test-utils`. Dependencies only the moved code used are dropped.
+* **Paths stay as they were:**
+  * `tls/mod.rs`: `pub use zen_tls_rustcrypto as rustcrypto;`, so `tls::rustcrypto::provider()` (`tls::provider`, `tests/tls.rs`) is unchanged.
+  * `lib.rs`: `pub use zen_tls_rustcrypto::rsakey;`, so `crate::rsakey` (`webauthn.rs`, `tls/ring.rs`) and `zen_server::rsakey::testing` (`tests/common/pki.rs`, `tests/tls.rs`) are unchanged.
+  * So `tests/tls.rs`, `tests/mtls.rs` and `tests/common/pki.rs` aren't edited.
+* `tls/ring.rs` stays in zen-server: it's ring's provider with the shared `X25519MLKEM768` and the key policy in front.
+
+### CI
+* The `rust` job's wasm32 check adds `cargo check -p zen-tls-rustcrypto --target wasm32-unknown-unknown`. This checks now that the provider builds where 5.5.8 needs it.
+* `cargo test --all` and the `pure-rust` job (`--no-default-features`) cover the crate as a workspace member.
+
+### Docs
+Paths that name `tls/rustcrypto.rs` or `rsakey.rs` change to the crate:
+* spec/TECH_DEBT.md (TD-TLS-RSA-SERVER-KEY, the hybrid's X25519, the provider review)
+* spec/operations.md §8's provider table, if it names a path; `tls::rustcrypto` stays valid
+* this plan's survey line
+* the README crates table gets a row
+* the log in both plan copies
+
+### Out of scope (5.5.7)
+* TLS 1.2 suites (ECDHE AEAD with EMS) and a 1.2-capable provider for the engine. They come with the engine that uses them, tested against real clients there. zen-server's own listener stays TLS 1.3 only.
+* RSA signing in the pure-Rust provider: still refused (TD-TLS-RSA-SERVER-KEY). Until that's resolved, the engine's certificates are ECDSA or Ed25519.
+
+### Verification
+* `cargo fmt --check`
+* clippy, `--all-targets -D warnings`: default, `--no-default-features`, `--all-features`
+* `cargo test -p zen-tls-rustcrypto` (the moved unit tests)
+* `cargo test -p zen-server --test tls --test mtls`, default (ring and the two providers against each other) and `--no-default-features`
+* the full zen-server suite once
+* `cargo check -p zen-tls-rustcrypto --target wasm32-unknown-unknown`
+* `cargo tree -p zen-server --no-default-features -i ring` is still empty: the pure build stays pure
+* `npx vitest run apps/echo` and the client TLS tests (`packages/client/test/mtls.test.ts`) once against the rebuilt binary
+* CI green on the PR
 
 ## Step 5.5.5 in detail: `@zen/svc`, raw
 
