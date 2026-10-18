@@ -75,6 +75,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             "fs",
             "crdt_rows",
             "fs_pages",
+            "svc",
         ]
         .map(String::from)
         .to_vec(),
@@ -291,6 +292,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/svc/state", post(svc::api::state))
         .route("/v1/svc/read", post(svc::api::read))
         .route("/v1/svc/release", post(svc::api::release))
+        .route("/v1/svc/reveal", post(svc::reveal::reveal))
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/admin/origins/get", post(origin::admin_get))
         .route("/v1/admin/origins/set", post(origin::admin_set))

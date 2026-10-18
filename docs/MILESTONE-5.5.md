@@ -31,7 +31,7 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
 
 **Branch:** `claude/brave-knuth-gk03mm`. Push with retries (2, 4, 8, 16 s). Restart from main: `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`, then push `--force-with-lease`.
 
-**Constraints:** no model names in the repo; commit trailers as before; `CARGO_INCREMENTAL=0`; never `pkill -f`; agents never push; about 4.4 GB of disk free.
+**Constraints:** no model names in the repo; commit trailers as before; `CARGO_INCREMENTAL=0`; never `pkill -f`; agents never push; about 10 GB of disk free (prune stale `target/debug/deps` executables when low). The local FDB cluster for tests: `./target/debug/zen-serve serve -c /tmp/zen-ci/node.toml` (built with `--features fdb`), cluster file `/tmp/zen-ci/data/fdb.cluster`.
 
 **Log:**
 * **Step 0** (plan): done. Restarted from main after PR #35 (milestone 5 step 11) merged; wrote `docs/MILESTONE-5.5.md` (this plan), added 5.5 to DESIGN-3 §6 and the README status; commit `docs: milestone 5.5 plan (relayed services)`. Next: plan step 5.5.1 (spec) in detail, on "go".
@@ -66,140 +66,171 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * OPS.md §2.2: stale test executables in `target/debug/deps`.
   * Verified: fmt; clippy default, `--all-features` and `--no-default-features`; `tests/svc.rs` (9 tests) 3× on embedded and on FDB; the full zen-store and zen-server suites on FDB and embedded.
   * CI fix: CI's newer stable toolchain deprecates `AtomicUsize::fetch_update` (renamed `try_update`), and `-D warnings` failed the Rust jobs on it. `Service::open` now uses `fetch_add`, then `fetch_sub` when over `max_conns`. Commit `server: max_conns count without fetch_update`.
-  * (next) step 5.5.3 (the step, reveal, the writer): plan in detail after PR #38 merges.
+* **Step 5.5.3** (the step, reveal, the writer): done, PR #39. Commits: `docs: milestone 5.5 step 3 plan`; `spec: svc step and writer details`; `spec: an empty end record sits at out_head`; `server: svc commit step, reveal, writer, timers`; the docs and this log.
+  * As planned, plus details settled while building:
+    * An empty record (FIN, close or abort alone) sits at the new `out_head` itself. So `pending`, reveals and the writer look at records from `written_to` to the end of `ro`, not only below `out_head`. The writer acts on such a record without clearing it; the reap does.
+    * A sealed empty record still needs its reveal before the writer acts on it, like any other sealed record.
+    * zen-core gains `open_key_escrow`: a claim lists bare escrows, and `open_escrow` needed a whole record.
+    * A committed step also wakes a local connection at once (the same fast path as a reveal); other nodes are woken through their doorbell.
+    * The writer keeps its own `written_to` after the first pass. Advancing `rw` after a write retries until it applies, and after `commit_unknown` it re-reads `rw`, so the quota is never given back twice.
+    * A close record shuts down the write side before draining input for 1 s, so the peer sees EOF at once.
+    * A step's 400 checks that depend on the service (`resumable`, sealed or plain records) run both in `validate`, against the config, and in the step, against `rc`.
+  * Verified:
+    * fmt; clippy default, `--no-default-features` and `--all-features`
+    * `tests/svc.rs` (18 tests) 3× on embedded and once on FDB
+    * `tests/multinode.rs` on FDB, including the new two-node echo
+    * the full zen-core, zen-proto and zen-server suites on embedded
+    * zen-server on FDB: all passed but `dump.rs` `a_started_server_counts_as_empty`, which once got `too_old` in `dump::is_empty` (two one-item range reads, so a stalled transaction on the loaded local cluster); `tests/dump.rs` then passed 3× on FDB
+    * the dev wasm build declares `SvcStep` for `Commit.svc`
+* **Step 5.5.4** (stream push): next. Restart from main after PR #39 merges, plan it in detail, commit the plan, open a PR, and stop for the user to compact.
 
-## Step 5.5.2 in detail: the relay core, input side
+## Step 5.5.3 in detail: the step, reveal, the writer
 
-Server only (zen-proto types plus zen-server); no client code. Normative behaviour is spec/svc.md §2, §3, §6, §10 and api.md §14.1–14.4, 14.6 and 14.8, with keys from keyspace.md §3.9. No spec change is expected; if one turns up, it gets its own `spec:` commit first. Commits: `docs: milestone 5.5 step 2 plan`; `server: relayed services, input side (config, accept, leases, claims, read)`; docs and the log.
+This step adds the output side, on the server only. Normative behaviour is spec/svc.md §3 (steps 6–10), §4 and §5, and api.md §6 and §14.5–14.7. Formats are formats.md §13.1–13.2, using the zen-core `svc` functions from 5.5.1. With this step a Rust test can act as a complete handler: claim, read, step, reveal, and see the bytes arrive at the peer.
 
-**Out of scope, deferred to later steps:**
-* 5.5.3: the `svc` commit step, reveal, the writer, the `idle_secs`/`handshake_secs` timers, `/v1/info` feature `"svc"`
-* 5.5.4: the `rli` input log and stream push
-* 5.5.11: `tcp-auth` connect
-* 5.5.12: the inbox (the config field `inbox` arrives then)
+**Commits:**
+1. `docs: milestone 5.5 step 3 plan`
+2. `spec: svc step and writer details`
+3. `server: svc commit step, reveal, writer, timers`
+4. the docs and the log
 
-Until 5.5.3, nothing moves `in_acked`, so a connection's input is bounded by its window.
+**Out of scope:**
+* stream frames `svc_sub`/`svc_reveal`/`svc_in` (5.5.4)
+* the TS client, `kv.ts` `empty()` and the wasm wire list (5.5.5)
+* `tcp-auth` (5.5.11)
+* the inbox and `unseal`'s effect (5.5.12; the flag is stored now)
 
-### zen-proto (`crates/zen-proto/src/lib.rs`)
-* **Requests:** `SvcInfoRequest {fs, svc}`, `SvcLeaseRequest {fs, svc, lease, ttl_ms?, release?}`, `SvcNextRequest {fs, svc, lease, limit?, wait_ms?}`, `SvcStateRequest {fs, svc, conn, token}`, `SvcReadRequest {fs, svc, conn, token, from, max_bytes?, wait_ms?}`, `SvcReleaseRequest {fs, svc, lease, conn, token, close?}`.
-* **Responses:**
-  * `SvcInfo`, `SvcLeaseResult {expires_version}`, `SvcClaims {conns}`
-  * `SvcClaim {conn, token, peer: SvcPeer, accepted_ms, in_acked, in_head, out_head, written_to, flags, state?, inbox_ct?, pending: [SvcPending {off, escrow}]}`
-  * `SvcPeer {addr?, user?, device?}`
-  * `SvcReadResult {chunks: [SvcChunk {off, data, sealed}], in_head, written_to, flags}`
-* Bytes use the crate's existing serde-bytes helpers, and fields follow api.md §14 names. Each type derives `ts` like its neighbours; the wasm `wire.rs` list comes in 5.5.5.
+### Spec clarifications (`spec:` commit; svc.md, api.md §14.5/§14.7)
+* **Half-close then end.** When a FIN record has been written, the peer's EOF is stored and all input is acked, the node closes the socket and reaps.
+* **Timers.**
+  * "No committed step" (`handshake_secs`) means `ra` is still all zeros and there is no state.
+  * "Bytes wait" (`idle_secs`) means unacked input (`in_acked < in_head`) or unwritten output (`written_to < out_head`).
+  * Both timers abort with a reset.
+* **`resumable` on a `resume: false` service is 400** (it could never be honoured; svc.md §5 says such a connection is aborted when its claim lapses after a step).
+* **Reveal results.**
+  * A plain record returns 1: there is nothing to reveal.
+  * At most 1,000 entries per request (413 over).
+
+### zen-proto
+* **`SvcStep`:** `{fs, svc, conn, token, in_from, in_to, out_from, out: [bytes], state?, resumable?, unseal?}`.
+* **`Commit.svc: Vec<SvcStep>`:** `#[serde(default, skip_serializing_if = "Vec::is_empty")]`. Every Rust `Commit` literal already ends in `..Default::default()`, so nothing else breaks.
+* **Reveal types:** `SvcRevealRequest {fs, svc, reveals: [SvcReveal {conn, off, key}]}` and `SvcRevealResult {results: [u8]}`.
 
 ### zen-server
-* **`config.rs`:**
-  * `pub service: Vec<ServiceConfig>` (`#[serde(default)]`, as `fs`; also in `with_data_dir`).
-  * `ServiceConfig {name, fs, id (hex → bytes), mode: Tcp | TcpAuth, listen?, max_conns, per_ip_rate, per_ip_burst, window, out_window, accept_wait_ms, handshake_secs, idle_secs, resume}`, with the svc.md §2 defaults and `deny_unknown_fields`.
-  * `validate`:
-    * `name` and `id` unique
-    * the `fs` is configured
-    * `id` is 16·n bytes, 1 ≤ n ≤ 16
-    * `listen` required for `tcp`, refused for `tcp-auth`
-    * `window` and `out_window` at least 65,536
-    * `listen` addresses unique
-  * Unit tests for each refusal. `examples/zen-serve.toml` and `examples/zen-serve-fdb.toml` get a commented `[[service]]` (`example_configs_parse` covers them).
-* **`keys.rs`:** builders for every §3.9 key (`rc rh rw ra rm rz ri ro rv rs rq rqh rl rx rld rk rn rnq rnc`), plus `relay_prefixes()` for dump.
-* **`error.rs`:** `conn_closed` (412) and `window` (429).
-* **New module `src/svc/`:**
-  * **`mod.rs`:** the `Svc` hub on `AppState`:
-    * the node id (16 random bytes per start)
-    * the services by `(fs, id)`
-    * the per-node map `conn → mpsc::Sender<Cmd>` for local connection tasks (`Cmd::Wake`, `Cmd::Abort`)
-    * a `JoinSet` of every svc task, aborted by `Server::abort`
+* **`commit.rs` `validate`:**
+  * For each step:
+    * the fs is configured and the service exists (404)
+    * topic `consume` on `svc`
+    * `conn` is 16 bytes
+    * `in_from ≤ in_to`
+    * at most one step per `(fs, svc, conn)`
+    * `state` ≤ `max_value_bytes`
+  * For each record:
+    * it parses (`zen_core::svc::parse_record`)
+    * flags are only 1|2|4|8, with at most one of FIN, close and abort
+    * no record follows a FIN, close or abort record
+    * an empty record carries FIN, close or abort
+    * its raw length is ≤ `max_value_bytes − 130`
+  * Each step and each record counts as one operation. Records and state count toward `max_commit_bytes`.
+* **`commit.rs` `execute`:** after the consume steps and before the appends, `svc::step::apply(&mut t, st, caller, step, i as u16, &mut delta)` runs for each step. The quota delta merges into the existing per-fs `delta`, so the existing quota check and `atomic_add` cover it.
+* **New `svc/step.rs` `apply`** (svc.md §4, checks in order):
+  1. `check_claim` (`rm` read normally, `rz` → `conn_closed`).
+  2. Read `rc` and `ra` normally:
+     * sealed records with `rc.resume` false, or plain ones with it true → 400
+     * `resumable` with `resume` false → 400
+  3. `in_from == in_acked` and `out_from == out_head`, else `cursor_moved`.
+  4. `in_to ≤ in_head` by a snapshot read of `rh`, else `cursor_moved`.
+  5. `ra` FIN with records → `conn_closed`; `ra` close or abort → `conn_closed`.
+  6. `out_head + raw − written_to` (snapshot of `rw`) ≤ `rc.out_window`, else 429 `window`.
+  7. The state rule: if `state_len > 0`, the step moves a cursor, and it carries no `state` → 400.
 
-    It also holds the encodings of `rm`, `ra`, `rh`, `rc` (CBOR), the `Claim` builder (it reads `rc`, `ra` normally and `rh`/`rw` by snapshot, plus `rs` and the pending escrows of `ro` entries in `[written_to, out_head)` without `rv`, via `zen_core::svc::parse_record`), and `check_claim(t, caller, …)`, which mirrors `consume::check_token` (`rm` read normally; token, holder and non-zero lease, else `claim_lost`; missing or `rz` present gives `conn_closed`).
-  * **`node.rs`:**
-    * The node lease renewer: `rk(node)` every 1 s, expiring 10 s later. If the lease was lost (the sweeper reaped it), the node aborts its sockets.
-    * The node work loop: it watches `rn(node)`, reads `rnq(node, *)`, dispatches `Cmd`s to local connection tasks (an `rz` present → `Abort`; otherwise `Wake`, which 5.5.3 uses for `in_acked` and records), and clears exactly the entries it read.
-  * **`listen.rs`:**
-    * One accept loop per `tcp` service. Admission: `max_conns` (a per-service `AtomicUsize`) and the per-IP token bucket, in memory, before any write.
-    * The accept transaction:
-      * `rc`
-      * `rh`, `ra`, `rw` zeroed
-      * `rm = zeros(48) ‖ u64 0 ‖ vs` (versionstamped value; the suffix is the user version)
-      * `rq(fs, svc, vs) = conn` (versionstamped key)
-      * the `rqh` doorbell
-      * `rnc`
-    * Then it spawns the connection task.
-  * **`conn.rs`:** the connection task, which owns the socket.
-    * **Reader:** it batches up to 32 KiB, or what arrives within 5 ms. Each batch is one transaction:
-      * a snapshot of `ra` for the window
-      * `rm` read normally, to find the lease
-      * the fs byte quota by snapshot, from `st.acl().limits`
-      * writes: `ri(off) = 0x00 ‖ data`, `rh += len`, the quota add, and the `rld` doorbell of the holder's lease
-    * **On `commit_unknown`:** it re-reads `rh`. If `in_head` already moved by the batch, it continues; otherwise it resends.
-    * **Window or quota full:** it stops reading and waits for a `Cmd::Wake` or a 1 s recheck.
-    * **EOF:** it sets the `rh` EOF flag and rings the lease, then keeps the socket open for output (5.5.3).
-    * **Ending:** a read error or reset, a `Cmd::Abort` (an RST via `set_linger(0)`), or an `accept_wait_ms` expiry with the claim token still 0 each lead to closing the socket and then `reap`.
-  * **`reap.rs`:**
-    * **`reap(st, fs, svc, conn)`**, one transaction:
-      * reads `rc`, `rm`, `rh`, `ra`, `rw`
-      * deletes `rc rh ra rw rm rz rs`, the `ri`/`ro`/`rv` ranges, `rnc`, and the `rq` entry (queued) or `rx` (claimed)
-      * subtracts the quota (`in_head − in_cleared + out_head − written_to + state_len`)
-      * rings the holder's `rld`
-    * **`requeue_or_abort(t, …)`** (svc.md §6): fresh or resumable gives `rm = zeros ‖ token ‖ vs`, `rq`, `rqh`; otherwise `rz = 2`, plus `rnq` and `rn` for the owning node.
-    * **`end_lease`:** pages `rx(lease, *)` (100 per transaction), requeues or aborts each, and deletes `rl` last.
-    * **`sweep(st, now)`**, hooked into `sweep_once`: scans `rk` by snapshot; for each expired node, pages its `rnc` and reaps each connection, then deletes `rk`. It also reaps expired handler leases per configured service.
-  * **`api.rs`**, the endpoints:
-    * **`info`** (topic `consume` or `append`).
-    * **`lease`** (`consume`):
-      * Acquire, renew and release follow `consume::lease`.
-      * Another device's live lease id gives `not_leader`. `ttl_ms` defaults to 5,000, capped at 60,000.
-      * It then reaps expired peer leases: a snapshot scan of `rl(fs, svc, *)`, each expired one re-read normally and ended. Released leases end at once.
-    * **`next`:**
-      * The caller's live lease is required, else `not_leader`; expired leases are reaped first.
-      * It takes a snapshot range of `rq`, adds a read conflict per picked key, and reads `rm` normally (it must still be queued with that vs).
-      * It writes `rm = lease ‖ device ‖ token + 1`, deletes the `rq` key and writes `rx`.
-      * `limit` defaults to 1, capped at 64.
-      * Long-poll: watch `rqh` first, and wait at most until the earliest live lease expiry among the service's leases (then reap).
-    * **`state`:** `check_claim`, then the `Claim`.
-    * **`read`:**
-      * `check_claim`; `from < in_acked` gives `cursor_moved`.
-      * A reverse read of one key ≤ `from`, then forward up to `max_bytes`. The first chunk may start before `from`.
-      * Long-poll on `rld(lease)`: the watch is armed before the read, `wait_ms` ≤ 30,000.
-    * **`release`:** `check_claim`; then `close` writes `rz = 3` and wakes the node, otherwise `requeue_or_abort` and delete `rx`.
-* **`state.rs`:** `svc: Svc` on `AppState`.
+  Then the effects:
+  * **Input.** A snapshot reverse read of one `ri` key below `in_to`. A chunk that spans `in_to` stays, and `in_cleared` becomes its start; otherwise `in_cleared = in_to`. Then `clear_range(ri(0), ri(in_cleared))`.
+  * **Records.** `ro(off)` for each, with `off` advancing by the raw length.
+  * **Cursors.** The new `ra`; flags `|=` FIN/close/abort from the records, 8 for `resumable`, 16 for `unseal`.
+  * **State.** `rs` is set when `state` is present.
+  * **Quota.** `+raw − (new in_cleared − old) + (new state_len − old)`.
+  * **Wake-up.** The node's `rnq(node, vs_incomplete(i))` and its `rn` doorbell (with user version `i`, so steps in one commit don't collide).
+* **New `svc/reveal.rs`, `POST /v1/svc/reveal`.** Needs topic `consume`, no token. Each entry gets its own transaction and result code:
+  * `rc` missing → 2
+  * `off ≥ ra.out_head` → 2
+  * `off < written_to` (snapshot) or `rv(off)` present → 1
+  * no `ro(off)` → 2
+  * a plain record → 1
+  * `zen_core::svc::reveal`:
+    * `Error::Param` (the key hash doesn't match) → 3
+    * `Error::Decrypt` → 3; if the caller is the claim holder, also an abort request with reason 1 (`reap::abort_request`)
+  * otherwise `rv(off) = k_r`, `rnq` and `rn` → 0. After the commit, a local `Cmd::Wake` when the connection lives on this node (the fast path).
+* **`svc/conn.rs`, the writer.**
+  * The socket is split (`into_split`). The writer is a pinned future in the same task, polled as a `select!` branch, so the connection stays one task and `Svc::abort` still stops everything.
+  * The writer waits on a `Notify`, rung by `Cmd::Wake` (and once at start):
+    * It reads `rw`, `ra` and the `ro`/`rv` entries in `[written_to, out_head)` by snapshot.
+    * It decrypts revealed records in order, up to 256 KiB per batch, and stops at the first record that isn't revealed.
+    * It runs `write_all`, then one transaction:
+      * `rm` read normally (a reap conflicts; `rm` missing → gone)
+      * clear `ro`/`rv` in `[old, new)`
+      * `rw = new`
+      * quota `−(new − old)`
+      * ring the holder's `rld` while its lease exists
+  * Record flags at the record:
+    * **FIN:** `shutdown()` of the write half; the writer ends with `Fin`.
+    * **Close:** read and discard input for up to 1 s, then close and reap.
+    * **Abort:** reset (`set_zero_linger` through `OwnedWriteHalf::as_ref()`) and reap.
+  * A failed write → reap.
+  * After FIN, the main loop closes and reaps once EOF is stored and `in_acked == in_head`; it re-checks on `Wake`.
+* **`svc/conn.rs`, the timers.**
+  * `handshake_secs` after accept: if `ra` is still empty (snapshot), abort.
+  * `idle_secs` (0: off): local timestamps of the last input read and the last output written; when they're older than `idle_secs`, a snapshot of `rh`/`ra`/`rw` decides. Waiting bytes → not idle; otherwise abort.
+* **`svc/mod.rs`:** `RA_UNSEAL = 16`, and helpers shared by `step`, `reveal` and the writer.
 * **`lib.rs`:**
-  * `start` binds the service listeners after the API listener, then spawns the node renewer, the work loop and the accept loops into the hub's `JoinSet`.
-  * `Server::abort` also aborts them, since tests run many servers per process.
-  * Routes are `/v1/svc/{info,lease,next,state,read,release}`.
-  * `sweep_once` calls `svc::sweep`.
-* **`dump.rs`:** `private()` also skips the relay prefixes. Prefixes are compared as packed tuple strings, so `"rc"` can't match `"rcx"`.
+  * the route `/v1/svc/reveal`
+  * the `/v1/info` feature `"svc"`
+  * api.md §14's "a server without the feature refuses them" holds: the server has the feature from now on
+* **`error.rs`:** nothing new (`window` and `conn_closed` exist).
 
-### Tests: `crates/zen-server/tests/svc.rs` (both backends, through `Harness`)
-Helpers: a service on a free port (`free_port()` from supervisor.rs), a raw `tokio::net::TcpStream` peer, `lease`/`next`/`read` wrappers, and a deadline-poll helper.
-1. **Accept, claim, read.**
-   * The peer writes "hello". A lease and `next` return the claim with token 1 and the peer address; `read` returns the exact bytes.
-   * More bytes wake a `read` waiting with `wait_ms`.
-   * A long-poll `next` wakes on a new connection.
-2. **Backpressure.** With `window` 65,536, the peer writes 16 MB in the background. `in_head` stops below `window` + 32 KiB, and the peer's write hasn't finished after 1 s.
-3. **EOF and RST.** `shutdown()` sets the EOF flag in `read`'s flags. A reset (linger 0, then drop) reaps the connection: `read`/`state` give `conn_closed`.
-4. **No handler.** `accept_wait_ms` 300: the peer sees the connection closed, and its keys are gone.
-5. **Admission.** With `max_conns` 2, a third connection is closed at once. With `per_ip_burst` 3 and `per_ip_rate` 0, the fourth is closed.
-6. **Leases.**
-   * Another device on the same lease id gets `not_leader`.
-   * Lease A expires (`ttl_ms` 300, the expiry retry loop from api.rs): its fresh connection is requeued and claimed by B with token 2. A's `read` gets `claim_lost`.
-   * `release` requeues, and with `close` the peer sees a reset.
-7. **Rights.** A member without `consume` on the service id gets 403 on `lease` and `next`; `info` works with `append`.
-8. **Dead node.**
-   * Seed an expired `rk` for a fake node and a full connection in storage through `h.server.state.store`, then call `zen_server::sweep_once`. Every relay key is gone and the quota counter is back.
-   * A node whose own lease was reaped aborts its sockets.
-9. **Export.** An export taken while a connection is open has no relay keys (beside the existing dump tests).
-10. **Config** (unit tests in `config.rs`).
+### Tests: `crates/zen-server/tests/svc.rs`, extended (both backends unless noted)
+A test handler helper: `SvcKeys::from_parts` with a random key, `seal_record`/`seal_state`, a step builder, a commit, and a reveal.
+1. **Echo.** The peer writes `hello\n`. The handler reads, then commits a step: ack 6, one sealed record, a state. It reveals → 0, and the peer reads `hello\n`.
+   * The same `commit_id` replayed returns the same result, and `out_head` doesn't move.
+   * Quota: input cleared and output written bring the counter back to its baseline.
+2. **Refusals.**
+   * a stale token → `claim_lost`
+   * a stale `in_from` or `out_from`, or `in_to > in_head` → `cursor_moved`
+   * a plain record on a resume service → 400
+   * two steps for one connection → 400
+   * a missing state after a stateful step → 400
+   * a record over `out_window` → 429 `window`
+   * records after a FIN → `conn_closed`
+3. **Reveal codes.**
+   * off beyond `out_head` → 2
+   * a wrong key → 3, and the connection lives
+   * a repeat → 1
+   * a record whose `key_hash` matches but whose body is tampered → 3, and the holder's reveal aborts the connection (the peer sees a reset)
+4. **Half-close and close.**
+   * A FIN record: the peer reads EOF, can still write, and the handler reads that input. Once the peer shuts down too and the input is acked, the connection is reaped.
+   * A close record: the peer gets its bytes, then EOF.
+   * An abort record: the peer gets a reset.
+5. **Takeover with an exact transcript.**
+   * Handler A echoes lines with `resumable: true` and a counter in the state. It commits its last step without revealing, and its lease (`ttl_ms` 300) lapses.
+   * Handler B claims with token 2 and opens the state at the given cursors. It finds the pending escrow, opens it with `open_escrow` and re-reveals, then continues.
+   * The peer receives every echo exactly once, in order.
+6. **`resume: false`.** Plain records are written without a reveal. When the claim lapses after a step, the connection is aborted, not requeued.
+7. **Timers.**
+   * `handshake_secs` 1: no step → reset.
+   * `idle_secs` 1: after a step, silence → reset.
+   * With input left unacked, the connection is still open after 2.5 s.
+8. **Many connections.** 1,000 open, unclaimed connections on one node, and an echo on a new connection still completes within 2 s. This bounds per-connection cost; no per-connection watches exist by construction.
+9. **`/v1/info`** lists `"svc"`.
+10. **`tests/multinode.rs` (FDB):** the socket on node A, the handler on node B (`h.peer()`); the echo arrives through A.
 
 ### Docs
-* The commented `[[service]]` in both example configs.
-* `spec/OPS.md`: one line, that relay ports must be reachable and that every node needs the same service table.
+* api.md §14.5/§14.7 and svc.md: the clarifications (the `spec:` commit).
 * The log in both plan copies.
 
 ### Verification
-* `cargo fmt --check`
-* clippy, default and `--no-default-features`, `-D warnings`
-* `cargo test -p zen-server --test svc` three times on embedded, and once on FDB with the local cluster (`ZEN_TEST_BACKEND=fdb`), as CI's `fdb` job is the gate
-* `cargo test -p zen-server` in full once
+* fmt; clippy (default, `--no-default-features`, `--all-features`)
+* `cargo test -p zen-server --test svc` 3× on embedded and once on FDB (the local cluster in `/tmp/zen-ci`), plus `--test multinode` on FDB
+* the full `cargo test -p zen-server` once, and the FDB suite as CI runs it
 * CI green on the PR
 
 ## Facts the design rests on (code survey)

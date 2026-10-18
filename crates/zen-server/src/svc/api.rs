@@ -28,7 +28,7 @@ const MAX_WAIT_MS: u32 = 30_000;
 const MAX_CLAIMS: u32 = 64;
 
 /// The configured service `svc` of `fs`, else 404.
-fn service(st: &Shared, fs: u32, svc: &[u8]) -> ApiResult<Arc<Service>> {
+pub(crate) fn service(st: &Shared, fs: u32, svc: &[u8]) -> ApiResult<Arc<Service>> {
     st.check_fs(fs)?;
     check_topic(svc)?;
     st.svc

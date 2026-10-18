@@ -75,7 +75,8 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
         + req.writes.len()
         + req.clear_ranges.len()
         + req.append.len()
-        + req.consume.len();
+        + req.consume.len()
+        + req.svc.iter().map(|s| 1 + s.out.len()).sum::<usize>();
     if ops > l.max_commit_ops as usize {
         return Err(too_large("too many operations"));
     }
@@ -135,6 +136,10 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
         if c.from.len() != 12 || c.to.len() != 12 {
             return Err(bad_request("offsets are 12 bytes"));
         }
+    }
+    let mut steps = HashSet::new();
+    for s in &req.svc {
+        bytes += crate::svc::step::validate(st, caller, s, &mut steps)?;
     }
     let value_ok = |n: usize| -> ApiResult<()> {
         if n > l.max_value_bytes as usize {
@@ -339,6 +344,9 @@ pub async fn execute(
         for c in &req.consume {
             consume_step(&mut t, caller, c).await?;
         }
+        for (i, s) in req.svc.iter().enumerate() {
+            crate::svc::step::apply(&mut t, st, caller, s, i as u16, &mut delta).await?;
+        }
         let mut groups = HashMap::new();
         let mut readied: HashSet<(u32, Vec<u8>, Vec<u8>)> = HashSet::new();
         for (i, a) in req.append.iter().enumerate() {
@@ -452,7 +460,16 @@ pub async fn execute(
     });
     match res {
         Ok((Outcome::Replay(rec), _)) => replay(&rec, &caller.device),
-        Ok((Outcome::Applied(n, w, a), stamp)) => Ok(result(&stamp, n, w, a)),
+        Ok((Outcome::Applied(n, w, a), stamp)) => {
+            // The fast path for steps on this node's connections; the node
+            // doorbell wakes the others.
+            for s in &req.svc {
+                if let Ok(conn) = <[u8; 16]>::try_from(&s.conn[..]) {
+                    st.svc.send(&conn, crate::svc::Cmd::Wake);
+                }
+            }
+            Ok(result(&stamp, n, w, a))
+        }
         Err(e) if matches!(e.code, "conflict" | "too_old" | "commit_unknown") => {
             // The commit may have landed under an earlier attempt (resend
             // after an unknown result): answer from the record if so.

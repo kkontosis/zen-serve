@@ -1435,6 +1435,10 @@ pub struct Commit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub crdt_ops: Vec<CrdtOp>,
+    /// Relayed-service steps (api.md §14.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub svc: Vec<SvcStep>,
 }
 
 /// `POST /v1/commit` response.
@@ -3196,6 +3200,100 @@ pub struct SvcReleaseRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub close: Option<bool>,
+}
+
+/// A step of a relayed connection, in a commit's `svc` list (api.md §14.5).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcStep {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// Connection id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub conn: Vec<u8>,
+    /// Claim token.
+    pub token: u64,
+    /// Input acked from (`in_acked`).
+    pub in_from: u64,
+    /// Input acked to.
+    pub in_to: u64,
+    /// Output offset of the first record (`out_head`).
+    pub out_from: u64,
+    /// Output records (formats.md §13.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub out: Vec<ByteBuf>,
+    /// The new state, sealed kind 9.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub state: Option<Vec<u8>>,
+    /// Sticky: the connection may be taken over (svc.md §6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub resumable: Option<bool>,
+    /// Sticky: stop sealing input (svc.md §9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub unseal: Option<bool>,
+}
+
+/// A record key to reveal (api.md §14.7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcReveal {
+    /// Connection id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub conn: Vec<u8>,
+    /// The record's output offset.
+    pub off: u64,
+    /// The record key `k_r` (32 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub key: Vec<u8>,
+}
+
+/// `POST /v1/svc/reveal` request (api.md §14.7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcRevealRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// Keys to reveal (at most 1,000).
+    pub reveals: Vec<SvcReveal>,
+}
+
+/// `POST /v1/svc/reveal` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcRevealResult {
+    /// One code per reveal: 0 revealed, 1 already, 2 not committed, 3 bad key.
+    pub results: Vec<u8>,
 }
 
 // ---------------------------------------------------------------- admin

@@ -296,6 +296,12 @@ pub fn parse_record(bytes: &[u8]) -> Result<Record<'_>> {
 /// successor's re-reveal. `k` must be at the escrow's epoch.
 pub fn open_escrow(k: &SvcKeys, conn: &[u8; 16], off: u64, record: &[u8]) -> Result<Key32> {
     let escrow = parse_record(record)?.escrow.ok_or(Error::Format)?;
+    open_key_escrow(k, conn, off, escrow)
+}
+
+/// Open a kind-10 escrow on its own, as a claim's `pending` list carries it
+/// (api.md §14.3): the key `k_r` of the record at `off`.
+pub fn open_key_escrow(k: &SvcKeys, conn: &[u8; 16], off: u64, escrow: &[u8]) -> Result<Key32> {
     let (epoch, pt) = seal::open(Kind::SvcKey, &k.key, &key_aad(k, conn, off), escrow)?;
     if epoch != k.epoch {
         return Err(Error::Decrypt);

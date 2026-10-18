@@ -730,7 +730,7 @@ Claim = { conn: bytes(16), token: u64,
 ```
 
 * Claims up to `limit` (default 1, at most 64) connections from the front of the ready queue under the caller's live `lease` (else 412 `not_leader`). Each claim's `token` is one more than the connection's last.
-* `pending` holds the kind-10 escrows (formats.md §13.1) of the records in `[written_to, out_head)` whose key is not revealed, in offset order.
+* `pending` holds the kind-10 escrows (formats.md §13.1) of the committed records from `written_to` whose key is not revealed, in offset order. That includes an empty record that ends the output, which sits at `out_head` itself (svc.md §4).
 * **Long-polling.** With `wait_ms` (≤ 30,000) and nothing queued, the request waits for the queue doorbell, at most until the earliest expiry among the service's leases, and reaps it then (§14.2).
 * Needs topic `consume`.
 
@@ -755,6 +755,7 @@ The checks, in order, and the effects are normative in svc.md §4. In short:
   * a bad record shape
   * a record's raw bytes over `max_value_bytes − 130`
   * sealed records on a `resume: false` service, or plain ones on a `resume: true` service
+  * `resumable` on a `resume: false` service
   * a state over `max_value_bytes`
   * a step that moves a cursor of a connection with a state but carries no new state
   * two steps for one connection in a commit
@@ -783,13 +784,13 @@ Effects: input below `in_to` is cleared, the records are stored and the cursors 
 {fs, svc, reveals: [{conn: bytes(16), off: u64, key: bytes(32)}]} → {results: [u8]}
 ```
 
-Each entry is handled on its own (there is no batch atomicity); `results` has one code per entry:
+Each entry is handled on its own (there is no batch atomicity); `results` has one code per entry. At most 1,000 entries per request (413 over).
 
 | Code | Meaning |
 |---|---|
 | 0 | revealed: the key is stored (`rv`) and the owning node woken |
-| 1 | already revealed or written; nothing changed |
-| 2 | not committed: no record at `off` below `out_head`, or the connection is reaped |
+| 1 | already revealed or written, or a plain record (nothing to reveal); nothing changed |
+| 2 | not committed: no record at `off`, or the connection is reaped |
 | 3 | bad key: `key_hash` doesn't match, or the record's AEAD doesn't open with it (formats.md §13.2) |
 
 A code-3 reveal from the claim holder whose `key_hash` matches but whose AEAD fails aborts the connection, since the record could never be written. Needs topic `consume`; no claim token, since revealing a committed record is always safe (svc.md §5).
