@@ -5,7 +5,7 @@
 // serves `echo-tls` behind `tls()`, with the certificate from `certs`; and
 // `mirror`, which sends back whatever arrives, serves `mirror-tls`.
 import { bytes } from '@zen/client';
-import type { Db, DbOptions } from '@zen/db';
+import type { Db } from '@zen/db';
 import {
   type Layer,
   type RawHandler,
@@ -14,9 +14,9 @@ import {
   serve,
   tls,
 } from '@zen/svc';
+import type { Cert, Line } from './schema.js';
 
-/** The database namespace. */
-export const NS = 'echo';
+export { type Cert, DB_OPTIONS, type Line, NS, putCert } from './schema.js';
 
 /** The service's topic path: its topic id is the service id. */
 export const SERVICE = ['svc', 'echo'];
@@ -26,40 +26,6 @@ export const TLS_SERVICE = ['svc', 'echo-tls'];
 
 /** The mirror service over TLS (bulk transfers). */
 export const MIRROR_SERVICE = ['svc', 'mirror-tls'];
-
-/** A line, as stored. */
-export type Line = {
-  /** The connection id, hex. */
-  conn: string;
-  n: number;
-  line: string;
-};
-
-/** A certificate, as stored (PEM). */
-export type Cert = {
-  name: string;
-  /** The chain, leaf first. */
-  chain: string;
-  key: string;
-};
-
-export const DB_OPTIONS: DbOptions = {
-  schema: 2,
-  migrations: {
-    1: async (m) => {
-      await m.createTable('lines', { pk: ['conn', 'n'] });
-      await m.createIndex('lines', 'by_conn_n', {
-        fields: [
-          ['conn', 'text'],
-          ['n', 'int'],
-        ],
-      });
-    },
-    2: async (m) => {
-      await m.createTable('certs', { pk: ['name'] });
-    },
-  },
-};
 
 const text = new TextDecoder();
 
@@ -100,11 +66,6 @@ export const mirror: RawHandler = (c) => {
   c.ack(c.input.length);
   if (c.eof) c.end();
 };
-
-/** Store the certificate `name` (a row, sealed like every row). */
-export async function putCert(db: Db, cert: Cert): Promise<void> {
-  await db.table<Cert>('certs').put(cert);
-}
 
 /** A `tls()` layer with the stored certificate `name`. */
 export async function tlsLayer(db: Db, name = 'echo'): Promise<Layer> {

@@ -189,6 +189,36 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx vitest run` 3× after the fix: 458 passed each time; the 7 skipped are the opt-in benches. This includes `packages/svc/test/tlswasm.test.ts` (15 tests) and `apps/echo/test/tls.test.ts` (6 tests).
     * `npx playwright test`: smoke and apps, 15 specs, including the TLS case in `apps/echo/e2e/echo.spec.ts`
     * `cargo test -p zen-svc` (unchanged: 23 and 6 tests)
+  * **CI fix:** on head a041fc4 both `client` runs failed. Vitest passed; then Playwright stopped before any test with `Cannot find module …/node_modules/@zen/db/dist/index.js imported from packages/svc/src/state.ts`. Commit `apps: the echo e2e spec doesn't load @zen/svc`.
+    * Cause: the new TLS case in `apps/echo/e2e/echo.spec.ts` imported `apps/echo/src/echo.ts`, which imports `@zen/svc`.
+    * Playwright maps `@zen/svc` to its sources through `apps/tsconfig.json`. Imports inside `packages/svc/src` resolve against that package's own tsconfig, which has no paths, so `@zen/db` resolves to its build. CI doesn't build `@zen/db`; locally a stale build hid this.
+    * Fix: the database parts (`NS`, `DB_OPTIONS`, `Line`, `Cert`, `putCert`) move to `apps/echo/src/schema.ts`. `echo.ts` re-exports them, and the spec imports `schema.ts`.
+    * Verified with the local `packages/db/dist` moved aside, as in CI. The error reproduced before the fix; after it, `npx playwright test` (15) passed, and so did `npx vitest run apps/echo` (11) and `npm run check`.
+
+## Step 5.5.8 CI fix: the echo e2e spec must not load `@zen/svc`
+
+**Failure:** both `client` runs on head a041fc4. Vitest passed, then Playwright stopped before running any test:
+`Cannot find module '…/node_modules/@zen/db/dist/index.js' imported from …/packages/svc/src/state.ts`.
+The other 6 checks are green.
+
+**Root cause:**
+1. The TLS case added to `apps/echo/e2e/echo.spec.ts` imports `DB_OPTIONS, NS, putCert` from `../src/echo.js`, which imports `@zen/svc`.
+2. Playwright maps `@zen/svc` to its sources through `apps/tsconfig.json`'s paths. But the imports inside `packages/svc/src/*` resolve against `packages/svc/tsconfig.json`, which has no paths. So `@zen/db` goes to `node_modules/@zen/db/dist`.
+3. CI builds only `@zen/client` and `@zen/fs`, so that file doesn't exist there.
+4. Locally a stale `packages/db/dist` exists, so it passed.
+
+(chat.spec imports `@zen/db` from a file under `apps/`, where the paths apply.)
+
+**Fix (one commit, `apps: the echo e2e spec doesn't load @zen/svc`):**
+* Move `NS`, `DB_OPTIONS`, `Cert` and `putCert` out of `apps/echo/src/echo.ts` into a new `apps/echo/src/schema.ts`. That module imports only `@zen/db` types, so nothing from `@zen/svc`.
+* `echo.ts` re-exports them, so the UI, worker and tests are unchanged.
+* `echo.spec.ts` imports from `../src/schema.js`.
+
+**Verify:**
+* Reproduce CI first: move the local `packages/db/dist` aside. Confirm `npx playwright test apps/echo` fails with the same error, then passes with the fix. Restore the dist afterwards.
+* `npm run check`; `npx vitest run apps/echo`; `npx playwright test` (all 15).
+* Push. CI must be green on all 8 checks.
+* Log the CI fix and "CI green" in both plan copies (`cp`), push, stop for compaction.
 
 ## Step 5.5.8 in detail: `@zen/svc-wasm` and the `tls()` layer
 

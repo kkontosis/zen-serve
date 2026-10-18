@@ -7,7 +7,7 @@ import { expect, test } from '@playwright/test';
 import { testCerts } from '../../../packages/client/src/testing/index.js';
 import { openApp, startWorld, until, type World } from '../../shared/harness.js';
 import { signInWorker } from '../../shared/node.js';
-import { DB_OPTIONS, NS, putCert } from '../src/echo.js';
+import { DB_OPTIONS, NS, putCert } from '../src/schema.js';
 import { GRANTS } from '../test/grants.js';
 
 let w: World;
