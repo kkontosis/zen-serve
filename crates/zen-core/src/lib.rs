@@ -22,6 +22,7 @@ pub mod rng;
 pub mod seal;
 pub mod sig;
 pub mod suite;
+pub mod svc;
 pub mod token;
 
 #[cfg(feature = "test-utils")]

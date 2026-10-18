@@ -11,7 +11,7 @@ use crate::rng::DetRng;
 use crate::seal::{self, EventBody};
 use crate::sig::{self, DeviceSecret, SigningIdentity};
 use crate::token::{NameChain, TopicKeys, kv_key};
-use crate::{Result, fs, labels};
+use crate::{Result, fs, labels, svc};
 use serde_json::{Value, json};
 
 fn h(b: &[u8]) -> String {
@@ -39,6 +39,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("header.json", header_vectors()?),
         ("acl.json", acl_vectors()?),
         ("zendb.json", crate::db_vectors::zendb_vectors()?),
+        ("svc.json", svc_vectors()?),
     ])
 }
 
@@ -529,5 +530,68 @@ fn acl_vectors() -> Result<Value> {
         "doc": h(&doc_bytes),
         "hash": h(&crate::kdf::acl_hash(&doc_bytes)),
         "signed": h(&signed),
+    }))
+}
+
+/// The fixture connection id of `svc.json`.
+pub const FIXTURE_CONN: [u8; 16] = [0xC0; 16];
+
+/// The fixture inbox seed of `svc.json`.
+pub fn fixture_inbox_seed() -> [u8; 32] {
+    core::array::from_fn(|i| 0x40 + i as u8)
+}
+
+fn svc_vectors() -> Result<Value> {
+    let fs = fixture_fs();
+    let topic = TopicKeys::new(&fs, &["svc", "ssh"]);
+    let k = svc::SvcKeys::new(&fs, &topic);
+    let conn = FIXTURE_CONN;
+    let state = svc::seal_state(
+        &k,
+        &conn,
+        1234,
+        567,
+        b"engine state",
+        &mut DetRng::new("svc-state"),
+    )?;
+    let (record, k_r) = svc::seal_record(
+        &k,
+        &conn,
+        567,
+        0,
+        b"SSH-2.0-zen\r\n",
+        &mut DetRng::new("svc-record"),
+    )?;
+    let (fin, fin_key) =
+        svc::seal_record(&k, &conn, 580, svc::FIN, b"", &mut DetRng::new("svc-fin"))?;
+    let plain = svc::plain_record(svc::CLOSE, b"221 bye\r\n")?;
+    let seed = fixture_inbox_seed();
+    let public = svc::inbox_public(&seed);
+    let (ct, inbox) = svc::inbox_encaps(
+        &public,
+        fs.fs_id,
+        k.id(),
+        &conn,
+        &mut DetRng::new("svc-inbox"),
+    )?;
+    let chunks = [
+        (0u64, &b"EHLO example.org\r\n"[..]),
+        (18, &b"MAIL FROM:<a@example.org>\r\n"[..]),
+    ];
+    let chunks: Vec<Value> = chunks
+        .iter()
+        .map(|(off, data)| {
+            Ok(json!({"off": off, "data": h(data), "sealed": h(&inbox.seal_chunk(*off, data)?)}))
+        })
+        .collect::<Result<_>>()?;
+    Ok(json!({
+        "description": "Relayed services (formats.md §13) for the fixture fs (epoch 0): the service svc/ssh, connection conn. K_svc = KDF(\"zen/v1/svc-aead\", D_svc, \"\"). Keys and nonces come from DetRng(seed).",
+        "svc": {"segments": ["svc", "ssh"], "id": h(k.id()), "k_svc": h(k.key().as_ref())},
+        "conn": h(&conn),
+        "state": {"in_acked": 1234, "out_head": 567, "plaintext": h(b"engine state"), "rng_seed": "svc-state", "sealed": h(&state)},
+        "record": {"off": 567, "flags": 0, "raw": h(b"SSH-2.0-zen\r\n"), "rng_seed": "svc-record", "k_r": h(k_r.as_ref()), "key_hash": h(&svc::key_hash(&k_r)), "record": h(&record)},
+        "fin_record": {"off": 580, "flags": svc::FIN, "raw": "", "rng_seed": "svc-fin", "k_r": h(fin_key.as_ref()), "record": h(&fin)},
+        "plain_record": {"flags": svc::CLOSE, "raw": h(b"221 bye\r\n"), "record": h(&plain)},
+        "inbox": {"seed": h(&seed), "public": h(&public), "rng_seed": "svc-inbox", "ct": h(&ct), "chunks": chunks},
     }))
 }

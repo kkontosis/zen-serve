@@ -45,6 +45,10 @@ pub const DB_BOUNDARY: &str = "zen/v1/db-boundary";
 pub const DB_NODE_ID: &str = "zen/v1/db-node-id";
 /// KDF: PRF key for a zen-db CRDT table's field and element tokens.
 pub const DB_CRDT: &str = "zen/v1/db-crdt";
+/// KDF: a relayed service's key `K_svc`, from its topic data key (spec/formats.md §13).
+pub const SVC_AEAD: &str = "zen/v1/svc-aead";
+/// KDF: the key sealing a connection's input chunks (spec/formats.md §13.3).
+pub const SVC_INBOX: &str = "zen/v1/svc-inbox";
 /// Hash: fingerprint of public key material.
 pub const FINGERPRINT: &str = "zen/v1/fingerprint";
 /// Hash: chain hash of a signed ACL document.
@@ -61,6 +65,8 @@ pub const PASSKEY_ID: &str = "zen/v1/passkey-id";
 pub const OPAQUE_KEYSLOT: &str = "zen/v1/opaque-keyslot";
 /// Hash: digest of a zen-db value split into parts.
 pub const DB_PARTS_DIGEST: &str = "zen/v1/db-parts-digest";
+/// Hash: `key_hash` of an output record's key (spec/formats.md §13.1).
+pub const SVC_REVEAL: &str = "zen/v1/svc-reveal";
 
 /// OPAQUE: prefix of the AKE context, `label ‖ 0x00 ‖ origin` (sign-in
 /// method 3).
@@ -84,6 +90,14 @@ pub const AAD_FS_CHUNK: &str = "zen/v1/aad/fs-chunk";
 pub const AAD_CRDT_VALUE: &str = "zen/v1/aad/crdt-value";
 /// AAD domain: a local record (kind 8).
 pub const AAD_LOCAL: &str = "zen/v1/aad/local";
+/// AAD domain: svc state (kind 9).
+pub const AAD_SVC_STATE: &str = "zen/v1/aad/svc-state";
+/// AAD domain: svc output-key escrow (kind 10).
+pub const AAD_SVC_KEY: &str = "zen/v1/aad/svc-key";
+/// AAD domain: body of an output record (no header).
+pub const AAD_SVC_OUT: &str = "zen/v1/aad/svc-out";
+/// AAD domain: sealed input chunk (no header).
+pub const AAD_SVC_IN: &str = "zen/v1/aad/svc-in";
 
 /// Signature domain prefix, prepended to every signed message.
 pub const SIG_DOMAIN: &str = "zen/v1/sig";
@@ -134,6 +148,8 @@ pub const ALL: &[&str] = &[
     DB_BOUNDARY,
     DB_NODE_ID,
     DB_CRDT,
+    SVC_AEAD,
+    SVC_INBOX,
     FINGERPRINT,
     ACL_CHAIN,
     RANGE_HASH,
@@ -142,6 +158,7 @@ pub const ALL: &[&str] = &[
     PASSKEY_ID,
     OPAQUE_KEYSLOT,
     DB_PARTS_DIGEST,
+    SVC_REVEAL,
     OPAQUE_CONTEXT,
     AAD_KV,
     AAD_EVENT,
@@ -152,6 +169,10 @@ pub const ALL: &[&str] = &[
     AAD_FS_CHUNK,
     AAD_CRDT_VALUE,
     AAD_LOCAL,
+    AAD_SVC_STATE,
+    AAD_SVC_KEY,
+    AAD_SVC_OUT,
+    AAD_SVC_IN,
     SIG_DOMAIN,
     SIG_DEVICE_CERT,
     SIG_COMMIT,
