@@ -1,8 +1,9 @@
 //! Several zen-serve nodes on one FoundationDB cluster: shared sessions and
 //! challenges, cross-node ephemeral pub/sub and subscriptions, fencing across
-//! nodes, a relayed connection served from another node. The multi-node
-//! cases run with `ZEN_TEST_BACKEND=fdb` only; logout and challenge reuse run
-//! on every backend.
+//! nodes, a relayed connection served from another node, its input pushed
+//! over a stream on that node. The multi-node cases run with
+//! `ZEN_TEST_BACKEND=fdb` only; logout and challenge reuse run on every
+//! backend.
 
 mod common;
 
@@ -463,16 +464,12 @@ async fn opaque_sign_in_crosses_nodes() {
     opaque_sign_in(&b, "alice", b"pw two").await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn relayed_connection_across_nodes() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use zen_core::rng::OsRng;
-    use zen_core::svc::{SvcKeys, seal_record};
+const SVC: [u8; 16] = [0x5E; 16];
+
+/// Two nodes on FoundationDB with a relayed service, Alice signed in on B.
+/// Returns A, B, Alice's token on B and the service's address on A.
+async fn relay_nodes() -> (Harness, Harness, Vec<u8>, std::net::SocketAddr) {
     use zen_server::config::{ServiceConfig, SvcMode};
-    if !on_fdb() {
-        return;
-    }
-    const SVC: [u8; 16] = [0x5E; 16];
     // The socket on node A, the handler on node B.
     let a = Harness::start_with(|c| {
         c.service.push(ServiceConfig {
@@ -507,6 +504,19 @@ async fn relayed_connection_across_nodes() {
         }
     };
     let addr = a.server.state.svc.local_addr("echo").unwrap();
+    (a, b, tb, addr)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relayed_connection_across_nodes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zen_core::rng::OsRng;
+    use zen_core::svc::{SvcKeys, seal_record};
+    if !on_fdb() {
+        return;
+    }
+    // The socket on node A, the handler on node B.
+    let (_a, b, tb, addr) = relay_nodes().await;
     let _: SvcLeaseResult = b
         .call(
             "/v1/svc/lease",
@@ -605,4 +615,129 @@ async fn relayed_connection_across_nodes() {
         .expect("the echo arrives through A")
         .unwrap();
     assert_eq!(&got, b"pong");
+}
+
+/// The socket on node A; the lease, the stream subscription, the step and
+/// `svc_reveal` on node B.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushed_input_across_nodes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zen_core::rng::OsRng;
+    use zen_core::svc::{SvcKeys, seal_record};
+    if !on_fdb() {
+        return;
+    }
+    let (_a, b, tb, addr) = relay_nodes().await;
+    let _: SvcLeaseResult = b
+        .call(
+            "/v1/svc/lease",
+            Some(&tb),
+            &SvcLeaseRequest {
+                fs: 1,
+                svc: SVC.to_vec(),
+                lease: vec![1; 16],
+                ttl_ms: None,
+                release: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut ws = connect(&b, &tb).await;
+    send(
+        &mut ws,
+        &Frame::SvcSub {
+            id: 1,
+            fs: 1,
+            svc: SVC.to_vec(),
+            lease: vec![1; 16],
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(1) });
+    let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"ping").await.unwrap();
+    // Skip svc_ready frames.
+    let next = async |ws: &mut Ws| loop {
+        match recv(ws).await {
+            Frame::SvcReady { .. } => continue,
+            f => break f,
+        }
+    };
+    let mut c: SvcClaims = b
+        .call(
+            "/v1/svc/next",
+            Some(&tb),
+            &SvcNextRequest {
+                fs: 1,
+                svc: SVC.to_vec(),
+                lease: vec![1; 16],
+                limit: None,
+                wait_ms: Some(10_000),
+            },
+        )
+        .await
+        .unwrap();
+    let c = c.conns.pop().expect("claimed on B");
+    let conn: [u8; 16] = c.conn.as_slice().try_into().unwrap();
+    let mut got = Vec::new();
+    while got.len() < 4 {
+        match next(&mut ws).await {
+            Frame::SvcIn { conn: k, data, .. } if k == c.conn => got.extend_from_slice(&data),
+            f => panic!("{f:?}"),
+        }
+    }
+    assert_eq!(got, b"ping", "pushed through B");
+    let k = SvcKeys::from_parts(1, 1, &SVC, [0x4B; 32]);
+    let (rec, k_r) = seal_record(&k, &conn, 0, 0, b"pong", &mut OsRng).unwrap();
+    let mut commit_id = vec![0u8; 16];
+    getrandom::fill(&mut commit_id).unwrap();
+    let _: CommitResult = b
+        .call(
+            "/v1/commit",
+            Some(&tb),
+            &Commit {
+                commit_id,
+                svc: vec![SvcStep {
+                    fs: 1,
+                    svc: SVC.to_vec(),
+                    conn: c.conn.clone(),
+                    token: c.token,
+                    in_from: 0,
+                    in_to: 4,
+                    out_from: 0,
+                    out: vec![ByteBuf::from(rec)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        &Frame::SvcReveal {
+            id: 2,
+            fs: 1,
+            svc: SVC.to_vec(),
+            reveals: vec![SvcReveal {
+                conn: c.conn.clone(),
+                off: 0,
+                key: k_r.to_vec(),
+            }],
+        },
+    )
+    .await;
+    assert_eq!(
+        next(&mut ws).await,
+        Frame::SvcRevealed {
+            id: 2,
+            results: vec![0]
+        }
+    );
+    let mut out = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), peer.read_exact(&mut out))
+        .await
+        .expect("the echo arrives through A")
+        .unwrap();
+    assert_eq!(&out, b"pong");
 }

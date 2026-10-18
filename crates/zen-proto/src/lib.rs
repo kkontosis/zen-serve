@@ -3396,6 +3396,35 @@ pub enum Frame {
         #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
         prefix: Option<Vec<u8>>,
     },
+    /// Client: push the input of the connections held under a lease
+    /// (api.md §14.10).
+    SvcSub {
+        /// Subscription id.
+        id: u32,
+        /// fs_id.
+        fs: u32,
+        /// Service id.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        svc: Vec<u8>,
+        /// Handler lease id (16 bytes).
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        lease: Vec<u8>,
+    },
+    /// Client: `/v1/svc/reveal` over the stream (api.md §14.7).
+    SvcReveal {
+        /// Request id, echoed by the answer.
+        id: u32,
+        /// fs_id.
+        fs: u32,
+        /// Service id.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        svc: Vec<u8>,
+        /// Keys to reveal (at most 1,000).
+        reveals: Vec<SvcReveal>,
+    },
     /// Server: acknowledgement.
     Ok {
         /// Subscription id, if any.
@@ -3451,6 +3480,37 @@ pub enum Frame {
         code: String,
         /// Message.
         message: String,
+    },
+    /// Server: an input chunk of a held connection (api.md §14.10).
+    SvcIn {
+        /// Subscription id.
+        id: u32,
+        /// Connection id.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        conn: Vec<u8>,
+        /// The chunk's input offset.
+        off: u64,
+        /// The chunk (formats.md §13.3 when sealed); empty for the EOF.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        data: Vec<u8>,
+        /// Sealed by the inbox.
+        sealed: bool,
+        /// As in `SvcClaim`.
+        flags: u8,
+    },
+    /// Server: the service's ready queue changed.
+    SvcReady {
+        /// Subscription id.
+        id: u32,
+    },
+    /// Server: the answer to `svc_reveal`.
+    SvcRevealed {
+        /// The request id.
+        id: u32,
+        /// One code per reveal, as `SvcRevealResult`.
+        results: Vec<u8>,
     },
 }
 
@@ -3538,6 +3598,35 @@ mod tests {
                 envelope: vec![0, 0, 9],
             },
             Frame::Ok { id: None },
+            Frame::SvcSub {
+                id: 3,
+                fs: 1,
+                svc: vec![5; 16],
+                lease: vec![6; 16],
+            },
+            Frame::SvcReveal {
+                id: 4,
+                fs: 1,
+                svc: vec![5; 16],
+                reveals: vec![SvcReveal {
+                    conn: vec![7; 16],
+                    off: 9,
+                    key: vec![8; 32],
+                }],
+            },
+            Frame::SvcIn {
+                id: 3,
+                conn: vec![7; 16],
+                off: 1 << 40,
+                data: b"hello".to_vec(),
+                sealed: false,
+                flags: 1,
+            },
+            Frame::SvcReady { id: 3 },
+            Frame::SvcRevealed {
+                id: 4,
+                results: vec![0, 3],
+            },
         ];
         for f in frames {
             let back: Frame = from_cbor(&to_cbor(&f)).unwrap();

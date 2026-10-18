@@ -1,5 +1,5 @@
-//! WebSocket `/v1/stream` (api.md §9): gap-free subscriptions (G9) and
-//! ephemeral pub/sub.
+//! WebSocket `/v1/stream` (api.md §9): gap-free subscriptions (G9),
+//! ephemeral pub/sub, and pushed relay input (§14.10).
 
 use crate::acl::{R_APPEND, R_READ};
 use crate::auth::{Caller, resolve};
@@ -15,12 +15,14 @@ use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use zen_proto::{Frame, ZERO_OFFSET, from_cbor, to_cbor};
+use zen_proto::{Frame, SvcRevealRequest, ZERO_OFFSET, from_cbor, to_cbor};
 
 const BATCH: usize = 256;
 const MAX_SUBS: usize = 256;
+/// `svc_reveal` requests of one socket running at once.
+const REVEALS_IN_FLIGHT: usize = 8;
 
 /// `GET /v1/stream`.
 pub async fn ws(State(st): State<Shared>, upgrade: WebSocketUpgrade) -> Response {
@@ -93,6 +95,7 @@ async fn run(st: Shared, sock: WebSocket) {
     });
     let mut token: Option<Vec<u8>> = None;
     let mut tasks: HashMap<u32, JoinHandle<()>> = HashMap::new();
+    let reveals_in_flight = Arc::new(Semaphore::new(REVEALS_IN_FLIGHT));
     while let Some(Ok(msg)) = ws_rx.next().await {
         let bytes = match msg {
             Message::Binary(b) => b,
@@ -215,6 +218,59 @@ async fn run(st: Shared, sock: WebSocket) {
                         let _ = out.send(err_frame(Some(id), &e)).await;
                     }
                 }
+            }
+            Frame::SvcSub { id, fs, svc, lease } => {
+                let started = async {
+                    crate::svc::api::service(&st, fs, &svc)?;
+                    let lease = crate::svc::parse_id(&lease, "lease")?;
+                    if tasks.len() >= MAX_SUBS || tasks.contains_key(&id) {
+                        return Err(bad_request(
+                            "subscription id in use or too many subscriptions",
+                        ));
+                    }
+                    crate::svc::push::check(&st, &caller, fs, &svc, &lease).await?;
+                    Ok(lease)
+                }
+                .await;
+                match started {
+                    Ok(lease) => {
+                        let _ = out.send(Frame::Ok { id: Some(id) }).await;
+                        let h = tokio::spawn(crate::svc::push::run(
+                            st.clone(),
+                            tok,
+                            id,
+                            fs,
+                            svc,
+                            lease,
+                            out.clone(),
+                        ));
+                        tasks.insert(id, h);
+                    }
+                    Err(e) => {
+                        let _ = out.send(err_frame(Some(id), &e)).await;
+                    }
+                }
+            }
+            Frame::SvcReveal {
+                id,
+                fs,
+                svc,
+                reveals,
+            } => {
+                // Reveals run beside the socket's reads, a few at a time.
+                let Ok(permit) = reveals_in_flight.clone().acquire_owned().await else {
+                    break;
+                };
+                let (st, out) = (st.clone(), out.clone());
+                tokio::spawn(async move {
+                    let req = SvcRevealRequest { fs, svc, reveals };
+                    let f = match crate::svc::reveal::run(&st, &caller, &req).await {
+                        Ok(results) => Frame::SvcRevealed { id, results },
+                        Err(e) => err_frame(Some(id), &e),
+                    };
+                    let _ = out.send(f).await;
+                    drop(permit);
+                });
             }
             Frame::Unsub { id } => {
                 if let Some(h) = tasks.remove(&id) {

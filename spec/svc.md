@@ -173,7 +173,7 @@ With `inbox`:
   * A released lease is reaped at once.
 * **Doorbells.** These are keys whose value is a versionstamp, rewritten to wake whoever watches them. There are three kinds:
   * **The service queue `rqh`:** rung by accepts and requeues; `next` waits on it.
-  * **A handler lease `rld`:** rung by input on its connections, by `written_to` advancing, and by a reap; `/v1/svc/read` and stream pushes wait on it. Input also appends a short-lived entry to the lease's input log `rli`, so a stream push reads only the connections that changed.
+  * **A handler lease `rld`:** rung by input on its connections, by claims under it, by `written_to` advancing, and by a reap; `/v1/svc/read` and stream pushes wait on it. Input and claims also append a short-lived entry to the lease's input log `rli`, so a stream push reads only the connections that changed. Ending a lease deletes its `rld` (which wakes its watchers) and its `rli`.
   * **A node `rn`:** rung by steps, reveals and abort requests, each with a work entry `rnq`; the owning node's writer waits on it and clears exactly the entries it read.
 * **No watch per connection.** Storage watches are limited (about 10,000 per FoundationDB client), so the number of watches grows with nodes, services and handler leases, never with connections.
 

@@ -9,11 +9,13 @@
 //! * [`api`]: the `/v1/svc/*` endpoints
 //! * [`step`]: the `svc` commit step
 //! * [`reveal`]: releasing output records by their keys
+//! * [`push`]: pushed input over `/v1/stream` (`svc_sub`)
 
 pub mod api;
 pub mod conn;
 pub mod listen;
 pub mod node;
+pub mod push;
 pub mod reap;
 pub mod reveal;
 pub mod step;
@@ -306,6 +308,15 @@ pub(crate) fn enqueue(t: &mut Box<dyn Txn>, fs: u32, svc: &[u8], conn: &Id, toke
 /// Ring a doorbell.
 pub(crate) fn ring(t: &mut Box<dyn Txn>, bell: &[u8]) {
     t.set_versionstamped_value(bell, &[], &[]);
+}
+
+/// Append `conn` to a lease's input log `rli`, so its stream pushes read
+/// it (svc.md §10). `uv` tells apart the entries of one transaction.
+pub(crate) fn log_input(t: &mut Box<dyn Txn>, fs: u32, svc: &[u8], lease: &Id, conn: &Id, uv: u16) {
+    let (p, s) = keys::svc_lease_input(fs, svc, lease)
+        .vs_incomplete(uv)
+        .finish_incomplete();
+    t.set_versionstamped_key(&p, &s, conn);
 }
 
 /// `ra`: the step cursors.

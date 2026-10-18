@@ -205,8 +205,8 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 | `pack("rqh", fs, svc)` | `versionstamp`: the queue doorbell | accept, requeues |
 | `pack("rl", fs, svc, lease)` | handler lease: `holder(32) ‖ u64 expires_version` | leases |
 | `pack("rx", fs, svc, lease, conn)` | empty: the connections claimed under a lease | claims |
-| `pack("rld", fs, svc, lease)` | `versionstamp`: the lease doorbell | input, writers, reaps |
-| `pack("rli", fs, svc, lease, vs)` | `conn(16)`: the lease's input log, for stream pushes | the node's reader |
+| `pack("rld", fs, svc, lease)` | `versionstamp`: the lease doorbell | input, claims, writers, reaps |
+| `pack("rli", fs, svc, lease, vs)` | `conn(16)`: the lease's input log, for stream pushes | the node's reader, claims |
 | `pack("rk", node)` | node lease: `u64 expires_version` | the node |
 | `pack("rn", node)` | `versionstamp`: the node doorbell | steps, reveals, abort requests |
 | `pack("rnq", node, vs)` | `u32 fs ‖ lp(svc) ‖ conn(16)`: work for the node's writer | steps, reveals, abort requests |
@@ -222,4 +222,5 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
   * reaps the connections (`rnc`) of every node whose `rk` has expired, then deletes that `rk`
   * reaps expired handler leases (svc.md §10)
   * deletes `rli` entries older than `limits.ephemeral_ttl_secs`
+* **Ending a lease** deletes its `rl`, `rld` and every `rli` entry, after requeueing its connections.
 * **Relay keys are transient:** `export` skips the prefixes above and `import` ignores them (operations.md §6); a socket can't move with the data.
