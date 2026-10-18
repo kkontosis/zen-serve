@@ -128,4 +128,10 @@ impl TopicKeys {
     pub fn event_aead_key(&self) -> Key32 {
         kdf(labels::EVENT_AEAD, &self.data, &[])
     }
+
+    /// `KDF("zen/v1/svc-aead", D_topic, "")`: the service key `K_svc` when
+    /// this topic is a relayed service's id (spec/formats.md §13).
+    pub fn svc_aead_key(&self) -> Key32 {
+        kdf(labels::SVC_AEAD, &self.data, &[])
+    }
 }

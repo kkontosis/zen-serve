@@ -30,6 +30,8 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/db-boundary` | K_db | `index_id` (16 B) | PRF key choosing private-index node boundaries and shards (zendb.md §5.4) |
 | `zen/v1/db-node-id` | K_db | `index_id` (16 B) | PRF key of private-index node ids (zendb.md §5.4.2) |
 | `zen/v1/db-crdt` | K_db | `table_id` (16 B) | PRF key of a CRDT table's field and element tokens (zendb.md §19.2) |
+| `zen/v1/svc-aead` | the topic data key D_svc of a service id | empty | service key `K_svc`: seals svc states and output-key escrows (formats.md §13) |
+| `zen/v1/svc-inbox` | X-Wing shared secret of a connection | `u32(fs_id) ‖ lp(svc) ‖ conn` (16 B) | key sealing a connection's input chunks (formats.md §13.3) |
 
 ## Hash labels (`BLAKE3.derive_key(label, data)`)
 
@@ -43,6 +45,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/passkey-id` | a passkey's credential-store id from its WebAuthn credential id (auth.md §4.1, formats.md §6) |
 | `zen/v1/opaque-keyslot` | the secret of an OPAQUE export-key keyslot from the 64-byte export key (formats.md §6, type 5) |
 | `zen/v1/db-parts-digest` | digest of a zen-db value split into parts: a large row or message body (zendb.md §4.2, §10.3) |
+| `zen/v1/svc-reveal` | `key_hash` of an output record's key, which a reveal must match (formats.md §13.1) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 
@@ -57,6 +60,10 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/fs-chunk` | filesystem chunk (kind 6) |
 | `zen/v1/aad/crdt-value` | CRDT value (kind 7; zendb.md §19.2) |
 | `zen/v1/aad/local` | Local record (kind 8; zendb.md §9.3) |
+| `zen/v1/aad/svc-state` | svc state (kind 9; formats.md §13) |
+| `zen/v1/aad/svc-key` | svc output key escrow (kind 10; formats.md §13.1) |
+| `zen/v1/aad/svc-out` | body of an output record: `label ‖ 0x00 ‖ context`, no header (formats.md §13.1) |
+| `zen/v1/aad/svc-in` | sealed input chunk: `label ‖ 0x00`, no header or context (formats.md §13.3) |
 
 ## OPAQUE (auth.md §8)
 

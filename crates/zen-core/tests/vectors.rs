@@ -405,3 +405,68 @@ fn prolly_is_history_independent_and_bounded() {
         );
     }
 }
+
+#[test]
+fn svc_vectors_open_from_files() {
+    use zen_core::svc;
+    let fs = fs_from_file();
+    let v = load("svc.json");
+    let topic = TopicKeys::new(&fs, &["svc", "ssh"]);
+    assert_eq!(topic.id(), hx(&v["svc"]["id"]));
+    let k = svc::SvcKeys::new(&fs, &topic);
+    assert_eq!(k.key().as_ref(), &hx(&v["svc"]["k_svc"])[..]);
+    let conn: [u8; 16] = hx(&v["conn"]).try_into().unwrap();
+    let st = &v["state"];
+    let cur = |f: &str| st[f].as_u64().unwrap();
+    assert_eq!(
+        svc::open_state(
+            &k,
+            &conn,
+            cur("in_acked"),
+            cur("out_head"),
+            &hx(&st["sealed"])
+        )
+        .unwrap(),
+        hx(&st["plaintext"])
+    );
+
+    let r = &v["record"];
+    let off = r["off"].as_u64().unwrap();
+    let rec = hx(&r["record"]);
+    let k_r: [u8; 32] = hx(&r["k_r"]).try_into().unwrap();
+    assert_eq!(hx(&r["key_hash"]), svc::key_hash(&k_r));
+    assert_eq!(
+        svc::reveal(fs.fs_id, k.id(), &conn, off, &rec, &k_r).unwrap(),
+        hx(&r["raw"])
+    );
+    assert_eq!(*svc::open_escrow(&k, &conn, off, &rec).unwrap(), k_r);
+
+    let f = &v["fin_record"];
+    let fin = hx(&f["record"]);
+    let fin_key: [u8; 32] = hx(&f["k_r"]).try_into().unwrap();
+    assert_eq!(svc::parse_record(&fin).unwrap().flags, svc::FIN);
+    let fin_off = f["off"].as_u64().unwrap();
+    assert!(
+        svc::reveal(fs.fs_id, k.id(), &conn, fin_off, &fin, &fin_key)
+            .unwrap()
+            .is_empty()
+    );
+
+    let p = &v["plain_record"];
+    let plain = hx(&p["record"]);
+    let parsed = svc::parse_record(&plain).unwrap();
+    assert_eq!(parsed.body, &hx(&p["raw"])[..]);
+
+    let i = &v["inbox"];
+    let seed: [u8; 32] = hx(&i["seed"]).try_into().unwrap();
+    assert_eq!(svc::inbox_public(&seed), hx(&i["public"]));
+    let key = svc::inbox_decaps(&seed, &hx(&i["ct"]), fs.fs_id, k.id(), &conn).unwrap();
+    let mut next = 0;
+    for c in i["chunks"].as_array().unwrap() {
+        let off = c["off"].as_u64().unwrap();
+        assert_eq!(off, next, "chunks are contiguous");
+        let data = key.open_chunk(off, &hx(&c["sealed"])).unwrap();
+        assert_eq!(data, hx(&c["data"]));
+        next = off + data.len() as u64;
+    }
+}

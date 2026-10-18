@@ -286,3 +286,11 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** `Db.close()` and `UnlockedFs.close()` don't fence transactions in flight. A transaction still running after its fs is closed uses freed WASM keys and fails with WASM's `null pointer passed to rust` rather than a clear `closed` error. Seen in CI on milestone 5 step 10 (a chat test closed an fs while receipt writes it had started were still running; the test now waits for them).
 * **Why deferred:** Callers that await their own work never hit it; found while integrating the apps.
 * **What it would take:** `Db.close()` waits for (or rejects with `DbError('closed')`) its open transactions and handler runs; `UnlockedFs` checks a `closed` flag before using its keys and throws `ZenError(0, 'closed')`; a test closing during a transaction.
+
+## TD-SVC-STATE-ROLLBACK
+
+* **Status:** open
+* **Context:** A relayed connection's state (formats.md §13, kind 9) holds a TLS or SSH engine's keys and sequence numbers. Its authenticated data binds the connection and the cursors, so the server can't pair it with other cursors. But a malicious server can serve an older, consistent snapshot of the whole connection and the handler's database (zendb.md §14). The engine then reuses record sequence numbers; if its new output differs (timestamps, randomness), the server sees two records under one nonce (svc.md §12).
+* **Why deferred:** Detecting a consistent rollback needs state outside the server: signed, gossiped checkpoints. That is milestone 6's authenticated tier. Honest failures can't cause reuse, because uncommitted output is never revealed (svc.md §5).
+* **Mitigations until then:** A handler aborts a connection when a claim shows cursors lower than it has seen (svc.md §6). TLS 1.2 AES-GCM uses random explicit nonces.
+* **What it would take:** Put `(conn, out_head)` in the handler-signed checkpoint of milestone 6 (zendb.md §14), and have a successor refuse a state older than the newest checkpoint it can verify.

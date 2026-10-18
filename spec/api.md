@@ -5,7 +5,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
 ## 1. Conventions
 
 * **Encoding.** Request and response bodies are **CBOR** (RFC 8949), `Content-Type: application/cbor`. Maps use text keys, with the field names below. Byte fields are CBOR byte strings. Integers are unsigned unless noted. `?` marks an optional field, which may be absent or `null`.
-* **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSocket `GET /v1/stream`.
+* **Methods.** Everything under `/v1` is `POST` with a CBOR body, except `GET /v1/info` and the WebSockets `GET /v1/stream` and `GET /v1/svc/connect` (§14.9).
 * **Authentication.** Requests carry `Authorization: Bearer <session token>`, where the token is base64url without padding (§3), or `Authorization: Bearer zen_at_…`, an API token used as is (§3.8, auth.md §9). These requests don't need it: `/v1/info`, `/v1/acl/put`, and the sign-in requests `/v1/auth/challenge`, `/v1/auth/session`, `/v1/auth/password/{params,session}`, `/v1/auth/passkey/session/begin`, `/v1/auth/passkey/session`, `/v1/auth/mtls/session` and `/v1/auth/opaque/login/{start,finish}`.
 * **Errors.** An error response is `{code: text, message: text}` with this status:
 
@@ -23,8 +23,10 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
+  | 412 | `conn_closed` (a relayed connection is closing, closed or reaped, §14) | no |
   | 413 | `too_large` | no |
   | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, §3.16, credentials per user §3.7, §3.8, §3.11, §3.13, §3.15) | later |
+  | 429 | `window` (a relayed connection's unwritten output is at `out_window`, §14.5) | once the node writes; the lease doorbell rings |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
 
@@ -36,7 +38,7 @@ No authentication. Returns:
 { server: text, api: 1,
   suites: [1],                       // supported suite ids (spec/suites.md)
   formats: [1],
-  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows", "fs_pages"
+  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows", "fs_pages", "svc"
   cross_origin_isolation: bool,      // DESIGN-3 §4.2
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
@@ -383,7 +385,8 @@ POST /v1/commit
               from: bytes(12), to: bytes(12), token: u64}],
   chunks?: [{fs, id: bytes(16), data: bytes}],              // filesystem chunks (fs.md §4.1)
   pages?: [{fs, id: bytes(16), data: bytes}],               // chunk-list pages (fs.md §4.1, formats.md §11.6)
-  crdt_ops?: [CrdtOp] }                                     // filesystem operations (fs.md §3, §4), CRDT rows (§13)
+  crdt_ops?: [CrdtOp],                                      // filesystem operations (fs.md §3, §4), CRDT rows (§13)
+  svc?: [SvcStep] }                                         // relayed-service steps (§14.5)
 → { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)], dots: [bytes(12)],
     set_dots: [bytes(12)] }                                  // one per `add`, in order (§13)
 
@@ -401,7 +404,7 @@ CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), 
 The whole commit is **one storage transaction**: all of it applies, or none of it.
 
 1. **Idempotency.** If `commit_id` already committed, the stored result is returned and nothing is applied again. The record is kept for `idempotency_ttl_secs` (default 24 h, G13). A `commit_id` reused by a different device returns 409 `commit_id_reused`.
-2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`, and consumes need topic `consume`. Then sizes and quotas are checked: at most `max_commit_ops` operations, and at most `max_commit_bytes` counting every payload plus 512 bytes per operation for its keys and index entries.
+2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`; consumes and `svc` steps need topic `consume`. Then sizes and quotas are checked: at most `max_commit_ops` operations, and at most `max_commit_bytes` counting every payload plus 512 bytes per operation for its keys and index entries.
 3. **Short mode.** With `read_version`, the transaction runs at that version, and every `read_conflicts` range conflicts with any write committed after it. That gives full serializability, including phantoms. Anything else the server reads (cursors, leases, idempotency) is checked the same way. A conflict returns 409 `conflict`.
 4. **Long mode.**
    * Each `expect` key is re-read: its version must equal `version`, or the key must be absent when `version` is null.
@@ -410,7 +413,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
    * A range with more than `max_range_items` items, or more than `max_range_bytes` of keys and values, returns 413.
    * Any mismatch returns 409 `conflict`.
 5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys and `max_range_bytes`, else 413), then `writes`, where the last write to a key wins.
-6. **Consumes** (§8.3) are processed before appends, in order.
+6. **Consumes** (§8.3) are processed before appends, in order. Then the **`svc` steps** (§14.5), in order; each step and each of its output records count as one operation, and the records and state toward `max_commit_bytes`.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
 9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` or `pages` (the stored version holds both, keyspace.md §3.6). That bounds an inline file at about `max_value_bytes / 32` chunks, and a paged one at about `max_value_bytes / 64` pages (fs.md §4). A `write` carries `chunks` or `pages`, never both (400). Chunks apply before pages, and pages before the operations, so a commit can upload a file's last chunks, its last page and its `write` together. Each page counts as one operation toward `max_commit_ops`, and its data plus 48 bytes per chunk it lists (the reference counts it adds) toward `max_commit_bytes`. A server without the feature `"fs_pages"` refuses `pages` (400). Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
@@ -530,6 +533,8 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `unsub` | `id` | stop a subscription |
 | `epub` | `fs, topic, data: bytes` | ephemeral publish: not in the log; kept for at most about a minute (§9.1). Needs topic `append`. Rate-limited per device (§9.1): over the limit, the reply is `err` with code `quota`. |
 | `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe: messages published after the `ok`. Needs topic `read`. |
+| `svc_sub` | `id, fs, svc, lease: bytes(16)` | push the input of the connections the caller holds under `lease`, and wake-ups of the service's ready queue (§14.10). Needs topic `consume`. |
+| `svc_reveal` | `id, fs, svc, reveals` | `/v1/svc/reveal` over the stream (§14.7); answered by `svc_revealed`. |
 
 **Server → client:**
 
@@ -539,6 +544,9 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `ev` | `id, topic, offset, key_token?, envelope` |
 | `eph` | `id, topic, data, sender: bytes(32)` (device fp) |
 | `err` | `id?, code, message` |
+| `svc_in` | `id, conn: bytes(16), off: u64, data, sealed: bool, flags: u8` (an input chunk, §14.6) |
+| `svc_ready` | `id` (the service's ready queue changed: call `/v1/svc/next`) |
+| `svc_revealed` | `id, results: [u8]` (§14.7) |
 
 * Consumer delivery is not pushed over the stream: `/v1/consume/next` with `wait_ms` long-polls instead (§8.3).
 * Watches only wake a subscription. The data always comes from a range read after the subscription's cursor, so reconnecting with the last received `offset` loses nothing.
@@ -682,3 +690,126 @@ POST /v1/crdt/versions {fs, objects: [bytes], read_version?}
 * An object whose row register is `alive: false`, and whose last change is older than `crdt_horizon_secs`, is purged by the sweeper with all its entries. So is an object that has **no** row register and no change within the horizon.
 * An operation naming a purged object starts it afresh. A late `row` or `lww` operation for it is older than the horizon and gets `stale_op` anyway.
 * Clients therefore insert a row (a `row` operation with `alive: true`) before relying on its fields: an object made of field operations alone is purged after the horizon.
+
+## 14. Relayed services (spec/svc.md)
+
+A service relays TCP connections to handlers on member clients. The semantics are in [svc.md](svc.md), the keys in keyspace.md §3.9, the formats in formats.md §13.
+
+* `svc` is the service id, a topic id; `conn` and `lease` are 16-byte ids; offsets (`off`, `in_*`, `out_*`, `written_to`) are `u64` byte offsets in the connection's input or output stream.
+* Rights are topic rights on `svc`. A `svc` that is not configured for `fs` returns 404 `not_found`.
+* A server with the feature `"svc"` serves these endpoints and accepts `svc` steps; one without refuses them (400).
+
+### 14.1 `POST /v1/svc/info`
+
+`{fs, svc}` → `{mode: "tcp" | "tcp-auth", window: u32, out_window: u32, resume: bool, inbox?: bytes, accept_wait_ms: u32, handshake_secs: u32, idle_secs: u32}`. `inbox` is the X-Wing public key (formats.md §13.3). Needs topic `consume` or `append`.
+
+### 14.2 `POST /v1/svc/lease`
+
+```
+{fs, svc, lease: bytes(16), ttl_ms?: u32, release?: bool} → {expires_version: u64}
+```
+
+* **Acquire or renew.** The lease is created or renewed for the caller's device, with `ttl_ms` defaulting to 5,000 (at most 60,000). Expiry is measured in versions, as for consumer leases (§8.2). A lease id held live by another device returns 412 `not_leader`.
+* **Release.** With `release`, the lease ends now; the response's `expires_version` is 0.
+* **Reaping.** Every call also reaps the service's expired leases. A lease that ends (released, or expired and reaped) requeues each of its connections that is fresh or resumable and aborts the others (svc.md §6).
+* Needs topic `consume`.
+
+### 14.3 `POST /v1/svc/next`
+
+```
+{fs, svc, lease, limit?: u32, wait_ms?: u32} → {conns: [Claim]}
+
+Claim = { conn: bytes(16), token: u64,
+          peer: {addr: text} | {user: bytes(32), device: bytes(32)},    // tcp | tcp-auth
+          accepted_ms: u64,
+          in_acked: u64, in_head: u64, out_head: u64, written_to: u64,
+          flags: u8,                     // rh EOF (1) | ra flags << 1 (keyspace.md §3.9)
+          state?: bytes,                 // sealed kind 9 (formats.md §4)
+          inbox_ct?: bytes,              // X-Wing ciphertext (formats.md §13.3)
+          pending: [{off: u64, escrow: bytes}] }   // committed records not yet revealed
+```
+
+* Claims up to `limit` (default 1, at most 64) connections from the front of the ready queue under the caller's live `lease` (else 412 `not_leader`). Each claim's `token` is one more than the connection's last.
+* `pending` holds the kind-10 escrows (formats.md §13.1) of the records in `[written_to, out_head)` whose key is not revealed, in offset order.
+* **Long-polling.** With `wait_ms` (≤ 30,000) and nothing queued, the request waits for the queue doorbell, at most until the earliest expiry among the service's leases, and reaps it then (§14.2).
+* Needs topic `consume`.
+
+### 14.4 `POST /v1/svc/state`
+
+`{fs, svc, conn, token}` → `Claim`. The current holder re-reads its connection: after `cursor_moved`, or after giving up on a commit whose outcome is unknown (svc.md §5). 412 `claim_lost` unless the caller holds the claim; 412 `conn_closed` for a reaped connection.
+
+### 14.5 The `svc` commit step
+
+```
+SvcStep = { fs, svc, conn: bytes(16), token: u64,
+            in_from: u64, in_to: u64,    // ack input [in_from, in_to)
+            out_from: u64,               // the output offset of the first record
+            out?: [bytes],               // output records (formats.md §13.1)
+            state?: bytes,               // sealed kind 9, replaces the stored state
+            resumable?: bool,            // sticky: the connection may be taken over (svc.md §6)
+            unseal?: bool }              // sticky: stop sealing input (svc.md §9)
+```
+
+The checks, in order, and the effects are normative in svc.md §4. In short:
+* **400** for malformed requests:
+  * a bad record shape
+  * a record's raw bytes over `max_value_bytes − 130`
+  * sealed records on a `resume: false` service, or plain ones on a `resume: true` service
+  * a state over `max_value_bytes`
+  * a step that moves a cursor of a connection with a state but carries no new state
+  * two steps for one connection in a commit
+* **412 `claim_lost`:** the caller doesn't hold `token`.
+* **412 `cursor_moved`:** `in_from ≠ in_acked`, `out_from ≠ out_head`, or `in_to > in_head`.
+* **412 `conn_closed`:** the connection is reaped, or has an abort request pending, or has closed. Records after a FIN also get it.
+* **429 `window`:** the output would exceed `out_window`.
+
+Effects: input below `in_to` is cleared, the records are stored and the cursors advanced, the state is replaced, and the owning node is woken. A replayed `commit_id` returns the stored result and applies nothing, so its records and keys are fixed (svc.md §5).
+
+### 14.6 `POST /v1/svc/read`
+
+```
+{fs, svc, conn, token, from: u64, max_bytes?: u32, wait_ms?: u32}
+→ {chunks: [{off: u64, data: bytes, sealed: bool}], in_head: u64, written_to: u64, flags: u8}
+```
+
+* Returns input chunks from the one containing `from`, in order, up to `max_bytes` (default and cap: `max_range_bytes`). A first chunk that starts before `from` is returned whole. `data` is formats.md §13.3's sealed chunk when `sealed`, else the raw bytes.
+* `from < in_acked` returns 412 `cursor_moved`. 412 `claim_lost` and `conn_closed` as in §14.4.
+* **Long-polling.** With `wait_ms` (≤ 30,000) and no input at or after `from`, waits for the holder's lease doorbell (svc.md §10).
+* `flags` is as in `Claim`.
+
+### 14.7 `POST /v1/svc/reveal`
+
+```
+{fs, svc, reveals: [{conn: bytes(16), off: u64, key: bytes(32)}]} → {results: [u8]}
+```
+
+Each entry is handled on its own (there is no batch atomicity); `results` has one code per entry:
+
+| Code | Meaning |
+|---|---|
+| 0 | revealed: the key is stored (`rv`) and the owning node woken |
+| 1 | already revealed or written; nothing changed |
+| 2 | not committed: no record at `off` below `out_head`, or the connection is reaped |
+| 3 | bad key: `key_hash` doesn't match, or the record's AEAD doesn't open with it (formats.md §13.2) |
+
+A code-3 reveal from the claim holder whose `key_hash` matches but whose AEAD fails aborts the connection, since the record could never be written. Needs topic `consume`; no claim token, since revealing a committed record is always safe (svc.md §5).
+
+### 14.8 `POST /v1/svc/release`
+
+`{fs, svc, lease, conn, token, close?: bool}` → `{}`. The holder gives up one connection: with `close`, it is aborted; otherwise it is requeued if fresh or resumable and aborted if not (svc.md §6). 412 `claim_lost` unless the caller holds the claim.
+
+### 14.9 `GET /v1/svc/connect?fs=<fs>&svc=<hex>` (WebSocket, `tcp-auth`)
+
+* Authentication is a Bearer header, or, when the client can't set headers, a first binary frame `{op: "auth", token}` as on `/v1/stream`.
+* The server then checks topic `append` on `svc` (403 otherwise) and the service's mode, accepts the connection as svc.md §3 describes (with `peer = {user, device}`), and sends a binary frame `{op: "ok", conn: bytes(16)}`.
+* After that, binary frames carry the byte stream both ways, in order.
+* A text frame `"fin"` is a half-close of the sender's direction: from the client, the EOF flag; from the server, a FIN record.
+* A WebSocket close, from either side, ends the connection: from the client like a reset, from the server after a close or abort record.
+
+### 14.10 Pushed input (`svc_sub`)
+
+* A subscription pushes `svc_in` frames for the connections the caller holds under `lease`, in offset order per connection.
+* **Where pushing starts.** On subscribing, and for each connection the caller claims later (it calls `/v1/svc/next`), pushing starts at the connection's `in_acked`. After a reconnect, the client subscribes again, so pushing resumes at `in_acked` with no gap.
+* **Flow.** The server pushes at most `window` bytes beyond `in_acked` per connection; acked input frees room.
+* **`svc_ready`** is sent when the service's ready queue changes.
+* A lost claim simply stops the pushes for that connection; the next step on it gets `claim_lost`.
