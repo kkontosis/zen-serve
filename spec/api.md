@@ -755,6 +755,7 @@ The checks, in order, and the effects are normative in svc.md §4. In short:
   * a bad record shape
   * a record's raw bytes over `max_value_bytes − 130`
   * sealed records on a `resume: false` service, or plain ones on a `resume: true` service
+  * `resumable` on a `resume: false` service
   * a state over `max_value_bytes`
   * a step that moves a cursor of a connection with a state but carries no new state
   * two steps for one connection in a commit
@@ -783,12 +784,12 @@ Effects: input below `in_to` is cleared, the records are stored and the cursors 
 {fs, svc, reveals: [{conn: bytes(16), off: u64, key: bytes(32)}]} → {results: [u8]}
 ```
 
-Each entry is handled on its own (there is no batch atomicity); `results` has one code per entry:
+Each entry is handled on its own (there is no batch atomicity); `results` has one code per entry. At most 1,000 entries per request (413 over).
 
 | Code | Meaning |
 |---|---|
 | 0 | revealed: the key is stored (`rv`) and the owning node woken |
-| 1 | already revealed or written; nothing changed |
+| 1 | already revealed or written, or a plain record (nothing to reveal); nothing changed |
 | 2 | not committed: no record at `off` below `out_head`, or the connection is reaped |
 | 3 | bad key: `key_hash` doesn't match, or the record's AEAD doesn't open with it (formats.md §13.2) |
 

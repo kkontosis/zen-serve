@@ -30,12 +30,15 @@ A service is a `[[service]]` table in the server configuration. **Every node car
 | `out_window` | committed, unwritten output bytes per connection (≥ 65,536) | 1,048,576 |
 | `accept_wait_ms` | a connection not claimed within this time is aborted | 10,000 |
 | `handshake_secs` | a connection with no committed step this long after accept is aborted | 30 |
-| `idle_secs` | a connection with no input and no output for this long is aborted; `0` turns it off | 300 |
+| `idle_secs` | a connection with no input and no output for this long, and no bytes waiting, is aborted; `0` turns it off | 300 |
 | `resume` | output is released by key reveal (§5), so another handler can take over (§6) | true |
 | `inbox` | an X-Wing public key (hex, formats.md §13.3): input is sealed at rest (§9) | none |
 
 * **Rights** are topic rights on `id` (api.md §1, formats.md §3.3): `consume` to handle, `append` to connect over `tcp-auth`. Topic grants are prefix grants, so a grant on `svc/` covers every service of the fs.
 * **The service key.** `K_svc = KDF("zen/v1/svc-aead", D_svc, "")`, where `D_svc` is the topic data key of `id` at the epoch (formats.md §3.3). It seals the state (kind 9) and the output-key escrows (kind 10). Giving a worker the topic keys of `svc/<name>` delegates exactly that service, as with events.
+* **Timers.** Both abort with a reset (§3, step 10).
+  * `handshake_secs`: "no committed step" means `ra` is still all zeros and there is no state.
+  * `idle_secs`: bytes wait while input is unacked (`in_acked < in_head`) or output is unwritten (`written_to < out_head`). A waiting connection is stalled on the handler or the peer, not idle, so the timer doesn't fire.
 * **Settings travel with the connection.** At accept, the owning node copies `mode`, `window`, `out_window` and `resume` into the connection record, so a step behaves the same on whichever node receives it.
 
 ## 3. Connection lifecycle
@@ -64,7 +67,7 @@ A service is a `[[service]]` table in the server configuration. **Every node car
 7. **Writing.** The owning node writes revealed records to the socket in order from `written_to`, and plain records as soon as they commit.
    * After each `write_all`, one transaction clears the written records and their keys and advances `written_to`. It also rings the holder's lease doorbell, which wakes a handler waiting on `window`.
    * A record that isn't revealed yet blocks the records after it.
-8. **Half-close.** A record with FIN shuts down the socket's write side once everything before it is written. The handler may still read and ack input; further records get `conn_closed`.
+8. **Half-close.** A record with FIN shuts down the socket's write side once everything before it is written. The handler may still read and ack input; further records get `conn_closed`. Once the FIN record is written, the peer's EOF is stored and all input is acked, the node closes the socket and reaps (step 10).
 9. **Close and abort.**
    * A record with close: once everything before it is written, the node reads and discards input for up to 1 s, so the kernel doesn't reset the last bytes, then closes the socket.
    * A record with abort: the node resets the socket (`SO_LINGER` 0) when it reaches the record.
@@ -87,6 +90,7 @@ A step is one entry of a commit's `svc` list (api.md §14.5): `{fs, svc, conn, t
    * an empty record carries FIN, close or abort
    * a record's raw length is at most `max_value_bytes − 130`
    * the records match the service: sealed when `resume` is on, plain when it's off
+   * `resumable` only when `resume` is on: a `resume: false` connection is never taken over (§6)
    * `state` is at most `max_value_bytes`
    * `in_from ≤ in_to`
    * there is at most one step per connection in the commit
