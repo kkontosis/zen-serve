@@ -6,11 +6,21 @@
 // with the `echo` certificate of `certs`), `mirror` (the mirror behind
 // TLS, default service mirror-tls), `ssh` (echo over SSH, with the host
 // key of `certs`, default service echo-ssh), `auth` (`raw` on the tcp-auth
-// service echo-auth) or `ssh-auth` (`ssh` on echo-ssh-auth). Built to
+// service echo-auth), `ssh-auth` (`ssh` on echo-ssh-auth) or `inbox` (`raw`
+// on echo-inbox, with the inbox seed of `certs`). Built to
 // apps/dist/echo/workers/handler.mjs.
 import { type Layer, type ServeHandle, type ServeOptions, serve } from '@zen/svc';
 import { workerFromEnv } from '../../shared/node.js';
-import { DB_OPTIONS, echo, mirror, NS, sshEcho, sshLayer, tlsLayer } from '../src/echo.js';
+import {
+  DB_OPTIONS,
+  echo,
+  inboxSeed,
+  mirror,
+  NS,
+  sshEcho,
+  sshLayer,
+  tlsLayer,
+} from '../src/echo.js';
 
 const w = await workerFromEnv();
 const db = await w.open(NS, { ...DB_OPTIONS, warn: (m) => console.log(`warn: ${m}`) });
@@ -21,10 +31,12 @@ const defaults: Record<string, string> = {
   ssh: 'echo-ssh',
   auth: 'echo-auth',
   'ssh-auth': 'echo-ssh-auth',
+  inbox: 'echo-inbox',
 };
 const name = process.env.ECHO_SERVICE ?? defaults[layerName] ?? 'echo';
 // The tcp-auth services run the same layers.
-const kind = { auth: 'raw', 'ssh-auth': 'ssh' }[layerName] ?? layerName;
+const kind = { auth: 'raw', 'ssh-auth': 'ssh', inbox: 'raw' }[layerName] ?? layerName;
+const inbox = layerName === 'inbox' ? await inboxSeed(db) : undefined;
 const common = {
   service: ['svc', name],
   leaseTtlMs: ttl,
@@ -41,6 +53,7 @@ if (kind === 'ssh') {
     ...common,
     handler: kind === 'mirror' ? mirror : echo,
     ...(layer ? { layer } : {}),
+    ...(inbox ? { inbox } : {}),
   });
 }
 console.log('handler ready');
