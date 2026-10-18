@@ -660,7 +660,7 @@ export class ConsumerHandle {
             signal,
           })) {
             if (signal.aborted) break;
-            await this.track(this.one(c, d));
+            await this.track(this.one(c, d, signal));
             backoff = 100;
           }
         } else {
@@ -669,7 +669,7 @@ export class ConsumerHandle {
             waitMs: Math.min(this.opts.waitMs ?? 25_000, 30_000),
           });
           if (signal.aborted) break;
-          await Promise.all(ds.map((d) => this.track(this.one(c, d))));
+          await Promise.all(ds.map((d) => this.track(this.one(c, d, signal))));
           backoff = 100;
         }
       } catch (e) {
@@ -696,27 +696,43 @@ export class ConsumerHandle {
     }
   }
 
-  private async nack(c: Consumer, d: Delivery): Promise<void> {
-    try {
-      await c.nack(d);
-    } catch (e) {
-      if (isCode(e, 'not_leader')) throw e;
-      if (!dropped(e)) this.report(e);
+  /** Nack a delivery. Retried while the network fails: until it lands, the claim holds the key. */
+  private async nack(c: Consumer, d: Delivery, signal: AbortSignal): Promise<void> {
+    for (let backoff = 100; ; backoff = Math.min(backoff * 2, 5000)) {
+      try {
+        await c.nack(d);
+        return;
+      } catch (e) {
+        if (isCode(e, 'not_leader')) throw e;
+        if (isCode(e, 'network') && !signal.aborted) {
+          await pause(backoff, signal);
+          continue;
+        }
+        if (!dropped(e)) this.report(e);
+        return;
+      }
     }
   }
 
-  /** Handle one delivery: one transaction with the handler and the consume step. */
-  private async one(c: Consumer, d: Delivery): Promise<void> {
+  /**
+   * Handle one delivery: one transaction with the handler and the consume
+   * step. A network failure is the transport's, not the handler's: the
+   * claim still holds the key, and a nack would fail as well, so the key's
+   * later events would wait for the claim to expire. The delivery runs
+   * again once the network is back instead; if an earlier attempt did
+   * commit, the retry's consume step is `claim_lost` or `cursor_moved`.
+   */
+  private async one(c: Consumer, d: Delivery, signal: AbortSignal): Promise<void> {
     if (d.error) {
       this.report(d.error);
-      return this.nack(c, d);
+      return this.nack(c, d, signal);
     }
     let msg: Message;
     try {
       msg = await openMessage(this.db, this.opts.topic, d);
     } catch (e) {
       this.report(e);
-      return this.nack(c, d);
+      return this.nack(c, d, signal);
     }
     const b: Binding = { consumer: c, delivery: d, acked: false };
     const m = msg as Delivered;
@@ -726,23 +742,32 @@ export class ConsumerHandle {
       b.acked = true;
     };
     bindings.set(m, b);
-    try {
-      if (this.manual) {
-        await this.handler(m as Delivered<never>, undefined as never);
-        if (!b.acked) throw new DbError('bad_value', 'the handler neither acked nor committed');
-      } else {
-        await this.db.transaction(async (tx) => {
-          tx.causation = m.eventId;
-          await this.handler(m as Delivered<never>, tx);
-          await c.ack(d, tx.raw);
-        }, this.opts.txn);
+    for (let backoff = 100; ; backoff = Math.min(backoff * 2, 5000)) {
+      try {
+        if (this.manual) {
+          await this.handler(m as Delivered<never>, undefined as never);
+          if (!b.acked) throw new DbError('bad_value', 'the handler neither acked nor committed');
+        } else {
+          await this.db.transaction(async (tx) => {
+            tx.causation = m.eventId;
+            await this.handler(m as Delivered<never>, tx);
+            await c.ack(d, tx.raw);
+          }, this.opts.txn);
+        }
+        return;
+      } catch (e) {
+        if (b.acked || dropped(e)) return;
+        if (isCode(e, 'not_leader')) throw e;
+        if (isCode(e, 'network') && !signal.aborted) {
+          this.report(e, m);
+          await pause(backoff, signal);
+          continue;
+        }
+        if (!this.manual && (await this.failed(c, d, m, e))) return;
+        this.report(e, m);
+        await this.nack(c, d, signal);
+        return;
       }
-    } catch (e) {
-      if (b.acked || dropped(e)) return;
-      if (isCode(e, 'not_leader')) throw e;
-      if (!this.manual && (await this.failed(c, d, m, e))) return;
-      this.report(e, m);
-      await this.nack(c, d);
     }
   }
 
