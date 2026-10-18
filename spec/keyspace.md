@@ -80,7 +80,7 @@ Mode bytes: 1 `broadcast`, 2 `sequential`, 3 `partitioned`, 4 `per_key`, 5 `sing
 | `pack("acl_head")` | `u64 version` of the current ACL |
 | `pack("meta", name)` | metadata: `"version"` (embedded backend's version clock), `"challenge_key"` (32 random bytes, the cluster-wide challenge MAC key, api.md §3.1) |
 
-Metadata belongs to one store (or one cluster): `export` skips every `meta` key, `import` ignores them in a file, and they don't count as data when `import` checks that the target is empty (operations.md §6). Each target keeps or creates its own.
+Metadata belongs to one store (or one cluster), and so do the relay keys of §3.9: `export` skips every `meta` key and every relay key, `import` ignores them in a file, and they don't count as data when `import` checks that the target is empty (operations.md §6). Each target keeps or creates its own.
 
 ### 3.5 Sessions, challenges, ephemeral ring
 
@@ -184,3 +184,42 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * **The sweeper** reads `cd` entries whose versionstamp is older than `crdt_horizon_secs` (in versions: `secs × 1,000,000`), re-checks the object, and clears `co`, `cw`, `cn`, `cs` and `cv` of the object with the `cd` entry, in pages like the rest of the sweeper.
 * The prefix `"cr"` of an earlier draft is the chunk reference count (§3.6).
 * `add_count` in the idempotency record (§3.4) is the number of `add` operations of the commit, so a replay returns the same `set_dots`.
+
+### 3.9 Relayed services (svc.md)
+
+`svc` is a service id (a topic id, as a byte-string element). `conn`, `lease` and `node` are 16-byte ids. `off` is an integer element, a byte offset in a connection's input or output stream. `vs` is a 12-byte versionstamp element. `holder` is a 32-byte device fingerprint.
+
+| Key | Value | Written by |
+|---|---|---|
+| `pack("rc", fs, svc, conn)` | connection record, CBOR: `{node: bytes(16), peer: {addr} \| {user, device}, accepted_ms, mode, window, out_window, resume, inbox?: {v: 1, ct: bytes}}` (svc.md §2, formats.md §13.3) | accept, once |
+| `pack("rh", fs, svc, conn)` | `u64 in_head ‖ u8 flags` (1 EOF) | the node's reader |
+| `pack("rw", fs, svc, conn)` | `u64 written_to` | the node's writer |
+| `pack("ra", fs, svc, conn)` | `u64 in_acked ‖ u64 in_cleared ‖ u64 out_head ‖ u32 state_len ‖ u8 flags` (1 FIN, 2 close, 4 abort, 8 resumable, 16 unseal) | steps |
+| `pack("rm", fs, svc, conn)` | claim: `lease(16) ‖ holder(32) ‖ u64 token`, then `queued(12)` while queued, when lease and holder are zeros | accept, claims, requeues |
+| `pack("rz", fs, svc, conn)` | abort request: `u8 reason` (1 bad record, 2 not resumable on requeue, 3 released with `close`) | any node |
+| `pack("ri", fs, svc, conn, off)` | input chunk: `u8 sealed ‖ data` (formats.md §13.3) | the node's reader |
+| `pack("ro", fs, svc, conn, off)` | output record (formats.md §13.1) | steps |
+| `pack("rv", fs, svc, conn, off)` | a revealed record key `k_r(32)` | reveals |
+| `pack("rs", fs, svc, conn)` | the state, sealed kind 9 (formats.md §4) | steps |
+| `pack("rq", fs, svc, vs)` | `conn(16)`: the ready queue, oldest first | accept, requeues |
+| `pack("rqh", fs, svc)` | `versionstamp`: the queue doorbell | accept, requeues |
+| `pack("rl", fs, svc, lease)` | handler lease: `holder(32) ‖ u64 expires_version` | leases |
+| `pack("rx", fs, svc, lease, conn)` | empty: the connections claimed under a lease | claims |
+| `pack("rld", fs, svc, lease)` | `versionstamp`: the lease doorbell | input, writers, reaps |
+| `pack("rli", fs, svc, lease, vs)` | `conn(16)`: the lease's input log, for stream pushes | the node's reader |
+| `pack("rk", node)` | node lease: `u64 expires_version` | the node |
+| `pack("rn", node)` | `versionstamp`: the node doorbell | steps, reveals, abort requests |
+| `pack("rnq", node, vs)` | `u32 fs ‖ lp(svc) ‖ conn(16)`: work for the node's writer | steps, reveals, abort requests |
+| `pack("rnc", node, fs, svc, conn)` | empty: a node's connections, for reaping | accept |
+
+* **Split by writer.** The node's reader, the node's writer and the steps each own their counter key (`rh`, `rw`, `ra`). Each reads the others by snapshot. Every counter only grows, so a stale read only stalls or refuses early, and the socket side never conflicts with the handler side.
+* **Conflicts that matter.** Steps, claims, requeues and reaps read `rm` normally, and claims read `ra` normally, so a late step of a previous holder and a claim can't both commit. The node's reader reads `rm` normally to ring the right lease doorbell.
+* **The ready queue.** A queued connection's `rm` holds its `rq` versionstamp, so a reap can delete the entry. A claim deletes the entry and writes `rx`.
+* **Claim tokens only grow.** `rm` lives as long as the connection, through requeues.
+* **Output.** `ro` and `rv` entries live from their step, or their reveal, until written; the writer clears both for `[written_to, new written_to)`.
+* **Quota.** The byte counter (§3.1) is kept without reading values. It grows by input appended (`in_head`), output appended (raw bytes) and the state's growth. It shrinks by input cleared (`in_cleared`), output written (`written_to`), and the state's shrinking. A reap subtracts `in_head − in_cleared + out_head − written_to + state_len`.
+* **The sweeper:**
+  * reaps the connections (`rnc`) of every node whose `rk` has expired, then deletes that `rk`
+  * reaps expired handler leases (svc.md §10)
+  * deletes `rli` entries older than `limits.ephemeral_ttl_secs`
+* **Relay keys are transient:** `export` skips the prefixes above and `import` ignores them (operations.md §6); a socket can't move with the data.
