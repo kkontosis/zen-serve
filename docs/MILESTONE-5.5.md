@@ -155,6 +155,12 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `cargo test -p zen-svc` 3× (23 rustls-client tests and 6 `s_client` tests)
     * zen-server `tests/tls.rs` and `tests/mtls.rs`, default (14 and 8) and `--no-default-features` (10 and 8), alone and built together with zen-svc (rustls's `tls12` unified)
     * `cargo check -p zen-svc --target wasm32-unknown-unknown`; `cargo tree -p zen-svc -e normal -i ring` is empty
+  * **CI fix:** on head 73404e6 the `rust` job (both runs) and one `pure-rust` run failed `crates/zen-svc/tests/openssl.rs` `s_client_large_lines` at `assert!(c.stdout.contains(&want))`. Commit `svc: s_client tests wait for the echo before closing stdin`.
+    * The assertions before it passed: the engine received all 120,002 bytes and echoed them. Only `s_client`'s stdout was short.
+    * Root cause, a race in the test: the `s_client` helper closed stdin 300 ms after the last line, and `s_client` shuts the connection down as soon as it reads EOF on stdin, dropping echo still in flight. 300 ms was enough for 120 KB locally, not on the CI runners.
+    * The failure didn't reproduce locally, even on one loaded CPU. The mechanism was confirmed against OpenSSL directly: with a Python TLS echo server that waits 1 s, `s_client` with stdin closed after 0.3 s printed no echo, and with stdin open for 2 s it did.
+    * Fix: a thread reads `s_client`'s stdout as it arrives, and the helper keeps stdin open until stdout holds `wait_for` (or 30 s pass). The data tests pass their expected echo; the renegotiation and no-EMS tests pass `None`.
+    * Verified: clippy on zen-svc; `cargo test -p zen-svc --test openssl` 5×, and 3 rounds of three copies at once.
 
 ## Step 5.5.7 in detail: the TLS engine (`crates/zen-svc`, native)
 
