@@ -10,7 +10,7 @@ use zen_core::keyslot::{self, Argon2Params, Unlock};
 use zen_core::rng::OsRng;
 use zen_core::seal;
 use zen_core::sig;
-use zen_core::{kdf, labels, opaque, pwkey, token};
+use zen_core::{kdf, labels, opaque, pwkey, svc, token};
 use zeroize::Zeroizing;
 
 type R<T> = Result<T, JsValue>;
@@ -72,6 +72,8 @@ export interface PrfParams { credentialId: Uint8Array; prfSalt: Uint8Array }
 export interface OpaqueFinished { message: Uint8Array; exportKey: Uint8Array; serverPublicKey: Uint8Array }
 /** A verified device certificate. */
 export interface DeviceCert { devicePublic: Uint8Array; createdUnix: bigint }
+/** A sealed output record and its key, revealed once the commit is known. */
+export interface SealedRecord { record: Uint8Array; key: Uint8Array }
 "#;
 
 // ------------------------------------------------------------------ misc
@@ -419,6 +421,12 @@ impl FsKeys {
         TopicKeys(token::TopicKeys::new(&self.0, &byte_list(segments)))
     }
 
+    /// The keys of the relayed service whose id is `topic`'s (spec/svc.md §8).
+    #[wasm_bindgen(js_name = svcKeys)]
+    pub fn svc_keys(&self, topic: &TopicKeys) -> SvcKeys {
+        SvcKeys(svc::SvcKeys::new(&self.0, &topic.0))
+    }
+
     /// Seal an event body for a topic.
     #[wasm_bindgen(js_name = sealEvent)]
     pub fn seal_event(
@@ -574,6 +582,107 @@ impl TopicKeys {
     pub fn event_key_token(&self, key: &[u8]) -> Vec<u8> {
         self.0.event_key_token(key).to_vec()
     }
+}
+
+// ------------------------------------------------------------------ svc
+
+/// The keys of a relayed service at one epoch (spec/svc.md §8). Secret.
+#[wasm_bindgen]
+pub struct SvcKeys(svc::SvcKeys);
+
+fn conn_id(conn: &[u8]) -> R<[u8; 16]> {
+    arr(conn)
+}
+
+#[wasm_bindgen]
+impl SvcKeys {
+    /// From a delegated `K_svc` (spec/svc.md §8).
+    #[wasm_bindgen(js_name = fromParts)]
+    pub fn from_parts(fs_id: u32, epoch: u32, id: &[u8], key: &[u8]) -> R<SvcKeys> {
+        Ok(SvcKeys(svc::SvcKeys::from_parts(
+            fs_id,
+            epoch,
+            id,
+            arr(key)?,
+        )))
+    }
+
+    /// The fs the service belongs to.
+    #[wasm_bindgen(getter, js_name = fsId)]
+    pub fn fs_id(&self) -> u32 {
+        self.0.fs_id
+    }
+
+    /// The epoch of these keys.
+    #[wasm_bindgen(getter)]
+    pub fn epoch(&self) -> u32 {
+        self.0.epoch
+    }
+
+    /// The service id.
+    #[wasm_bindgen(getter)]
+    pub fn id(&self) -> Vec<u8> {
+        self.0.id().to_vec()
+    }
+
+    /// Seal a connection's state (kind 9) at the cursors after the step.
+    #[wasm_bindgen(js_name = sealState)]
+    pub fn seal_state(
+        &self,
+        conn: &[u8],
+        in_acked: u64,
+        out_head: u64,
+        plaintext: &[u8],
+    ) -> R<Vec<u8>> {
+        svc::seal_state(
+            &self.0,
+            &conn_id(conn)?,
+            in_acked,
+            out_head,
+            plaintext,
+            &mut OsRng,
+        )
+        .map_err(core_err)
+    }
+
+    /// Open a connection's state with a claim's cursors.
+    #[wasm_bindgen(js_name = openState)]
+    pub fn open_state(
+        &self,
+        conn: &[u8],
+        in_acked: u64,
+        out_head: u64,
+        sealed: &[u8],
+    ) -> R<Vec<u8>> {
+        svc::open_state(&self.0, &conn_id(conn)?, in_acked, out_head, sealed).map_err(core_err)
+    }
+
+    /// Seal an output record at output offset `off` (formats.md §13.1),
+    /// under a fresh key: the record, and the key to reveal after the commit.
+    #[wasm_bindgen(js_name = sealRecord, unchecked_return_type = "SealedRecord")]
+    pub fn seal_record(&self, conn: &[u8], off: u64, flags: u8, raw: &[u8]) -> R<JsValue> {
+        let (record, key) = svc::seal_record(&self.0, &conn_id(conn)?, off, flags, raw, &mut OsRng)
+            .map_err(core_err)?;
+        let o = js_sys::Object::new();
+        js_sys::Reflect::set(&o, &"record".into(), &js_sys::Uint8Array::from(&record[..]))?;
+        js_sys::Reflect::set(&o, &"key".into(), &js_sys::Uint8Array::from(&key[..]))?;
+        Ok(o.into())
+    }
+
+    /// Open the key escrow of the record at `off`, as a claim's `pending`
+    /// list carries it: the key to re-reveal.
+    #[wasm_bindgen(js_name = openKeyEscrow)]
+    pub fn open_key_escrow(&self, conn: &[u8], off: u64, escrow: &[u8]) -> R<Vec<u8>> {
+        svc::open_key_escrow(&self.0, &conn_id(conn)?, off, escrow)
+            .map(|k| k.to_vec())
+            .map_err(core_err)
+    }
+}
+
+/// A plain output record (`resume: false`, formats.md §13.1).
+#[wasm_bindgen(js_name = plainRecord)]
+pub fn plain_record(flags: u8, raw: &[u8]) -> R<Vec<u8>> {
+    svc::plain_record(flags, raw).map_err(core_err)
 }
 
 // ------------------------------------------------------------------ keyslots
