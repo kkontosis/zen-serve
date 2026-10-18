@@ -4,8 +4,8 @@
 //!
 //! * The crypto provider ([`provider`]): ring's, with our post-quantum
 //!   hybrid key exchange added ([`ring`], the `ring` feature, on by
-//!   default), or the pure-Rust one on RustCrypto ([`rustcrypto`], built
-//!   with `--no-default-features`).
+//!   default), or the pure-Rust one on RustCrypto ([`rustcrypto`], the
+//!   `zen-tls-rustcrypto` crate, built with `--no-default-features`).
 //! * `[tls]` absent: plain HTTP, as before.
 //! * `[tls] cert` and `key`: the listener speaks TLS only.
 //! * `[tls] client_ca`, with `[auth] mtls` on: the server asks for a client
@@ -18,7 +18,7 @@
 
 #[cfg(feature = "ring")]
 pub mod ring;
-pub mod rustcrypto;
+pub use zen_tls_rustcrypto as rustcrypto;
 
 use crate::config::TlsConfig;
 use axum::extract::connect_info::Connected;

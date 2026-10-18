@@ -632,45 +632,9 @@ pub mod soft {
         Rsa(Box<rsa::RsaPrivateKey>),
     }
 
-    /// A deterministic RNG for RSA key generation (BLAKE3 in XOF mode).
-    struct XofRng(blake3::OutputReader);
-
-    impl rsa::rand_core::TryRng for XofRng {
-        type Error = std::convert::Infallible;
-        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
-            let mut b = [0; 4];
-            self.0.fill(&mut b);
-            Ok(u32::from_le_bytes(b))
-        }
-        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
-            let mut b = [0; 8];
-            self.0.fill(&mut b);
-            Ok(u64::from_le_bytes(b))
-        }
-        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
-            self.0.fill(dst);
-            Ok(())
-        }
-    }
-
-    impl rsa::rand_core::TryCryptoRng for XofRng {}
-
-    /// An RSA key of `bits` from a seed byte. Generated once per process:
-    /// key generation is slow.
+    /// An RSA key of `bits` from a seed byte (cached per process).
     pub fn rsa_key(seed: u8, bits: usize) -> rsa::RsaPrivateKey {
-        use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-        static KEYS: OnceLock<Mutex<HashMap<(u8, usize), rsa::RsaPrivateKey>>> = OnceLock::new();
-        let keys = KEYS.get_or_init(Default::default);
-        if let Some(k) = keys.lock().expect("keys").get(&(seed, bits)) {
-            return k.clone();
-        }
-        let mut h = blake3::Hasher::new_derive_key("zen/test/webauthn-rsa");
-        h.update(&[seed]);
-        h.update(&(bits as u64).to_be_bytes());
-        let k = rsa::RsaPrivateKey::new(&mut XofRng(h.finalize_xof()), bits).expect("RSA key");
-        keys.lock().expect("keys").insert((seed, bits), k.clone());
-        k
+        crate::rsakey::testing::rsa_key(seed, bits)
     }
 
     /// A software authenticator holding one credential.
