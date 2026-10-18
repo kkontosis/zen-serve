@@ -190,6 +190,12 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<crate::cbor::Bad> for Error {
+    fn from(b: crate::cbor::Bad) -> Error {
+        Error::BadState(b.0)
+    }
+}
+
 enum Inner {
     Handshake(Box<handshake::Handshake>),
     Session(Box<Session>),

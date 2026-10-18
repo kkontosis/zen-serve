@@ -4,5 +4,8 @@
 //! and for wasm32 (`@zen/svc-wasm`).
 //!
 //! * [`tls`]: a TLS 1.3 and 1.2 server (svc.md §7.1).
+//! * [`ssh`]: an SSH-2 server (svc.md §7.2).
 
+mod cbor;
+pub mod ssh;
 pub mod tls;
