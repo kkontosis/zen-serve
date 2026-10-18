@@ -117,8 +117,22 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx playwright test` (smoke and apps, 14 specs), including `apps/echo/e2e/echo.spec.ts`
     * `cargo test -p zen-server --test svc` (24 tests; the server is unchanged)
   * CI green on PR #42's head (all 8 checks); merged.
-* **Step 5.5.6** (the shared TLS provider crate): planned. Restarted from main after PR #42 merged; the plan is below.
-  * Next: on "go", the code.
+* **Step 5.5.6** (the shared TLS provider crate): done, PR #43. Restarted from main after PR #42 merged. Commits: `docs: milestone 5.5 step 6 plan`; `tls: the RustCrypto rustls provider in its own crate (zen-tls-rustcrypto)`; the docs and this log.
+  * As planned, plus details settled while building:
+    * On wasm32, rustls's `std` feature needs a clock (`UnixTime::now`), which rustls-pki-types has there only with its `web` feature (web-time, JavaScript's `Date.now`). The crate turns it on for wasm32, next to getrandom's `wasm_js`. So rustls's default time provider works in the wasm build too.
+    * One moved unit test built an `Iv` with `Iv::new`, which rustls has only with its `tls12` feature; another workspace crate turned that on, so it built inside zen-server and not alone. It uses `Iv::from` now.
+    * zen-server drops aes-gcm, hmac, ml-kem and x25519-dalek; p384 becomes a dev-dependency (`tests/common/pki.rs`); chacha20poly1305 stays (the sealed OPAQUE login state).
+    * `webauthn::soft::rsa_key` calls `rsakey::testing::rsa_key` (same label, so the same keys); `tls/ring.rs`'s own `rsa_key_with_exp` stays.
+  * Docs: the README crates table, TECH_DEBT (the hybrid and provider-review entries), operations.md §8's provider table, this plan's survey line.
+  * Verified:
+    * `cargo fmt --check`; clippy `--all-targets -D warnings` default, `--no-default-features` and `--all-features`; clippy on the crate alone, native and wasm32
+    * `cargo test -p zen-tls-rustcrypto` (10 tests: the provider's 6 and the key policy's 4)
+    * `tests/tls.rs` and `tests/mtls.rs` unchanged: default (14 and 8) and `--no-default-features` (10 and 8)
+    * the full zen-server suite (16 test binaries, 178 tests)
+    * `cargo check -p zen-tls-rustcrypto --target wasm32-unknown-unknown`, also with `test-utils`
+    * `cargo tree -p zen-server --no-default-features -i ring` is empty
+    * `npx vitest run apps/echo packages/client/test/mtls.test.ts` against the rebuilt binary (6 tests)
+  * Next: CI on PR #43; then plan step 5.5.7 (the TLS engine, native) after it merges.
 
 ## Step 5.5.6 in detail: the shared TLS provider crate
 
@@ -387,7 +401,7 @@ interface RawStep {
   * After that, KeyUpdate state is not serializable (`conn/kernel.rs:118–148`). **So we capture the traffic secrets with a per-connection `KeyLog`** (`key_log.rs:30–34`) and do HKDF-Expand-Label for the key, IV and `traffic upd` ourselves.
   * `send_tls13_tickets` must be 0 (default 2, `builder.rs:123`). Early data stays 0.
   * On wasm32, `ServerConfig::builder_with_details(provider, time_provider)` (`server_conn.rs:535`) takes JS time; the default time provider panics there.
-* **Crypto crates** already in the workspace: aes-gcm, chacha20poly1305, x25519-dalek, ed25519-dalek, sha2, hmac, blake3, ml-kem, x-wing. The RustCrypto rustls provider is `crates/zen-server/src/tls/rustcrypto.rs` (it uses `rsakey.rs`). There is no SSH crate.
+* **Crypto crates** already in the workspace: aes-gcm, chacha20poly1305, x25519-dalek, ed25519-dalek, sha2, hmac, blake3, ml-kem, x-wing. The RustCrypto rustls provider is `crates/zen-tls-rustcrypto` (since step 5.5.6; it was zen-server's `tls/rustcrypto.rs`, with `rsakey.rs`). There is no SSH crate.
 * **Client:**
   * `kv.ts` `Transaction`: `extra: Partial<Commit>`, the `onCommit`/`onError` hooks, `build()`. `empty()` must learn every new field.
   * `log.ts` `Consumer` (claims, tokens).

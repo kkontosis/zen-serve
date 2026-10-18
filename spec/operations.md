@@ -310,7 +310,7 @@ zen-server has a Cargo feature **`ring`**, on by default, that chooses the TLS c
 
 | | Default build (`ring`) | Pure-Rust build (`--no-default-features`) |
 |---|---|---|
-| Provider | rustls's provider on [ring](https://github.com/briansmith/ring) (`tls::ring` in zen-server) | zen-serve's own on RustCrypto (`tls::rustcrypto`) |
+| Provider | rustls's provider on [ring](https://github.com/briansmith/ring) (`tls::ring` in zen-server) | zen-serve's own on RustCrypto (`tls::rustcrypto`, the `zen-tls-rustcrypto` crate) |
 | Record protection, HKDF, signature verification, signing, randomness | ring | RustCrypto |
 | `X25519MLKEM768` | zen-serve's, on RustCrypto (ring has no ML-KEM) | the same |
 | `X25519`, `secp256r1` | ring | RustCrypto |
