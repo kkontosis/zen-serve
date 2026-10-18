@@ -96,12 +96,27 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * the full zen-server suite on embedded and on FDB, and zen-proto
     * the dev wasm build (the `Frame` type gains the five variants) and `npm run check`
   * CI green on PR #40's head (all 8 checks).
-* **Step 5.5.5** (`@zen/svc`, raw): planned, PR #41. Restarted from main after PR #40 merged; the plan is below.
+* **Step 5.5.5** (`@zen/svc`, raw): done, PR #41 (the plan and the CI fix) and PR #42 (the code). Restarted from main after PR #41 merged. Commits: `docs: milestone 5.5 step 5 plan`; `db: a delivery whose commit failed on the network is retried, not nacked`; `wasm: svc seals and the svc request codecs`; `client: svc_sub on the stream; a svc step makes a transaction non-empty`; `svc: @zen/svc, the raw handler runtime`; `apps: echo, a relayed line service`; the docs and this log.
+  * As planned, plus details settled while building:
+    * The stream's svc subscription is `Stream.subscribeSvc(fs, svc, lease, {onEvent, onError})`, delivering `SvcPush` items (`input` or `ready`) like `subscribe`, rather than its own `{input, ready, end}` callbacks.
+    * `@zen/client` gains `Service` (`fs.service(...path)`): the `/v1/svc/*` requests, and the service keys per epoch (`keysAt`, `keysFor`, `sealKeys`). The plan had these inside `@zen/svc`; the client tests need them too.
+    * The flag constants (`SVC_FIN`, `SVC_CLOSE`, `SVC_ABORT`) live in `@zen/svc`, not the wasm. `peekSealed` reads an escrow's epoch (tested), so no `escrowEpoch` binding.
+    * A fresh connection (no step yet) gets a first step even without input, for protocols where the server speaks first. On a `resume` service that step carries `resumable`, so each connection's first step commits.
+    * A connection is forgotten after a close or abort record, or after its FIN once the peer's EOF is in and all input is acked. The server reaps a connection without telling its holder, so one quiet for 10 s is checked with `/v1/svc/state`, which frees its slot when it is gone.
+    * The test server restarts in place (`TestServer.restart`), with `[[service]]` tables from `serviceToml`; `startWorld({services})` uses it. Members get `consume` on `svc/` through the app's grants, not a harness default.
+    * The echo table has an index on `(conn, n)`, so listing lines doesn't scan.
+    * `resume: false` test: the server's sweeper runs every 60 s, so the test starts a second handler, whose lease calls reap the lapsed lease. It never receives the connection, which is aborted.
   * CI fix done before "go": one `client` run on the plan commit failed the kanban offline test (the index didn't follow a move within 15 s). Commit `db: a delivery whose commit failed on the network is retried, not nacked`, as in "CI fix first" below.
     * `packages/db/test/network.test.ts` failed on the old code (the second event of the key didn't arrive within 10 s) and passes with the fix in about 3 s.
     * Verified: `npm run check`; `packages/db` and `apps/kanban`; the kanban offline test 5×; the whole vitest suite 3×.
     * Seen once, in the first of those three full runs: the kanban test "deleting a card moves its attachment directory to TRASH" failed an assertion in 55 ms. It involves no consumer and no network error, so this fix doesn't reach it. It didn't recur in 3 kanban-only runs, 4 parallel runs of that test, or the 2 other full runs. Not yet investigated: watch CI for it.
-  * Next: on "go", the code.
+  * Verified:
+    * `cargo fmt --check`; clippy on zen-wasm (wasm32, `-D warnings`); the dev wasm build
+    * `npm run check`, and `tsc -p packages/client/tsconfig.test.json`
+    * `npx vitest run` 3× (437 tests, all passed each time), including the new `packages/client/test/svcvectors.test.ts` and `svc.test.ts`, `packages/svc/test/input.test.ts` and `apps/echo/test/echo.test.ts`
+    * `npx playwright test` (smoke and apps, 14 specs), including `apps/echo/e2e/echo.spec.ts`
+    * `cargo test -p zen-server --test svc` (24 tests; the server is unchanged)
+  * Next: step 5.5.6 (the shared TLS provider crate): plan it in detail on "go", after the PR merges.
 
 ## Step 5.5.5 in detail: `@zen/svc`, raw
 

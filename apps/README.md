@@ -2,6 +2,8 @@
 
 Five small web apps on `@zen/db`, `@zen/fs` and `@zen/loro`, specified in [`docs/EXAMPLES.md`](../docs/EXAMPLES.md) and built in milestone 5 step 10, plus `hello`, the smallest app, which is the template of the others and the smoke test of the app build.
 
+`echo` (milestone 5.5 step 5) is a relayed TCP service on `@zen/svc` (spec/svc.md): each line a peer sends on the service's port is answered with `<n>: <line>` and stored in `lines`, in one transaction. Its handler runs as a Node worker (`workers/handler.ts`) or in the page (the Serve button). The tests kill handler workers mid-stream and check that every line is answered and stored exactly once, in order.
+
 ## Layout of an app
 
 ```
@@ -24,7 +26,7 @@ apps/<name>/
 |---|---|
 | `boot.ts` | the browser: `boot`, `ready`, `h` (elements), `render`, `message` |
 | `node.ts` | workers and scenarios: `signInWorker` (a device key file, optionally a vault), `workerFromEnv` |
-| `harness.ts` | tests: `startWorld` (a server serving `apps/dist`, members with the app's grants), `openApp` (a page signed in), `spawnWorker` / `workerEnv`, `until`, `net` (an offline switch on a Node session) |
+| `harness.ts` | tests: `startWorld` (a server serving `apps/dist`, members with the app's grants, relayed `services` on free ports), `openApp` (a page signed in), `spawnWorker` / `workerEnv`, `until`, `net` (an offline switch on a Node session) |
 | `fractional.ts` | position keys between two others (`keyBetween`, `keysBetween`) |
 
 ## Build, serve, test
