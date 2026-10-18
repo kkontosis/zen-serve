@@ -6,7 +6,19 @@
 import { bytes, ZenError } from '@zen/client';
 import type * as SW from '@zen/svc-wasm';
 import { SVC_CLOSE, SVC_FIN } from './flags.js';
-import type { Engine, Finished, HandlerOut, Layer, LayerConn, Prepared, TlsInfo } from './layer.js';
+import {
+  concat,
+  type Engine,
+  type Finished,
+  type Layer,
+  type LayerConn,
+  type Live,
+  type Prepared,
+  type RawStep,
+  Step,
+  type StepContext,
+  type TlsInfo,
+} from './layer.js';
 import { loadSvcWasm, type SvcWasm, type WasmSource } from './wasm.js';
 
 /** Options of `tls()`. */
@@ -31,7 +43,7 @@ export interface TlsLayerOptions {
  * is reported through `onError` when `serve()` starts, and nothing is
  * claimed.
  */
-export function tls(opts: TlsLayerOptions): Layer {
+export function tls(opts: TlsLayerOptions): Layer<RawStep> {
   return {
     engine: 'tls',
     open: async () => {
@@ -49,7 +61,7 @@ export function tls(opts: TlsLayerOptions): Layer {
   };
 }
 
-class TlsEngine implements Engine {
+class TlsEngine implements Engine<RawStep> {
   readonly name = 'tls';
 
   constructor(
@@ -57,7 +69,7 @@ class TlsEngine implements Engine {
     readonly config: SW.TlsConfig,
   ) {}
 
-  conn(): LayerConn {
+  conn(): LayerConn<RawStep> {
     return new TlsConn(this);
   }
 
@@ -75,19 +87,28 @@ const EMPTY = new Uint8Array(0);
 
 const latin1 = new TextDecoder('latin1');
 
-function concat(parts: Uint8Array[]): Uint8Array {
-  const n = parts.reduce((a, p) => a + p.length, 0);
-  if (parts.length === 1) return parts[0]!;
-  const out = new Uint8Array(n);
-  let at = 0;
-  for (const p of parts) {
-    out.set(p, at);
-    at += p.length;
-  }
-  return out;
+/** A TLS step prepared from the input. */
+interface TlsPrepared extends Prepared {
+  /** Input bytes the engine consumed (whole records): the step's ack. */
+  consumed: number;
+  /** Bytes to send before the handler's: handshake flights, alerts, KeyUpdates. */
+  out: Uint8Array;
+  /** The handler's input (plaintext) and EOF. */
+  input: Uint8Array;
+  eof: boolean;
+  tls?: TlsInfo;
+  /** Complete records wait behind the plaintext held: once the handler acks, step again. */
+  held: boolean;
+  /** The engine state after the input (null: handshaking). */
+  engineState: Uint8Array | null;
 }
 
-class TlsConn implements LayerConn {
+/** An attempt at a TLS step. */
+interface TlsLive extends Live<RawStep> {
+  readonly view: Step;
+}
+
+class TlsConn implements LayerConn<RawStep> {
   /** The handshake, in memory until it is done. */
   private hs: SW.TlsConn | undefined;
   /** The committed engine state, once established. */
@@ -118,7 +139,7 @@ class TlsConn implements LayerConn {
     }
   }
 
-  prepare(input: Uint8Array, eof: boolean, finSent: boolean): Prepared {
+  prepare(input: Uint8Array, eof: boolean, finSent: boolean): TlsPrepared {
     if (this.state) {
       const c = this.e.sw.TlsConn.restore(this.e.config, this.state);
       try {
@@ -150,7 +171,7 @@ class TlsConn implements LayerConn {
   }
 
   /** A step of an established connection, from the engine after its input. */
-  private after(c: SW.TlsConn, p: SW.TlsProgress, finSent: boolean, fragile: boolean): Prepared {
+  private after(c: SW.TlsConn, p: SW.TlsProgress, finSent: boolean, fragile: boolean): TlsPrepared {
     const input = c.plaintext();
     const eof = c.peerClosed || p.truncated;
     const alpn = c.alpn;
@@ -181,7 +202,26 @@ class TlsConn implements LayerConn {
     };
   }
 
-  finish(p: Prepared, h: HandlerOut): Finished {
+  open(p: TlsPrepared, ctx: StepContext): TlsLive {
+    const s = new Step(
+      ctx.conn,
+      ctx.peer,
+      p.input,
+      p.eof,
+      ctx.state,
+      ctx.finSent,
+      room(p, ctx.outWindow),
+      p.tls,
+    );
+    return {
+      view: s,
+      app: () => s.state,
+      finish: () => this.finish(p, s),
+      dispose: () => {},
+    };
+  }
+
+  private finish(p: TlsPrepared, s: Step): Finished {
     if (p.error || !p.engineState) {
       return {
         inAck: p.consumed,
@@ -189,16 +229,18 @@ class TlsConn implements LayerConn {
         endFlag: p.error ? SVC_CLOSE : 0,
         engineState: p.engineState,
         engineChanged: p.engineState !== null && !this.same(p.engineState),
+        again: false,
       };
     }
     const c = this.e.sw.TlsConn.restore(this.e.config, p.engineState);
     try {
-      c.consume(h.acked);
+      c.consume(s.acked);
       const parts = [p.out];
-      let endFlag = h.endFlag;
-      if (h.writes.length) {
+      let endFlag = s.endFlag;
+      const writes = s.writes();
+      if (writes.length) {
         try {
-          parts.push(c.write(h.writes));
+          parts.push(c.write(writes));
         } catch (e) {
           // TLS 1.2 at its key's record limit: close (svc.md §7.1).
           if (!(e instanceof Error && e.message === 'key_limit')) throw e;
@@ -213,6 +255,8 @@ class TlsConn implements LayerConn {
         endFlag,
         engineState: state,
         engineChanged: state !== null && !this.same(state),
+        // Records held back behind the plaintext: the handler made room.
+        again: p.held && s.acked > 0,
       };
     } finally {
       c.free();
@@ -223,19 +267,12 @@ class TlsConn implements LayerConn {
     return this.state !== null && bytes.equal(this.state, s);
   }
 
-  committed(p: Prepared, f: Finished, h: HandlerOut): void {
+  committed(p: TlsPrepared, f: Finished, live: TlsLive): void {
     if (f.engineState) this.state = f.engineState;
     if (p.call) {
-      this.seenPlain = p.input.length - h.acked;
+      this.seenPlain = p.input.length - live.view.acked;
       this.seenEof = p.eof;
     }
-  }
-
-  room(p: Prepared, outWindow: number): number {
-    // A record adds at most 29 bytes (1.2 GCM) to 16 KiB; keep room for a
-    // KeyUpdate and close_notify.
-    const n = outWindow - p.out.length - 256;
-    return n <= 0 ? 0 : Math.floor((n * 16384) / (16384 + 32));
   }
 
   private dropHandshake(): void {
@@ -247,4 +284,12 @@ class TlsConn implements LayerConn {
     this.dropHandshake();
     this.state = null;
   }
+}
+
+/** Most plaintext a step may write so its records fit `outWindow`. */
+function room(p: TlsPrepared, outWindow: number): number {
+  // A record adds at most 29 bytes (1.2 GCM) to 16 KiB; keep room for a
+  // KeyUpdate and close_notify.
+  const n = outWindow - p.out.length - 256;
+  return n <= 0 ? 0 : Math.floor((n * 16384) / (16384 + 32));
 }

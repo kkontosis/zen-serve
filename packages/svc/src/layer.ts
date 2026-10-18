@@ -1,7 +1,12 @@
 // Layers: what sits between a connection's bytes and the handler (svc.md
-// §7). `raw()` hands the bytes through; `tls()` (tls.ts) terminates TLS.
-// The runtime prepares each step outside its transaction, then finishes it
-// inside, where it may run again on a conflict.
+// §7). `raw()` hands the bytes through; `tls()` (tls.ts) terminates TLS and
+// `ssh()` (ssh.ts) SSH. The runtime prepares each step outside its
+// transaction, then opens it inside, where it may run again on a conflict:
+// the layer gives the handler its view of the step (a `RawStep`, an
+// `SshStep`) and turns what the handler did into the step's output.
+import { bytes } from '@zen/client';
+import type { SvcInfo, SvcPeer } from '@zen/wasm';
+import { SVC_ABORT, SVC_CLOSE, SVC_FIN } from './flags.js';
 
 /** What the handler learns of a TLS connection (`RawStep.tls`). */
 export interface TlsInfo {
@@ -17,36 +22,52 @@ export interface TlsInfo {
   readonly truncated: boolean;
 }
 
+/** One step of a connection, as a raw or TLS handler sees it. */
+export interface RawStep {
+  readonly conn: Uint8Array;
+  readonly peer: SvcPeer;
+  /** The input not yet acked, from `in_acked`. */
+  readonly input: Uint8Array;
+  /** The peer sent FIN: `input` is all there is. */
+  readonly eof: boolean;
+  /** The application's state, carried across steps and takeovers (null: none). */
+  state: Uint8Array | null;
+  /** Consume the first `n` bytes of `input`. Ack only whole protocol units. */
+  ack(n: number): void;
+  /** Send bytes, after those of earlier steps. */
+  write(data: Uint8Array | string): void;
+  /** Shut down the write side after the writes (FIN). Input can still be acked. */
+  end(): void;
+  /** Close the connection after the writes. */
+  close(): void;
+  /** Reset the connection. */
+  abort(): void;
+  /** Under `tls()`: the connection's TLS parameters. */
+  readonly tls?: TlsInfo;
+}
+
 /** @internal A step prepared from the input, before the transaction. */
 export interface Prepared {
-  /** Input bytes the layer consumed itself (TLS records); 0 when the handler's ack counts. */
-  consumed: number;
-  /** Bytes to send before the handler's: handshake flights, alerts, KeyUpdates. */
-  out: Uint8Array;
-  /** The connection can be resumed from this step on (its handshake is done). */
+  /** The connection can be resumed from this step on (TLS: its handshake is done). */
   established: boolean;
   /** Call the handler. */
   call: boolean;
-  /** The handler's input and EOF. */
-  input: Uint8Array;
-  eof: boolean;
-  tls?: TlsInfo;
-  /** The connection failed: send `out`, then close, without the handler. */
+  /** The connection failed: reported; the layer's step sends what it must and closes. */
   error?: unknown;
-  /** Complete records wait behind the plaintext held: once the handler acks, step again. */
-  held: boolean;
-  /** The engine state after the input (null: none). */
-  engineState: Uint8Array | null;
   /** Preparing changed something in memory that can't be redone (a handshake moved on). */
   fragile: boolean;
 }
 
-/** @internal What the handler did, for the layer to turn into bytes. */
-export interface HandlerOut {
-  acked: number;
-  writes: Uint8Array;
-  /** SVC_FIN, SVC_CLOSE, SVC_ABORT or 0. */
-  endFlag: number;
+/** @internal What a step's view is opened with. */
+export interface StepContext {
+  conn: Uint8Array;
+  peer: SvcPeer;
+  /** The application's state, as committed. */
+  state: Uint8Array | null;
+  /** The handler ended its side (FIN) in an earlier step. */
+  finSent: boolean;
+  /** Most bytes the step's output may hold. */
+  outWindow: number;
 }
 
 /** @internal A step's output, inside the transaction. */
@@ -55,15 +76,30 @@ export interface Finished {
   inAck: number;
   /** Bytes to send. */
   bytes: Uint8Array;
+  /** SVC_FIN, SVC_CLOSE, SVC_ABORT or 0. */
   endFlag: number;
   /** The engine state to seal (null: none). */
   engineState: Uint8Array | null;
   /** It differs from the committed one. */
   engineChanged: boolean;
+  /** Step again at once, without new input (the handler made room for held input). */
+  again: boolean;
+}
+
+/** @internal One attempt at a step, inside the transaction. */
+export interface Live<S> {
+  /** What the handler gets. */
+  readonly view: S;
+  /** The application's state after the handler. */
+  app(): Uint8Array | null;
+  /** Turn the handler's step into output. */
+  finish(): Finished;
+  /** Free what the attempt holds (it ran, or the handler threw). */
+  dispose(): void;
 }
 
 /** @internal A layer's side of one connection. */
-export interface LayerConn {
+export interface LayerConn<S> {
   /**
    * The committed engine state, from a claim or a re-read (null: none).
    * `same`: the cursors are those this side last saw. Throws when the
@@ -72,70 +108,161 @@ export interface LayerConn {
   load(engineState: Uint8Array | null, same: boolean): void;
   /** Process input (`eof`: the peer's FIN follows it). `finSent`: the handler ended its side. */
   prepare(input: Uint8Array, eof: boolean, finSent: boolean): Prepared;
-  /** Turn the handler's step into output (may run more than once). */
-  finish(p: Prepared, h: HandlerOut): Finished;
+  /** Open an attempt at the step (may run more than once). */
+  open(p: Prepared, ctx: StepContext): Live<S>;
   /** The step committed (or needed no commit). */
-  committed(p: Prepared, f: Finished, h: HandlerOut): void;
-  /** Most bytes the handler may write in a step whose output may be `outWindow`. */
-  room(p: Prepared, outWindow: number): number;
+  committed(p: Prepared, f: Finished, live: Live<S>): void;
   free(): void;
 }
 
 /** @internal A started layer. */
-export interface Engine {
+export interface Engine<S> {
   readonly name: string;
-  conn(): LayerConn;
+  conn(): LayerConn<S>;
   close(): void;
 }
 
-/** A layer between the relay's bytes and the handler: `raw()` or `tls(…)`. */
-export interface Layer {
+/** A layer between the relay's bytes and the handler: `raw()`, `tls(…)` or `ssh(…)`. */
+export interface Layer<S = RawStep> {
   /** The engine's name in the connection state (svc.md §7). */
   readonly engine: string;
-  /** @internal Load what it needs (a WASM module, a certificate); throws when it can't. */
-  open(): Promise<Engine>;
+  /**
+   * @internal Load what it needs (a WASM module, a key), given the
+   * service's settings; throws when it can't.
+   */
+  open(info: SvcInfo): Promise<Engine<S>>;
 }
 
 const EMPTY = new Uint8Array(0);
 
-class RawConn implements LayerConn {
-  load(): void {}
+/** Join byte strings. */
+export function concat(parts: Uint8Array[]): Uint8Array {
+  if (parts.length === 1) return parts[0]!;
+  const n = parts.reduce((a, p) => a + p.length, 0);
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
 
-  prepare(input: Uint8Array, eof: boolean): Prepared {
-    return {
-      consumed: 0,
-      out: EMPTY,
-      established: true,
-      call: true,
-      input,
-      eof,
-      held: false,
-      engineState: null,
-      fragile: false,
-    };
+/** @internal The `RawStep` of raw and TLS handlers. */
+export class Step implements RawStep {
+  acked = 0;
+  readonly out: Uint8Array[] = [];
+  outBytes = 0;
+  endFlag = 0;
+
+  constructor(
+    readonly conn: Uint8Array,
+    readonly peer: SvcPeer,
+    readonly input: Uint8Array,
+    readonly eof: boolean,
+    public state: Uint8Array | null,
+    private readonly finSent: boolean,
+    private readonly room: number,
+    readonly tls: TlsInfo | undefined,
+  ) {}
+
+  ack(n: number): void {
+    if (!Number.isInteger(n) || n < 0 || n > this.input.length) {
+      throw new RangeError(`ack(${n}): ${this.input.length} input bytes`);
+    }
+    this.acked = Math.max(this.acked, n);
   }
 
-  finish(_p: Prepared, h: HandlerOut): Finished {
+  private open(what: string): void {
+    if (this.endFlag) throw new Error(`${what} after end, close or abort`);
+    if (this.finSent) throw new Error(`${what} after the connection's FIN`);
+  }
+
+  write(data: Uint8Array | string): void {
+    this.open('write');
+    const d = typeof data === 'string' ? bytes.utf8(data) : data;
+    if (this.outBytes + d.length > this.room) {
+      throw new RangeError(`a step writes at most ${this.room} bytes (out_window)`);
+    }
+    if (d.length) {
+      this.out.push(d);
+      this.outBytes += d.length;
+    }
+  }
+
+  end(): void {
+    this.open('end');
+    this.endFlag = SVC_FIN;
+  }
+
+  close(): void {
+    this.closing('close');
+    this.endFlag = SVC_CLOSE;
+  }
+
+  abort(): void {
+    this.closing('abort');
+    this.endFlag = SVC_ABORT;
+  }
+
+  /** Close or abort may replace this step's FIN, not an earlier step's. */
+  private closing(what: string): void {
+    if (this.endFlag && this.endFlag !== SVC_FIN) throw new Error(`${what} after close or abort`);
+    if (this.finSent) throw new Error(`${what} after the connection's FIN`);
+  }
+
+  /** The writes, joined. */
+  writes(): Uint8Array {
+    return this.out.length ? concat(this.out) : EMPTY;
+  }
+}
+
+/** A raw step: the input as it is. */
+interface RawPrepared extends Prepared {
+  input: Uint8Array;
+  eof: boolean;
+}
+
+class RawConn implements LayerConn<RawStep> {
+  load(): void {}
+
+  prepare(input: Uint8Array, eof: boolean): RawPrepared {
+    return { established: true, call: true, input, eof, fragile: false };
+  }
+
+  open(p: RawPrepared, ctx: StepContext): Live<RawStep> {
+    const s = new Step(
+      ctx.conn,
+      ctx.peer,
+      p.input,
+      p.eof,
+      ctx.state,
+      ctx.finSent,
+      ctx.outWindow,
+      undefined,
+    );
     return {
-      inAck: h.acked,
-      bytes: h.writes,
-      endFlag: h.endFlag,
-      engineState: null,
-      engineChanged: false,
+      view: s,
+      app: () => s.state,
+      finish: () => ({
+        inAck: s.acked,
+        bytes: s.writes(),
+        endFlag: s.endFlag,
+        engineState: null,
+        engineChanged: false,
+        again: false,
+      }),
+      dispose: () => {},
     };
   }
 
   committed(): void {}
 
-  room(_p: Prepared, outWindow: number): number {
-    return outWindow;
-  }
-
   free(): void {}
 }
 
 /** The handler sees the connection's bytes as they are. */
-export function raw(): Layer {
-  const engine: Engine = { name: 'raw', conn: () => new RawConn(), close: () => {} };
+export function raw(): Layer<RawStep> {
+  const engine: Engine<RawStep> = { name: 'raw', conn: () => new RawConn(), close: () => {} };
   return { engine: 'raw', open: async () => engine };
 }
