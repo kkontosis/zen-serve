@@ -118,6 +118,8 @@ interface Conn {
   due: boolean;
   busy: boolean;
   gone: boolean;
+  /** Since when input past a gap has waited (local ms; 0: no gap). */
+  gapAt: number;
   /** When the connection last changed (local ms). */
   at: number;
   /** Reveals of this connection, in order. */
@@ -137,7 +139,9 @@ interface Step0 extends Prepared {
 /** Input pushed for a connection whose claim hasn't arrived yet. */
 interface Early {
   at: number;
-  bytes: number;
+  /** The offsets the chunks span (pushes repeat bytes, so not their sum). */
+  lo: bigint;
+  hi: bigint;
   chunks: Extract<SvcPush, { type: 'input' }>[];
 }
 
@@ -488,6 +492,7 @@ export class ServeHandle {
       due: c.in_acked === 0n && c.out_head === 0n && !c.state,
       busy: false,
       gone: false,
+      gapAt: 0,
       at: Date.now(),
       reveals: Promise.resolve(),
       layer: this.engine!.conn(),
@@ -595,14 +600,22 @@ export class ServeHandle {
     const conn = this.held.get(key);
     if (!conn) {
       // Input for a claim whose response hasn't arrived: keep it briefly.
+      // A push starts at `in_acked` and holds at most `window` bytes, but
+      // pushes repeat bytes and may start a little before the claim's
+      // `in_acked`: the bound is on the span. A chunk dropped here leaves a
+      // gap, which `repair` reads again.
+      const end = p.off + BigInt(p.data.length);
       let e = this.early.get(key);
       if (!e) {
-        e = { at: Date.now(), bytes: 0, chunks: [] };
+        e = { at: Date.now(), lo: p.off, hi: end, chunks: [] };
         this.early.set(key, e);
       }
-      if (e.bytes + p.data.length <= (this.info?.window ?? 0)) {
+      const lo = p.off < e.lo ? p.off : e.lo;
+      const hi = end > e.hi ? end : e.hi;
+      if (hi - lo <= BigInt(2 * (this.info?.window ?? 0))) {
         e.chunks.push(p);
-        e.bytes += p.data.length;
+        e.lo = lo;
+        e.hi = hi;
       }
       return;
     }
@@ -622,6 +635,32 @@ export class ServeHandle {
     conn.at = Date.now();
     if (p.data.length) conn.input.add(p.off, p.data);
     if (p.flags & C_EOF && p.data.length === 0) conn.eofAt = p.off;
+    if (conn.input.pending === 0) conn.gapAt = 0;
+    else if (!conn.gapAt) conn.gapAt = Date.now();
+  }
+
+  /**
+   * Read input that a lost push left missing (input past a gap for over a
+   * second): the server keeps everything from `in_acked`.
+   */
+  private async repair(conn: Conn): Promise<void> {
+    const r = await this.svc.read(conn.conn, conn.token, conn.input.end, {
+      maxBytes: this.info?.window ?? 0,
+    });
+    if (conn.gone) return;
+    for (const c of r.chunks) {
+      this.input(conn, {
+        type: 'input',
+        conn: conn.conn,
+        off: c.off,
+        data: c.data,
+        sealed: c.sealed,
+        flags: 0,
+      });
+    }
+    // Pushes resume past what was read; a gap left now is new.
+    if (conn.input.pending === 0) conn.gapAt = 0;
+    else conn.gapAt = Date.now();
   }
 
   /** Drop stale early input, and check on connections that went quiet. */
@@ -629,6 +668,21 @@ export class ServeHandle {
     const now = Date.now();
     for (const [k, e] of this.early) if (now - e.at > 10_000) this.early.delete(k);
     for (const c of this.held.values()) {
+      if (!c.busy && c.gapAt && now - c.gapAt > 1000) {
+        c.busy = true;
+        void this.track(
+          this.repair(c)
+            .catch((e) => {
+              if (!isCode(e, 'claim_lost') && !isCode(e, 'conn_closed')) throw e;
+              this.forget(c);
+            })
+            .finally(() => {
+              c.busy = false;
+              this.schedule(c, signal);
+            }),
+        );
+        continue;
+      }
       if (c.busy || now - c.at < 10_000) continue;
       // The server reaps a connection (a reset, a timeout) without telling
       // the holder: ask, so its slot frees.

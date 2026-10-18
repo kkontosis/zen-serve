@@ -265,13 +265,25 @@ describe('echo over TLS', () => {
           }
         }
       })();
-      for (const frac of [0.3, 0.65]) {
-        await until(() => back() >= N * frac, 120_000, `${frac * 100}% back`);
-        await worker.kill();
-        worker = await start();
+      try {
+        for (const frac of [0.3, 0.65]) {
+          await until(() => back() >= N * frac, 120_000, `${frac * 100}% back`);
+          await worker.kill();
+          worker = await start();
+        }
+        await Promise.race([
+          sending,
+          sleep(120_000).then(() => {
+            throw new Error('sending stalled');
+          }),
+        ]);
+        await until(() => back() >= N, 120_000, 'all 20 MB back');
+      } catch (e) {
+        const logs = started.map((k, i) => `worker ${i}:\n${k.output.join('\n')}`).join('\n');
+        throw new Error(
+          `${String(e)}; ${back()} bytes back; client errors: ${p.errors.map(String)}\n${logs}`,
+        );
       }
-      await sending;
-      await until(() => back() >= N, 120_000, 'all 20 MB back');
       expect(back()).toBe(N);
       const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
       expect(sha(p.got())).toBe(sha(data));
