@@ -143,10 +143,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: FUSE (zen-mount)
+      - name: FUSE (zen-mount), OpenSSH client (ssh() tests)
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q fuse3 libfuse-dev pkg-config
+          sudo apt-get install -y -q fuse3 libfuse-dev pkg-config openssh-client
           sudo chmod 666 /dev/fuse
       - name: Build zen-serve and the WASM module
         run: |

@@ -3,7 +3,8 @@
 // with `n` counting the connection's lines, and a row `{conn, n, line}` in
 // `lines`, committed in one transaction with the reply. The same handler
 // serves `echo-tls` behind `tls()`, with the certificate from `certs`; and
-// `mirror`, which sends back whatever arrives, serves `mirror-tls`.
+// `mirror`, which sends back whatever arrives, serves `mirror-tls`. Over
+// SSH (ssh.ts), `sshEcho` serves `echo-ssh`.
 import { bytes } from '@zen/client';
 import type { Db } from '@zen/db';
 import {
@@ -16,7 +17,17 @@ import {
 } from '@zen/svc';
 import type { Cert, Line } from './schema.js';
 
-export { type Cert, DB_OPTIONS, type Line, NS, putCert } from './schema.js';
+export {
+  type Cert,
+  DB_OPTIONS,
+  type Line,
+  NS,
+  putCert,
+  putHostKey,
+  putSshKey,
+  type SshKey,
+} from './schema.js';
+export { SSH_SERVICE, STUB_COMMIT, STUB_REFS, sshEcho, sshLayer } from './ssh.js';
 
 /** The service's topic path: its topic id is the service id. */
 export const SERVICE = ['svc', 'echo'];

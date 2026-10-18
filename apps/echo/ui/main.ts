@@ -1,10 +1,23 @@
-// The echo app's page: serve the echo service from this tab, plain or over
-// TLS (with the `echo` certificate of `certs`), and the lines it stored,
-// live. A peer connects to the service's port (`nc host port`, or
-// `openssl s_client -connect host:port` for TLS).
-import { type Layer, serve } from '@zen/svc';
+// The echo app's page: serve the echo service from this tab, plain, over
+// TLS (with the `echo` certificate of `certs`) or over SSH (with the host
+// key of `certs` and the keys of `ssh_keys`), and the lines it stored,
+// live. A peer connects to the service's port (`nc host port`, `openssl
+// s_client -connect host:port` for TLS, `ssh -p port user@host lines`).
+import type { DbTransaction } from '@zen/db';
+import { type ServeHandle, serve } from '@zen/svc';
 import { boot, h, ready, render } from '../../shared/boot.js';
-import { DB_OPTIONS, echo, lines, NS, SERVICE, TLS_SERVICE, tlsLayer } from '../src/echo.js';
+import {
+  DB_OPTIONS,
+  echo,
+  lines,
+  NS,
+  SERVICE,
+  SSH_SERVICE,
+  sshEcho,
+  sshLayer,
+  TLS_SERVICE,
+  tlsLayer,
+} from '../src/echo.js';
 
 const ctx = await boot({ app: 'echo', ns: NS, db: DB_OPTIONS });
 const { db, root } = ctx;
@@ -18,10 +31,16 @@ const show = async () => {
   );
 };
 
+type Handle = Pick<ServeHandle, 'stop' | 'running' | 'conns'>;
+type Start = (onError: (e: unknown) => void) => Promise<Handle>;
+
+/** Show new lines after a step commits. */
+const showing = (tx: DbTransaction) => tx.after(() => void show());
+
 /** A button that starts and stops one service, with its status. */
-function toggle(id: string, label: string, service: string[], layer?: () => Promise<Layer>) {
+function toggle(id: string, label: string, start: Start) {
   const status = h('span', { id: `${id}-status` }, 'stopped');
-  let handle: ReturnType<typeof serve> | undefined;
+  let handle: Handle | undefined;
   const button = h(
     'button',
     {
@@ -36,26 +55,17 @@ function toggle(id: string, label: string, service: string[], layer?: () => Prom
           button.textContent = label;
           return;
         }
-        let l: Layer | undefined;
+        const onError = (e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.log(`svc: ${msg}`);
+          status.textContent = `error: ${msg}`;
+        };
         try {
-          l = await layer?.();
+          handle = await start(onError);
         } catch (e) {
-          status.textContent = `error: ${e instanceof Error ? e.message : String(e)}`;
+          onError(e);
           return;
         }
-        handle = serve(db, {
-          service,
-          handler: async (c, tx) => {
-            await echo(c, tx);
-            tx.after(() => void show());
-          },
-          ...(l ? { layer: l } : {}),
-          onError: (e) => {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.log(`svc: ${msg}`);
-            status.textContent = `error: ${msg}`;
-          },
-        });
         status.textContent = 'serving';
         button.textContent = 'Stop';
       },
@@ -69,10 +79,40 @@ function toggle(id: string, label: string, service: string[], layer?: () => Prom
   };
 }
 
-const plain = toggle('serve', 'Serve', SERVICE);
-const overTls = toggle('serve-tls', 'Serve TLS', TLS_SERVICE, () => tlsLayer(db));
+const plain = toggle('serve', 'Serve', async (onError) =>
+  serve(db, {
+    service: SERVICE,
+    handler: async (c, tx) => {
+      await echo(c, tx);
+      showing(tx);
+    },
+    onError,
+  }),
+);
+const overTls = toggle('serve-tls', 'Serve TLS', async (onError) =>
+  serve(db, {
+    service: TLS_SERVICE,
+    layer: await tlsLayer(db),
+    handler: async (c, tx) => {
+      await echo(c, tx);
+      showing(tx);
+    },
+    onError,
+  }),
+);
+const overSsh = toggle('serve-ssh', 'Serve SSH', async (onError) =>
+  serve(db, {
+    service: SSH_SERVICE,
+    layer: await sshLayer(db),
+    handler: async (c, tx) => {
+      await sshEcho(c, tx);
+      showing(tx);
+    },
+    onError,
+  }),
+);
 
-render(root, plain.el, overTls.el, h('h2', {}, 'Lines'), list);
+render(root, plain.el, overTls.el, overSsh.el, h('h2', {}, 'Lines'), list);
 await show();
 // Lines another handler stored.
 setInterval(() => void show(), 2000);
@@ -81,4 +121,6 @@ ready(ctx, {
   conns: plain.conns,
   servingTls: overTls.serving,
   connsTls: overTls.conns,
+  servingSsh: overSsh.serving,
+  connsSsh: overSsh.conns,
 });
