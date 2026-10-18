@@ -147,6 +147,55 @@ The plaintext of a kind-9 state is a CBOR map `{v: 1, engine: text, engine_state
 
 The whole state is at most `max_value_bytes`. An engine that must queue output (for example while an SSH channel's window is closed) bounds the queue by holding back its input acks.
 
+### 7.1 The TLS engine
+
+The TLS engine (`engine: "tls"`) terminates TLS in the handler. The handshake runs through rustls; once it is done, the engine's own record layer takes over, and its state is the connection's `engine_state`.
+
+**Versions and suites.**
+* TLS 1.3 with `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256`.
+* TLS 1.2 with `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` and `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` only: ECDHE, an AEAD, and the extended master secret (RFC 7627) required. A 1.2 client without it is refused.
+* Key exchange: `X25519MLKEM768` (1.3 only), `X25519` and `secp256r1`. The server's key is ECDSA (P-256, P-384) or Ed25519; RSA server keys are not supported (TD-TLS-RSA-SERVER-KEY).
+
+**Refused or never offered.**
+* No session tickets, no session-id resumption, no PSK and no early data: every connection does a full handshake.
+* No renegotiation (1.2): a `HelloRequest`-style handshake record from the client gets a `no_renegotiation` warning and is otherwise ignored.
+* No client certificates, and no post-handshake authentication. In 1.3, a post-handshake message other than `KeyUpdate` gets an `unexpected_message` alert.
+
+**Resumable after the handshake.** A connection becomes resumable (§6) on the step that finishes the handshake. Until then there is no `engine_state`: rustls's handshake state can't be serialized, so a handler that dies mid-handshake leaves a connection that is aborted (TD-SVC-TLS-HANDSHAKE-RESUME). Handshake steps aren't idempotent either; a runtime that retries such a step's commit re-sends the same output, and aborts the connection when the step's outcome is unknown.
+
+**Input and acks.**
+* Input is acked only at TLS record boundaries (§6). An incomplete record stays unacked until the rest arrives; at EOF it is a truncation.
+* Decrypted application data the application hasn't consumed is carried in the state. The engine stops decrypting (and acking) once it holds 16,384 bytes, so the state stays bounded: the unconsumed plaintext is at most 16,384 bytes plus one record's.
+* A `close_notify` from the peer is remembered; input after it is ignored.
+
+**Output.**
+* Application data is sent in records of at most 16,384 plaintext bytes.
+* **Key limits.** At the AES-GCM confidentiality limit, 2^24 records under one key, a 1.3 connection sends `KeyUpdate` (without requesting one) and continues under the new key; a 1.2 connection sends `close_notify` and refuses further writes. ChaCha20-Poly1305 has no limit here.
+* **The 1.2 AES-GCM explicit nonce** (RFC 5288 leaves its construction open): a 32-bit prefix, drawn at random for each batch of records the engine sends, followed by the low 32 bits of the record's sequence number. Since the connection closes before 2^24 records, the explicit nonce is unique within a connection; a state rolled back (§12) reuses a sequence number with a fresh prefix. 1.2 ChaCha20-Poly1305 follows RFC 7905.
+* **KeyUpdate.** The engine answers a peer's `KeyUpdate` that requests an update with its own, in the output of the same step (once per received request), and can send one on the application's request. A traffic secret is updated as RFC 8446 §7.2 says: `HKDF-Expand-Label(secret, "traffic upd", "", Hash.length)`.
+
+**Errors.** A record that is too long (more than 2^14 + 256 ciphertext bytes in 1.3, 2^14 + 2048 in 1.2, or more than 2^14 plaintext bytes) gets `record_overflow`; a record that doesn't decrypt gets `bad_record_mac`; an unknown or unexpected content type gets `unexpected_message`. A fatal alert, received or sent, closes the connection: the engine sends the alert (encrypted after the handshake) and then a close record.
+
+**The switch.** When the handshake is done, the engine takes the record keys and sequence numbers from rustls (`dangerous_into_kernel_connection`). For 1.3 it also captures the two application traffic secrets (`CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0`, which `KeyUpdate` needs), re-derives the keys and IVs from them and checks they equal rustls's; a mismatch aborts the connection. Application data that arrived with the client's last handshake flight is decrypted by rustls and carried over as unconsumed plaintext.
+
+**`engine_state`.** A CBOR map:
+```
+{ v: 1,
+  ver: uint,                  // 0x0304 (TLS 1.3) or 0x0303 (TLS 1.2)
+  suite: uint,                // the IANA cipher suite number
+  tx: dir, rx: dir,           // the server's sending and receiving directions
+  plain: bytes,               // decrypted application data not consumed yet (≤ 16,384 + 16,384)
+  sni?: text,                 // the client's server name, if it sent one
+  alpn?: bytes,               // the negotiated protocol, if any
+  flags: uint }               // 1 peer_closed, 2 sent_close, 4 closed (after a fatal alert)
+dir = { seq: uint,            // the next record's sequence number
+        secret?: bytes,       // 1.3: the current traffic secret (32 or 48 bytes)
+        key?: bytes, iv?: bytes }  // 1.2: the write key (16 or 32 bytes) and IV (12 bytes)
+```
+* For 1.2 AES-GCM, `iv`'s first 4 bytes are the salt and the rest is ignored; for ChaCha20-Poly1305 it is the 12-byte IV.
+* A state whose `v`, `ver` or `suite` the engine doesn't know, or whose fields have the wrong lengths, is refused; the runtime then releases the connection with `close`.
+* Keys are in the state, so a rotation doesn't protect a live TLS connection (§8).
+
 ## 8. Epochs and delegation
 
 * A handler seals the state and the escrows under the newest epoch it holds; `key_epoch` is in the sealed header (formats.md §4).
@@ -210,6 +259,6 @@ With `inbox`:
   * The engine then reuses record sequence numbers. If its new output differs (timestamps, randomness), the server sees two TLS or SSH records under one nonce.
   * **Mitigations:**
     * a handler aborts on a cursor regression it can see (§6)
-    * TLS 1.2 AES-GCM uses random 64-bit explicit nonces (RFC 5288), which a rollback can't repeat
+    * TLS 1.2 AES-GCM explicit nonces carry a 32-bit prefix drawn at random for each batch of records (§7.1), so a rolled-back sequence number repeats a nonce only with probability 2^-32 per batch
   * The fix is milestone 6's handler-signed checkpoint, carrying `(conn, out_head)`.
   * Honest failures never cause reuse: an uncommitted record is never revealed.
