@@ -2,7 +2,7 @@
 //! the connections held under a lease, found through the lease's input log
 //! `rli`, and wake-ups of the service's ready queue.
 
-use super::api::chunks;
+use super::api::{chunks, plain_len};
 use super::reap::last_id;
 use super::{Acks, ClaimRec, Id, RH_EOF, decode_head, decode_lease, flags};
 use crate::acl::R_CONSUME;
@@ -275,7 +275,7 @@ async fn conn_turn(
     let fl = flags(rh, ra.flags);
     let mut frames = Vec::with_capacity(chunks.len() + 1);
     for c in chunks {
-        h.next = h.next.max(c.off + c.data.len() as u64);
+        h.next = h.next.max(c.off + plain_len(&c));
         frames.push(Frame::SvcIn {
             id,
             conn: conn.to_vec(),

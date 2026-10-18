@@ -7,10 +7,10 @@
 use super::listen::reset;
 use super::reap::{reap, reap_unclaimed};
 use super::{
-    Acks, ClaimRec, Cmd, ConnRec, Id, RH_EOF, Service, Slot, decode_head, decode_u64, encode_head,
-    enqueue, log_input, ring, tail_int, unix_ms,
+    Acks, ClaimRec, Cmd, ConnRec, Id, Inbox, RA_UNSEAL, RH_EOF, Service, Slot, decode_head,
+    decode_u64, encode_head, enqueue, log_input, ring, tail_int, unix_ms,
 };
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, internal};
 use crate::keys::{self, end_of};
 use crate::state::Shared;
 use crate::txn::txn_loop;
@@ -21,15 +21,16 @@ use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
-use zen_core::svc::{ABORT, CLOSE, FIN, parse_record};
+use zen_core::rng::OsRng;
+use zen_core::svc::{ABORT, CLOSE, FIN, InboxKey, inbox_encaps, parse_record};
 use zen_proto::{ByteBuf, Frame, SvcPeer, to_cbor};
 
 /// The most input one batch carries.
@@ -273,6 +274,8 @@ pub fn spawn(st: &Shared, slot: Slot, sock: Sock, peer: SvcPeer) {
             st: st2,
             svc,
             conn,
+            inbox: OnceLock::new(),
+            sealing: AtomicBool::new(true),
         };
         c.run(sock, peer, rx).await;
     });
@@ -297,6 +300,10 @@ struct Conn {
     fs: u32,
     id: Vec<u8>,
     conn: Id,
+    /// The key sealing input chunks, on a service with an inbox (svc.md §9).
+    inbox: OnceLock<InboxKey>,
+    /// Input is sealed until a step sets `unseal`.
+    sealing: AtomicBool,
 }
 
 /// How a connection's task ends.
@@ -732,6 +739,18 @@ impl Conn {
     /// The accept transaction (svc.md §3, step 2).
     async fn accept(&self, peer: SvcPeer) -> ApiResult<()> {
         let cfg = &self.svc.cfg;
+        let inbox = match &cfg.inbox {
+            Some(pk) => {
+                let (ct, key) = inbox_encaps(pk, self.fs, &self.id, &self.conn, &mut OsRng)
+                    .map_err(|e| internal(format!("inbox encapsulation: {e}")))?;
+                let _ = self.inbox.set(key);
+                Some(Inbox {
+                    v: 1,
+                    ct: ByteBuf::from(ct),
+                })
+            }
+            None => None,
+        };
         let rc = zen_proto::to_cbor(&ConnRec {
             node: ByteBuf::from(self.st.svc.node.to_vec()),
             peer,
@@ -740,7 +759,7 @@ impl Conn {
             window: cfg.window,
             out_window: cfg.out_window,
             resume: cfg.resume,
-            inbox: None,
+            inbox,
         });
         let (fs, svc, conn) = (self.fs, &self.id[..], &self.conn);
         txn_loop!(self.st.store, None, |t| {
@@ -764,11 +783,30 @@ impl Conn {
 
     /// Append a batch at `in_head` (svc.md §3, step 3). After an unknown
     /// commit result, `rh` tells whether it applied, so a batch is never
-    /// appended twice.
+    /// appended twice. On a service with an inbox, the batch is sealed
+    /// until the connection's `ra` has `unseal` (svc.md §9).
     async fn append(&self, in_head: u64, data: &[u8], eof: bool) -> ApiResult<Outcome> {
         let (fs, svc, conn) = (self.fs, &self.id[..], &self.conn);
         let max_bytes = self.st.acl().limits.get(&fs).and_then(|l| l.max_bytes);
         let len = data.len() as u64;
+        let plain = || {
+            let mut v = Vec::with_capacity(data.len() + 1);
+            v.push(0);
+            v.extend_from_slice(data);
+            v
+        };
+        let sealed = match self.inbox.get() {
+            Some(key) if len > 0 && self.sealing.load(Ordering::Relaxed) => {
+                let c = key
+                    .seal_chunk(in_head, data)
+                    .map_err(|e| internal(format!("sealing input: {e}")))?;
+                let mut v = Vec::with_capacity(c.len() + 1);
+                v.push(1);
+                v.extend_from_slice(&c);
+                Some(v)
+            }
+            _ => None,
+        };
         loop {
             let r = txn_loop!(self.st.store, None, |t| {
                 if let (Some(max), true) = (max_bytes, len > 0) {
@@ -797,9 +835,17 @@ impl Conn {
                     return Ok(Outcome::Gone);
                 }
                 if len > 0 {
-                    let mut v = Vec::with_capacity(data.len() + 1);
-                    v.push(0);
-                    v.extend_from_slice(data);
+                    let mut v = sealed.as_ref();
+                    if v.is_some() {
+                        // By snapshot: steps own `ra`, and `unseal` is sticky.
+                        let k = keys::conn("ra", fs, svc, conn);
+                        let ra = Acks::decode(t.snapshot_get(&k).await?.as_deref());
+                        if ra.flags & RA_UNSEAL != 0 {
+                            self.sealing.store(false, Ordering::Relaxed);
+                            v = None;
+                        }
+                    }
+                    let v = v.cloned().unwrap_or_else(plain);
                     t.set(
                         &keys::conn_key("ri", fs, svc, conn)
                             .int(in_head as i64)

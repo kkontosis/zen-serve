@@ -103,6 +103,9 @@ ephemeral_burst_bytes = 1048576
 # handshake_secs = 30
 # idle_secs = 300               # 0 = never
 # resume = true                 # handlers can take over live connections
+## inbox = "<hex>": the X-Wing public key (1216 bytes) of a sealed inbox.
+## Input is then sealed at rest, and only handlers holding its seed read
+## it (spec/svc.md §9; docs/CLIENT.md §11 makes the key pair).
 #
 ## A tcp-auth service has no port of its own: members connect through
 ## zen-serve's listener (/v1/svc/connect, with a zen token and topic
