@@ -244,6 +244,10 @@ pub struct Progress {
     pub events: Vec<Event>,
     /// The client sent DISCONNECT, or its input ended.
     pub peer_closed: bool,
+    /// Reading stopped with complete input left: a question waits for
+    /// [`Conn::authorize`], or unread data or held replies reached their
+    /// bound. Input again once the application has answered or consumed.
+    pub held: bool,
     /// The engine ended the connection (its DISCONNECT is in `out`), or
     /// the client disconnected. The runtime closes the connection after
     /// sending `out`.
@@ -357,8 +361,9 @@ impl Conn {
             return p;
         }
         self.chans.retain(|c| !c.gone());
-        let (at, r) = self.read(buf, now);
+        let (at, held, r) = self.read(buf, now);
         p.consumed = at;
+        p.held = held && r.is_ok() && !eof;
         match r {
             Err(Stop::Fail(f)) => p.error = Some(self.fail(f)),
             Err(Stop::Peer(reason, message)) => {
@@ -382,22 +387,23 @@ impl Conn {
     }
 
     /// Reads lines and packets until the input runs out or something
-    /// holds reading back; the bytes consumed.
-    fn read(&mut self, buf: &[u8], now: u64) -> (usize, Result<(), Stop>) {
+    /// holds reading back: the bytes consumed, and whether reading was
+    /// held back with input left.
+    fn read(&mut self, buf: &[u8], now: u64) -> (usize, bool, Result<(), Stop>) {
         let mut at = 0;
         if self.vc.is_none() {
             match self.version(buf) {
                 Ok(n) => at = n,
-                Err(f) => return (at, Err(f)),
+                Err(f) => return (at, false, Err(f)),
             }
             if self.vc.is_none() {
-                return (at, Ok(()));
+                return (at, false, Ok(()));
             }
         }
         let mut held_back = false;
         loop {
             if self.auth.ask.is_some() {
-                break;
+                return (at, at < buf.len(), Ok(()));
             }
             if self.held.len() >= HELD_MSGS || self.held_bytes() >= HELD_BYTES {
                 held_back = true;
@@ -407,7 +413,7 @@ impl Conn {
             let total = match self.rx.next_len(rest) {
                 Ok(Some(n)) if n <= rest.len() => n,
                 Ok(_) => break,
-                Err(e) => return (at, Err(packet_error(e))),
+                Err(e) => return (at, false, Err(packet_error(e))),
             };
             let unread = self.unread();
             if unread > 0 && unread + total > UNREAD_MAX {
@@ -418,17 +424,17 @@ impl Conn {
             let payload = match self.rx.open(rest) {
                 Ok(Some((p, _))) => zeroize::Zeroizing::new(p),
                 Ok(None) => break,
-                Err(e) => return (at, Err(packet_error(e))),
+                Err(e) => return (at, false, Err(packet_error(e))),
             };
             at += total;
             if let Err(e) = self.packet(seq, &payload, now) {
-                return (at, Err(e));
+                return (at, false, Err(e));
             }
         }
         if held_back && let Err(e) = self.scan_ahead(&buf[at..]) {
-            return (at, Err(e));
+            return (at, false, Err(e));
         }
-        (at, Ok(()))
+        (at, held_back && at < buf.len(), Ok(()))
     }
 
     /// The client's version line, after up to [`MAX_LINES`] other lines.

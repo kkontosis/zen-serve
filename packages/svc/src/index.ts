@@ -10,4 +10,5 @@ export {
   serve,
 } from './serve.js';
 export { decodeState, type EngineState, encodeState } from './state.js';
-export { loadSvcWasm, type TlsLayerOptions, tls, type WasmSource } from './tls.js';
+export { type TlsLayerOptions, tls } from './tls.js';
+export { loadSvcWasm, type WasmSource } from './wasm.js';
