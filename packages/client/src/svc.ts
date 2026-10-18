@@ -1,7 +1,10 @@
-// Relayed services, the handler side (spec/api.md §14, svc.md): the
-// requests a handler makes and the keys it seals with. The runtime that
-// drives them is @zen/svc.
-import type { SvcClaim, SvcInfo, SvcKeys, SvcReadResult, SvcReveal } from '@zen/wasm';
+// Relayed services (spec/api.md §14, svc.md). The handler side: the
+// requests a handler makes and the keys it seals with; the runtime that
+// drives them is @zen/svc. The connector side: a member's connection to a
+// `tcp-auth` service (§14.9).
+import type { Frame, SvcClaim, SvcInfo, SvcKeys, SvcReadResult, SvcReveal } from '@zen/wasm';
+import { fromB64url, utf8 } from './bytes.js';
+import { ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
 import type { Topic } from './log.js';
 import type { Session } from './session.js';
@@ -152,5 +155,139 @@ export class Service {
       { ...this.base, reveals },
     );
     return [...r.results];
+  }
+}
+
+// ---------------------------------------------------------------- connectors
+
+/** The largest frame on `/v1/svc/connect`, both ways (§14.9). */
+export const SVC_FRAME = 65_536;
+
+/** What a connector does with a `tcp-auth` connection. */
+export interface SvcConnectOptions {
+  /** The fs of the service. */
+  fs: number;
+  /** The service id: its `[[service]] id`. */
+  svc: Uint8Array;
+  /** Bytes from the service, in order. */
+  onData?: (data: Uint8Array) => void;
+  /** The service's half-close: no more data comes. */
+  onFin?: () => void;
+  /**
+   * The connection ended: `reset` false after the service ended it
+   * normally (close 1000), true for a reset, a lost WebSocket or `reset()`.
+   */
+  onClose?: (reset: boolean) => void;
+  /** A `WebSocket` constructor; else the transport's, else the global one. */
+  WebSocket?: typeof WebSocket;
+}
+
+const STATUS: Record<string, number> = {
+  unauthorized: 401,
+  forbidden: 403,
+  not_found: 404,
+  quota: 429,
+  bad_request: 400,
+};
+
+/**
+ * A connection to a `tcp-auth` service (§14.9): a byte stream to whichever
+ * handler holds it. Rights are checked once, when it opens.
+ *
+ * Writes queue in the WebSocket: pause the source while `bufferedAmount`
+ * is high. Reads can't be paused (the standard WebSocket has no way to),
+ * so a slow consumer buffers what arrives (TD-SVC-CONNECT-BACKPRESSURE).
+ */
+export class SvcSocket {
+  private ended = false;
+
+  private constructor(
+    private readonly ws: WebSocket,
+    /** The connection id. */
+    readonly conn: Uint8Array,
+  ) {}
+
+  /** Connect and authenticate (with a first frame, which browsers can send). */
+  static open(session: Session, opts: SvcConnectOptions): Promise<SvcSocket> {
+    const t = session.client.transport;
+    const Ctor = opts.WebSocket ?? t.opts.WebSocket ?? globalThis.WebSocket;
+    const hex = [...opts.svc].map((b) => b.toString(16).padStart(2, '0')).join('');
+    const ws = new Ctor(t.wsUrl(`/v1/svc/connect?fs=${opts.fs}&svc=${hex}`));
+    ws.binaryType = 'arraybuffer';
+    const token = session.token.startsWith('zen_at_')
+      ? utf8(session.token)
+      : fromB64url(session.token);
+    return new Promise<SvcSocket>((resolve, reject) => {
+      let sock: SvcSocket | undefined;
+      ws.onopen = () => ws.send(zw.encodeFrame({ op: 'auth', token }));
+      ws.onmessage = (m: MessageEvent) => {
+        if (sock) {
+          if (typeof m.data === 'string') {
+            if (m.data === 'fin') opts.onFin?.();
+          } else {
+            opts.onData?.(new Uint8Array(m.data as ArrayBuffer));
+          }
+          return;
+        }
+        let f: Frame;
+        try {
+          f = zw.decodeFrame(new Uint8Array(m.data as ArrayBuffer));
+        } catch (e) {
+          reject(new ZenError(0, 'format', `bad frame: ${String(e)}`));
+          ws.close(4000);
+          return;
+        }
+        if (f.op === 'ok' && f.conn) {
+          sock = new SvcSocket(ws, f.conn);
+          resolve(sock);
+        } else if (f.op === 'err') {
+          reject(new ZenError(STATUS[f.code] ?? 0, f.code, f.message));
+        } else {
+          reject(new ZenError(0, 'format', `unexpected frame ${f.op}`));
+          ws.close(4000);
+        }
+      };
+      ws.onclose = (e: CloseEvent) => {
+        if (!sock) {
+          reject(new ZenError(0, 'network', `the connection closed (${e.code})`));
+          return;
+        }
+        if (sock.ended) return;
+        sock.ended = true;
+        opts.onClose?.(e.code !== 1000);
+      };
+      ws.onerror = () => {
+        // onclose follows.
+      };
+    });
+  }
+
+  /** Bytes written and not yet sent. */
+  get bufferedAmount(): number {
+    return this.ws.bufferedAmount;
+  }
+
+  /** Whether the connection is still open. */
+  get open(): boolean {
+    return !this.ended && this.ws.readyState === 1;
+  }
+
+  /** Send bytes, in frames of at most 64 KiB. */
+  write(data: Uint8Array): void {
+    for (let at = 0; at < data.length; at += SVC_FRAME) {
+      this.ws.send(data.subarray(at, Math.min(at + SVC_FRAME, data.length)));
+    }
+  }
+
+  /** Half-close: nothing more is sent; data still arrives. */
+  fin(): void {
+    this.ws.send('fin');
+  }
+
+  /** Reset the connection (any close from the connector is one). */
+  reset(): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.ws.close(4000);
   }
 }

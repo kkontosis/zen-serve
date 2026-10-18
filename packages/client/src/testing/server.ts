@@ -65,7 +65,9 @@ export interface ServiceSpec {
   fs: number;
   /** The service id: the topic id of its path. */
   id: Uint8Array;
-  port: number;
+  /** `tcp` (the default) listens on `port`; `tcp-auth` has no port. */
+  mode?: 'tcp' | 'tcp-auth';
+  port?: number;
   resume?: boolean;
   /** Other `[[service]]` settings (`window`, `accept_wait_ms`, …). */
   more?: Record<string, number | boolean | string>;
@@ -80,8 +82,8 @@ export function serviceToml(services: ServiceSpec[]): string {
         name: s.name,
         fs: s.fs,
         id,
-        mode: 'tcp',
-        listen: `127.0.0.1:${s.port}`,
+        mode: s.mode ?? 'tcp',
+        ...(s.mode === 'tcp-auth' ? {} : { listen: `127.0.0.1:${s.port}` }),
         ...(s.resume === false ? { resume: false } : {}),
         ...s.more,
       };

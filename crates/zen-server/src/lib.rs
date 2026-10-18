@@ -295,6 +295,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/svc/read", post(svc::api::read))
         .route("/v1/svc/release", post(svc::api::release))
         .route("/v1/svc/reveal", post(svc::reveal::reveal))
+        .route("/v1/svc/connect", get(svc::connect::connect))
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/admin/origins/get", post(origin::admin_get))
         .route("/v1/admin/origins/set", post(origin::admin_set))

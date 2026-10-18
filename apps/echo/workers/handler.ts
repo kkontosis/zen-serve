@@ -4,8 +4,9 @@
 // waits after a kill), ECHO_SERVICE the service (`svc/<name>`, default
 // echo), ECHO_LAYER the layer: `raw` (default), `tls` (echo behind TLS,
 // with the `echo` certificate of `certs`), `mirror` (the mirror behind
-// TLS, default service mirror-tls) or `ssh` (echo over SSH, with the host
-// key of `certs`, default service echo-ssh). Built to
+// TLS, default service mirror-tls), `ssh` (echo over SSH, with the host
+// key of `certs`, default service echo-ssh), `auth` (`raw` on the tcp-auth
+// service echo-auth) or `ssh-auth` (`ssh` on echo-ssh-auth). Built to
 // apps/dist/echo/workers/handler.mjs.
 import { type Layer, type ServeHandle, type ServeOptions, serve } from '@zen/svc';
 import { workerFromEnv } from '../../shared/node.js';
@@ -14,9 +15,16 @@ import { DB_OPTIONS, echo, mirror, NS, sshEcho, sshLayer, tlsLayer } from '../sr
 const w = await workerFromEnv();
 const db = await w.open(NS, { ...DB_OPTIONS, warn: (m) => console.log(`warn: ${m}`) });
 const ttl = Number(process.env.ECHO_LEASE_TTL_MS ?? 5000);
-const kind = process.env.ECHO_LAYER ?? 'raw';
-const defaults: Record<string, string> = { mirror: 'mirror-tls', ssh: 'echo-ssh' };
-const name = process.env.ECHO_SERVICE ?? defaults[kind] ?? 'echo';
+const layerName = process.env.ECHO_LAYER ?? 'raw';
+const defaults: Record<string, string> = {
+  mirror: 'mirror-tls',
+  ssh: 'echo-ssh',
+  auth: 'echo-auth',
+  'ssh-auth': 'echo-ssh-auth',
+};
+const name = process.env.ECHO_SERVICE ?? defaults[layerName] ?? 'echo';
+// The tcp-auth services run the same layers.
+const kind = { auth: 'raw', 'ssh-auth': 'ssh' }[layerName] ?? layerName;
 const common = {
   service: ['svc', name],
   leaseTtlMs: ttl,

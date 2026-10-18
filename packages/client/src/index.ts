@@ -89,6 +89,9 @@ export {
   REVEAL_NOT_COMMITTED,
   REVEALED,
   Service,
+  SVC_FRAME,
+  type SvcConnectOptions,
+  SvcSocket,
 } from './svc.js';
 export { Transport, type TransportOptions } from './transport.js';
 export {

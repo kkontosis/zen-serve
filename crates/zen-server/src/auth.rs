@@ -281,24 +281,33 @@ pub async fn resolve(st: &Shared, token: &[u8]) -> ApiResult<Caller> {
     })
 }
 
+/// The `Authorization: Bearer` value of `headers`, if any.
+pub fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+}
+
+/// Resolve a Bearer header's value: an API token, or a session token in
+/// base64url.
+pub async fn resolve_bearer(st: &Shared, h: &str) -> ApiResult<Caller> {
+    if crate::token::is_api_token(h.as_bytes()) {
+        return resolve(st, h.as_bytes()).await;
+    }
+    let token = URL_SAFE_NO_PAD
+        .decode(h)
+        .map_err(|_| unauthorized("bad bearer token"))?;
+    resolve(st, &token).await
+}
+
 impl FromRequestParts<Shared> for Caller {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, st: &Shared) -> Result<Self, ApiError> {
-        let h = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| unauthorized("missing bearer token"))?
-            .trim();
-        if crate::token::is_api_token(h.as_bytes()) {
-            return resolve(st, h.as_bytes()).await;
-        }
-        let token = URL_SAFE_NO_PAD
-            .decode(h)
-            .map_err(|_| unauthorized("bad bearer token"))?;
-        resolve(st, &token).await
+        let h = bearer(&parts.headers).ok_or_else(|| unauthorized("missing bearer token"))?;
+        resolve_bearer(st, h).await
     }
 }
 

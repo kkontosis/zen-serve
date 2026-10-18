@@ -48,7 +48,13 @@ async fn subscribe_history_then_live_and_resume_without_gaps() {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(1) });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: Some(1),
+            conn: None
+        }
+    );
     let mut last = Vec::new();
     for i in 0..3 {
         let (_, o, n) = ev(recv(&mut ws).await);
@@ -78,7 +84,13 @@ async fn subscribe_history_then_live_and_resume_without_gaps() {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(2) });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: Some(2),
+            conn: None
+        }
+    );
     let writer = {
         let base = h.base.clone();
         let http = h.http.clone();
@@ -137,7 +149,13 @@ async fn prefix_subscription_and_live_only() {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(1) });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: Some(1),
+            conn: None
+        }
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     publish(&h, &tok, 1, &other).await;
     publish(&h, &tok, 2, &chat_b).await;
@@ -203,7 +221,13 @@ async fn stream_requires_auth_and_rights() {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(2) });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: Some(2),
+            conn: None
+        }
+    );
     // Bob may read topic 7 but not publish to it.
     send(
         &mut ws,
@@ -237,7 +261,13 @@ async fn ephemeral_fan_out() {
         },
     )
     .await;
-    assert_eq!(recv(&mut b).await, Frame::Ok { id: Some(9) });
+    assert_eq!(
+        recv(&mut b).await,
+        Frame::Ok {
+            id: Some(9),
+            conn: None
+        }
+    );
     send(
         &mut a,
         &Frame::Epub {
@@ -449,7 +479,13 @@ async fn ephemeral_publishes_are_rate_limited() {
         },
     )
     .await;
-    assert_eq!(recv(&mut b).await, Frame::Ok { id: Some(1) });
+    assert_eq!(
+        recv(&mut b).await,
+        Frame::Ok {
+            id: Some(1),
+            conn: None
+        }
+    );
     let epub = |n: u8| Frame::Epub {
         fs: 1,
         topic: topic(3),

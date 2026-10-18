@@ -71,12 +71,15 @@ export interface WorldOptions {
   users?: string[];
   /** The grants of every member (default: fs read/write only). */
   grants?: GrantSpec[];
+  /** Members whose grants differ from `grants`, by name. */
+  grantsOf?: Record<string, GrantSpec[]>;
   /** Server options (limits, …); `unencrypted_dir` is set here. */
   server?: ServerOptions;
   /**
-   * Relayed services of fs 1 (spec/svc.md), each a `tcp` service on a free
-   * port. A service id is the topic id of its path, which only an unlocked
-   * fs can compute: the server is restarted with them once the fs exists.
+   * Relayed services of fs 1 (spec/svc.md): `tcp` services on a free port,
+   * or `tcp-auth`. A service id is the topic id of its path, which only an
+   * unlocked fs can compute: the server is restarted with them once the fs
+   * exists.
    */
   services?: WorldService[];
 }
@@ -86,6 +89,8 @@ export interface WorldService {
   name: string;
   /** Its topic path (conventionally `['svc', name]`). */
   path: string[];
+  /** `tcp` (default) or `tcp-auth` (reached through `/v1/svc/connect`). */
+  mode?: 'tcp' | 'tcp-auth';
   /** Output by key reveal, so handlers can take over (default true). */
   resume?: boolean;
   /** Other `[[service]]` settings. */
@@ -106,8 +111,10 @@ export interface World {
   admin: Session;
   /** A user by name. */
   user(name: string): WorldUser;
-  /** The port of a relayed service (`WorldOptions.services`). */
+  /** The port of a `tcp` relayed service (`WorldOptions.services`). */
   servicePort(name: string): number;
+  /** The id of a relayed service, hex (its `[[service]] id`). */
+  serviceId(name: string): string;
   /** The URL of an app's page (`query` without `?`). */
   appUrl(app: string, query?: string): string;
   /** Stop the server and delete its data and the device files. */
@@ -126,6 +133,7 @@ export async function startWorld(o: WorldOptions = {}): Promise<World> {
   };
   let server = await spawnServer(serverOpts);
   const ports = new Map<string, number>();
+  const ids = new Map<string, string>();
   const origin = `http://localhost:${server.port}`;
   const files = await mkdtemp(join(tmpdir(), 'zen-apps-'));
   try {
@@ -146,7 +154,7 @@ export async function startWorld(o: WorldOptions = {}): Promise<World> {
     // Topic grants name topic ids, which only an unlocked fs can compute.
     const grants: Grant[] = [];
     for (const p of people) {
-      for (const g of o.grants ?? [FS_RW]) {
+      for (const g of o.grantsOf?.[p.name] ?? o.grants ?? [FS_RW]) {
         grants.push({
           fs: 1,
           ...(g.topic
@@ -163,13 +171,16 @@ export async function startWorld(o: WorldOptions = {}): Promise<World> {
     if (o.services?.length) {
       const specs = [];
       for (const sv of o.services) {
-        const port = await freePort();
-        ports.set(sv.name, port);
+        const id = ufs.topic(...sv.path).id;
+        ids.set(sv.name, hex(id));
+        const port = sv.mode === 'tcp-auth' ? undefined : await freePort();
+        if (port !== undefined) ports.set(sv.name, port);
         specs.push({
           name: sv.name,
           fs: 1,
-          id: ufs.topic(...sv.path).id,
-          port,
+          id,
+          ...(port !== undefined ? { port } : {}),
+          ...(sv.mode ? { mode: sv.mode } : {}),
           ...(sv.resume !== undefined ? { resume: sv.resume } : {}),
           ...(sv.more ? { more: sv.more } : {}),
         });
@@ -210,8 +221,13 @@ export async function startWorld(o: WorldOptions = {}): Promise<World> {
       },
       servicePort(name) {
         const p = ports.get(name);
-        if (p === undefined) throw new Error(`no service ${name}`);
+        if (p === undefined) throw new Error(`no tcp service ${name}`);
         return p;
+      },
+      serviceId(name) {
+        const id = ids.get(name);
+        if (id === undefined) throw new Error(`no service ${name}`);
+        return id;
       },
       appUrl: (app, query) => `${origin}/unencrypted/${app}/index.html${query ? `?${query}` : ''}`,
       async stop() {

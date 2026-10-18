@@ -113,7 +113,12 @@ async fn run(st: Shared, sock: WebSocket) {
             (Frame::Auth { token: t }, _) => match resolve(&st, t).await {
                 Ok(_) => {
                     token = Some(t.clone());
-                    let _ = out.send(Frame::Ok { id: None }).await;
+                    let _ = out
+                        .send(Frame::Ok {
+                            id: None,
+                            conn: None,
+                        })
+                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -162,7 +167,12 @@ async fn run(st: Shared, sock: WebSocket) {
                 })();
                 match started {
                     Ok((target, after)) => {
-                        let _ = out.send(Frame::Ok { id: Some(id) }).await;
+                        let _ = out
+                            .send(Frame::Ok {
+                                id: Some(id),
+                                conn: None,
+                            })
+                            .await;
                         let h = tokio::spawn(subscription(
                             st.clone(),
                             tok,
@@ -202,7 +212,12 @@ async fn run(st: Shared, sock: WebSocket) {
                 };
                 match started {
                     Ok((target, rx)) => {
-                        let _ = out.send(Frame::Ok { id: Some(id) }).await;
+                        let _ = out
+                            .send(Frame::Ok {
+                                id: Some(id),
+                                conn: None,
+                            })
+                            .await;
                         let h = tokio::spawn(ephemeral(
                             st.clone(),
                             tok,
@@ -234,7 +249,12 @@ async fn run(st: Shared, sock: WebSocket) {
                 .await;
                 match started {
                     Ok(lease) => {
-                        let _ = out.send(Frame::Ok { id: Some(id) }).await;
+                        let _ = out
+                            .send(Frame::Ok {
+                                id: Some(id),
+                                conn: None,
+                            })
+                            .await;
                         let h = tokio::spawn(crate::svc::push::run(
                             st.clone(),
                             tok,
@@ -276,7 +296,12 @@ async fn run(st: Shared, sock: WebSocket) {
                 if let Some(h) = tasks.remove(&id) {
                     h.abort();
                 }
-                let _ = out.send(Frame::Ok { id: Some(id) }).await;
+                let _ = out
+                    .send(Frame::Ok {
+                        id: Some(id),
+                        conn: None,
+                    })
+                    .await;
             }
             Frame::Epub { fs, topic, data } => {
                 let r = (|| {

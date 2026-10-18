@@ -4,6 +4,9 @@
   "description": "zen-svc: handlers of relayed TCP services on zen-db (spec/svc.md)",
   "license": "MIT",
   "type": "module",
+  "bin": {
+    "zen-connect": "./dist/zen-connect.mjs"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -14,7 +17,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p ."
+    "build": "tsc -p . && node ../../scripts/build-zen-connect.mjs"
   },
   "dependencies": {
     "@zen/client": "0.1.0",

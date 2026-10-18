@@ -10,9 +10,11 @@
 //! * [`step`]: the `svc` commit step
 //! * [`reveal`]: releasing output records by their keys
 //! * [`push`]: pushed input over `/v1/stream` (`svc_sub`)
+//! * [`connect`]: `tcp-auth` connections over `/v1/svc/connect`
 
 pub mod api;
 pub mod conn;
+pub mod connect;
 pub mod listen;
 pub mod node;
 pub mod push;
@@ -99,7 +101,7 @@ impl Service {
     }
 
     /// Take one accept from `ip`'s bucket (svc.md §3, admission).
-    fn take(&self, ip: IpAddr, now: Instant) -> bool {
+    pub(crate) fn take(&self, ip: IpAddr, now: Instant) -> bool {
         let (rate, burst) = (
             f64::from(self.cfg.per_ip_rate),
             f64::from(self.cfg.per_ip_burst),
@@ -125,18 +127,31 @@ impl Service {
         }
     }
 
-    /// Count an open connection, unless at `max_conns`.
-    fn open(&self) -> bool {
+    /// Count an open connection, unless at `max_conns`. The slot is
+    /// given back when the [`Slot`] drops.
+    pub(crate) fn open(self: &Arc<Self>) -> Option<Slot> {
         if self.open.fetch_add(1, Ordering::AcqRel) < self.cfg.max_conns as usize {
-            true
+            Some(Slot(self.clone()))
         } else {
             self.open.fetch_sub(1, Ordering::AcqRel);
-            false
+            None
         }
     }
+}
 
-    fn close(&self) {
-        self.open.fetch_sub(1, Ordering::AcqRel);
+/// An open connection's `max_conns` slot of its service.
+pub struct Slot(Arc<Service>);
+
+impl Slot {
+    /// The service.
+    pub fn service(&self) -> &Arc<Service> {
+        &self.0
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

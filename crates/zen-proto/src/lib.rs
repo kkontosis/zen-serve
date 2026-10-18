@@ -3431,6 +3431,10 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", tsify(optional))]
         id: Option<u32>,
+        /// The connection id (`/v1/svc/connect` only, api.md §14.9).
+        #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+        conn: Option<Vec<u8>>,
     },
     /// Server: a stored event.
     Ev {
@@ -3597,7 +3601,10 @@ mod tests {
                 key_token: None,
                 envelope: vec![0, 0, 9],
             },
-            Frame::Ok { id: None },
+            Frame::Ok {
+                id: None,
+                conn: None,
+            },
             Frame::SvcSub {
                 id: 3,
                 fs: 1,

@@ -7,6 +7,7 @@ import { TreeClock } from './clock.js';
 import { Fs } from './fs.js';
 import { type Authenticator, passkeyCreate } from './passkey.js';
 import { Stream, type StreamOptions } from './stream.js';
+import { type SvcConnectOptions, SvcSocket } from './svc.js';
 import type { Dec, Enc } from './transport.js';
 import { zw } from './wasm.js';
 
@@ -103,6 +104,14 @@ export class Session {
   /** Open the WebSocket stream (§9). */
   stream(opts?: StreamOptions): Promise<Stream> {
     return Stream.open(this, opts);
+  }
+
+  /**
+   * Connect to a `tcp-auth` service (§14.9): needs topic `append` on its
+   * id. Rejects with a `ZenError` (`forbidden`, `not_found`, `quota`, …).
+   */
+  svcConnect(opts: SvcConnectOptions): Promise<SvcSocket> {
+    return SvcSocket.open(this, opts);
   }
 
   // ---------------------------------------------------------------- credentials
