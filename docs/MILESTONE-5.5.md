@@ -259,7 +259,44 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * This step changes nothing in `@zen/db` or `@zen/client` but the test helpers. Not investigated further: watch CI for it.
     * `npx playwright test apps/echo` (3 specs, the SSH case included)
     * `cargo test -p zen-svc`: 11 unit, `openssh.rs` 10, `openssl.rs` 6, `ssh.rs` 18, `tls.rs` 23
-  * Next: push, and confirm CI green on PR #47 (the `openssh-pq` job now runs on demand only).
+  * CI on PR #47's head 6c2b32a: `rust`, `pure-rust` and `fdb` are green in both runs. `openssh-pq` was skipped, as it now should be. The push run's `client` is green; the pull-request run's `client` failed.
+  * Vitest passed in that run, the SSH tests included. Playwright passed 14 of 16 specs, the echo SSH case included. The 2 failures are both in `apps/chat/e2e/chat.spec.ts`:
+    * "typing reaches the others…": Carol's `#typing` read "alice, bob typing…" for a while, then "" once Bob's indicator expired, instead of "bob typing…".
+    * "a reaction shows on every page" timed out: it runs on the same pages after that failure. A consequence, not its own failure.
+  * CI fix done (below): commit `apps: chat: a typing indicator older than its display time is ignored`.
+    * The unit test passes with the existing typing test: `apps/chat` vitest, 9 tests.
+    * `npx playwright test apps/chat` passed 5 times; `npm run check` passes.
+    * The test's age bound is a minute below zero, so it doesn't depend on how the two clocks compare.
+  * Next: confirm CI green on the fix's push.
+
+### CI fix: a stale typing indicator in the chat app
+
+**Root cause.**
+1. In the spec's first test Carol's context goes offline while Alice and Bob talk. `send()` fills the composer, so each message also publishes a typing indicator.
+2. The server never replays ephemeral messages (`eph.rs` tails from the newest entry). Chromium's offline emulation holds the frames of the open WebSocket instead of dropping them. So Alice's indicator from the offline period reaches Carol when she comes back.
+3. The second test starts within the 3 s an indicator is shown, so Carol shows Alice as typing next to Bob.
+4. The chat UI (`apps/chat/ui/main.ts` `showTyping`) shows any indicator for 3 s from its arrival, however old it is. That is a real bug: a device back online shows stale "typing" lines.
+
+The push run passed because the overlap depends on timing. Nothing here is from this step's changes.
+
+**Fix** (commit `apps: chat: a typing indicator older than its display time is ignored`):
+* `onTyping(db, room, fn, maxAgeMs = 3000)` in `apps/chat/src/chat.ts` drops a message whose sender's time is too old:
+  * the sender's time is `m.hlc >> 16n`, Unix ms (formats.md §11.1)
+  * "too old" is more than `maxAgeMs` behind the corrected clock, `db.fs.session.clock.now()` (`packages/client/src/clock.ts`)
+  * `EphemeralMsg` already carries `hlc` (`packages/db/src/broker.ts`)
+* The UI's 3 s display time becomes a shared constant, `TYPING_SHOW_MS`, used both there and as the default `maxAgeMs`.
+* Unit test in `apps/chat/test/chat.test.ts`:
+  * an indicator published, then received through `onTyping` with `maxAgeMs: 0` after a 50 ms wait, is dropped
+  * a fresh one is passed on
+  * the existing typing test is unchanged
+
+**Verify:**
+* the chat unit tests
+* `npx playwright test apps/chat` 5×
+* `npm run check`
+* push, then CI green on both `client` runs
+
+After that: log the CI result in both plan copies, push, stop for compaction.
 
 ## Step 5.5.10 in detail: `ssh()` in `@zen/svc`
 
