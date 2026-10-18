@@ -809,8 +809,12 @@ A code-3 reveal from the claim holder whose `key_hash` matches but whose AEAD fa
 
 ### 14.10 Pushed input (`svc_sub`)
 
+* **Subscribing.** `svc_sub` needs topic `consume` (else `err` `forbidden`) and a live lease `lease` held by the caller's device (else `err` `not_leader`). It counts toward the socket's 256 subscriptions, and `unsub` ends it. Rights and the lease are checked again on every wake-up, as for `sub`: when the lease ends or changes hands, the subscription ends with `err` `not_leader`.
 * A subscription pushes `svc_in` frames for the connections the caller holds under `lease`, in offset order per connection.
-* **Where pushing starts.** On subscribing, and for each connection the caller claims later (it calls `/v1/svc/next`), pushing starts at the connection's `in_acked`. After a reconnect, the client subscribes again, so pushing resumes at `in_acked` with no gap.
-* **Flow.** The server pushes at most `window` bytes beyond `in_acked` per connection; acked input frees room.
-* **`svc_ready`** is sent when the service's ready queue changes.
+  * Each `svc_in` carries one input chunk, as `/v1/svc/read` returns it (§14.6); the first one pushed for a connection may start before `in_acked`. `flags` is as in `Claim`.
+  * The peer's EOF is pushed once, as an `svc_in` with empty `data` at `in_head` and the EOF flag.
+* **Where pushing starts.** On subscribing, for each connection the caller claims later (it calls `/v1/svc/next`), and when a connection's claim token changes under the same lease, pushing starts at the connection's `in_acked`. So a client may receive bytes it already has, and drops them by `off`. Within one subscription and one claim, no byte is pushed twice. After a reconnect, the client subscribes again, so pushing resumes at `in_acked` with no gap.
+* **Flow.** The server pushes at most `window` bytes beyond `in_acked` per connection (the node stores no more than that); acked input frees room.
+* **`svc_ready`** is sent once right after the `ok` if the service's ready queue isn't empty, then whenever the queue changes.
 * A lost claim simply stops the pushes for that connection; the next step on it gets `claim_lost`.
+* **`svc_reveal`** is `/v1/svc/reveal` over the stream, with the same checks. It is answered by `svc_revealed` with its `id`, or by `err` with its `id` (for example `too_large` over 1,000 entries). It is not a subscription.
