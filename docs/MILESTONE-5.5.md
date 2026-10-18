@@ -31,7 +31,7 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
 
 **Branch:** `claude/brave-knuth-gk03mm`. Push with retries (2, 4, 8, 16 s). Restart from main: `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`, then push `--force-with-lease`.
 
-**Constraints:** no model names in the repo; commit trailers as before; `CARGO_INCREMENTAL=0`; never `pkill -f`; agents never push; about 4.4 GB of disk free.
+**Constraints:** no model names in the repo; commit trailers as before; `CARGO_INCREMENTAL=0`; never `pkill -f`; agents never push; about 10 GB of disk free (prune stale `target/debug/deps` executables when low). The local FDB cluster for tests: `./target/debug/zen-serve serve -c /tmp/zen-ci/node.toml` (built with `--features fdb`), cluster file `/tmp/zen-ci/data/fdb.cluster`.
 
 **Log:**
 * **Step 0** (plan): done. Restarted from main after PR #35 (milestone 5 step 11) merged; wrote `docs/MILESTONE-5.5.md` (this plan), added 5.5 to DESIGN-3 §6 and the README status; commit `docs: milestone 5.5 plan (relayed services)`. Next: plan step 5.5.1 (spec) in detail, on "go".
@@ -66,7 +66,23 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * OPS.md §2.2: stale test executables in `target/debug/deps`.
   * Verified: fmt; clippy default, `--all-features` and `--no-default-features`; `tests/svc.rs` (9 tests) 3× on embedded and on FDB; the full zen-store and zen-server suites on FDB and embedded.
   * CI fix: CI's newer stable toolchain deprecates `AtomicUsize::fetch_update` (renamed `try_update`), and `-D warnings` failed the Rust jobs on it. `Service::open` now uses `fetch_add`, then `fetch_sub` when over `max_conns`. Commit `server: max_conns count without fetch_update`.
-* **Step 5.5.3** (the step, reveal, the writer): planned below ("Step 5.5.3 in detail"). Restart from main after PR #38 merged; commit `docs: milestone 5.5 step 3 plan`, open a PR, **stop for the user to compact**; then on "go" the code.
+* **Step 5.5.3** (the step, reveal, the writer): done, PR #39. Commits: `docs: milestone 5.5 step 3 plan`; `spec: svc step and writer details`; `spec: an empty end record sits at out_head`; `server: svc commit step, reveal, writer, timers`; the docs and this log.
+  * As planned, plus details settled while building:
+    * An empty record (FIN, close or abort alone) sits at the new `out_head` itself. So `pending`, reveals and the writer look at records from `written_to` to the end of `ro`, not only below `out_head`. The writer acts on such a record without clearing it; the reap does.
+    * A sealed empty record still needs its reveal before the writer acts on it, like any other sealed record.
+    * zen-core gains `open_key_escrow`: a claim lists bare escrows, and `open_escrow` needed a whole record.
+    * A committed step also wakes a local connection at once (the same fast path as a reveal); other nodes are woken through their doorbell.
+    * The writer keeps its own `written_to` after the first pass. Advancing `rw` after a write retries until it applies, and after `commit_unknown` it re-reads `rw`, so the quota is never given back twice.
+    * A close record shuts down the write side before draining input for 1 s, so the peer sees EOF at once.
+    * A step's 400 checks that depend on the service (`resumable`, sealed or plain records) run both in `validate`, against the config, and in the step, against `rc`.
+  * Verified:
+    * fmt; clippy default, `--no-default-features` and `--all-features`
+    * `tests/svc.rs` (18 tests) 3× on embedded and once on FDB
+    * `tests/multinode.rs` on FDB, including the new two-node echo
+    * the full zen-core, zen-proto and zen-server suites on embedded
+    * zen-server on FDB: all passed but `dump.rs` `a_started_server_counts_as_empty`, which once got `too_old` in `dump::is_empty` (two one-item range reads, so a stalled transaction on the loaded local cluster); `tests/dump.rs` then passed 3× on FDB
+    * the dev wasm build declares `SvcStep` for `Commit.svc`
+* **Step 5.5.4** (stream push): next. Restart from main after PR #39 merges, plan it in detail, commit the plan, open a PR, and stop for the user to compact.
 
 ## Step 5.5.3 in detail: the step, reveal, the writer
 
