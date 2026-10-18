@@ -413,8 +413,74 @@ pub async fn connect(h: &Harness, token: &[u8]) -> Ws {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: None });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: None,
+            conn: None
+        }
+    );
     ws
+}
+
+/// How a connector authenticates on `/v1/svc/connect`.
+#[derive(Clone, Copy)]
+pub enum ConnectAuth<'a> {
+    /// A Bearer header (a session token, base64url).
+    Header(&'a [u8]),
+    /// A first `auth` frame.
+    Frame(&'a [u8]),
+    /// Neither.
+    None,
+}
+
+/// Why `/v1/svc/connect` refused.
+#[derive(Debug)]
+pub enum Refused {
+    /// Before the upgrade: the HTTP status and error code.
+    Http(u16, String),
+    /// After it: the `err` frame's code.
+    Frame(String),
+}
+
+/// Connect to the `tcp-auth` service `svc` of fs 1 (api.md §14.9):
+/// the WebSocket after its `ok`, and the connection id.
+pub async fn svc_connect(
+    h: &Harness,
+    auth: ConnectAuth<'_>,
+    svc: &[u8],
+) -> Result<(Ws, Vec<u8>), Refused> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let hex: String = svc.iter().map(|b| format!("{b:02x}")).collect();
+    let url = format!("ws://{}/v1/svc/connect?fs=1&svc={hex}", h.server.addr);
+    let mut req = url.into_client_request().unwrap();
+    if let ConnectAuth::Header(t) = auth {
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", URL_SAFE_NO_PAD.encode(t))
+                .parse()
+                .unwrap(),
+        );
+    }
+    let mut ws = match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => ws,
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+            let body: ErrorBody = from_cbor(r.body().as_deref().unwrap_or_default()).unwrap();
+            return Err(Refused::Http(r.status().as_u16(), body.code));
+        }
+        Err(e) => panic!("connect: {e}"),
+    };
+    if let ConnectAuth::Frame(t) = auth {
+        send(&mut ws, &Frame::Auth { token: t.to_vec() }).await;
+    }
+    match recv(&mut ws).await {
+        Frame::Ok {
+            id: None,
+            conn: Some(conn),
+        } => Ok((ws, conn)),
+        Frame::Err { code, .. } => Err(Refused::Frame(code)),
+        f => panic!("unexpected frame {f:?}"),
+    }
 }
 
 pub async fn send(ws: &mut Ws, f: &Frame) {

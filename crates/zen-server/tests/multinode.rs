@@ -175,7 +175,13 @@ async fn ephemeral_and_subscriptions_cross_nodes() {
         },
     )
     .await;
-    assert_eq!(recv(&mut wb).await, Frame::Ok { id: Some(1) });
+    assert_eq!(
+        recv(&mut wb).await,
+        Frame::Ok {
+            id: Some(1),
+            conn: None
+        }
+    );
     send(
         &mut wb,
         &Frame::Sub {
@@ -187,7 +193,13 @@ async fn ephemeral_and_subscriptions_cross_nodes() {
         },
     )
     .await;
-    assert_eq!(recv(&mut wb).await, Frame::Ok { id: Some(2) });
+    assert_eq!(
+        recv(&mut wb).await,
+        Frame::Ok {
+            id: Some(2),
+            conn: None
+        }
+    );
 
     let mut wa = connect(&a, &ta).await;
     send(
@@ -469,15 +481,21 @@ const SVC: [u8; 16] = [0x5E; 16];
 /// Two nodes on FoundationDB with a relayed service, Alice signed in on B.
 /// Returns A, B, Alice's token on B and the service's address on A.
 async fn relay_nodes() -> (Harness, Harness, Vec<u8>, std::net::SocketAddr) {
+    let (a, b, tb) = relay_nodes_in(zen_server::config::SvcMode::Tcp).await;
+    let addr = a.server.state.svc.local_addr("echo").unwrap();
+    (a, b, tb, addr)
+}
+
+/// Two nodes with a relayed service in `mode`; Alice's token on B.
+async fn relay_nodes_in(mode: zen_server::config::SvcMode) -> (Harness, Harness, Vec<u8>) {
     use zen_server::config::{ServiceConfig, SvcMode};
-    // The socket on node A, the handler on node B.
     let a = Harness::start_with(|c| {
         c.service.push(ServiceConfig {
             name: "echo".into(),
             fs: 1,
             id: SVC.to_vec(),
-            mode: SvcMode::Tcp,
-            listen: Some("127.0.0.1:0".parse().unwrap()),
+            mode,
+            listen: (mode == SvcMode::Tcp).then(|| "127.0.0.1:0".parse().unwrap()),
             max_conns: 16,
             per_ip_rate: 0,
             per_ip_burst: 1,
@@ -503,24 +521,15 @@ async fn relay_nodes() -> (Harness, Harness, Vec<u8>, std::net::SocketAddr) {
             Err(e) => panic!("{e:?}"),
         }
     };
-    let addr = a.server.state.svc.local_addr("echo").unwrap();
-    (a, b, tb, addr)
+    (a, b, tb)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn relayed_connection_across_nodes() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use zen_core::rng::OsRng;
-    use zen_core::svc::{SvcKeys, seal_record};
-    if !on_fdb() {
-        return;
-    }
-    // The socket on node A, the handler on node B.
-    let (_a, b, tb, addr) = relay_nodes().await;
-    let _: SvcLeaseResult = b
+/// Take the handler lease on `h`.
+async fn svc_lease(h: &Harness, tok: &[u8]) {
+    let _: SvcLeaseResult = h
         .call(
             "/v1/svc/lease",
-            Some(&tb),
+            Some(tok),
             &SvcLeaseRequest {
                 fs: 1,
                 svc: SVC.to_vec(),
@@ -531,12 +540,17 @@ async fn relayed_connection_across_nodes() {
         )
         .await
         .unwrap();
-    let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
-    peer.write_all(b"ping").await.unwrap();
-    let mut c: SvcClaims = b
+}
+
+/// On `h`: claim the next connection, read `want`, answer `reply` and
+/// reveal it.
+async fn svc_answer(h: &Harness, tok: &[u8], want: &[u8], reply: &[u8]) {
+    use zen_core::rng::OsRng;
+    use zen_core::svc::{SvcKeys, seal_record};
+    let mut c: SvcClaims = h
         .call(
             "/v1/svc/next",
-            Some(&tb),
+            Some(tok),
             &SvcNextRequest {
                 fs: 1,
                 svc: SVC.to_vec(),
@@ -547,12 +561,12 @@ async fn relayed_connection_across_nodes() {
         )
         .await
         .unwrap();
-    let c = c.conns.pop().expect("claimed on B");
+    let c = c.conns.pop().expect("claimed");
     let conn: [u8; 16] = c.conn.as_slice().try_into().unwrap();
-    let r: SvcReadResult = b
+    let r: SvcReadResult = h
         .call(
             "/v1/svc/read",
-            Some(&tb),
+            Some(tok),
             &SvcReadRequest {
                 fs: 1,
                 svc: SVC.to_vec(),
@@ -565,15 +579,15 @@ async fn relayed_connection_across_nodes() {
         )
         .await
         .unwrap();
-    assert_eq!(r.chunks[0].data, b"ping");
+    assert_eq!(r.chunks[0].data, want);
     let k = SvcKeys::from_parts(1, 1, &SVC, [0x4B; 32]);
-    let (rec, k_r) = seal_record(&k, &conn, 0, 0, b"pong", &mut OsRng).unwrap();
+    let (rec, k_r) = seal_record(&k, &conn, 0, 0, reply, &mut OsRng).unwrap();
     let mut commit_id = vec![0u8; 16];
     getrandom::fill(&mut commit_id).unwrap();
-    let _: CommitResult = b
+    let _: CommitResult = h
         .call(
             "/v1/commit",
-            Some(&tb),
+            Some(tok),
             &Commit {
                 commit_id,
                 svc: vec![SvcStep {
@@ -582,7 +596,7 @@ async fn relayed_connection_across_nodes() {
                     conn: c.conn.clone(),
                     token: c.token,
                     in_from: 0,
-                    in_to: 4,
+                    in_to: want.len() as u64,
                     out_from: 0,
                     out: vec![ByteBuf::from(rec)],
                     ..Default::default()
@@ -592,10 +606,10 @@ async fn relayed_connection_across_nodes() {
         )
         .await
         .unwrap();
-    let r: SvcRevealResult = b
+    let r: SvcRevealResult = h
         .call(
             "/v1/svc/reveal",
-            Some(&tb),
+            Some(tok),
             &SvcRevealRequest {
                 fs: 1,
                 svc: SVC.to_vec(),
@@ -609,12 +623,52 @@ async fn relayed_connection_across_nodes() {
         .await
         .unwrap();
     assert_eq!(r.results, [0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relayed_connection_across_nodes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if !on_fdb() {
+        return;
+    }
+    // The socket on node A, the handler on node B.
+    let (_a, b, tb, addr) = relay_nodes().await;
+    svc_lease(&b, &tb).await;
+    let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"ping").await.unwrap();
+    svc_answer(&b, &tb, b"ping", b"pong").await;
     let mut got = [0u8; 4];
     tokio::time::timeout(Duration::from_secs(10), peer.read_exact(&mut got))
         .await
         .expect("the echo arrives through A")
         .unwrap();
     assert_eq!(&got, b"pong");
+}
+
+/// A `tcp-auth` connector's WebSocket on node A, the handler on node B.
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_auth_across_nodes() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    if !on_fdb() {
+        return;
+    }
+    let (a, b, tb) = relay_nodes_in(zen_server::config::SvcMode::TcpAuth).await;
+    let ta = a.sign_in(&User::new(1)).await.unwrap();
+    svc_lease(&b, &tb).await;
+    let (mut ws, _) = svc_connect(&a, ConnectAuth::Header(&ta), &SVC)
+        .await
+        .unwrap();
+    ws.send(Message::Binary(b"ping".to_vec().into()))
+        .await
+        .unwrap();
+    svc_answer(&b, &tb, b"ping", b"pong").await;
+    let m = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("the echo arrives through A")
+        .unwrap()
+        .unwrap();
+    assert_eq!(m, Message::Binary(b"pong".to_vec().into()));
 }
 
 /// The socket on node A; the lease, the stream subscription, the step and
@@ -653,7 +707,13 @@ async fn pushed_input_across_nodes() {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(1) });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: Some(1),
+            conn: None
+        }
+    );
     let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
     peer.write_all(b"ping").await.unwrap();
     // Skip svc_ready frames.

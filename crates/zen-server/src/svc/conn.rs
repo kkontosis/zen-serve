@@ -1,19 +1,25 @@
 //! A relayed connection's task, which owns its socket (svc.md §3): it
 //! accepts the connection in storage, appends the input in batches, writes
 //! released output, keeps the timers, and reaps the connection when the
-//! socket closes.
+//! socket closes. The socket is a TCP stream (`tcp`) or a WebSocket from
+//! `/v1/svc/connect` (`tcp-auth`, api.md §14.9).
 
 use super::listen::reset;
 use super::reap::{reap, reap_unclaimed};
 use super::{
-    Acks, ClaimRec, Cmd, ConnRec, Id, RH_EOF, Service, decode_head, decode_u64, encode_head,
+    Acks, ClaimRec, Cmd, ConnRec, Id, RH_EOF, Service, Slot, decode_head, decode_u64, encode_head,
     enqueue, log_input, ring, tail_int, unix_ms,
 };
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::keys::{self, end_of};
 use crate::state::Shared;
 use crate::txn::txn_loop;
+use axum::body::Bytes;
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +30,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use zen_core::svc::{ABORT, CLOSE, FIN, parse_record};
-use zen_proto::{ByteBuf, SvcPeer};
+use zen_proto::{ByteBuf, Frame, SvcPeer, to_cbor};
 
 /// The most input one batch carries.
 pub const BATCH: usize = 32 * 1024;
@@ -38,16 +44,227 @@ const OUT_BATCH: usize = 256 * 1024;
 const OUT_RECORDS: usize = 64;
 /// How long a close record's connection drains input.
 const DRAIN: Duration = Duration::from_secs(1);
+/// The largest WebSocket frame, both ways (api.md §14.9).
+pub const WS_FRAME: usize = 64 * 1024;
+/// The close code of a connection that ended normally.
+pub const WS_NORMAL: u16 = 1000;
+/// The close code of a reset (api.md §14.9).
+pub const WS_RESET: u16 = 4000;
 
-/// Accept `sock` as a new connection of `svc` and run it.
-pub fn spawn(st: &Shared, svc: Arc<Service>, sock: TcpStream, peer: SvcPeer) {
+/// A connection's transport.
+pub enum Sock {
+    /// A `tcp` service's socket.
+    Tcp(TcpStream),
+    /// A `tcp-auth` connection's WebSocket, authenticated already.
+    Ws(Box<WebSocket>),
+}
+
+/// The read half of a [`Sock`].
+enum Rd {
+    Tcp(OwnedReadHalf),
+    /// `rest` is what is left of the last binary frame: nothing more is
+    /// read until it is consumed, so the input window holds.
+    Ws {
+        rx: SplitStream<WebSocket>,
+        rest: Bytes,
+    },
+}
+
+/// The write half of a [`Sock`].
+enum Wr {
+    Tcp(OwnedWriteHalf),
+    Ws(SplitSink<WebSocket, Message>),
+}
+
+impl Sock {
+    fn split(self) -> (Rd, Wr) {
+        match self {
+            Sock::Tcp(s) => {
+                let (r, w) = s.into_split();
+                (Rd::Tcp(r), Wr::Tcp(w))
+            }
+            Sock::Ws(ws) => {
+                let (tx, rx) = (*ws).split();
+                (
+                    Rd::Ws {
+                        rx,
+                        rest: Bytes::new(),
+                    },
+                    Wr::Ws(tx),
+                )
+            }
+        }
+    }
+
+    /// A WebSocket learns its connection id once the accept has
+    /// committed (api.md §14.9); false if it's gone.
+    async fn accepted(&mut self, conn: &Id) -> bool {
+        match self {
+            Sock::Tcp(_) => true,
+            Sock::Ws(ws) => {
+                let ok = Frame::Ok {
+                    id: None,
+                    conn: Some(conn.to_vec()),
+                };
+                ws.send(Message::Binary(to_cbor(&ok).into())).await.is_ok()
+            }
+        }
+    }
+
+    /// The accept failed: a WebSocket gets the error first.
+    async fn refused(self, e: &ApiError) {
+        match self {
+            Sock::Tcp(s) => reset(s),
+            Sock::Ws(ws) => {
+                let mut ws = *ws;
+                let f = Frame::Err {
+                    id: None,
+                    code: e.code.into(),
+                    message: e.message.clone(),
+                };
+                let _ = ws.send(Message::Binary(to_cbor(&f).into())).await;
+                ws_close(ws, WS_RESET).await;
+            }
+        }
+    }
+
+    /// Reset: `SO_LINGER` 0, or close 4000.
+    async fn reset(self) {
+        match self {
+            Sock::Tcp(s) => reset(s),
+            Sock::Ws(ws) => ws_close(*ws, WS_RESET).await,
+        }
+    }
+
+    /// Close: the connection ended normally.
+    async fn close(self) {
+        match self {
+            Sock::Tcp(s) => drop(s),
+            Sock::Ws(ws) => ws_close(*ws, WS_NORMAL).await,
+        }
+    }
+
+    /// A close record (svc.md §3 step 9): read and discard input for up to
+    /// [`DRAIN`] after shutting down the write side, so the kernel doesn't
+    /// reset the last bytes; then close.
+    async fn drain(self) {
+        match self {
+            Sock::Tcp(mut sock) => {
+                let _ = sock.shutdown().await;
+                let mut buf = [0u8; 4096];
+                let until = Instant::now() + DRAIN;
+                while let Ok(Ok(n)) = tokio::time::timeout_at(until, sock.read(&mut buf)).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+            Sock::Ws(ws) => ws_close(*ws, WS_NORMAL).await,
+        }
+    }
+}
+
+/// Send a close with `code`, then read and discard until the client's
+/// close, for up to [`DRAIN`].
+async fn ws_close(mut ws: WebSocket, code: u16) {
+    let until = Instant::now() + DRAIN;
+    let close = Message::Close(Some(CloseFrame {
+        code,
+        reason: "".into(),
+    }));
+    if !matches!(
+        tokio::time::timeout_at(until, ws.send(close)).await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    while let Ok(Some(Ok(m))) = tokio::time::timeout_at(until, ws.next()).await {
+        if matches!(m, Message::Close(_)) {
+            break;
+        }
+    }
+}
+
+impl Rd {
+    /// Read input into `buf` (not empty); 0 is the peer's FIN (a `"fin"`
+    /// frame on a WebSocket). Cancel-safe.
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Rd::Tcp(r) => r.read(buf).await,
+            Rd::Ws { rx, rest } => loop {
+                if !rest.is_empty() {
+                    let n = rest.len().min(buf.len());
+                    buf[..n].copy_from_slice(&rest.split_to(n));
+                    return Ok(n);
+                }
+                match rx.next().await {
+                    Some(Ok(Message::Binary(b))) => *rest = b,
+                    Some(Ok(Message::Text(t))) if t.as_str() == "fin" => return Ok(0),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Text(_))) => {
+                        return Err(io::Error::other("a text frame other than fin"));
+                    }
+                    // The client's close, or a frame over the limit: a reset.
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err(io::ErrorKind::ConnectionReset.into());
+                    }
+                    Some(Err(e)) => return Err(io::Error::other(e)),
+                }
+            },
+        }
+    }
+
+    fn reunite(self, wr: Wr) -> Sock {
+        match (self, wr) {
+            (Rd::Tcp(r), Wr::Tcp(w)) => Sock::Tcp(r.reunite(w).expect("the halves of one socket")),
+            (Rd::Ws { rx, .. }, Wr::Ws(tx)) => Sock::Ws(Box::new(
+                rx.reunite(tx).expect("the halves of one WebSocket"),
+            )),
+            _ => unreachable!("the halves of one socket"),
+        }
+    }
+}
+
+impl Wr {
+    /// Write all of `data`: in frames of at most [`WS_FRAME`] on a
+    /// WebSocket.
+    async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            Wr::Tcp(w) => w.write_all(data).await,
+            Wr::Ws(tx) => {
+                for c in data.chunks(WS_FRAME) {
+                    tx.feed(Message::Binary(Bytes::copy_from_slice(c)))
+                        .await
+                        .map_err(io::Error::other)?;
+                }
+                tx.flush().await.map_err(io::Error::other)
+            }
+        }
+    }
+
+    /// Half-close: shut down the write side, or send `"fin"`.
+    async fn fin(&mut self) {
+        match self {
+            Wr::Tcp(w) => {
+                let _ = w.shutdown().await;
+            }
+            Wr::Ws(tx) => {
+                let _ = tx.send(Message::Text("fin".into())).await;
+            }
+        }
+    }
+}
+
+/// Accept `sock` as a new connection of the slot's service and run it.
+pub fn spawn(st: &Shared, slot: Slot, sock: Sock, peer: SvcPeer) {
     let mut conn = [0u8; 16];
     getrandom::fill(&mut conn).expect("OS RNG");
     let st2 = st.clone();
+    let svc = slot.service().clone();
     st.svc.spawn_conn(conn, move |rx| async move {
         let _guard = Guard {
             st: st2.clone(),
-            svc: svc.clone(),
+            _slot: slot,
             conn,
         };
         let c = Conn {
@@ -64,14 +281,13 @@ pub fn spawn(st: &Shared, svc: Arc<Service>, sock: TcpStream, peer: SvcPeer) {
 /// Unregisters the task and frees its `max_conns` slot, however it ends.
 struct Guard {
     st: Shared,
-    svc: Arc<Service>,
+    _slot: Slot,
     conn: Id,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         self.st.svc.unregister(&self.conn);
-        self.svc.close();
     }
 }
 
@@ -122,19 +338,6 @@ struct Output {
     bad: bool,
 }
 
-/// Read and discard input for up to [`DRAIN`] after shutting down the
-/// write side, so the kernel doesn't reset the last bytes; then close.
-async fn drain(mut sock: TcpStream) {
-    let _ = sock.shutdown().await;
-    let mut buf = [0u8; 4096];
-    let until = Instant::now() + DRAIN;
-    while let Ok(Ok(n)) = tokio::time::timeout_at(until, sock.read(&mut buf)).await {
-        if n == 0 {
-            break;
-        }
-    }
-}
-
 /// What a batch's transaction found.
 enum Outcome {
     /// Appended; whether a handler has ever claimed the connection.
@@ -146,14 +349,19 @@ enum Outcome {
 }
 
 impl Conn {
-    async fn run(&self, sock: TcpStream, peer: SvcPeer, mut rx: mpsc::Receiver<Cmd>) {
+    async fn run(&self, mut sock: Sock, peer: SvcPeer, mut rx: mpsc::Receiver<Cmd>) {
         if let Err(e) = self.accept(peer).await {
             tracing::warn!(service = %self.svc.cfg.name, error = %e.message, "accept failed");
-            reset(sock);
+            sock.refused(&e).await;
             self.reap().await;
             return;
         }
-        let (mut rd, mut wr) = sock.into_split();
+        if !sock.accepted(&self.conn).await {
+            sock.reset().await;
+            self.reap().await;
+            return;
+        }
+        let (mut rd, mut wr) = sock.split();
         let wake = Notify::new();
         wake.notify_one();
         let t0 = Instant::now();
@@ -164,19 +372,19 @@ impl Conn {
             self.serve(&mut rd, &mut rx, &wake, writer.as_mut(), t0, &last_out)
                 .await
         };
-        let sock = rd.reunite(wr).expect("the halves of one socket");
+        let sock = rd.reunite(wr);
         match end {
             End::Reset => {
-                reset(sock);
+                sock.reset().await;
                 self.reap().await;
             }
-            End::Reaped => reset(sock),
+            End::Reaped => sock.reset().await,
             End::Close => {
-                drop(sock);
+                sock.close().await;
                 self.reap().await;
             }
             End::Drain => {
-                drain(sock).await;
+                sock.drain().await;
                 self.reap().await;
             }
         }
@@ -186,7 +394,7 @@ impl Conn {
     /// the timers, until the connection ends.
     async fn serve<W: Future<Output = Written>>(
         &self,
-        rd: &mut OwnedReadHalf,
+        rd: &mut Rd,
         rx: &mut mpsc::Receiver<Cmd>,
         wake: &Notify,
         mut writer: Pin<&mut W>,
@@ -271,8 +479,12 @@ impl Conn {
                         }
                         held = Some(buf[..len].to_vec());
                     }
-                    // A reset or a failed read: the connection is over.
-                    Err(_) => return End::Close,
+                    // A reset or a failed read: the connection is over. On a
+                    // WebSocket, the client's close is a reset (api.md §14.9).
+                    Err(_) => return match rd {
+                        Rd::Tcp(_) => End::Close,
+                        Rd::Ws { .. } => End::Reset,
+                    },
                 },
                 _ = tokio::time::sleep_until(accept_by), if !claimed => {
                     match reap_unclaimed(&self.st, self.fs, &self.id, &self.conn).await {
@@ -339,7 +551,7 @@ impl Conn {
     /// reveals may have released more.
     async fn writer(
         &self,
-        wr: &mut OwnedWriteHalf,
+        wr: &mut Wr,
         wake: &Notify,
         t0: Instant,
         last_out: &AtomicU64,
@@ -374,7 +586,7 @@ impl Conn {
                 written = Some(to);
             }
             if out.end & FIN != 0 {
-                let _ = wr.shutdown().await;
+                wr.fin().await;
                 return Written::Fin;
             }
             if out.end & CLOSE != 0 {

@@ -1,5 +1,6 @@
 //! Accepting relayed connections (svc.md §3, steps 1 and 2).
 
+use super::conn::Sock;
 use super::{Service, conn, node};
 use crate::config::SvcMode;
 use crate::state::Shared;
@@ -55,16 +56,19 @@ async fn accept_loop(st: Shared, svc: Arc<Service>, listener: TcpListener) {
             }
         };
         // Admission, before anything is written.
-        if !svc.take(peer.ip(), Instant::now()) || !svc.open() {
-            tracing::debug!(service = %svc.cfg.name, %peer, "refused: over a limit");
-            reset(sock);
-            continue;
-        }
+        let slot = match svc.take(peer.ip(), Instant::now()).then(|| svc.open()) {
+            Some(Some(s)) => s,
+            _ => {
+                tracing::debug!(service = %svc.cfg.name, %peer, "refused: over a limit");
+                reset(sock);
+                continue;
+            }
+        };
         let _ = sock.set_nodelay(true);
         conn::spawn(
             &st,
-            svc.clone(),
-            sock,
+            slot,
+            Sock::Tcp(sock),
             zen_proto::SvcPeer {
                 addr: Some(peer.to_string()),
                 ..Default::default()

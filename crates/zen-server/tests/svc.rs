@@ -1,7 +1,8 @@
 //! Relayed services (spec/svc.md, api.md §14): accept, claims, reads,
 //! backpressure, closing, admission, leases, rights, dead nodes and export;
 //! then the output side: steps, reveals, the writer, takeover and timers;
-//! then pushed input and reveals over `/v1/stream`.
+//! then pushed input and reveals over `/v1/stream`; then `tcp-auth`
+//! connections over `/v1/svc/connect`.
 
 mod common;
 
@@ -1339,7 +1340,13 @@ async fn svc_sub(h: &Harness, tok: &[u8], lease: u8) -> Ws {
         },
     )
     .await;
-    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(SUB) });
+    assert_eq!(
+        recv(&mut ws).await,
+        Frame::Ok {
+            id: Some(SUB),
+            conn: None
+        }
+    );
     ws
 }
 
@@ -1739,4 +1746,371 @@ async fn reveal_over_the_stream() {
         Frame::Err { id, code, .. } => assert_eq!((id, code.as_str()), (Some(6), "too_large")),
         f => panic!("{f:?}"),
     }
+}
+
+// ---------------------------------------------------------------- tcp-auth
+
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+/// A `tcp` service's id, next to the `tcp-auth` one.
+const TCP_SVC: [u8; 16] = [0x7C; 16];
+
+/// A server with a `tcp-auth` service `SVC` and a `tcp` service `TCP_SVC`.
+/// Alice can do anything; Bob may only `consume`. Returns their tokens.
+async fn auth_setup(f: impl FnOnce(&mut ServiceConfig)) -> (Harness, Vec<u8>, Vec<u8>) {
+    let h = Harness::start_with(|c| {
+        service(|s| {
+            s.mode = SvcMode::TcpAuth;
+            s.listen = None;
+            f(s);
+        })(c);
+        service(|s| {
+            s.name = "plain".into();
+            s.id = TCP_SVC.to_vec();
+        })(c);
+    })
+    .await;
+    let (alice, bob) = (User::new(1), User::new(2));
+    let grants = vec![
+        fs_grant(&alice, 1, &["read", "write"]),
+        topic_grant(&alice, 1, &[], &["read", "append", "consume"]),
+        fs_grant(&bob, 1, &["read", "write"]),
+        topic_grant(&bob, 1, &[], &["consume"]),
+    ];
+    let (signed, _) = signed_acl(&alice, 1, None, &[&alice], &[&alice, &bob], grants, vec![]);
+    h.put_acl(signed, h.server.claim_token.clone())
+        .await
+        .unwrap();
+    let a = h.sign_in(&alice).await.unwrap();
+    let b = h.sign_in(&bob).await.unwrap();
+    (h, a, b)
+}
+
+/// A connector: Alice's WebSocket, authenticated by header.
+async fn connector(h: &Harness, tok: &[u8]) -> (Ws, Vec<u8>) {
+    svc_connect(h, ConnectAuth::Header(tok), &SVC)
+        .await
+        .unwrap()
+}
+
+/// The next message within `within`, skipping pings and pongs. `None`:
+/// nothing came. The end of the stream or an error reads as a close
+/// without a frame.
+async fn ws_next(ws: &mut Ws, within: Duration) -> Option<Message> {
+    let until = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(until, ws.next()).await {
+            Err(_) => return None,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(Some(Ok(m))) => return Some(m),
+            Ok(_) => return Some(Message::Close(None)),
+        }
+    }
+}
+
+/// The close code of a close message.
+fn close_code(m: &Option<Message>) -> Option<u16> {
+    match m {
+        Some(Message::Close(Some(f))) => Some(f.code.into()),
+        _ => None,
+    }
+}
+
+/// Exactly `n` bytes of binary frames; each at most 64 KiB.
+async fn ws_reads(ws: &mut Ws, n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        match ws_next(ws, Duration::from_secs(10)).await {
+            Some(Message::Binary(b)) => {
+                assert!(b.len() <= 65_536, "a frame of {} bytes", b.len());
+                out.extend_from_slice(&b);
+            }
+            m => panic!("expected data, got {m:?}"),
+        }
+    }
+    assert_eq!(out.len(), n);
+    out
+}
+
+async fn ws_write(ws: &mut Ws, data: &[u8]) {
+    ws.send(Message::Binary(data.to_vec().into()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_echo() {
+    let (h, a, _) = auth_setup(|_| {}).await;
+    let k = svc_keys();
+    lease(&h, &a, 1, None).await.unwrap();
+    let (mut ws, conn) = connector(&h, &a).await;
+    ws_write(&mut ws, b"hello\n").await;
+    let c = claim(&h, &a, 1).await;
+    assert_eq!(c.conn, conn);
+    // The peer is the connector: Alice's user and device.
+    let alice = User::new(1);
+    assert_eq!(c.peer.addr, None);
+    assert_eq!(c.peer.user.as_deref(), Some(&alice.fp()[..]));
+    assert_eq!(
+        c.peer.device.as_deref(),
+        Some(&alice.device.public().fingerprint()[..])
+    );
+    let mut held = Held::of(&c);
+    assert_eq!(read_n(&h, &a, &c, 0, 6).await, b"hello\n");
+    let (s, keys) = sealed_step(&k, &held, 6, &[(0, b"hello\n")], None);
+    step(&h, &a, &mut held, s).await.unwrap();
+    reveal(&h, &a, &held.conn, &keys).await.unwrap();
+    assert_eq!(ws_reads(&mut ws, 6).await, b"hello\n");
+
+    // The client's "fin" is the EOF flag; the handler can still write.
+    ws.send(Message::Text("fin".into())).await.unwrap();
+    eventually("the EOF flag", async || {
+        read(&h, &a, &c, 6, 0).await.unwrap().flags & 1 == 1
+    })
+    .await;
+    // A FIN record arrives as "fin"; with the client's FIN in and all
+    // input acked, the connection ends with close 1000.
+    let (s, keys) = sealed_step(&k, &held, 6, &[(FIN, b"bye\n")], None);
+    step(&h, &a, &mut held, s).await.unwrap();
+    reveal(&h, &a, &held.conn, &keys).await.unwrap();
+    assert_eq!(ws_reads(&mut ws, 4).await, b"bye\n");
+    assert!(
+        matches!(ws_next(&mut ws, Duration::from_secs(10)).await, Some(Message::Text(t)) if t.as_str() == "fin")
+    );
+    assert_eq!(
+        close_code(&ws_next(&mut ws, Duration::from_secs(10)).await),
+        Some(1000)
+    );
+    eventually(
+        "reaped",
+        async || matches!(state(&h, &a, &c).await, Err(e) if e.1.code == "conn_closed"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_first_frame_auth() {
+    let (h, a, _) = auth_setup(|_| {}).await;
+    lease(&h, &a, 1, None).await.unwrap();
+    let (mut ws, conn) = svc_connect(&h, ConnectAuth::Frame(&a), &SVC).await.unwrap();
+    ws_write(&mut ws, b"x").await;
+    let c = claim(&h, &a, 1).await;
+    assert_eq!(c.conn, conn);
+    assert_eq!(read_n(&h, &a, &c, 0, 1).await, b"x");
+
+    // A bad token in the frame: err, then a close.
+    let bad = [7u8; 32];
+    match svc_connect(&h, ConnectAuth::Frame(&bad), &SVC).await {
+        Err(Refused::Frame(code)) => assert_eq!(code, "unauthorized"),
+        r => panic!("{:?}", r.map(|_| ())),
+    }
+    // Something else first.
+    let hex: String = SVC.iter().map(|b| format!("{b:02x}")).collect();
+    let url = format!("ws://{}/v1/svc/connect?fs=1&svc={hex}", h.server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    ws_write(&mut ws, b"data before auth").await;
+    match recv(&mut ws).await {
+        Frame::Err { code, .. } => assert_eq!(code, "bad_request"),
+        f => panic!("{f:?}"),
+    }
+    assert_eq!(
+        close_code(&ws_next(&mut ws, Duration::from_secs(5)).await),
+        Some(4000)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_refusals() {
+    let (h, a, b) = auth_setup(|s| s.max_conns = 1).await;
+    let http = |r: Result<(Ws, Vec<u8>), Refused>| match r {
+        Err(Refused::Http(status, code)) => (status, code),
+        r => panic!("{:?}", r.map(|_| ())),
+    };
+    let bad = [7u8; 32];
+    assert_eq!(
+        http(svc_connect(&h, ConnectAuth::Header(&bad), &SVC).await),
+        (401, "unauthorized".into())
+    );
+    // Bob may consume, not append.
+    assert_eq!(
+        http(svc_connect(&h, ConnectAuth::Header(&b), &SVC).await),
+        (403, "forbidden".into())
+    );
+    match svc_connect(&h, ConnectAuth::Frame(&b), &SVC).await {
+        Err(Refused::Frame(code)) => assert_eq!(code, "forbidden"),
+        r => panic!("{:?}", r.map(|_| ())),
+    }
+    // A tcp service, and no service at all.
+    for svc in [TCP_SVC, [0x11; 16]] {
+        assert_eq!(
+            http(svc_connect(&h, ConnectAuth::Header(&a), &svc).await),
+            (404, "not_found".into())
+        );
+    }
+    // max_conns = 1: the second is refused while the first is open.
+    let (ws, _) = connector(&h, &a).await;
+    assert_eq!(
+        http(svc_connect(&h, ConnectAuth::Header(&a), &SVC).await),
+        (429, "quota".into())
+    );
+    drop(ws);
+    eventually("the slot is free", async || {
+        svc_connect(&h, ConnectAuth::Header(&a), &SVC).await.is_ok()
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_close_abort_and_client_close() {
+    let (h, a, _) = auth_setup(|_| {}).await;
+    let store = h.server.state.store.clone();
+    let k = svc_keys();
+    lease(&h, &a, 1, None).await.unwrap();
+
+    // A close record: the bytes, then close 1000.
+    let (mut ws, _) = connector(&h, &a).await;
+    let c = claim(&h, &a, 1).await;
+    let mut held = Held::of(&c);
+    let (s, keys) = sealed_step(&k, &held, 0, &[(0, b"do"), (CLOSE, b"ne")], None);
+    step(&h, &a, &mut held, s).await.unwrap();
+    reveal(&h, &a, &held.conn, &keys).await.unwrap();
+    assert_eq!(ws_reads(&mut ws, 4).await, b"done");
+    assert_eq!(
+        close_code(&ws_next(&mut ws, Duration::from_secs(10)).await),
+        Some(1000)
+    );
+    eventually("reaped", async || gone(store.as_ref(), &held.conn).await).await;
+
+    // An abort record: close 4000.
+    let (mut ws, _) = connector(&h, &a).await;
+    let c = claim(&h, &a, 1).await;
+    let mut held = Held::of(&c);
+    let (s, keys) = sealed_step(&k, &held, 0, &[(ABORT, b"")], None);
+    step(&h, &a, &mut held, s).await.unwrap();
+    reveal(&h, &a, &held.conn, &keys).await.unwrap();
+    assert_eq!(
+        close_code(&ws_next(&mut ws, Duration::from_secs(10)).await),
+        Some(4000)
+    );
+    eventually("reaped", async || gone(store.as_ref(), &held.conn).await).await;
+
+    // The client closes: a reset, and the handler's next step is refused.
+    let (mut ws, _) = connector(&h, &a).await;
+    let c = claim(&h, &a, 1).await;
+    let held = Held::of(&c);
+    ws.close(None).await.unwrap();
+    eventually("reaped", async || gone(store.as_ref(), &held.conn).await).await;
+    let e = commit(
+        &h,
+        &a,
+        &commit_of(vec![sealed_step(&k, &held, 0, &[(0, b"late")], None).0]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&e), (412, "conn_closed"));
+
+    // A frame over 64 KiB: a reset.
+    let (mut ws, conn) = connector(&h, &a).await;
+    let c = claim(&h, &a, 1).await;
+    assert_eq!(c.conn, conn);
+    let _ = ws.send(Message::Binary(vec![1u8; 70_000].into())).await;
+    assert_eq!(
+        close_code(&ws_next(&mut ws, Duration::from_secs(10)).await),
+        Some(4000)
+    );
+    let conn: [u8; 16] = conn.try_into().unwrap();
+    eventually("reaped", async || gone(store.as_ref(), &conn).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_window() {
+    let (h, a, _) = auth_setup(|s| s.window = 65_536).await;
+    let k = svc_keys();
+    lease(&h, &a, 1, None).await.unwrap();
+    let (mut ws, _) = connector(&h, &a).await;
+    let data: Vec<u8> = (0..300 * 1024).map(|i| (i * 7 + i / 1000) as u8).collect();
+    let sent = data.clone();
+    let writer = tokio::spawn(async move {
+        for f in sent.chunks(65_536) {
+            ws_write(&mut ws, f).await;
+        }
+        ws
+    });
+    let c = claim(&h, &a, 1).await;
+    let mut held = Held::of(&c);
+    let mut got = Vec::new();
+    while got.len() < data.len() {
+        let r = read(&h, &a, &c, held.in_acked, 5_000).await.unwrap();
+        assert!(
+            r.in_head - held.in_acked <= 65_536,
+            "input stays within the window: {} past {}",
+            r.in_head - held.in_acked,
+            held.in_acked
+        );
+        let mut to = held.in_acked;
+        for ch in r.chunks {
+            let skip = (to - ch.off) as usize;
+            got.extend_from_slice(&ch.data[skip..]);
+            to = ch.off + ch.data.len() as u64;
+        }
+        // Ack it slowly, so the window fills.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (s, _) = sealed_step(&k, &held, to, &[], None);
+        step(&h, &a, &mut held, s).await.unwrap();
+    }
+    assert!(got == data, "the input arrives whole and in order");
+    let _ws = writer.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_takeover() {
+    let (h, a, _) = auth_setup(|_| {}).await;
+    // Bob handles too (topic consume), from his own lease.
+    let b = h.sign_in(&User::new(2)).await.unwrap();
+    let k = svc_keys();
+    lease(&h, &a, 1, None).await.unwrap();
+    let (mut ws, _) = connector(&h, &a).await;
+    ws_write(&mut ws, b"l0\nl1\nl2\n").await;
+    let ca = claim(&h, &a, 1).await;
+    let mut held = Held::of(&ca);
+    read_n(&h, &a, &ca, 0, 9).await;
+    let (mut s, keys) = sealed_step(&k, &held, 3, &[(0, b"l0\n")], Some(b"1"));
+    s.resumable = Some(true);
+    step(&h, &a, &mut held, s).await.unwrap();
+    reveal(&h, &a, &held.conn, &keys).await.unwrap();
+    // Committed, never revealed: Alice dies.
+    let (s, _lost) = sealed_step(&k, &held, 6, &[(0, b"l1\n")], Some(b"2"));
+    step(&h, &a, &mut held, s).await.unwrap();
+    lease(&h, &a, 1, Some(300)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    lease(&h, &b, 2, None).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let cb = loop {
+        let mut c = next(&h, &b, 2, 2_000).await.unwrap();
+        if let Some(c) = c.conns.pop() {
+            break c;
+        }
+        assert!(Instant::now() < deadline, "the connection is requeued");
+    };
+    let mut hb = Held::of(&cb);
+    assert_eq!((cb.in_acked, cb.out_head), (6, 6));
+    let keys: Vec<(u64, [u8; 32])> = cb
+        .pending
+        .iter()
+        .map(|p| {
+            (
+                p.off,
+                *zsvc::open_key_escrow(&k, &hb.conn, p.off, &p.escrow).unwrap(),
+            )
+        })
+        .collect();
+    reveal(&h, &b, &hb.conn, &keys).await.unwrap();
+    assert_eq!(read_n(&h, &b, &cb, 6, 3).await, b"l2\n");
+    let (s, keys) = sealed_step(&k, &hb, 9, &[(0, b"l2\n")], Some(b"3"));
+    step(&h, &b, &mut hb, s).await.unwrap();
+    reveal(&h, &b, &hb.conn, &keys).await.unwrap();
+    assert_eq!(ws_reads(&mut ws, 9).await, b"l0\nl1\nl2\n");
+    assert!(ws_next(&mut ws, Duration::from_millis(300)).await.is_none());
 }
