@@ -82,3 +82,24 @@ chunk_grace_secs = 86400
 # Ephemeral pub/sub (api.md §9.1): per device, per node.
 ephemeral_bytes_per_sec = 65536   # a message costs its data + 256 bytes; 0 = no limit
 ephemeral_burst_bytes = 1048576
+
+# Relayed services (spec/svc.md): zen-serve relays TCP connections to
+# handlers on member clients, blind. Every node needs the same table; only
+# `listen` may differ. Open the port to the internet: the peers connect there.
+# [[service]]
+# name = "ssh"
+# fs = 1
+## The service id: a topic id in hex, conventionally the topic "svc/<name>".
+## Handlers need topic `consume` on it; tcp-auth connectors `append`.
+# id = "00112233445566778899aabbccddeeff"
+# mode = "tcp"                  # or "tcp-auth" (no listen: over /v1/svc/connect)
+# listen = "0.0.0.0:2222"
+# max_conns = 1024              # per node
+# per_ip_rate = 10              # accepts per second per address; 0 = no limit
+# per_ip_burst = 50
+# window = 1048576              # unacked input bytes per connection (≥ 65536)
+# out_window = 1048576          # unwritten output bytes per connection (≥ 65536)
+# accept_wait_ms = 10000        # closed if no handler claims it by then
+# handshake_secs = 30
+# idle_secs = 300               # 0 = never
+# resume = true                 # handlers can take over live connections
