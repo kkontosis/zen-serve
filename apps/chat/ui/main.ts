@@ -27,6 +27,7 @@ import {
   sendMessage,
   sendPhoto,
   servePresence,
+  TYPING_SHOW_MS,
   Typing,
   whoIsOnline,
 } from '../src/chat.js';
@@ -193,7 +194,7 @@ function showTyping(from: string): void {
     setTimeout(() => {
       typists.delete(from);
       drawTyping();
-    }, 3000),
+    }, TYPING_SHOW_MS),
   );
   drawTyping();
 }
