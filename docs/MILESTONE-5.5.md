@@ -53,7 +53,19 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
   * `spec/test-vectors/svc.json` and its file test; 5 unit tests.
   * Docs: spec README, glossary, TD-SVC-STATE-ROLLBACK.
   * (planned next) step 5.5.2 (server relay core, input side) on "go", after PR #37 merges.
-* **Step 5.5.2** (relay core, input side): planned below ("Step 5.5.2 in detail"). Restart from main after PR #37 merged; commit `docs: milestone 5.5 step 2 plan`, open a PR, **stop for the user to compact**; then on "go" the code.
+* **Step 5.5.2** (relay core, input side): done, PR #38. Commits: `docs: milestone 5.5 step 2 plan`; `server: relayed services, input side (config, accept, leases, claims, read)`; the docs and this log.
+  * As planned, plus details settled while building:
+    * The reader caps each batch at the window's remaining room, so `in_head − in_acked` never exceeds `window`.
+    * Input held back by the quota or a storage error stays in memory, and nothing more is read until it's stored.
+    * An ended lease's doorbell `rld` is deleted (which wakes its watchers) rather than rung. A reap rings a holder's doorbell only while the lease exists.
+    * `reap_node` stops if the node renews meanwhile; the renewer then sees the lapse and aborts its sockets.
+    * `per_ip_rate = 0` turns the bucket off; admission refusals reset the socket.
+    * `Svc::local_addr(name)` gives the bound address, so tests listen on port 0.
+  * Docs:
+    * operations.md §4: every node needs the same service table, and the ports must be reachable.
+    * OPS.md §2.2: stale test executables in `target/debug/deps`.
+  * Verified: fmt; clippy default, `--all-features` and `--no-default-features`; `tests/svc.rs` (9 tests) 3× on embedded and on FDB; the full zen-store and zen-server suites on FDB and embedded.
+  * (next) step 5.5.3 (the step, reveal, the writer): plan in detail after PR #38 merges.
 
 ## Step 5.5.2 in detail: the relay core, input side
 
