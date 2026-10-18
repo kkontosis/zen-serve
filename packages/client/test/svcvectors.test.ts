@@ -1,6 +1,6 @@
 // Relayed-service seals through wasm, against spec/test-vectors/svc.json
 // (formats.md §13): states (kind 9), record key escrows (kind 10), plain
-// records.
+// records, the sealed inbox.
 import { readFileSync } from 'node:fs';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { fromHex, hex } from '../src/bytes.js';
@@ -79,6 +79,39 @@ describe('svc.json', () => {
     const p = V.plain_record;
     expect(hex(zw.plainRecord(p.flags, fromHex(p.raw)))).toBe(p.record);
     expect(() => zw.plainRecord(0, new Uint8Array())).toThrow('param');
+  });
+
+  it('the inbox: the public key, decapsulation and the chunks', () => {
+    const i = V.inbox;
+    const k = svcKeys();
+    const seed = fromHex(i.seed);
+    expect(hex(zw.inboxPublic(seed))).toBe(i.public);
+    const key = zw.InboxKey.decaps(seed, fromHex(i.ct), k.fsId, k.id, conn);
+    let next = 0n;
+    for (const c of i.chunks) {
+      const off = BigInt(c.off);
+      expect(off).toBe(next);
+      const data = key.openChunk(off, fromHex(c.sealed));
+      expect(hex(data)).toBe(c.data);
+      next = off + BigInt(data.length);
+    }
+    // Another offset, a flipped bit, another connection: no.
+    const c0 = fromHex(i.chunks[0].sealed);
+    expect(() => key.openChunk(1n, c0)).toThrow('decrypt');
+    c0[0] = c0[0]! ^ 1;
+    expect(() => key.openChunk(0n, c0)).toThrow('decrypt');
+    const other = zw.InboxKey.decaps(seed, fromHex(i.ct), k.fsId, k.id, new Uint8Array(16));
+    expect(() => other.openChunk(0n, fromHex(i.chunks[0].sealed))).toThrow('decrypt');
+    expect(() => zw.InboxKey.decaps(seed, fromHex(i.ct).subarray(1), k.fsId, k.id, conn)).toThrow(
+      'format',
+    );
+    // The node's side: what it seals, the handler opens.
+    const node = zw.InboxKey.encaps(fromHex(i.public), k.fsId, k.id, conn);
+    const sealed = node.sealChunk(5n, enc.encode('hi'));
+    expect(sealed.length).toBe(2 + 16);
+    const mine = zw.InboxKey.decaps(seed, node.ct!, k.fsId, k.id, conn);
+    expect(new TextDecoder().decode(mine.openChunk(5n, sealed))).toBe('hi');
+    for (const x of [key, other, node, mine]) x.free();
   });
 
   it('the svc request codecs round-trip', () => {
