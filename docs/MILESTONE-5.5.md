@@ -290,7 +290,28 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx vitest run` 3×: 481 passed each time, 7 skipped (the opt-in benches). This includes `apps/echo/test/connect.test.ts` (5) and `packages/client/test/svcconnect.test.ts` (3).
     * `npx playwright test`: smoke and apps, 16 specs, unchanged
   * CI green on PR #48's head f893d8a: all 8 checks across both runs, `openssh-pq` skipped. Merged at 2061b38.
-* **Step 5.5.12** (the sealed inbox): planned below. Next: on "go", implement it.
+* **Step 5.5.12** (the sealed inbox): done, PR #49. Restarted from main after PR #48 merged. Commits: `docs: milestone 5.5 step 12 plan`; `spec: sealed inbox details (svc.md §9, api.md §14)`; `server: the sealed inbox (config, sealing, unseal)`; `wasm: inbox bindings`; `svc: sealed input in serve(), and RawStep.unseal()`; `apps: echo with a sealed inbox`; `docs: the sealed inbox (CLIENT.md §11, apps README, TD-SVC-INBOX-ROTATION)`; this log.
+  * As planned, plus details settled while building:
+    * **The server** encapsulates in the accept transaction's setup. The `InboxKey` lives in a `OnceLock` on the connection task, next to a `sealing` flag. `append` seals the batch once, before its transaction. Inside it, while sealing, it reads `ra` by snapshot; once it sees `unseal`, it clears the flag (sticky) and stores the batch plain. A failed encapsulation fails the accept.
+    * **Plaintext lengths:** `api::plain_len` (data less the 16-byte tag when sealed) serves `/v1/svc/read` (the chunk holding `from`, and the `max_bytes` budget) and `svc_sub` pushes. Before the fix, a read from the end of a sealed chunk also returned that chunk, and two chunks' worth of `max_bytes` returned one. The new test fails on the old code at that read.
+    * **The config:** `inbox` is hex with an exact length (`INBOX_PUBLIC_LEN`). The example configs describe it in a `## ` prose line, not a commented setting, since their parse test uncomments the service examples.
+    * **The binding:** `InboxKey.encaps` returns a key whose `ct` getter holds the ciphertext (`undefined` for `decaps`), instead of a `{ct, key}` object. A wrong seed length is `param`; a wrong ciphertext length is `format`.
+    * **The runtime:**
+      * a claim with `inbox_ct` and no seed throws `inbox` in `load`, so it is reported and released with `close`
+      * sealed chunks are opened in `input()`, which pushes, early chunks and `repair()` all go through; an early chunk's span counts plaintext
+      * the claim flag `C_UNSEAL` (32, `ra`'s `RA_UNSEAL` shifted) marks it sent
+      * `Finished.unseal` is optional, so the SSH layer and the error paths don't set it
+    * **The serve()-level tests** are in `apps/echo/test/inbox.test.ts` rather than `packages/svc`: the echo harness is where `serve()` runs against a live server. They count `InboxKey.openChunk` calls to show that input after the `STARTTLS` reply arrives plain.
+    * The echo app's `STARTTLS` line is echoed like any other (`<n>: STARTTLS`), so transcripts stay uniform.
+  * Verified:
+    * `cargo fmt --all --check`; clippy `--all-targets -D warnings` on zen-server, default, `--no-default-features` and `--all-features`; clippy on zen-wasm for wasm32
+    * `cargo test -p zen-server --test svc` 3× on embedded and once on FDB (33 tests, 3 new: `inbox_seals_input`, `unseal_stops_sealing`, `unseal_without_inbox_is_a_no_op`); `tests/multinode.rs` and `tests/dump.rs` on FDB
+    * the config unit tests (bad length, not hex, a valid key)
+    * the full zen-server suite; `cargo test -p zen-core` (54, vectors unchanged)
+    * `scripts/build-wasm.sh --dev`; `npm run check`
+    * `npx vitest run` 3×: 486 passed each time, 7 skipped (the opt-in benches). This includes `packages/client/test/svcvectors.test.ts` (7, inbox vectors new) and `apps/echo/test/inbox.test.ts` (4).
+    * `npx playwright test`: 16 specs, unchanged
+  * The local FDB cluster had stopped (a container restart); it was restarted with the binary rebuilt `--features fdb`. Stale test executables were pruned (4 GB).
 
 ## Step 5.5.12 in detail: the sealed inbox
 
