@@ -198,6 +198,38 @@ async fn migrate_copies_into_another_store() {
     assert!(stamp[..] > first.versionstamp[..]);
 }
 
+/// A started server with a relayed service writes transient relay keys
+/// (its node lease); they don't count, so an import needs no `--force`.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_keys_count_as_empty() {
+    let target = Harness::start_with(|c| {
+        c.service.push(zen_server::config::ServiceConfig {
+            name: "echo".into(),
+            fs: 1,
+            id: vec![0x5E; 16],
+            mode: zen_server::config::SvcMode::Tcp,
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            max_conns: 16,
+            per_ip_rate: 0,
+            per_ip_burst: 50,
+            window: 262_144,
+            out_window: 1_048_576,
+            accept_wait_ms: 60_000,
+            handshake_secs: 30,
+            idle_secs: 300,
+            resume: true,
+        })
+    })
+    .await;
+    let store = target.server.state.store.clone();
+    let rk = zen_server::keys::node_lease(&target.server.state.svc.node);
+    {
+        let mut t = store.begin(None).await.unwrap();
+        assert!(t.get(&rk).await.unwrap().is_some(), "the node lease");
+    }
+    assert!(is_empty(store.as_ref()).await);
+}
+
 /// A server that was only ever started holds no data: its metadata (the
 /// challenge key, the embedded version clock) is private to it. So an
 /// import needs no `--force`, and the target keeps its own challenge key.

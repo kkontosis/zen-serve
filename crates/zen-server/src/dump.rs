@@ -141,15 +141,23 @@ pub async fn export(store: &dyn Storage, backend: &str, w: impl Write) -> Result
     Ok(stats)
 }
 
-/// Whether `store` holds any (non-private) key.
+/// Whether `store` holds any key an import would clash with: the private
+/// `meta` range and the transient relay keys (keyspace.md §3.9) don't
+/// count, since a started server writes them.
 pub async fn is_empty(store: &dyn Storage) -> Result<bool, String> {
     let mut t = store.begin(None).await.map_err(|e| e.to_string())?;
-    let meta = keys::meta_prefix();
-    // Everything before and after the private `meta` range.
-    for (b, e) in [
-        (&[][..], &meta[..]),
-        (&keys::end_of(&meta)[..], &[0xFF][..]),
-    ] {
+    let mut skip = keys::relay_prefixes();
+    skip.push(keys::meta_prefix());
+    skip.sort();
+    // The gaps between the skipped ranges, then the rest of the keyspace.
+    let mut from = Vec::new();
+    let mut gaps = Vec::new();
+    for p in &skip {
+        gaps.push((from, p.clone()));
+        from = keys::end_of(p);
+    }
+    gaps.push((from, vec![0xFF]));
+    for (b, e) in gaps.iter().filter(|(b, e)| b < e) {
         let got = t
             .snapshot_get_range(b, e, 1, false)
             .await
