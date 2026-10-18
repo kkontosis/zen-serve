@@ -540,7 +540,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 
 | `op` | Fields |
 |---|---|
-| `ok` | `id?` |
+| `ok` | `id?`, `conn?` (only on `/v1/svc/connect`, §14.9) |
 | `ev` | `id, topic, offset, key_token?, envelope` |
 | `eph` | `id, topic, data, sender: bytes(32)` (device fp) |
 | `err` | `id?, code, message` |
@@ -801,11 +801,24 @@ A code-3 reveal from the claim holder whose `key_hash` matches but whose AEAD fa
 
 ### 14.9 `GET /v1/svc/connect?fs=<fs>&svc=<hex>` (WebSocket, `tcp-auth`)
 
-* Authentication is a Bearer header, or, when the client can't set headers, a first binary frame `{op: "auth", token}` as on `/v1/stream`.
-* The server then checks topic `append` on `svc` (403 otherwise) and the service's mode, accepts the connection as svc.md §3 describes (with `peer = {user, device}`), and sends a binary frame `{op: "ok", conn: bytes(16)}`.
-* After that, binary frames carry the byte stream both ways, in order.
-* A text frame `"fin"` is a half-close of the sender's direction: from the client, the EOF flag; from the server, a FIN record.
-* A WebSocket close, from either side, ends the connection: from the client like a reset, from the server after a close or abort record.
+A member reaches a `tcp-auth` service through the server's own listener. `fs` is decimal, `svc` the service id in hex.
+
+* **Authentication**, two ways:
+  * **A Bearer header** (§3). Everything below is checked before the upgrade, and a failure is an HTTP error.
+  * **A first frame**, for clients that can't set headers (browsers): without a header the upgrade happens first, and the first frame must be a binary `{op: "auth", token}` as on `/v1/stream` (§9), within 10 s. A failure is a binary frame `{op: "err", code, message}`, then a close.
+* **Checks, in order:**
+  1. the token: 401 `unauthorized`
+  2. the service: 404 `not_found` when `svc` isn't configured for `fs` or isn't `tcp-auth`
+  3. topic `append` on `svc`: 403 `forbidden`
+  4. admission (svc.md §3, step 1): 429 `quota` at `max_conns`, or when the token bucket of the client's address is empty
+* **Accept.** The connection is accepted as svc.md §3 describes, with `peer = {user, device}` of the caller. Once the accept has committed, the server sends a binary frame `{op: "ok", conn: bytes(16)}`. If the accept fails, it sends `err` and closes.
+* **Data.** After the `ok`, binary frames carry the byte stream both ways, in order. A frame holds at most 65,536 bytes, both ways; a larger client frame resets the connection (close 4000).
+* **Half-close.** A text frame `"fin"` closes the sender's direction: from the client it sets the EOF flag; the server sends it when it reaches a FIN record. Other text frames from the client reset the connection.
+* **Close codes.** A WebSocket close ends the connection.
+  * From the server, 1000: it ended normally (a close record, or FIN both ways with all input acked). The connector should finish writing what it received, then close its side.
+  * From the server, 4000: a reset (an abort record, a timeout, a reap, a node shutting down). The connector should reset its local side.
+  * From the client, any close (and a lost WebSocket) is a reset, as a TCP peer's would be.
+* **Rights are checked once, at connect**, as a TCP peer is admitted once. Revoking `append` or the membership later doesn't end an open connection. The handler knows the connector's user and device from the claim's `peer`, and can end the connection itself.
 
 ### 14.10 Pushed input (`svc_sub`)
 

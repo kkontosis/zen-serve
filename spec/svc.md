@@ -25,7 +25,7 @@ A service is a `[[service]]` table in the server configuration. **Every node car
 | `mode` | `tcp`: a public port. `tcp-auth`: connections come from members over `/v1/svc/connect` | required |
 | `listen` | the address to accept on (`tcp` only; refused for `tcp-auth`) | required for `tcp` |
 | `max_conns` | open connections per node; further accepts are closed at once | 1,024 |
-| `per_ip_rate`, `per_ip_burst` | a token bucket of accepts per peer address, per node (`tcp` only); `0` turns it off | 10 per s, 50 |
+| `per_ip_rate`, `per_ip_burst` | a token bucket of accepts per peer address, per node (for `tcp-auth`, the WebSocket client's address); `0` turns it off | 10 per s, 50 |
 | `window` | unacked input bytes per connection (≥ 65,536) | 262,144 |
 | `out_window` | committed, unwritten output bytes per connection (≥ 65,536) | 1,048,576 |
 | `accept_wait_ms` | a connection not claimed within this time is aborted | 10,000 |
@@ -43,7 +43,8 @@ A service is a `[[service]]` table in the server configuration. **Every node car
 
 ## 3. Connection lifecycle
 
-1. **Admission** (`tcp`). The node checks `max_conns` and the peer's token bucket before it writes anything; over either, it closes the socket.
+1. **Admission.** The node checks `max_conns` and the peer's token bucket before it writes anything; over either, it closes the socket.
+   * For `tcp-auth`, the peer is a WebSocket on `/v1/svc/connect` (api.md §14.9). The node checks the token and topic `append` first, then admission, with the bucket of the WebSocket client's address; a refusal is 429 `quota`. Everything after admission is the same in both modes: **the connection is the WebSocket**, and the steps below read "socket" as the WebSocket. Losing the WebSocket loses the connection, as for TCP.
 2. **Accept.** The node picks a **connection id** (16 random bytes) and writes, in one transaction:
    * the connection record `rc` (its node, the peer, the time, the settings, the inbox ciphertext)
    * the counters `rh`, `ra`, `rw` at zero
@@ -56,6 +57,7 @@ A service is a `[[service]]` table in the server configuration. **Every node car
    * It stops reading while `in_head − in_acked ≥ window`. That is TCP backpressure: the peer's writes block.
    * It also stops reading while the fs is over its byte quota (keyspace.md §3.1). This is backpressure too, not an error.
    * A FIN from the peer sets the EOF flag in `rh`. A reset from the peer ends the connection (step 10).
+   * `tcp-auth`: each binary frame is input, and the text frame `"fin"` is the FIN. A frame larger than the room in the window is stored in parts: the rest waits in the node, and nothing more is read until it is stored. Any close from the client is a reset.
    * If the transaction returns `commit_unknown`, the node re-reads `rh` before it re-sends a batch, so a batch is never appended twice.
    * The node reads the claim `rm` (not by snapshot) and rings the doorbell of the lease holding the connection. So a handler claiming concurrently is never left asleep.
 4. **Claim.** A handler holds a lease (§10) and claims queued connections with `/v1/svc/next`.
@@ -67,10 +69,11 @@ A service is a `[[service]]` table in the server configuration. **Every node car
 7. **Writing.** The owning node writes revealed records to the socket in order from `written_to`, and plain records as soon as they commit.
    * After each `write_all`, one transaction clears the written records and their keys and advances `written_to`. It also rings the holder's lease doorbell, which wakes a handler waiting on `window`.
    * A record that isn't revealed yet blocks the records after it.
-8. **Half-close.** A record with FIN shuts down the socket's write side once everything before it is written. The handler may still read and ack input; further records get `conn_closed`. Once the FIN record is written, the peer's EOF is stored and all input is acked, the node closes the socket and reaps (step 10).
+8. **Half-close.** A record with FIN shuts down the socket's write side once everything before it is written (`tcp-auth`: the node sends the text frame `"fin"`). The handler may still read and ack input; further records get `conn_closed`. Once the FIN record is written, the peer's EOF is stored and all input is acked, the node closes the socket and reaps (step 10).
 9. **Close and abort.**
    * A record with close: once everything before it is written, the node reads and discards input for up to 1 s, so the kernel doesn't reset the last bytes, then closes the socket.
    * A record with abort: the node resets the socket (`SO_LINGER` 0) when it reaches the record.
+   * `tcp-auth`: output goes in binary frames of at most 65,536 bytes. A close record sends close 1000, then waits up to 1 s for the client's close, discarding data. An abort, and every reset of step 10, sends close 4000. A connection that ends with FIN both ways sends close 1000.
    * Steps after either get `conn_closed`.
 10. **End.** When the socket closes, for any reason, the node **reaps** the connection in one transaction:
     * deletes all of its keys
