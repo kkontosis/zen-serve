@@ -161,6 +161,172 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * The failure didn't reproduce locally, even on one loaded CPU. The mechanism was confirmed against OpenSSL directly: with a Python TLS echo server that waits 1 s, `s_client` with stdin closed after 0.3 s printed no echo, and with stdin open for 2 s it did.
     * Fix: a thread reads `s_client`'s stdout as it arrives, and the helper keeps stdin open until stdout holds `wait_for` (or 30 s pass). The data tests pass their expected echo; the renegotiation and no-EMS tests pass `None`.
     * Verified: clippy on zen-svc; `cargo test -p zen-svc --test openssl` 5×, and 3 rounds of three copies at once.
+  * CI green on PR #44's head (all 8 checks); merged.
+* **Step 5.5.8** (`@zen/svc-wasm` and the `tls()` layer): planned. Restarted from main after PR #44 merged; the plan is below.
+  * Next: on "go", the code (no `spec:` commit expected).
+
+## Step 5.5.8 in detail: `@zen/svc-wasm` and the `tls()` layer
+
+Handlers serve TLS: the step-5.5.7 engine is built for wasm as a second module, loaded only by services that use it, and `@zen/svc` gains a `tls()` layer between the relay's bytes and the app's handler. The handler sees plaintext through the same `RawStep` interface as a raw handler, so the echo handler runs over TLS unchanged. A handler killed mid-stream is resumed from the engine state; one killed mid-handshake leaves a connection the server aborts (svc.md §7.1, TD-SVC-TLS-HANDSHAKE-RESUME).
+
+**Commits:**
+1. `docs: milestone 5.5 step 8 plan` (also logs step 5.5.7's CI)
+2. `svc: the TLS engine for wasm (crates/zen-svc-wasm, @zen/svc-wasm)`
+3. `svc: the tls() layer in @zen/svc`
+4. `apps: echo over TLS`
+5. the docs and the log
+
+No `spec:` commit is expected: the engine, its state and when a connection becomes resumable are already in svc.md §7.1. If the runtime finds a gap, it gets one.
+
+### Facts from the survey
+* **The first module:**
+  * `scripts/build-wasm.sh` builds only `crates/zen-wasm` into `packages/zen-wasm/pkg` (wasm-bindgen `--target web`, with the version pinned from Cargo.lock: `=0.2.129`).
+  * `packages/zen-wasm` is just a `package.json`: name `@zen/wasm`, `exports` `"."` and `"./zen_wasm_bg.wasm"`.
+* **Loading the first module:** `packages/client/src/wasm.ts` `initWasm(source?)` memoizes one promise.
+  * Node: `createRequire(...).resolve('@zen/wasm/zen_wasm_bg.wasm')`, `readFile`, then `initSync`.
+  * Browsers: the glue's default, which fetches the file next to `import.meta.url`.
+* **App bundles (`scripts/build-apps.mjs`):**
+  * The `wasm` list copies a `.wasm` next to `main.js` when the metafile inputs show its glue.
+  * Node workers keep `@zen/wasm` external and load it from node_modules.
+  * `loro-crdt` is the precedent for a second module.
+* **zen-wasm's conventions:**
+  * Opaque handles are `#[wasm_bindgen] pub struct` newtypes, freed with `free()` from JS.
+  * Errors are a `js_sys::Error` named `ZenCryptoError` with a stable code as the message.
+  * `u64` maps to bigint; objects are returned typed through `unchecked_return_type`.
+* **`serve.ts`:**
+  * One `db.transaction` per step, whose callback may run more than once (conflicts).
+  * `'raw'` is hard-coded in two places: the state's `engine` check in `load`, and `encodeState` in `build`.
+  * `resumable` goes on the first step.
+  * A step is due on new input, on an unseen EOF, or on `due` for a fresh connection.
+* **CI:**
+  * The `client` job runs `scripts/build-wasm.sh` (release), installs wasm-bindgen through `taiki-e/install-action`, runs vitest and Playwright (smoke and apps).
+  * The `rust` job checks zen-svc for wasm32.
+  * The runners have `openssl`.
+* **Size:** the first module is 2.14 MB (589 KB gz) without wasm-opt (TD-CLIENT-WASM-OPT, STATS §4.1).
+* **rustls-pki-types** (1.15) parses PEM with its default `alloc` feature (`PemObject::from_pem_slice`, `pem_slice_iter`).
+
+### `crates/zen-svc-wasm` (new) and `@zen/svc-wasm`
+* **The crate:**
+  * A workspace member: `crate-type = ["cdylib", "rlib"]`, `wasm-bindgen = "=0.2.129"`, `js-sys`, and zen-svc.
+  * zen-svc already turns on getrandom's `wasm_js` and rustls-pki-types' `web` for wasm32.
+* **Bindings,** following zen-wasm's conventions. Errors are named `ZenTlsError`, with the codes `config`, `state`, `handshaking`, `closed`, `key_limit`, `unsupported`.
+  * `TlsConfig`:
+    * `new TlsConfig(certPem: Uint8Array, keyPem: Uint8Array, opts?: {alpn?: Uint8Array[], tls12?: boolean, tls13?: boolean, keyLimit?: number})`
+    * The PEM holds the chain, leaf first, and the key: PKCS#8 or SEC1. An RSA key or a mismatch gives `config`.
+  * `TlsConn`:
+    * `TlsConn.start(config)` and `TlsConn.restore(config, state)`.
+    * `input(buf, eof) → {consumed: number, out: Uint8Array, established, peerClosed, truncated, held, error?: {code, alert?}}`. `held`: the plaintext reached `PLAIN_HELD`, so complete records may be waiting.
+    * `plaintext()`, `consume(n)`, `write(data)`, `keyUpdate(requestPeer)`, `close()`, `state() → Uint8Array | undefined`.
+    * Getters: `established`, `version` (`'TLSv1.3'` or `'TLSv1.2'`), `suite` (the IANA name), `sni`, `alpn`.
+  * `PLAIN_HELD`.
+  * Handles are freed with `free()`; zen-svc's keys zeroize on drop.
+* **`scripts/build-wasm.sh`** builds both modules in turn: `zen-wasm` into `packages/zen-wasm/pkg`, `zen-svc-wasm` into `packages/svc-wasm/pkg`, printing both sizes. `--dev` applies to both.
+* **`packages/svc-wasm`** (`@zen/svc-wasm`):
+  * A `package.json` like `@zen/wasm`'s, with `exports` `"."` and `"./zen_svc_wasm_bg.wasm"`.
+  * Wiring: a root `workspaces` entry, `package-lock.json`, `.gitignore` (`packages/svc-wasm/pkg/`), biome's ignore list, and a `@zen/svc` dependency.
+* **App bundles:** `scripts/build-apps.mjs` adds the module to its `wasm` copy list (keyed on `svc-wasm/pkg/zen_svc_wasm.js`) and to the Node workers' externals.
+
+### `@zen/svc`: layers and `tls()`
+* **API:**
+  ```ts
+  serve(db, { service, handler, layer?: Layer /* default: raw() */, ... })
+  raw(): Layer
+  tls(opts: {
+    cert: string | Uint8Array;   // PEM: the chain, leaf first
+    key: string | Uint8Array;    // PEM: PKCS#8 or SEC1 (ECDSA P-256/P-384, Ed25519)
+    alpn?: string[];
+    versions?: ('1.2' | '1.3')[];  // default both
+    wasm?: URL | string | Response | BufferSource;  // where the module is, if not next to the glue
+  }): Layer
+  ```
+  * `RawStep` gains `readonly tls?: {version, suite, sni, alpn, truncated}`, set under `tls()`. So `RawHandler` serves both layers, and the echo handler runs over TLS unchanged.
+  * The handler's PEM comes from wherever the app keeps it; the echo app keeps it in a zen-db table, which is sealed like every row.
+* **Loading (`src/tls/wasm.ts`):**
+  * `loadSvcWasm(source?)` is memoized and imports `@zen/svc-wasm` dynamically, so the glue loads only when `tls()` is used.
+  * Node reads the `.wasm` through `createRequire` + `initSync`; browsers use the glue's fetch next to `import.meta.url`, or `source`.
+  * The layer loads it and builds its `TlsConfig` once, when `serve()` starts. A bad certificate or key is reported through `onError`, and nothing is claimed.
+* **The runtime (`serve.ts`), changed so a layer sits between bytes and handler:**
+  * **The engine name** in the state is the layer's (`raw` or `tls`). A claim whose state names another engine is released with `close` (as today for raw).
+  * **Before each attempt, outside the transaction,** the layer prepares the step from the input:
+    * The raw layer passes the input through.
+    * TLS feeds the raw bytes (from `in_acked`) to the engine and keeps:
+      * `consumed` (the step's input ack)
+      * the engine's `out` (handshake flights, KeyUpdate answers, alerts)
+      * `established`, `peerClosed`, `truncated`, `held`
+      * the engine state after input
+    * Established: the engine is restored from the last committed state on each attempt, so every step is also a takeover test.
+    * Handshaking: the `TlsConn` lives on the held connection between steps, because it can't be serialized. Its output and ack for this step are computed once and reused if the transaction runs again.
+  * **Inside the transaction** (which may run again):
+    * The TLS layer restores a `TlsConn` from the prepared state.
+    * The handler gets the plaintext as `input`. `eof` is `peerClosed || truncated`, and the handler can tell them apart through `c.tls.truncated`.
+    * The handler's `ack(n)` consumes plaintext. Its `write`s are encrypted. `end()` sends close_notify, then FIN; `close()` sends close_notify, then close; `abort()` resets without close_notify.
+    * The step's records carry the engine's `out` followed by the encrypted writes. Its state is `{engine: 'tls', engine_state, app}`. The object is freed.
+    * During the handshake the handler isn't called (no plaintext yet), unless the handshake finished in this step and data came with it.
+  * **`resumable`:**
+    * Raw: on the first step, as now.
+    * TLS: on the step that finished the handshake.
+    * Until then the connection has no state, and a lease loss aborts it on the server (svc.md §6).
+  * **Failures:**
+    * A fatal engine error sends `out` (the alert) with a close record, without calling the handler, and reports through `onError`.
+    * During the handshake, `cursor_moved`, `commit_unknown` or `network` after retries releases the connection with `close` instead of resyncing (svc.md §7.1).
+    * An established connection resyncs as today, restoring from the re-read state.
+  * **Progress without input:** when the engine held records back (`held`) and the handler consumed plaintext, the step is due again at once.
+  * **Cleanup:** wasm objects are freed when a connection is forgotten or given up, and on `stop()`.
+* **Unit tests (`packages/svc/test/tlswasm.test.ts`, no server):**
+  * The binding against Node's own TLS client, `tls.connect({socket})` over an in-memory duplex, with the engine as the server, restored from its state after every input.
+  * 1.3 and 1.2, data both ways, a client KeyUpdate where Node allows it, close_notify.
+  * Error codes: a bad PEM, an RSA key, a write while handshaking, a bad state.
+  * Also: the layer's prepare and step logic on a fake transaction, if it can be separated cleanly; otherwise it's covered by the app tests.
+
+### `apps/echo` over TLS
+* **`src/echo.ts`:**
+  * `TLS_SERVICE = ['svc', 'echo-tls']`, and `serveEcho(db, {tls?: {cert, key}})` passes `layer: tls(...)`.
+  * A `mirror` handler, which writes back all input and acks it, with no rows, for the bulk test, on `['svc', 'mirror-tls']`.
+  * A `certs` table (name → `{chain, key}`) holds the certificate and key.
+* **`workers/handler.ts`:** `ECHO_LAYER=tls` (or `mirror`) reads the `certs` row and serves that service.
+* **`ui/`:** a second toggle serves `echo-tls` from the tab.
+* **Test certificates:** made with the `openssl` CLI (P-256, SAN `localhost` and `127.0.0.1`) by a helper in `apps/shared`. It fails with a clear message when `openssl` is missing.
+* **Vitest (`apps/echo/test/tls.test.ts`),** with Node `tls.connect` peers trusting the test CA, `servername: 'localhost'`:
+  1. **The line echo over TLS 1.3 and over 1.2** (`maxVersion: 'TLSv1.2'`), in-process:
+     * the replies, the rows, and `bye` on the client's `end()`
+     * the peer sees close_notify, then EOF
+     * the negotiated version and suite on both sides
+  2. **SIGKILL mid-stream:**
+     * 200 lines, 5 ms apart, to a worker; it is killed at line ~80 and a second worker takes over (lease TTL 1 s).
+     * The TLS client sees no error, the transcript is `1:`…`200:` exactly once and in order, and the table holds 200 rows.
+  3. **SIGKILL mid-handshake:**
+     * A TCP proxy in the test forwards the ClientHello and the server's flight, then holds the client's second flight until the worker is killed.
+     * The server aborts the connection once the lease lapses, so the client gets an error or close, not a hang.
+     * A new connection then works with the successor.
+  4. **20 MB across two kills:**
+     * The client sends 20 MB of random bytes to `mirror-tls` and reads 20 MB back.
+     * The worker is killed twice during the transfer; the SHA-256 of what came back equals what was sent.
+* **Playwright (`apps/echo/e2e/echo.spec.ts`):** a TLS case. Alice's tab serves `echo-tls`; a Node TLS peer gets `1: …`. This checks the browser loading path: build-apps copies the second module and the glue fetches it.
+
+### CI
+* `client` job: `scripts/build-wasm.sh` now builds both modules; nothing else changes.
+* `rust` job's wasm32 check: `-p zen-svc-wasm`.
+
+### Docs
+* `docs/CLIENT.md` §11: `tls()`, `RawStep.tls`, where certificates live, and what a takeover keeps (established connections) and loses (handshakes).
+* `apps/README.md`: echo over TLS.
+* `docs/STATS.md` §4.1: the second module's size (release, gzipped).
+* TECH_DEBT TD-CLIENT-WASM-OPT: the second module.
+* README crates and packages tables: `crates/zen-svc-wasm`, `packages/svc-wasm`.
+* The log in both plan copies.
+
+### Out of scope
+* SSH (5.5.9–5.5.10); `tcp-auth` (5.5.11); the sealed inbox (5.5.12)
+* An admin helper to put certificates into the fs, and ACME (TD-SVC-ACME); SNI-based certificate selection; client certificates; RSA server keys
+* wasm-opt (TD-CLIENT-WASM-OPT)
+
+### Verification
+* `cargo fmt --check`; clippy `--all-targets -D warnings` default, `--no-default-features`, `--all-features`; clippy on `zen-svc-wasm` for wasm32
+* `scripts/build-wasm.sh` (release) and `--dev`
+* `npm run check`; `npx vitest run` 3× (all packages and apps, including the new tests)
+* `npx playwright test` (smoke and apps)
+* `cargo test -p zen-svc` once (unchanged)
+* CI green on the PR
 
 ## Step 5.5.7 in detail: the TLS engine (`crates/zen-svc`, native)
 
