@@ -293,11 +293,11 @@ await h.stop();                                      // the server requeues its 
 * **State.** `c.state` (bytes, or null) is sealed with the step (kind 9, bound to the connection's cursors) and comes back in the next step, also on another handler. Ack only whole protocol units: what isn't acked comes back as input.
 * **Takeover.** `serve` holds a handler lease (`leaseTtlMs`, default 5 s, renewed every second). When the handler dies, its connections move to another handler once the lease lapses, and that one continues from the last committed step: the output of a committed step is revealed by whichever handler holds the connection (its keys are escrowed under the service key), and the input not acked is pushed again. On a `resume: false` service, output is plain and a connection whose handler dies is closed.
 * **Where it runs.** Like consumers, `serve` runs while the database is the owner, so of a browser's tabs one serves. Keys come from the unlocked fs (`fs.service(...path).keysAt(epoch)`).
-* **Not yet:** the SSH layer, `tcp-auth`, the sealed inbox (a sealed input chunk closes the connection), and a line helper: milestone 5.5 steps 9–13.
+* **Not yet:** `tcp-auth`, the sealed inbox (a sealed input chunk closes the connection), and a line helper: milestone 5.5 steps 11–13.
 
 ### TLS: `tls()`
 
-A layer sits between the connection's bytes and the handler: `raw()` (the default) hands them through; `tls(…)` terminates TLS 1.3 and 1.2 in the handler (svc.md §7.1), so the server relays ciphertext it can't read. The handler is the same `RawHandler`: it sees plaintext, and `c.tls` tells it the connection's TLS parameters.
+A layer sits between the connection's bytes and the handler and gives the handler its view of each step: `raw()` (the default) hands the bytes through; `tls(…)` terminates TLS 1.3 and 1.2 in the handler (svc.md §7.1), so the server relays ciphertext it can't read; `ssh(…)` (below) serves SSH. Under `tls()` the handler is the same `RawHandler`: it sees plaintext, and `c.tls` tells it the connection's TLS parameters.
 
 ```ts
 import { serve, tls } from '@zen/svc';
@@ -315,9 +315,43 @@ const h = serve(db, {
 
 * **Certificates.** `cert` is the PEM chain, leaf first; `key` its PEM key, PKCS#8 or SEC1: ECDSA P-256 or P-384, or Ed25519 (RSA server keys aren't supported, TD-TLS-RSA-SERVER-KEY). One certificate per service, no SNI-based choice and no client certificates. The echo app keeps its certificate in a table, sealed like every row; an admin helper and ACME are later work (TD-SVC-ACME). A bad certificate or key is reported through `onError` when `serve` starts, and nothing is claimed.
 * **Versions.** `versions: ['1.3']` turns 1.2 off. 1.2 offers only the ECDHE-ECDSA AEAD suites and requires the extended master secret; there are no tickets, no resumption, no early data and no renegotiation.
-* **The module.** The engine is a second WASM module, `@zen/svc-wasm` (about 1 MB, 0.4 MB gzipped), loaded the first time a service uses `tls()`. Node reads it from `node_modules`; a browser fetches `zen_svc_wasm_bg.wasm` next to the glue (`scripts/build-apps.mjs` copies it next to an app's bundle), or from `tls({wasm})`.
+* **The module.** The engine is a second WASM module, `@zen/svc-wasm` (about 1.2 MB, 0.5 MB gzipped, with the SSH engine), loaded the first time a service uses `tls()` or `ssh()`. Node reads it from `node_modules`; a browser fetches `zen_svc_wasm_bg.wasm` next to the glue (`scripts/build-apps.mjs` copies it next to an app's bundle), or from `tls({wasm})`.
 * **When the handler runs.** On the step that finishes the handshake (so a server-first protocol can greet), and then on new plaintext or an EOF it hasn't seen. `c.eof` is set on close_notify, and on an EOF without it, which `c.tls.truncated` tells apart. `c.end()` sends close_notify, then FIN; `c.close()` close_notify, then closes; `c.abort()` resets without close_notify.
 * **What a takeover keeps.** Once the handshake is done, the engine state (keys, sequence numbers, the plaintext not acked) is sealed with every step, and a successor restores it and continues the live connection; the step that finishes the handshake also makes the connection resumable. A handshake can't be serialized: if its handler dies, or a handshake step's commit outcome is unknown, the connection is aborted (TD-SVC-TLS-HANDSHAKE-RESUME), and the client connects again.
+
+### SSH: `ssh()`
+
+`ssh(…)` serves SSH in the handler (svc.md §7.2): the key exchange (`mlkem768x25519-sha256` or `curve25519-sha256`), the Ed25519 host key, `publickey` logins and `session` channels with `exec`, `shell` and `subsystem`. An SSH connection isn't one byte stream, so the handler gets an `SshStep` instead of a `RawStep`: the login question to answer, the step's events, and the channels.
+
+```ts
+import { serve, ssh } from '@zen/svc';
+
+const host = await db.table('certs').get('ssh');    // the host key's PEM, kept by the app
+const h = serve(db, {
+  service: ['svc', 'git'],
+  layer: ssh({ hostKey: host.key }),
+  handler: async (c, tx) => {
+    if (c.question) {                                // may this key log in as this user?
+      const k = await tx.table('ssh_keys').get([c.question.user, c.question.key.fingerprint]);
+      c.answer(k !== undefined);
+    }
+    for (const e of c.events) if (e.type === 'exec') { /* e.ch, e.command: keep it in c.state */ }
+    for (const ch of c.channels) {
+      const n = ch.write(ch.data);                   // a cat: write what fits, ack that much
+      ch.ack(n);
+      if (ch.eof && ch.data.length === 0) { ch.exit(0); ch.close(); }
+    }
+  },
+});
+```
+
+* **Logins.** The handler decides: `c.question` is `{user, key: {algorithm, fingerprint, blob}, signed}`, asked once without a signature (a yes lets the client sign) and once with one (a yes logs it in). Answer in the step that asks; a question left unanswered is refused. User keys are Ed25519, or RSA (2,048 to 4,096 bits) with SHA-2 signatures. `c.user` is set once logged in. The echo app keeps `authorized_keys` in a table, `ssh_keys`, keyed by user and fingerprint.
+* **The host key** is an unencrypted OpenSSH Ed25519 PEM (`ssh-keygen -t ed25519 -N ''`), kept wherever the app keeps it; the echo app keeps it in `certs`. A bad key is reported through `onError` when `serve` starts.
+* **Events and channels.** `c.events` holds this step's `open`, `exec` (with `command`), `shell`, `subsystem` (with `name`), `data`, `eof` and `close`. A command comes only once, in its event, so keep it in `c.state` with whatever else a channel needs. `ch.data` is what the client sent and the handler hasn't acked; `ch.ack(n)` consumes it, which opens the client's window. `ch.write()` and `ch.stderr()` return how much they took: what the client's window takes, what fits the engine's 16 KiB queue, and what fits the step's output. Keep the rest (a `cat` simply doesn't ack it). `ch.exit(code)`, `ch.end()` and `ch.close()` follow what is queued. `c.disconnect()` ends the connection.
+* **When the handler runs.** On every step, since a window adjust carries no event but lets a writer go on. A step whose writes were cut short by `out_window`, or that acked data while the engine held input back, runs again at once. Once the engine has ended (the client disconnected, or a protocol error, sent as DISCONNECT and reported through `onError`), the connection is closed without the handler.
+* **The window.** Each channel is offered `window` bytes, by default (the service's `window` − 64 KiB) / 10, so that 10 channels' data in flight and a key exchange fit the relay's input window (svc.md §7.2). SSH services should set `window = 1048576` in their `[[service]]` table.
+* **What a takeover keeps:** everything, from the first step. The engine state (the version lines, both KEXINITs during a key exchange, keys and sequence numbers, the login in progress, the channels with their windows and buffers) is sealed with every step, so a successor continues the session mid-transfer, mid-rekey or mid-key-exchange; a question pending at a takeover is asked again.
+* **Not supported** (TD-SVC-SSH-SCOPE): passwords and keyboard-interactive logins, a PTY, port and agent forwarding, ECDSA and security-key user keys.
 
 ## 12. Security notes
 
