@@ -3,7 +3,7 @@
 use super::reap::{End, end_lease, reap_expired_leases, requeue_or_abort};
 use super::{
     Acks, ClaimRec, Id, RH_EOF, RZ_RELEASED, Service, check_claim, claim_of, decode_head,
-    decode_lease, decode_u64, encode_lease, flags, parse_id, tail_int,
+    decode_lease, decode_u64, encode_lease, flags, log_input, parse_id, ring, tail_int,
 };
 use crate::acl::{R_APPEND, R_CONSUME};
 use crate::auth::Caller;
@@ -190,7 +190,12 @@ async fn claim_some(
         t.set(&rm, &ClaimRec::claimed(lease, device, token));
         t.clear(&k);
         t.set(&keys::svc_claims(fs, svc, lease).bytes(&conn).finish(), &[]);
+        log_input(t, fs, svc, lease, &conn, out.len() as u16);
         out.push(claim_of(t, fs, svc, &conn, token).await?);
+    }
+    // The lease's stream pushes start on the new claims.
+    if !out.is_empty() {
+        ring(t, &keys::svc_lease_bell(fs, svc, lease));
     }
     Ok(out)
 }
@@ -269,7 +274,7 @@ pub async fn read(
 
 /// Input chunks from the one containing `from`, up to `max` bytes (at
 /// least one chunk). Chunks are immutable, so snapshot reads are exact.
-async fn chunks(
+pub(crate) async fn chunks(
     t: &mut Box<dyn Txn>,
     fs: u32,
     svc: &[u8],

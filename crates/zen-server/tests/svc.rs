@@ -1,6 +1,7 @@
 //! Relayed services (spec/svc.md, api.md §14): accept, claims, reads,
 //! backpressure, closing, admission, leases, rights, dead nodes and export;
-//! then the output side: steps, reveals, the writer, takeover and timers.
+//! then the output side: steps, reveals, the writer, takeover and timers;
+//! then pushed input and reveals over `/v1/stream`.
 
 mod common;
 
@@ -1319,4 +1320,423 @@ async fn info_lists_svc() {
     let h = Harness::start().await;
     let i: Info = h.get("/v1/info").await;
     assert!(i.features.iter().any(|f| f == "svc"));
+}
+
+// ---------------------------------------------------------------- stream push
+
+const SUB: u32 = 9;
+
+/// A stream socket subscribed to lease `lease`'s input.
+async fn svc_sub(h: &Harness, tok: &[u8], lease: u8) -> Ws {
+    let mut ws = connect(h, tok).await;
+    send(
+        &mut ws,
+        &Frame::SvcSub {
+            id: SUB,
+            fs: 1,
+            svc: SVC.to_vec(),
+            lease: vec![lease; 16],
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut ws).await, Frame::Ok { id: Some(SUB) });
+    ws
+}
+
+/// The next frame within `within`, if any.
+async fn frame_within(ws: &mut Ws, within: Duration) -> Option<Frame> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(Message::Binary(b)))) => return Some(from_cbor(&b).unwrap()),
+            Ok(Some(Ok(_))) => continue,
+            Ok(_) | Err(_) => return None,
+        }
+    }
+}
+
+/// The next frame that isn't `svc_ready`.
+async fn next_push(ws: &mut Ws) -> Frame {
+    loop {
+        match recv(ws).await {
+            Frame::SvcReady { id } => assert_eq!(id, SUB),
+            f => return f,
+        }
+    }
+}
+
+/// Wait for a `svc_ready`, skipping other frames.
+async fn ready(ws: &mut Ws) {
+    while recv(ws).await != (Frame::SvcReady { id: SUB }) {}
+}
+
+/// What a subscription pushed of each connection: the input from where it
+/// was first asked for, and whether the EOF came.
+#[derive(Default)]
+struct Pushed {
+    from: std::collections::HashMap<Vec<u8>, u64>,
+    data: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    eof: std::collections::HashSet<Vec<u8>>,
+}
+
+impl Pushed {
+    /// Take one `svc_in`. Within a claim nothing is pushed twice, so each
+    /// chunk starts where the last one ended (the first may start before
+    /// the cursor asked for).
+    fn take(&mut self, f: Frame) {
+        let Frame::SvcIn {
+            id,
+            conn,
+            off,
+            data,
+            sealed,
+            flags,
+        } = f
+        else {
+            panic!("expected svc_in, got {f:?}");
+        };
+        assert_eq!(id, SUB);
+        assert!(!sealed);
+        let from = *self.from.entry(conn.clone()).or_insert(off);
+        let got = self.data.entry(conn.clone()).or_default();
+        let end = from + got.len() as u64;
+        if data.is_empty() {
+            assert!(flags & 1 != 0, "an empty svc_in is the EOF");
+            assert_eq!(off, end, "the EOF sits at in_head");
+            assert!(self.eof.insert(conn), "the EOF is pushed once");
+            return;
+        }
+        assert!(!self.eof.contains(&conn), "nothing after the EOF");
+        if got.is_empty() {
+            assert!(off <= from);
+            got.extend_from_slice(&data[(from - off) as usize..]);
+        } else {
+            assert_eq!(off, end, "chunks are contiguous and not repeated");
+            got.extend_from_slice(&data);
+        }
+    }
+
+    /// Pushes until `conn` has `n` bytes from `from` (the first svc_in of a
+    /// connection fixes `from`).
+    async fn until(&mut self, ws: &mut Ws, conn: &[u8], from: u64, n: usize) -> Vec<u8> {
+        self.from.entry(conn.to_vec()).or_insert(from);
+        while self.data.get(conn).map_or(0, Vec::len) < n {
+            let f = next_push(ws).await;
+            self.take(f);
+        }
+        self.data[conn].clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_input() {
+    let (h, tok, addr) = setup(|_| {}).await;
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    // The queue is empty: no svc_ready yet.
+    assert_eq!(
+        frame_within(&mut ws, Duration::from_millis(300)).await,
+        None
+    );
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"hello").await.unwrap();
+    ready(&mut ws).await;
+    let c = claim(&h, &tok, 1).await;
+    let mut p = Pushed::default();
+    assert_eq!(p.until(&mut ws, &c.conn, 0, 5).await, b"hello");
+
+    let mut worst = Duration::ZERO;
+    for i in 0..10 {
+        let t0 = Instant::now();
+        let line = format!("line {i}\n");
+        peer.write_all(line.as_bytes()).await.unwrap();
+        let have = p.data[&c.conn].len();
+        let got = p.until(&mut ws, &c.conn, 0, have + line.len()).await;
+        assert!(got.ends_with(line.as_bytes()));
+        worst = worst.max(t0.elapsed());
+    }
+    println!("push latency, worst of 10: {worst:?}");
+    assert!(
+        worst < Duration::from_secs(1),
+        "pushed within 1 s: {worst:?}"
+    );
+
+    peer.shutdown().await.unwrap();
+    let f = next_push(&mut ws).await;
+    p.take(f);
+    assert!(p.eof.contains(&c.conn));
+    assert_eq!(
+        frame_within(&mut ws, Duration::from_millis(300)).await,
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_resumes_after_reconnect() {
+    let (h, tok, addr) = setup(|_| {}).await;
+    let k = svc_keys();
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"0123456789").await.unwrap();
+    let c = claim(&h, &tok, 1).await;
+    let mut held = Held::of(&c);
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    let mut p = Pushed::default();
+    assert_eq!(p.until(&mut ws, &c.conn, 0, 10).await, b"0123456789");
+    let (s, _) = sealed_step(&k, &held, 3, &[], None);
+    step(&h, &tok, &mut held, s).await.unwrap();
+    drop(ws);
+
+    peer.write_all(b"abc").await.unwrap();
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    let mut p = Pushed::default();
+    // From the chunk holding in_acked, with no gap.
+    let first = next_push(&mut ws).await;
+    let Frame::SvcIn { off, ref data, .. } = first else {
+        panic!("{first:?}");
+    };
+    assert!(
+        off <= 3 && off + data.len() as u64 > 3,
+        "starts at in_acked"
+    );
+    p.from.insert(c.conn.clone(), 3);
+    p.take(first);
+    assert_eq!(p.until(&mut ws, &c.conn, 3, 10).await, b"3456789abc");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_follows_claims() {
+    let (h, tok, addr) = setup(|_| {}).await;
+    let k = svc_keys();
+    lease(&h, &tok, 1, None).await.unwrap();
+    lease(&h, &tok, 2, None).await.unwrap();
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"abcdef").await.unwrap();
+    let c1 = claim(&h, &tok, 1).await;
+    let mut p = Pushed::default();
+    assert_eq!(p.until(&mut ws, &c1.conn, 0, 6).await, b"abcdef");
+    let mut held = Held::of(&c1);
+    let (mut s, _) = sealed_step(&k, &held, 2, &[], Some(b"s"));
+    s.resumable = Some(true);
+    step(&h, &tok, &mut held, s).await.unwrap();
+
+    // Released and claimed again under the same lease: pushing restarts
+    // at in_acked.
+    release(&h, &tok, &c1, 1, false).await;
+    let c2 = claim(&h, &tok, 1).await;
+    assert_eq!(c2.token, c1.token + 1);
+    let mut p = Pushed::default();
+    assert_eq!(p.until(&mut ws, &c2.conn, 2, 4).await, b"cdef");
+
+    // Claimed under another lease: no more pushes on this subscription.
+    release(&h, &tok, &c2, 1, false).await;
+    let c3 = claim(&h, &tok, 2).await;
+    peer.write_all(b"zz").await.unwrap();
+    let mut other = svc_sub(&h, &tok, 2).await;
+    let mut q = Pushed::default();
+    assert_eq!(q.until(&mut other, &c3.conn, 2, 6).await, b"cdefzz");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while let Some(f) = frame_within(&mut ws, deadline - Instant::now()).await {
+        assert!(matches!(f, Frame::SvcReady { .. }), "no push: {f:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_refusals() {
+    let h = Harness::start_with(service(|_| {})).await;
+    let (alice, bob, carol) = (User::new(1), User::new(2), User::new(3));
+    let grants = vec![
+        fs_grant(&alice, 1, &["read", "write"]),
+        topic_grant(&alice, 1, &[], &["read", "append", "consume"]),
+        fs_grant(&bob, 1, &["read", "write"]),
+        topic_grant(&bob, 1, &SVC, &["consume"]),
+        fs_grant(&carol, 1, &["read", "write"]),
+        topic_grant(&carol, 1, &SVC, &["append"]),
+    ];
+    let (signed, _) = signed_acl(
+        &alice,
+        1,
+        None,
+        &[&alice],
+        &[&alice, &bob, &carol],
+        grants,
+        vec![],
+    );
+    h.put_acl(signed, h.server.claim_token.clone())
+        .await
+        .unwrap();
+    let a = h.sign_in(&alice).await.unwrap();
+    let b = h.sign_in(&bob).await.unwrap();
+    let c = h.sign_in(&carol).await.unwrap();
+    let addr = h.server.state.svc.local_addr("echo").unwrap();
+    lease(&h, &a, 1, None).await.unwrap();
+    let refused = async |tok: &[u8], lease: u8| {
+        let mut ws = connect(&h, tok).await;
+        send(
+            &mut ws,
+            &Frame::SvcSub {
+                id: SUB,
+                fs: 1,
+                svc: SVC.to_vec(),
+                lease: vec![lease; 16],
+            },
+        )
+        .await;
+        match recv(&mut ws).await {
+            Frame::Err { id, code, .. } => {
+                assert_eq!(id, Some(SUB));
+                code
+            }
+            f => panic!("{f:?}"),
+        }
+    };
+    assert_eq!(refused(&c, 1).await, "forbidden");
+    assert_eq!(refused(&a, 2).await, "not_leader");
+    assert_eq!(refused(&b, 1).await, "not_leader", "another device's lease");
+
+    // Releasing the lease ends the subscription and its input log.
+    let mut ws = svc_sub(&h, &a, 1).await;
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"x").await.unwrap();
+    let cl = claim(&h, &a, 1).await;
+    Pushed::default().until(&mut ws, &cl.conn, 0, 1).await;
+    let _: SvcLeaseResult = h
+        .call(
+            "/v1/svc/lease",
+            Some(&a),
+            &SvcLeaseRequest {
+                fs: 1,
+                svc: SVC.to_vec(),
+                lease: vec![1; 16],
+                ttl_ms: None,
+                release: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    match next_push(&mut ws).await {
+        Frame::Err { id, code, .. } => assert_eq!((id, code.as_str()), (Some(SUB), "not_leader")),
+        f => panic!("{f:?}"),
+    }
+    let rli = Key::new().str("rli").finish();
+    assert!(
+        relay_data(h.server.state.store.as_ref())
+            .await
+            .iter()
+            .all(|k| !k.starts_with(&rli)),
+        "no input log left"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_many() {
+    let (h, tok, addr) = setup(|_| {}).await;
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    let mut peers = Vec::new();
+    for _ in 0..100 {
+        peers.push(TcpStream::connect(addr).await.unwrap());
+    }
+    let mut conns = std::collections::HashMap::new();
+    while conns.len() < 100 {
+        let got: SvcClaims = h
+            .call(
+                "/v1/svc/next",
+                Some(&tok),
+                &SvcNextRequest {
+                    fs: 1,
+                    svc: SVC.to_vec(),
+                    lease: vec![1; 16],
+                    limit: Some(64),
+                    wait_ms: Some(5_000),
+                },
+            )
+            .await
+            .unwrap();
+        for c in got.conns {
+            conns.insert(c.peer.addr.clone().unwrap(), c.conn);
+        }
+    }
+    let t0 = Instant::now();
+    for (i, peer) in peers.iter_mut().enumerate() {
+        peer.write_all(format!("line {i}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut p = Pushed::default();
+    let want = |i: usize| format!("line {i}\n").into_bytes();
+    let done = |p: &Pushed| {
+        peers.iter().enumerate().all(|(i, peer)| {
+            let conn = &conns[&peer.local_addr().unwrap().to_string()];
+            p.data.get(conn).is_some_and(|d| *d == want(i))
+        })
+    };
+    while !done(&p) {
+        let f = next_push(&mut ws).await;
+        p.take(f);
+    }
+    let took = t0.elapsed();
+    println!("100 connections pushed in {took:?}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reveal_over_the_stream() {
+    let (h, tok, addr) = setup(|_| {}).await;
+    let k = svc_keys();
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"hi").await.unwrap();
+    let c = claim(&h, &tok, 1).await;
+    let mut held = Held::of(&c);
+    Pushed::default().until(&mut ws, &c.conn, 0, 2).await;
+    let (s, keys) = sealed_step(&k, &held, 2, &[(0, b"hi")], None);
+    step(&h, &tok, &mut held, s).await.unwrap();
+    let reveals = |n: usize| {
+        (0..n)
+            .map(|i| SvcReveal {
+                conn: held.conn.to_vec(),
+                off: if i == 0 { keys[0].0 } else { 100 + i as u64 },
+                key: keys[0].1.to_vec(),
+            })
+            .collect::<Vec<_>>()
+    };
+    send(
+        &mut ws,
+        &Frame::SvcReveal {
+            id: 5,
+            fs: 1,
+            svc: SVC.to_vec(),
+            reveals: reveals(1),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_push(&mut ws).await,
+        Frame::SvcRevealed {
+            id: 5,
+            results: vec![0]
+        }
+    );
+    assert_eq!(peer_reads(&mut peer, 2).await, b"hi");
+
+    send(
+        &mut ws,
+        &Frame::SvcReveal {
+            id: 6,
+            fs: 1,
+            svc: SVC.to_vec(),
+            reveals: reveals(1_001),
+        },
+    )
+    .await;
+    match next_push(&mut ws).await {
+        Frame::Err { id, code, .. } => assert_eq!((id, code.as_str()), (Some(6), "too_large")),
+        f => panic!("{f:?}"),
+    }
 }

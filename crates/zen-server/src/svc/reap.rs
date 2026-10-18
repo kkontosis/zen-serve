@@ -4,11 +4,12 @@
 use super::{Acks, ClaimRec, ConnRec, Id, RA_RESUMABLE, RZ_NOT_RESUMABLE, decode_head};
 use super::{decode_lease, decode_u64, encode_work, enqueue, ring};
 use crate::error::{ApiResult, not_leader};
+use crate::ids::offset;
 use crate::keys::{self, end_of};
 use crate::state::Shared;
 use crate::txn::txn_loop;
 use zen_store::tuple::{Elem, unpack};
-use zen_store::{Txn, Version};
+use zen_store::{Txn, VERSIONS_PER_SEC, Version, stamp_of};
 
 /// Leases, `rx` entries and node connections handled per transaction.
 const PAGE: usize = 100;
@@ -194,6 +195,8 @@ pub async fn end_lease(st: &Shared, fs: u32, svc: &[u8], lease: &Id, how: End) -
                 // Deleting the doorbell wakes its watchers, like a ring.
                 t.clear(&key);
                 t.clear(&keys::svc_lease_bell(fs, svc, lease));
+                let rli = keys::svc_lease_input(fs, svc, lease).finish();
+                t.clear_range(&rli, &end_of(&rli));
                 return Ok(true);
             }
             Ok(false)
@@ -229,7 +232,8 @@ pub async fn reap_expired_leases(st: &Shared, fs: u32, svc: &[u8]) -> ApiResult<
 }
 
 /// The sweeper's relay pass: reap the connections of expired node leases,
-/// then the expired handler leases of every service.
+/// then the expired handler leases of every service, then trim the live
+/// leases' input logs.
 pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
     let p = keys::node_leases().finish();
     let (nodes, _) = txn_loop!(st.store, None, |t| {
@@ -243,8 +247,32 @@ pub async fn sweep(st: &Shared, now: Version) -> ApiResult<()> {
             reap_node(st, &node).await?;
         }
     }
+    let cutoff = now.saturating_sub(st.cfg.limits.ephemeral_ttl_secs * VERSIONS_PER_SEC);
     for s in st.svc.services() {
         reap_expired_leases(st, s.cfg.fs, &s.cfg.id).await?;
+        trim_input_logs(st, s.cfg.fs, &s.cfg.id, cutoff).await?;
+    }
+    Ok(())
+}
+
+/// Delete the `rli` entries older than `cutoff` of a service's leases
+/// (keyspace.md §3.9).
+async fn trim_input_logs(st: &Shared, fs: u32, svc: &[u8], cutoff: Version) -> ApiResult<()> {
+    let p = keys::svc_key("rl", fs, svc).finish();
+    let (leases, _) = txn_loop!(st.store, None, |t| {
+        Ok(t.snapshot_get_range(&p, &end_of(&p), 10_000, false).await?)
+    })?;
+    let below = offset(&stamp_of(cutoff), 0);
+    for chunk in leases.chunks(PAGE) {
+        txn_loop!(st.store, None, |t| {
+            for (k, _) in chunk {
+                if let Some(lease) = last_id(k) {
+                    let rli = keys::svc_lease_input(fs, svc, &lease);
+                    t.clear_range(&rli.clone().finish(), &rli.vs(&below).finish());
+                }
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }

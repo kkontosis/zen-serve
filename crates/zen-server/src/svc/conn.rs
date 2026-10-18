@@ -7,7 +7,7 @@ use super::listen::reset;
 use super::reap::{reap, reap_unclaimed};
 use super::{
     Acks, ClaimRec, Cmd, ConnRec, Id, RH_EOF, Service, decode_head, decode_u64, encode_head,
-    enqueue, ring, tail_int, unix_ms,
+    enqueue, log_input, ring, tail_int, unix_ms,
 };
 use crate::error::ApiResult;
 use crate::keys::{self, end_of};
@@ -601,6 +601,7 @@ impl Conn {
                     &encode_head(in_head + len, if eof { RH_EOF } else { 0 }),
                 );
                 if rm.is_claimed() {
+                    log_input(&mut t, fs, svc, &rm.lease, conn, 0);
                     ring(&mut t, &keys::svc_lease_bell(fs, svc, &rm.lease));
                 }
                 Ok(Outcome::Done(rm.token > 0))

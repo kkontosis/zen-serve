@@ -32,7 +32,18 @@ pub async fn reveal(
     caller: Caller,
     Cbor(req): Cbor<SvcRevealRequest>,
 ) -> ApiResult<Cbor<SvcRevealResult>> {
-    service(&st, req.fs, &req.svc)?;
+    let results = run(&st, &caller, &req).await?;
+    Ok(Cbor(SvcRevealResult { results }))
+}
+
+/// Reveal a request's keys: the route, and `svc_reveal` on the stream.
+/// Returns one code per entry.
+pub(crate) async fn run(
+    st: &Shared,
+    caller: &Caller,
+    req: &SvcRevealRequest,
+) -> ApiResult<Vec<u8>> {
+    service(st, req.fs, &req.svc)?;
     caller.require_topic(req.fs, &req.svc, R_CONSUME)?;
     if req.reveals.len() > MAX_REVEALS {
         return Err(too_large("too many reveals"));
@@ -49,9 +60,9 @@ pub async fn reveal(
     }
     let mut results = Vec::with_capacity(todo.len());
     for (conn, off, key) in &todo {
-        results.push(one(&st, &caller, req.fs, &req.svc, conn, *off, key).await?);
+        results.push(one(st, caller, req.fs, &req.svc, conn, *off, key).await?);
     }
-    Ok(Cbor(SvcRevealResult { results }))
+    Ok(results)
 }
 
 /// One reveal, in its own transaction.
