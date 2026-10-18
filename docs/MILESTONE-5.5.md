@@ -269,7 +269,26 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * The test's age bound is a minute below zero, so it doesn't depend on how the two clocks compare.
   * CI green on PR #47's head f30dfa8: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), with `openssh-pq` skipped as it now should be.
   * Merged at f30dfa8. The commit that logged the green CI (`docs: milestone 5.5 step 10 CI green in the log`) was pushed after the merge, so it isn't in main. Step 5.5.11's plan commit carries that log entry.
-* **Step 5.5.11** (`tcp-auth` and `zen-connect`): planned below. Next: on "go", implement it.
+* **Step 5.5.11** (`tcp-auth` and `zen-connect`): done, PR #48. Restarted from main after PR #47 merged. Commits: `docs: milestone 5.5 step 11 plan`; `spec: tcp-auth details (api.md §14.9, svc.md §3)`; `server: tcp-auth services over /v1/svc/connect`; `client: connect to a tcp-auth service (Session.svcConnect)`; `svc: zen-connect`; `apps: echo over tcp-auth`; the docs and this log.
+  * As planned, plus details settled while building:
+    * **A client frame over 64 KiB resets with close 4000, not 1009.** axum's WebSocket reports the oversized message as an opaque read error, and the server can't tell it from other failures without matching on another crate's error type. So every reset is 4000, and api.md §14.9 says so.
+    * **Failed accepts.** The plan said an `unavailable` error; there is no such code. A failed accept sends the store's own error (`err` with its code), then close 4000.
+    * **Admission slots are a guard** (`svc::Slot`): `Service::open` returns one, and dropping it gives the `max_conns` slot back. A refused or abandoned upgrade can't leak a slot. The TCP accept loop uses it too.
+    * **Ending a WebSocket.** Every end sends its close (1000 or 4000), then reads until the client's close for up to 1 s. Dropping at once could make the kernel reset the TCP connection under the close frame. A client's close, an oversized frame or a text frame other than `"fin"` ends the connection as a reset.
+    * `auth::bearer` and `auth::resolve_bearer` factor out the `Caller` extractor's header parsing, so the connect handler can check the header before the upgrade.
+    * **`SvcSocket` takes its handlers in `svcConnect`'s options** (`onData`, `onFin`, `onClose`), so nothing arrives before they are set.
+    * **`zen-connect` and ssh's hang-up.** OpenSSH sends its ProxyCommand SIGHUP as it exits, after writing its last bytes. Killed at once, zen-connect dropped the WebSocket. The handler then learned of the end only from its 10 s quiet check (`/v1/svc/state`), and the in-process test's "connections forgotten" wait timed out. Now a hang-up in stdio mode lets zen-connect forward the rest of stdin and its EOF as `fin`, then wait up to 5 s for the service to close.
+    * **The harness:** `WorldOptions.grantsOf` gives a member other grants (Bob serves but may not connect). `WorldService.mode` and `World.serviceId(name)` were added. The echo grants add `append` on `svc/`.
+    * The example configs gain a commented `tcp-auth` entry; their parse test uncomments both and checks the modes.
+    * The `fdb` multinode test shares its handler steps (`svc_lease`, `svc_answer`) with the existing two-node echo.
+  * Verified:
+    * `cargo fmt --all --check`; clippy `--all-targets -D warnings`, default, `--no-default-features` and `--all-features`
+    * `cargo test -p zen-server --test svc` 3× on embedded (30 tests, 6 new) and once on FDB; `tests/multinode.rs` on FDB (12, `tcp_auth_across_nodes` new)
+    * the full zen-server and zen-proto suites on embedded
+    * the dev wasm build (`Frame`'s `ok` gains `conn`)
+    * `npm run check`
+    * `npx vitest run apps/echo/test/connect.test.ts` (5 tests) and `packages/client/test/svcconnect.test.ts` (3 tests)
+    * pending: `npx vitest run` 3×, `npx playwright test`, CI
 
 ### CI fix in step 5.5.10: a stale typing indicator in the chat app
 

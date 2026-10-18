@@ -103,3 +103,15 @@ ephemeral_burst_bytes = 1048576
 # handshake_secs = 30
 # idle_secs = 300               # 0 = never
 # resume = true                 # handlers can take over live connections
+#
+## A tcp-auth service has no port of its own: members connect through
+## zen-serve's listener (/v1/svc/connect, with a zen token and topic
+## `append` on the id), for example with zen-connect as an ssh ProxyCommand.
+## per_ip_rate counts the WebSocket clients' addresses (behind a reverse
+## proxy, its address: set 0 there).
+# [[service]]
+# name = "git"
+# fs = 1
+# id = "8899aabbccddeeff0011223344556677"
+# mode = "tcp-auth"
+# window = 1048576              # SSH services: 10 channel windows and 64 KiB

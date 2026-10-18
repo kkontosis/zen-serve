@@ -687,7 +687,7 @@ mod tests {
         for name in ["zen-serve.toml", "zen-serve-fdb.toml"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             Config::from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
-            // The commented `[[service]]` example parses once uncommented.
+            // The commented `[[service]]` examples parse once uncommented.
             let at = text.find("# [[service]]").expect("a service example");
             let svc: String = text[at..]
                 .lines()
@@ -695,7 +695,8 @@ mod tests {
                 .collect();
             let c = Config::from_toml(&format!("{}{svc}", &text[..at]))
                 .unwrap_or_else(|e| panic!("{name} with its service: {e}"));
-            assert_eq!(c.service.len(), 1);
+            let modes: Vec<_> = c.service.iter().map(|s| s.mode).collect();
+            assert_eq!(modes, [SvcMode::Tcp, SvcMode::TcpAuth]);
         }
     }
 

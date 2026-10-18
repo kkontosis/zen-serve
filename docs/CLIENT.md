@@ -293,7 +293,7 @@ await h.stop();                                      // the server requeues its 
 * **State.** `c.state` (bytes, or null) is sealed with the step (kind 9, bound to the connection's cursors) and comes back in the next step, also on another handler. Ack only whole protocol units: what isn't acked comes back as input.
 * **Takeover.** `serve` holds a handler lease (`leaseTtlMs`, default 5 s, renewed every second). When the handler dies, its connections move to another handler once the lease lapses, and that one continues from the last committed step: the output of a committed step is revealed by whichever handler holds the connection (its keys are escrowed under the service key), and the input not acked is pushed again. On a `resume: false` service, output is plain and a connection whose handler dies is closed.
 * **Where it runs.** Like consumers, `serve` runs while the database is the owner, so of a browser's tabs one serves. Keys come from the unlocked fs (`fs.service(...path).keysAt(epoch)`).
-* **Not yet:** `tcp-auth`, the sealed inbox (a sealed input chunk closes the connection), and a line helper: milestone 5.5 steps 11–13.
+* **Not yet:** the sealed inbox (a sealed input chunk closes the connection) and a line helper: milestone 5.5 steps 12–13.
 
 ### TLS: `tls()`
 
@@ -352,6 +352,44 @@ const h = serve(db, {
 * **The window.** Each channel is offered `window` bytes, by default (the service's `window` − 64 KiB) / 10, so that 10 channels' data in flight and a key exchange fit the relay's input window (svc.md §7.2). SSH services should set `window = 1048576` in their `[[service]]` table.
 * **What a takeover keeps:** everything, from the first step. The engine state (the version lines, both KEXINITs during a key exchange, keys and sequence numbers, the login in progress, the channels with their windows and buffers) is sealed with every step, so a successor continues the session mid-transfer, mid-rekey or mid-key-exchange; a question pending at a takeover is asked again.
 * **Not supported** (TD-SVC-SSH-SCOPE): passwords and keyboard-interactive logins, a PTY, port and agent forwarding, ECDSA and security-key user keys.
+
+### Members as clients: `tcp-auth` and `zen-connect`
+
+A `tcp` service is a public port: anyone on the internet can connect, and the handler authenticates them itself (an SSH key, a TLS client, a password in the protocol). A `tcp-auth` service has no port. Members connect through zen-serve's own listener, as a WebSocket on `/v1/svc/connect` with their zen token (api.md §14.9), and the server admits them only with topic `append` on the service id. Everything after that is the same as for `tcp`: the queue, the handlers, the steps, the takeover. The handler sees the connector in the claim's `peer`, `{user, device}`, instead of an address.
+
+```ts
+const s = await session.svcConnect({
+  fs: 1,
+  svc: bytes.fromHex('8899aabbccddeeff0011223344556677'),  // the [[service]] id
+  onData: (d) => out.write(d),
+  onFin: () => out.end(),                // the service half-closed
+  onClose: (reset) => {},                // false after a normal end (close 1000)
+});
+s.write(bytes.utf8('hello\n'));          // in frames of at most 64 KiB
+if (s.bufferedAmount > 1 << 20) { /* pause the source */ }
+s.fin();                                 // half-close; s.reset() resets
+```
+
+It works in browsers too (it authenticates with a first frame, not a header). A refusal rejects with a `ZenError`: `unauthorized`, `forbidden` (no `append`), `not_found` (no such service, or not `tcp-auth`), or `quota` (`max_conns`, or too many connections from the address).
+
+**`zen-connect`** (`@zen/svc`'s bin; `node scripts/build-zen-connect.mjs` builds `packages/svc/dist/zen-connect.mjs`) makes a `tcp-auth` service a local stream for ordinary clients. Without `--listen` it joins stdin and stdout to one connection, which is what ssh's `ProxyCommand` wants; with `--listen HOST:PORT`, each local connection accepted gets its own.
+
+```
+# ~/.ssh/config: git and ssh to the service, signed in with a device key.
+Host git.zen
+  HostKeyAlias git.zen
+  ProxyCommand zen-connect --url https://zen.example.org --fs 1 --svc 8899aabbccddeeff0011223344556677 --device-key ~/.config/zen/device.json
+
+# Then:  git clone ssh://git@git.zen/repo.git
+# Or a local port for any TCP client:
+#   zen-connect --url https://zen.example.org --svc 8899… --api-token-file ~/.config/zen/token --listen 127.0.0.1:2222
+```
+
+* **Sign-in:** `--api-token-file FILE` (or `$ZEN_API_TOKEN`), `--device-key FILE`, or `--user NAME` with the password in `$ZEN_PASSWORD`. Nothing is asked on the terminal: under `ProxyCommand`, stdin is the connection. With `--listen`, a session about to expire is signed in again before the next connection.
+* **Ends.** The local side's EOF is a `fin`; the service's `fin` ends the local output; a reset on either side resets the other. ssh hangs up its ProxyCommand as it exits: zen-connect still forwards what ssh wrote, then waits up to 5 s for the service to close.
+* **Rights are checked once**, when the connection opens, as a TCP peer is admitted once. Removing a member's `append` doesn't end their open connections; the handler knows who is connected and can end them itself.
+* **Backpressure.** Writes pause the local source while more than 1 MiB waits in the WebSocket. What the service sends can't be paused (the standard WebSocket has no way to): a local reader slower than the service makes zen-connect buffer it. SSH's own windows bound that; other protocols may not (TD-SVC-CONNECT-BACKPRESSURE).
+* **The address bucket.** `per_ip_rate` and `per_ip_burst` apply to the WebSocket client's address. Behind a reverse proxy every connector has the proxy's address: set `per_ip_rate = 0` there.
 
 ## 12. Security notes
 
