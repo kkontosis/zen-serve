@@ -195,10 +195,34 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * Fix: the database parts (`NS`, `DB_OPTIONS`, `Line`, `Cert`, `putCert`) move to `apps/echo/src/schema.ts`. `echo.ts` re-exports them, and the spec imports `schema.ts`.
     * Verified with the local `packages/db/dist` moved aside, as in CI. The error reproduced before the fix; after it, `npx playwright test` (15) passed, and so did `npx vitest run apps/echo` (11) and `npm run check`.
   * CI green on PR #45's head (all 8 checks); merged.
-* **Step 5.5.9** (the SSH engine, native): planned. Restarted from main after PR #45 merged; the plan is below.
+* **Step 5.5.9** (the SSH engine, native): done, PR #46. Restarted from main after PR #45 merged. Commits: `docs: milestone 5.5 step 9 plan`; `spec: the SSH engine (svc.md §7.2)`; `svc: the SSH engine (crates/zen-svc), native`; `ci: OpenSSH from source for the hybrid key exchange`; the docs and this log; `ci: the OpenSSH-from-source job runs on demand only`.
   * Decided with the user: implement `mlkem768x25519-sha256` too. OpenSSH has it only from 9.9, and Ubuntu 24.04 (here and on the runners) ships 9.6. So a CI job builds OpenSSH 10.6p1 from source to test the hybrid against it. Once that job has passed on the PR, it is switched to run on demand only.
-  * Next: on "go", the `spec:` commit, then the code.
-
+  * As planned, plus details settled while building (all in svc.md §7.2):
+    * **Bounds, sized to the state budget.** The plan's per-channel figures would allow 10 × 32 KiB of queued output, beyond `max_value_bytes`. So the bounds are across channels:
+      * Unread data: at most 32,768 bytes. A packet is read only when nothing is unread, or when what is unread plus the packet's length stays within that.
+      * Queued output: at most 16,384 bytes, in at most 64 pieces.
+      * Held replies during the server's own key exchange: at most 32 messages and 4,096 bytes.
+      * A full state measured about 47 KB; the OpenSSH transfers peaked at about 34 KB.
+    * **Packets up to 35,000 bytes** (RFC 4253 §6.1's minimum), not 256 KiB: a packet larger than the relay's input window could never be read. The client's KEXINIT is limited to 8,192 bytes.
+    * **A server rekey behind unread data.** From its KEXINIT to its NEWKEYS the server holds its output. An application whose writes are full then stops consuming, and the read bound stops reading, while the client's KEXINIT and init sit behind channel data in the input: a deadlock. So when reading is held back during its own key exchange, the engine decrypts ahead through the input it was given, without consuming it. It handles the client's KEXINIT and init there, replies, sends NEWKEYS, and skips those two sequence numbers when in-order reading reaches them (`kex.ahead` in the state). The OpenSSH server-rekey test goes through this path (4 of its 6 rekeys).
+    * **The channel window** is an engine option, `window`, default 98,304 bytes (the plan said 2 MiB). That read-ahead needs the client's data in flight to fit the relay's input window, so the channels' windows together, plus 64 KiB, should fit the service's `window`. 10 × 98,304 + 64 KiB is about 1 MiB, the window SSH services should use; 5.5.10's layer derives the option from the service.
+    * **Only the request kind is kept** for each channel's exec, shell or subsystem. The command or subsystem name reaches the application once, in its event, so a long command doesn't stay in the state.
+    * Other details:
+      * Without strict kex, an unexpected message during a key exchange gets UNIMPLEMENTED, as OpenSSH does.
+      * The state counts completed key exchanges (`kexes`).
+      * A wrong guess (`first_kex_packet_follows`) skips the client's next packet, in order and in the read-ahead alike.
+    * **The test client** (`ssh::client`, feature `test-utils`) is built on the engine's own wire, cipher and kex code, and checks the host-key signature. It holds its own messages during its key exchange, as RFC 4253 §7.1 requires.
+    * The engines' strict CBOR reading (`Fields`) moves from `tls/state.rs` to a shared `cbor` module.
+  * Verified:
+    * `cargo fmt --all --check`
+    * clippy `--all-targets -D warnings` on the workspace, default and `--no-default-features`; on zen-svc with `--all-features`, and for wasm32
+    * `cargo check -p zen-svc-wasm --target wasm32-unknown-unknown`; `cargo tree -p zen-svc -e normal -i ring` is empty
+    * `cargo test -p zen-svc` 3×:
+      * 11 unit tests
+      * `tests/ssh.rs` (18): sessions in whole reads and one byte at a time for every method and cipher, strict kex both ways, a wrong guess, the auth limit, a question across a restore, the read and write bounds, rekeys from either side, channel refusals, 300 malformed messages, bit flips, the version line, the state's checks
+      * `tests/openssh.rs` (10) against OpenSSH 9.6 (apt): both ciphers, RSA keys with SHA-2 and SHA-1 refused, an unauthorized key, 10 MB `cat` with `RekeyLimit=1M` (about 20 client rekeys), server rekeys, a 20 MB download, a shell, a subsystem, an exit status, 7-byte steps, keys read and fingerprinted as `ssh-keygen` does, and Terrapin through an injecting proxy
+      * the TLS tests unchanged
+    * Against OpenSSH 10.6p1 built with `scripts/build-openssh.sh`: `tests/openssh.rs` and `tests/openssh_pq.rs` (the hybrid with both ciphers, a 1 MB `cat` with rekeys both ways)
 ## Step 5.5.9 in detail: the SSH engine (`crates/zen-svc`, native)
 
 A sans-IO SSH server whose whole state serializes at every packet boundary, mid key exchange included. A successor handler continues the live session at any point. So unlike TLS, an SSH connection is resumable from its first step.

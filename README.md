@@ -21,7 +21,7 @@ Building blocks:
 | [`crates/zen-proto`](crates/zen-proto) | Wire types of the API (CBOR), shared by server and clients (native + `wasm32`) |
 | [`crates/zen-store`](crates/zen-store) | Storage trait with FoundationDB semantics, tuple encoding, embedded `redb` backend, FoundationDB backend (feature `fdb`) |
 | [`crates/zen-tls-rustcrypto`](crates/zen-tls-rustcrypto) | A rustls crypto provider on RustCrypto (pure Rust, native + `wasm32`; TLS 1.2 suites behind `tls12`), its record protection at the byte level, and the RSA key policy, for the server's native TLS and the relayed services' TLS |
-| [`crates/zen-svc`](crates/zen-svc) | Protocol engines of relayed services (sans-IO, native + `wasm32`): the TLS 1.3/1.2 server whose state another handler restores at any record boundary ([`spec/svc.md`](spec/svc.md) §7.1) |
+| [`crates/zen-svc`](crates/zen-svc) | Protocol engines of relayed services (sans-IO, native + `wasm32`): the TLS 1.3/1.2 server whose state another handler restores at any record boundary, and the SSH server whose state it restores at any packet boundary, key exchanges included ([`spec/svc.md`](spec/svc.md) §7.1, §7.2) |
 | [`crates/zen-server`](crates/zen-server) | The `zen-serve` binary: auth, signed ACL, KV, commit, event log, consumer groups, WebSocket stream, static files, FoundationDB supervisor, backup/export |
 | [`crates/zen-svc-wasm`](crates/zen-svc-wasm) | WASM bindings of zen-svc's TLS engine, a second module loaded only by services that use `tls()` (`@zen/svc-wasm`, built into [`packages/svc-wasm`](packages/svc-wasm)) |
 | [`crates/zen-wasm`](crates/zen-wasm) | WASM bindings of zen-core and zen-proto for the TypeScript client |
