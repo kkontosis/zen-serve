@@ -267,9 +267,11 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * The unit test passes with the existing typing test: `apps/chat` vitest, 9 tests.
     * `npx playwright test apps/chat` passed 5 times; `npm run check` passes.
     * The test's age bound is a minute below zero, so it doesn't depend on how the two clocks compare.
-  * Next: confirm CI green on the fix's push.
+  * CI green on PR #47's head f30dfa8: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), with `openssh-pq` skipped as it now should be.
+  * Merged at f30dfa8. The commit that logged the green CI (`docs: milestone 5.5 step 10 CI green in the log`) was pushed after the merge, so it isn't in main. Step 5.5.11's plan commit carries that log entry.
+* **Step 5.5.11** (`tcp-auth` and `zen-connect`): planned below. Next: on "go", implement it.
 
-### CI fix: a stale typing indicator in the chat app
+### CI fix in step 5.5.10: a stale typing indicator in the chat app
 
 **Root cause.**
 1. In the spec's first test Carol's context goes offline while Alice and Bob talk. `send()` fills the composer, so each message also publishes a typing indicator.
@@ -297,6 +299,186 @@ The push run passed because the overlap depends on timing. Nothing here is from 
 * push, then CI green on both `client` runs
 
 After that: log the CI result in both plan copies, push, stop for compaction.
+
+## Step 5.5.11 in detail: `tcp-auth` and `zen-connect`
+
+In `tcp-auth` mode, members reach a service through zen-serve's own HTTPS listener instead of a public port. The connector opens a WebSocket, `GET /v1/svc/connect` (api.md §14.9), with a zen token. The server checks topic `append` on the service id, then accepts the connection as if it came from a TCP socket. Everything after that is unchanged: the queue, claims, steps, reveals and takeover. Handlers see `peer = {user, device}`. A CLI, `zen-connect`, turns the WebSocket into a local port (`--listen`) or into stdin and stdout, for `ssh -o ProxyCommand=…`.
+
+**Commits:**
+1. `docs: milestone 5.5 step 11 plan` (also logs step 5.5.10's CI and merge)
+2. `spec: tcp-auth details (api.md §14.9, svc.md §3)`
+3. `server: tcp-auth services over /v1/svc/connect`
+4. `client: connect to a tcp-auth service (Session.svcConnect)`
+5. `svc: zen-connect`
+6. `apps: echo over tcp-auth`
+7. the docs and the log
+
+### Facts from the survey
+* **What exists today:**
+  * `SvcMode::TcpAuth` is in the config: `listen` is refused, and `Svc::new` builds its `Service`. The ready queue, `/v1/svc/*`, `svc_sub` and steps all work by `(fs, svc)` and don't depend on the mode. `/v1/svc/info` returns the mode. `ConnRec.mode` comes from the config.
+  * Nothing accepts `tcp-auth` connections: there is no route for `/v1/svc/connect`.
+  * `listen::start` takes the node lease and starts the work loop whenever any service is configured, including a `tcp-auth`-only node.
+* **The connection task is written against TCP.** `conn::spawn`, `Conn::run`, `Conn::serve`, `Conn::writer`, `drain` and `listen::reset` all take a `TcpStream` or one of its halves. The storage side doesn't depend on the transport: `accept`, `append`, `output`, `advance`, the timers and `Cmd`. Nothing reads `Service.addr` except `local_addr`, which only tests use. A connection belongs to the node that accepted it, through its node id.
+* **Admission:** `Service::take` (the per-IP bucket) and `Service::open`/`close` (`max_conns`) are private to `svc/mod.rs`. The HTTP router has `ConnectInfo<tls::Peer>`, which gives the client's address.
+* **Auth for WebSockets:** `/v1/stream` (stream.rs:28) authenticates with a first frame only. `Caller` reads `Authorization: Bearer` (auth.rs:284), `resolve` is at auth.rs:240, and `require_topic` at :146. `Frame::Ok {id}` has no `conn`.
+* **Rust tests:** `tokio-tungstenite` is already a dev-dependency, with `tests/common` `connect`/`send`/`recv`. `tests/svc.rs` drives handlers over HTTP (`lease`, `next`, `read`, `step`, `reveal`). Its `service()` builds a `tcp` service, and `setup` unwraps `local_addr`.
+* **Client:**
+  * `Stream.connect` uses `globalThis.WebSocket` (undici in Node 22) and authenticates with a first frame (`authToken`, stream.ts:228). `Transport.wsUrl` builds the URL. The `ws` package isn't installed.
+  * A service id is keyed by the fs naming key, so only an unlocked fs can compute it (`UnlockedFs.service().id`). A connector needs only a session, so it takes the id in hex, the one in `[[service]] id`.
+  * There's no token refresh: a session lasts `session_ttl_secs` (default 1 day), and API tokens don't expire unless set to.
+* **CLI precedent:** `zen-mount` (`packages/fuse/src/cli.ts`):
+  * `parseArgs`, a `HELP` text, exit 2 on bad usage
+  * secrets never taken from argv
+  * sign-in by `--user`, `--opaque`, `--api-token-file` / `$ZEN_API_TOKEN`, `--device-key` or `--vault`
+  * its test builds it with `tsc` first
+  * CI builds only `@zen/client` and `@zen/fs`, so a CLI in `@zen/svc` can't be built with `tsc` there: `@zen/db` isn't built.
+* **The harness:**
+  * `serviceToml` hard-codes `mode = "tcp"` and a `listen`.
+  * `startWorld` computes the service ids but doesn't expose them.
+  * The echo grants give members `consume` on `svc/`, not `append`.
+
+### spec (`spec:`)
+* **api.md §14.9:**
+  * Query `fs` (decimal) and `svc` (hex).
+  * **With a Bearer header,** everything is checked before the upgrade, and failures are HTTP errors:
+    * 401 `unauthorized`
+    * 403 `forbidden` (no topic `append`)
+    * 404 `not_found` (no such service, or not `tcp-auth`)
+    * 429 `quota` (`max_conns` or the address's token bucket)
+  * **Without a header,** the first frame must be `{op: "auth", token}`, within 10 s. A failure is a frame `{op: "err", code, message}` with the same codes, then a close.
+  * On success the server sends `{op: "ok", conn}`; `Frame::Ok` gains an optional `conn`.
+  * **Frames:**
+    * The client's binary frames are at most 65,536 bytes; a larger one is a reset (close 1009).
+    * The server's binary frames are at most 65,536 bytes.
+  * **Close codes:**
+    * 1000 from the server: the connection ended normally (a close record, or FIN both ways with all input acked).
+    * 4000 from the server: a reset (an abort record, a timeout, a reap). The connector should reset its local side.
+    * Any close from the client is a reset.
+  * **Rights are checked once, at connect,** as a TCP peer is admitted once. A later revocation doesn't end an open connection; the handler sees the connector's user and device, and can end it.
+* **svc.md §3:**
+  * Admission for `tcp-auth`: `max_conns`, and the token bucket of the WebSocket client's address.
+  * Steps 3, 8 and 9 in WebSocket terms:
+    * a `"fin"` text frame is the peer's FIN, both ways
+    * a close record sends close 1000, then waits up to 1 s for the client's close, discarding data
+    * an abort sends close 4000
+  * The connection is the WebSocket: losing the WebSocket loses the connection, as for TCP.
+
+### Server (`crates/zen-server`)
+* **`svc/conn.rs`:** the connection task gets a transport enum, `Sock::Tcp(TcpStream) | Sock::Ws(WebSocket)`, split into `Rd` and `Wr` enums with:
+  * `read(&mut buf) → io::Result<usize>`, where 0 is EOF: TCP's `Ok(0)`, or a `"fin"` frame
+  * `write_all`, `fin()`, `close()` (TCP: the existing drain; WS: close 1000, then drain) and `reset()` (TCP: `SO_LINGER` 0; WS: close 4000)
+  * For WS:
+    * The reader keeps the rest of a frame larger than the room it's given. It reads nothing new until that rest is consumed, so the input window holds.
+    * The writer splits output into 64 KiB frames.
+    * Halves come from `futures::StreamExt::split`, as in stream.rs.
+  * `run`, `serve`, `writer` and `drain` take these; TCP behaves exactly as before.
+  * For WS, `run` sends `{op: "ok", conn}` once `accept` has committed. If `accept` fails, it sends an `err` frame (`unavailable`) and closes.
+* **`svc/connect.rs` (new):** the axum handler `connect(State, ConnectInfo<tls::Peer>, Query, HeaderMap, WebSocketUpgrade)`.
+  * It runs the checks in the order above (auth, then service and mode, then `append`, then admission), before the upgrade when there's a header and after the first frame otherwise.
+  * It then calls `conn::spawn(st, svc, Sock::Ws(ws), SvcPeer {user, device})`.
+  * Its WebSocket limits are 65,536 bytes plus framing.
+* **Other changes:**
+  * `Service::take`, `open` and `close` become `pub(crate)`.
+  * `lib.rs` adds the route.
+  * zen-proto `Frame::Ok` gains `conn: Option<bytes>`, with serde default and skipped when absent.
+* **Tests (`tests/svc.rs`, both backends):**
+  * a `tcp-auth` service helper, and a WebSocket connector helper (header or first-frame auth)
+  * echo through the HTTP-driven handler:
+    * the claim's peer is the connector's `{user, device}`
+    * data both ways
+    * the client's `"fin"` sets EOF
+    * a FIN record arrives as `"fin"`
+    * then close 1000, and the connection is reaped
+  * first-frame auth works, and a bad first frame gets `err` `unauthorized`
+  * refusals:
+    * no token: 401
+    * a member without `append`: 403
+    * a `tcp` service or an unknown id: 404
+    * over `max_conns`: 429
+  * close and abort records: 1000 after the data; 4000
+  * the client's close: the handler's next step gets `conn_closed`
+  * the window: 300 KiB in 64 KiB frames to a 64 KiB window never puts `in_head` more than a window past `in_acked`, and all of it arrives as the handler acks
+  * a frame over 64 KiB: close 1009
+  * a takeover: the handler's lease lapses mid-stream, a second lease continues, and the transcript is exact
+  * `tests/multinode.rs` (FDB): connect on node A and handle on node B
+
+### `@zen/client`: `Session.svcConnect`
+* `session.svcConnect({fs, svc: Uint8Array, WebSocket?}) → Promise<SvcSocket>`, in `packages/client/src/svc.ts`. It opens `Transport.wsUrl('/v1/svc/connect?…')`, authenticates with a first frame (`authToken`, shared with stream.ts, since a browser can't set headers), and waits for `ok` or `err` (a `ZenError` with the code).
+* `SvcSocket`:
+  * `conn`
+  * `onData`, `onFin` and `onClose(reset: boolean)` callbacks
+  * `write(bytes)` in frames of at most 64 KiB, and `bufferedAmount`
+  * `fin()` and `reset()`
+* **Backpressure:**
+  * Outgoing: the caller pauses its source while `bufferedAmount` is over 1 MiB.
+  * Incoming: the standard WebSocket can't pause reading, so what the server sends is buffered when the local reader is slower. Protocols with their own flow control (SSH) bound this. Logged as TD-SVC-CONNECT-BACKPRESSURE.
+* **Tests (`packages/client/test/svcconnect.test.ts`),** against a `TestServer` with a `tcp-auth` service:
+  * a raw handler driven through `fs.service()`'s HTTP requests echoes bytes
+  * `fin` both ways
+  * the refusals as `ZenError` codes: `forbidden`, `not_found`, `unauthorized`
+
+### `zen-connect` (`packages/svc/src/connect-cli.ts`)
+* **Usage:** `zen-connect --url URL --fs N --svc HEX [--listen HOST:PORT]`, plus a sign-in option.
+  * Without `--listen`, it bridges stdin and stdout: ssh's `ProxyCommand`.
+  * With `--listen`, it opens one connection per accepted socket.
+* **Sign-in:** `--api-token-file` / `$ZEN_API_TOKEN`, `--device-key FILE`, or `--user NAME` with `$ZEN_PASSWORD`.
+  * There are no TTY prompts: under `ProxyCommand`, stdin is the byte stream.
+  * `--opaque` and `--vault` aren't supported; `zen-mount` keeps them.
+  * In `--listen` mode it signs in again when the session is within 60 s of expiry.
+* **Mapping between the two sides:**
+  * local EOF → `fin()`; the server's `"fin"` → `socket.end()`
+  * close 1000 → end, once written; 4000 or an error → `destroy()` (TCP reset)
+  * a local error → `reset()`
+* **Messages and exit codes:** errors print as `zen-connect: …`; exit 1 on failure, 2 on bad usage.
+* **The build:**
+  * `scripts/build-zen-connect.mjs` bundles it with esbuild into `packages/svc/dist/zen-connect.mjs`, as `build-apps.mjs` does for workers: `@zen/*` from sources, and `@zen/wasm` external.
+  * `@zen/svc`'s `bin` is `{"zen-connect": "./dist/zen-connect.mjs"}`, and its `build` script runs both.
+  * Tests run the script first.
+  * It imports only `@zen/client` and `node:*`, so it builds without `@zen/db`.
+
+### The echo app over `tcp-auth`
+* **Harness:**
+  * `ServiceSpec` and `WorldService` gain `mode` (`'tcp' | 'tcp-auth'`); `tcp-auth` has no port and no `listen`.
+  * `World.serviceId(name)` gives the hex id.
+  * The echo grants give members `append` on `svc/` too.
+* **`SSH_AUTH_SERVICE` (`svc/echo-ssh-auth`) and `AUTH_SERVICE` (`svc/echo-auth`):** the same handlers, on `tcp-auth`.
+* **`ECHO_LAYER`** gains `auth` (raw) and `ssh-auth`.
+* **Vitest (`apps/echo/test/connect.test.ts`):**
+  1. **ssh through `ProxyCommand`:**
+     * `ssh -o ProxyCommand="node …/zen-connect.mjs … --device-key …" … lines` gives `1: …`, `bye` and exit 0; `exit 3` gives 3.
+     * The `lines` rows record the connection.
+     * Signed in as Bob without `append`: ssh fails, and zen-connect's stderr says `forbidden`.
+  2. **`--listen` with the raw echo:**
+     * a Node `net` client gets the replies, then `bye` and EOF after its own `end()`
+     * two clients at once
+  3. **A takeover through the connector:** 200 lines, 5 ms apart, through `--listen` to a worker that is SIGKILLed at line ~80. The transcript is exact, and the table holds 200 rows.
+  4. **`git ls-remote`** through `GIT_SSH_COMMAND` with the `ProxyCommand`.
+* Playwright: none. The browser is a handler as before. A browser connector (`svcConnect` from a tab) is possible, but no page uses it yet.
+
+### CI
+Nothing new. The `client` job already has `ssh`, and the tests build `zen-connect` themselves.
+
+### Docs
+* `docs/CLIENT.md` §11: `tcp-auth`, `svcConnect`, `zen-connect` with an `ssh_config` example (`ProxyCommand zen-connect --url … --fs 1 --svc … --device-key …`), and the rights.
+* `apps/README.md`: echo over `tcp-auth`.
+* The example configs: a `tcp-auth` example entry.
+* TECH_DEBT: TD-SVC-CONNECT-BACKPRESSURE.
+* The log in both plan copies.
+
+### Out of scope
+* the sealed inbox (5.5.12)
+* resuming a connector's WebSocket after a network drop: the connection ends, as a TCP peer's would
+* rights re-checked during a connection
+* a browser page acting as a connector
+* `--vault` and OPAQUE sign-in in `zen-connect`
+
+### Verification
+* `cargo fmt --check`; clippy `--all-targets -D warnings`: default, `--no-default-features` and `--all-features`
+* `cargo test -p zen-server --test svc` 3× on embedded and once on FDB; `tests/multinode.rs` on FDB; the full zen-server suite once (`tests/stream.rs` for the `Frame::Ok` change)
+* the dev wasm build (the `Frame` type)
+* `npm run check`; `npx vitest run` 3×
+* `npx playwright test` once (unchanged)
+* CI green on the PR
 
 ## Step 5.5.10 in detail: `ssh()` in `@zen/svc`
 
