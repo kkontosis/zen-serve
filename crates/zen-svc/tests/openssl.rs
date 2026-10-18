@@ -13,8 +13,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use zen_svc::tls::{AlertDescription, Config, Error, Options};
 use zen_tls_rustcrypto::record::{self, Hash};
 use zen_tls_rustcrypto::testing::{KeyKind, pem};
@@ -84,8 +84,17 @@ struct Client {
 }
 
 /// Runs `s_client` against `port`, typing `lines` (with pauses, so each is
-/// its own read), then EOF on stdin, which makes it close.
-fn s_client(port: u16, ca: &Path, args: &[&str], lines: &[&str], conf: Option<&Path>) -> Client {
+/// its own read), then EOF on stdin, which makes it close. `s_client`
+/// closes at once on EOF, dropping what is still in flight, so with
+/// `wait_for` stdin stays open until its stdout holds that text.
+fn s_client(
+    port: u16,
+    ca: &Path,
+    args: &[&str],
+    lines: &[&str],
+    wait_for: Option<&str>,
+    conf: Option<&Path>,
+) -> Client {
     let dir = ca.parent().unwrap();
     let keylog = dir.join(format!("keylog-{port}.txt"));
     let mut cmd = Command::new("openssl");
@@ -108,6 +117,20 @@ fn s_client(port: u16, ca: &Path, args: &[&str], lines: &[&str], conf: Option<&P
         cmd.env("OPENSSL_CONF", c);
     }
     let mut child = cmd.spawn().unwrap();
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let stdout = stdout.clone();
+        let mut pipe = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                stdout.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        })
+    };
     std::thread::sleep(Duration::from_millis(400));
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -116,10 +139,20 @@ fn s_client(port: u16, ca: &Path, args: &[&str], lines: &[&str], conf: Option<&P
             let _ = stdin.flush();
             std::thread::sleep(Duration::from_millis(300));
         }
+        if let Some(want) = wait_for {
+            let until = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < until
+                && !String::from_utf8_lossy(&stdout.lock().unwrap()).contains(want)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
     let out = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    let stdout = std::mem::take(&mut *stdout.lock().unwrap());
     Client {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         ok: out.status.success(),
         keylog: std::fs::read_to_string(&keylog).unwrap_or_default(),
@@ -185,6 +218,7 @@ fn s_client_tls13_every_suite_and_group() {
                 &ca,
                 &["-tls1_3", "-ciphersuites", suite, "-groups", group],
                 &["hello", "world"],
+                Some("hello\nworld\n"),
                 None,
             );
             let server = h.join().unwrap();
@@ -216,6 +250,7 @@ fn s_client_tls12_every_suite_and_group() {
                 &ca,
                 &["-tls1_2", "-cipher", suite, "-groups", group],
                 &["hello", "world"],
+                Some("hello\nworld\n"),
                 None,
             );
             let server = h.join().unwrap();
@@ -246,6 +281,7 @@ fn s_client_key_updates() {
             &ca,
             &["-tls1_3", "-ciphersuites", suite],
             &["one", "k", "two", "K", "three", "k", "four"],
+            Some("three\nfour\n"),
             None,
         );
         let server = h.join().unwrap();
@@ -272,6 +308,7 @@ fn s_client_renegotiation_is_refused() {
         &ca,
         &["-tls1_2", "-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256"],
         &["one", "R", "two"],
+        None,
         None,
     );
     let server = h.join().unwrap();
@@ -301,7 +338,7 @@ fn s_client_without_ems_is_refused() {
     )
     .unwrap();
     let (port, h) = serve_one(config.clone());
-    let c = s_client(port, &ca, &["-tls1_2"], &["hello"], Some(&conf));
+    let c = s_client(port, &ca, &["-tls1_2"], &["hello"], None, Some(&conf));
     let server = h.join().unwrap();
     assert!(!server.conn.is_established());
     assert!(
@@ -313,7 +350,7 @@ fn s_client_without_ems_is_refused() {
     assert!(!c.ok);
     // With EMS (the same configuration otherwise), it works.
     let (port, h) = serve_one(config);
-    let c = s_client(port, &ca, &["-tls1_2"], &["hello"], None);
+    let c = s_client(port, &ca, &["-tls1_2"], &["hello"], Some("hello\n"), None);
     let server = h.join().unwrap();
     assert_eq!(server.received, b"hello\n", "{}", c.stderr);
 }
@@ -328,12 +365,12 @@ fn s_client_large_lines() {
         // Numbers only: s_client takes a stdin read that starts with Q, R, k
         // or K as a command.
         let line: String = (0..10_000).map(|i| format!("{i:05} ")).collect();
-        let c = s_client(port, &ca, &[v], &[&line, &line], None);
+        let want = format!("{line}\n{line}\n");
+        let c = s_client(port, &ca, &[v], &[&line, &line], Some(&want), None);
         let server = h.join().unwrap();
         assert!(server.errors.is_empty(), "{:?} {}", server.errors, c.stderr);
-        let want = format!("{line}\n{line}\n");
         assert_eq!(server.received.len(), want.len(), "{v}");
         assert!(server.received == want.as_bytes(), "{v}");
-        assert!(c.stdout.contains(&want));
+        assert!(c.stdout.contains(&want), "{v}");
     }
 }
