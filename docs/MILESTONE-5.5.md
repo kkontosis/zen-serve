@@ -35,7 +35,24 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
 
 **Log:**
 * **Step 0** (plan): done. Restarted from main after PR #35 (milestone 5 step 11) merged; wrote `docs/MILESTONE-5.5.md` (this plan), added 5.5 to DESIGN-3 §6 and the README status; commit `docs: milestone 5.5 plan (relayed services)`. Next: plan step 5.5.1 (spec) in detail, on "go".
-* **Step 5.5.1** (spec): planned below ("Step 5.5.1 in detail"). Restart from main after PR #36 merged; commit `docs: milestone 5.5 step 1 plan (spec)`, open a PR; on "go", the `spec:` commits, then zen-core and vectors.
+* **Step 5.5.1** (spec): done, PR #37. Commits: `docs: milestone 5.5 step 1 plan (spec)`; `spec: relayed services (svc.md, api §14, keyspace §3.9)`; `spec: seal kinds 9 and 10, output records, sealed inbox`; `core: svc seals and vectors`; the docs and this log.
+  * Spec as planned, plus details settled while writing:
+    * `rz` abort requests (reasons 1 bad record, 2 not resumable, 3 released with close) let any node abort; the owner resets and reaps.
+    * A closed socket is reaped at once (no lingering `peer_gone` or RST flags): `rh` flags are EOF only, and `rw` is `written_to` only.
+    * `ra` adds `u32 state_len`, for quota.
+    * `rq(fs, svc, vs) = conn`; a queued `rm` carries its `rq` versionstamp.
+    * `rli` is the lease's input log for stream pushes.
+    * The state rule: once a connection has a state, a cursor-moving step must carry a new one, because the AAD binds the cursors.
+    * Record flags are 1 FIN, 2 close, 4 plain, 8 abort; FIN still lets a handler ack input.
+    * `/v1/svc/state` re-syncs a holder; `Claim.flags` = EOF | `ra` flags << 1.
+    * Delegation carries `K_svc`, or `D_svc`, per epoch.
+  * zen-core `svc.rs`:
+    * `SvcKeys`
+    * `seal_state`/`open_state`, `seal_record`/`plain_record`/`parse_record`/`open_escrow`/`reveal`
+    * `inbox_public`/`inbox_encaps`/`inbox_decaps`/`InboxKey`
+  * `spec/test-vectors/svc.json` and its file test; 5 unit tests.
+  * Docs: spec README, glossary, TD-SVC-STATE-ROLLBACK.
+  * Next: plan step 5.5.2 (server relay core, input side) on "go", after PR #37 merges.
 
 ## Step 5.5.1 in detail: the spec
 
@@ -177,7 +194,7 @@ Plus: §3.4's export/import rule names these prefixes; the sweeper reaps the con
 1. **Accept:** the per-IP token bucket is checked before any write. A connection record `rc` is written: node id and boot epoch, peer address, the time, `in_head` 0, `in_acked` 0, `out_head` 0, `written_to` 0, flags. It is pushed onto the service's ready queue `rq`.
 2. **Input:** the owning node is the only writer. It reads the socket in batches (up to 32 KiB or 5 ms) into `ri(fs, svc, conn, u64 start offset)` and advances `in_head`, in one transaction. It stops reading once `in_head − in_acked ≥ window` (TCP backpressure). A peer FIN becomes an EOF marker; a reset becomes an RST marker.
 3. **Claim:** a handler holds a **handler lease** `rl` (renewed every 1 s, TTL 5 s; O(handlers), not O(connections)). It claims ready connections with `/v1/svc/next` (a long poll, or pushed over the stream). The claim token is bumped on every new claim. A connection becomes claimable again when its handler's lease lapses or the handler releases it.
-4. **The step,** in `/v1/commit` as a new `svc` list of `SvcStep {fs, svc, conn, token, in_from, in_to, out_from, out: [record], state?, close?}`. It is atomic with everything else in the commit (zen-db rows, events, consume steps). It checks and does:
+4. **The step,** in `/v1/commit` as a new `svc` list of `SvcStep {fs, svc, conn, token, in_from, in_to, out_from, out: [record], state?, resumable?, unseal?}` (close, FIN and abort are record flags; normative: spec/svc.md §4). It is atomic with everything else in the commit (zen-db rows, events, consume steps). It checks and does:
    * the claim token is current (else `claim_lost`, 412)
    * `in_from == in_acked` and `out_from == out_head` (else `cursor_moved`)
    * `in_to ≤ in_head` (a snapshot read: `in_head` only grows)
@@ -186,7 +203,7 @@ Plus: §3.4's export/import rule names these prefixes; the sweeper reaps the con
    * writes the sealed protocol state (`rs`, seal kind 9)
    * applies close flags
    * rings the owning node's doorbell
-5. **Reveal (the two-phase release):** each output record is `AEAD(k_r, raw) ‖ BLAKE3(k_r) ‖ seal_fs(k_r)` (seal kind 10), with `k_r` fresh and random **per commit attempt** (never derived from the seq). Only after the commit is known to have succeeded (`commit_unknown` is replayed with the same `commit_id` first) does the handler send `reveal {conn, seq, k_r}`. The server checks `BLAKE3(k_r)` and the AEAD tag, so **only committed bytes can ever reach the wire**. Reveals need no token, only `consume`, because revealing a committed record is always safe. A successor re-reveals by opening `seal_fs(k_r)`.
+5. **Reveal (the two-phase release):** each output record is `key_hash(k_r) ‖ escrow(k_r) (seal kind 10) ‖ AEAD(k_r, raw)` (formats.md §13.1), with `k_r` fresh and random **per record per commit attempt** (never derived from the offset). The server stores a revealed key in `rv` and decrypts at write time. Only after the commit is known to have succeeded (`commit_unknown` is replayed with the same `commit_id` first) does the handler send `reveal {conn, seq, k_r}`. The server checks `BLAKE3(k_r)` and the AEAD tag, so **only committed bytes can ever reach the wire**. Reveals need no token, only `consume`, because revealing a committed record is always safe. A successor re-reveals by opening `seal_fs(k_r)`.
 6. **Writing:** the owning node watches one doorbell key per node. It writes revealed records in order from `written_to` (an unrevealed record blocks the ones after it). After `write_all`, one transaction clears the records and advances `written_to`. Close markers: `shutdown_write` (FIN once everything before it is written) or `close`. Before a close, unread input is drained, so the kernel doesn't reset the last bytes. A failed socket write marks the connection `peer_gone`, and the handler's next step gets `conn_closed`. Fast path: a reveal that arrives on the owning node is written at once.
 7. **Node failure:** a socket is lost with its node (inherent to TCP). Nodes hold a node lease. The sweeper reaps connections of dead or old-epoch nodes, and a node reaps its own old epoch at boot.
 8. **`resume: false`:** the output is sent raw in the step (fenced by the token), there is no reveal, and a claim change closes the connection.

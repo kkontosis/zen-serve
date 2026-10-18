@@ -38,4 +38,10 @@
 | **saga** | A series of local transactions in different services, coordinated by an orchestrator, with compensations on failure (zendb.md §12.5). |
 | **CRDT table** | A zen-db table whose rows the server merges field by field (last writer wins, counters, sets) instead of serializing transactions; works offline (zendb.md §19). |
 | **horizon** | How far back (default 7 days) a late operation may reach. Older ones are refused with `stale_op` and **rebased**: reissued with a fresh HLC. |
-
+| **relayed service** | A TCP service whose connections zen-serve relays blind to handlers on member clients (svc.md). Its id is a topic id. |
+| **handler** | A member client serving a relayed service: it holds a handler lease and claims connections under it (svc.md §1). |
+| **connector** | A member client connecting to a `tcp-auth` service over `/v1/svc/connect` instead of a public port (svc.md §1). |
+| **step** | One entry of a commit's `svc` list: acks a connection's input, appends output records and replaces its sealed state, atomically with the commit (svc.md §4). |
+| **reveal** | Sending an output record's key after its commit is known, so the server can write it (svc.md §5). |
+| **takeover** | Another handler continuing a live connection from its last committed step after the holder's lease ends (svc.md §6). |
+| **resumable** | A connection a step has marked safe to take over; fresh connections are always requeued, others are aborted (svc.md §6). |
