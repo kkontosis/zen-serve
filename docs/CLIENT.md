@@ -2,7 +2,7 @@
 
 The TypeScript client of zen-serve, for Node 22+ and browsers (`packages/client`). Every format and algorithm runs in the WASM build of zen-core (`crates/zen-wasm`, `@zen/wasm`), and so does the CBOR wire encoding, through zen-proto: the client and the server share one definition of every byte. The server only ever sees ciphertext and opaque ids.
 
-`zen-mount`, a FUSE mount of a zen-serve filesystem, is in [§9](#9-zen-mount). The packages on top of the client have their own docs: `@zen/db` (tables, indexes, transactions, the broker, CRDT tables) in [DB.md](DB.md), `@zen/loro` (Loro documents on a topic, with snapshots and offline edits) in [DB.md §20](DB.md#20-loro-documents), and `@zen/fs` (the local replica) in [§8](#8-the-filesystem) below.
+`zen-mount`, a FUSE mount of a zen-serve filesystem, is in [§9](#9-zen-mount). The packages on top of the client have their own docs: `@zen/db` (tables, indexes, transactions, the broker, CRDT tables) in [DB.md](DB.md), `@zen/loro` (Loro documents on a topic, with snapshots and offline edits) in [DB.md §20](DB.md#20-loro-documents), `@zen/fs` (the local replica) in [§8](#8-the-filesystem) below, and `@zen/svc` (handlers of relayed TCP services) in [§11](#11-relayed-services-zensvc).
 
 ## 1. Building
 
@@ -266,7 +266,35 @@ await session.logout(); await vault.forget();             // sign-out
 * **`signIn(client)`** resumes the stored session while it hasn't expired (60 s margin), checked with one `/v1/grv` call (`{probe: false}` skips it). A session the server refuses (401) falls back to a device sign-in, and the new session is stored. When the server can't be reached, the stored session is returned: the kept header and local caches work, and calls fail with `network` until it is back. A token is only ever sent to the origin it was issued for.
 * **The store** needs the device layer (G15: the seed and token sit at rest under a non-extractable key), or `plaintext: true` and `allowPlaintext`. It can't have the fs layer, which needs the keys it unlocks. `Db.wipe` leaves the vault; `forget()` (or `forgetSession()`) clears it.
 
-## 11. Security notes
+## 11. Relayed services (`@zen/svc`)
+
+A relayed service (spec/svc.md) is a TCP port of zen-serve whose connections are served by handlers on member clients: the server stores each connection's bytes and never reads them. The service id is the topic id of a path, conventionally `svc/<name>`, and the server's `[[service]]` table names it; serving needs topic `consume` on it.
+
+```ts
+import { serve } from '@zen/svc';
+
+const h = serve(db, {
+  service: ['svc', 'echo'],
+  handler: async (c, tx) => {                       // one step: in one transaction with tx
+    const nl = c.input.lastIndexOf(10) + 1;          // input from in_acked, as bytes
+    if (nl) {
+      c.write(c.input.subarray(0, nl));              // output, released after the commit
+      await tx.table('lines').insert({ conn: bytes.hex(c.conn), at: Date.now() });
+      c.ack(nl);                                     // consume whole lines only
+    }
+    if (c.eof) c.end();                              // FIN; also close(), abort()
+  },
+});
+await h.stop();                                      // the server requeues its connections
+```
+
+* **One step, one commit.** The handler runs in a `db.transaction` whose commit also carries the step: the ack, the output and the connection's state. A conflict re-runs the handler. So a reply is sent if and only if the handler's writes committed, and a peer never sees output of a step that didn't.
+* **State.** `c.state` (bytes, or null) is sealed with the step (kind 9, bound to the connection's cursors) and comes back in the next step, also on another handler. Ack only whole protocol units: what isn't acked comes back as input.
+* **Takeover.** `serve` holds a handler lease (`leaseTtlMs`, default 5 s, renewed every second). When the handler dies, its connections move to another handler once the lease lapses, and that one continues from the last committed step: the output of a committed step is revealed by whichever handler holds the connection (its keys are escrowed under the service key), and the input not acked is pushed again. On a `resume: false` service, output is plain and a connection whose handler dies is closed.
+* **Where it runs.** Like consumers, `serve` runs while the database is the owner, so of a browser's tabs one serves. Keys come from the unlocked fs (`fs.service(...path).keysAt(epoch)`).
+* **Not yet:** TLS and SSH layers, `tcp-auth`, the sealed inbox (a sealed input chunk closes the connection), and a line helper: milestone 5.5 steps 7–13.
+
+## 12. Security notes
 
 * **Secrets stay in WASM memory** behind handles (`FsKeys`, `SigningIdentity`, `DeviceSecret`, `PasswordKey`, OPAQUE state); `free()` and `UnlockedFs.close()` zeroize them. Values passed in from JS (passwords, recovery keys) are copied; JS strings can't be wiped.
 * **Argon2id parameters.** The floor is 64 MiB, t=1. Browsers should register with 256 MiB, t=3 (the default of `addPassphrase`); 1 GiB takes ~8 s in WASM (docs/STATS.md §5.2). The parameters the server returns are bounded on use (formats.md §6), so a hostile server can't make a client hang.

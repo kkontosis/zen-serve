@@ -81,7 +81,15 @@ export {
   type StreamTarget,
   type SubscribeOptions,
   Subscription,
+  type SvcPush,
 } from './stream.js';
+export {
+  REVEAL_ALREADY,
+  REVEAL_BAD_KEY,
+  REVEAL_NOT_COMMITTED,
+  REVEALED,
+  Service,
+} from './svc.js';
 export { Transport, type TransportOptions } from './transport.js';
 export {
   CHUNK_SIZE,

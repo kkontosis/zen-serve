@@ -517,7 +517,7 @@ export class DbTransaction implements IndexTx {
 
   /**
    * Whether the commit would hold CRDT operations only (§19.7): no writes,
-   * appends, consume steps, file operations or reads in its read set but
+   * appends, consume or svc steps, file operations or reads in its read set but
    * the catalog records of its tables.
    */
   private crdtOnly(): boolean {
@@ -528,6 +528,7 @@ export class DbTransaction implements IndexTx {
       !c.clear_ranges?.length &&
       !c.append?.length &&
       !c.consume?.length &&
+      !c.svc?.length &&
       !c.chunks?.length &&
       !c.pages?.length &&
       !c.crdt_ops?.length &&

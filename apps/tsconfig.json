@@ -10,7 +10,8 @@
       "@zen/client/node": ["../packages/client/src/node.ts"],
       "@zen/db": ["../packages/db/src/index.ts"],
       "@zen/fs": ["../packages/fs/src/index.ts"],
-      "@zen/loro": ["../packages/loro/src/index.ts"]
+      "@zen/loro": ["../packages/loro/src/index.ts"],
+      "@zen/svc": ["../packages/svc/src/index.ts"]
     }
   },
   "include": ["*/src", "*/ui", "*/test", "*/e2e", "*/workers", "shared"],

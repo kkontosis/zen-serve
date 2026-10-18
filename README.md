@@ -26,7 +26,8 @@ Building blocks:
 | [`packages/db`](packages/db) | `@zen/db`: the client-side database (tables, indexes, queries, transactions), the in-app broker (`on`, consumers, scheduler, request/reply, sagas) and CRDT tables, with offline caches ([`docs/DB.md`](docs/DB.md)) |
 | [`packages/fs`](packages/fs) | `@zen/fs`: a local replica of a filesystem tree (the node table, content on demand, offline writes), under `zen-mount` too ([`docs/CLIENT.md`](docs/CLIENT.md) §8) |
 | [`packages/loro`](packages/loro) | `@zen/loro`: [Loro](https://loro.dev) documents kept on a topic, with snapshots and offline edits ([`docs/DB.md`](docs/DB.md) §20) |
-| [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger) and `hello`, on `@zen/db`, `@zen/fs` and `@zen/loro` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
+| [`packages/svc`](packages/svc) | `@zen/svc`: handlers of relayed TCP services, each step in one transaction with the handler's writes ([`spec/svc.md`](spec/svc.md), [`docs/CLIENT.md`](docs/CLIENT.md) §11) |
+| [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger), `hello`, and `echo` (a relayed line service), on `@zen/db`, `@zen/fs`, `@zen/loro` and `@zen/svc` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
 
@@ -39,7 +40,7 @@ Building blocks:
 * Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
 * Milestone 4.5 (zen-db and the in-app broker, specs only, [`spec/zendb.md`](spec/zendb.md), [`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): done.
 * Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
-* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md)): planned, next.
+* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md)): in progress. Done: the spec, the server relay, stream push and `@zen/svc` with raw handlers (steps 1–5).
 
 ## Building
 

@@ -25,7 +25,9 @@ import {
   zw,
 } from '../../packages/client/src/index.js';
 import {
+  freePort,
   type ServerOptions,
+  serviceToml,
   spawnServer,
   type TestServer,
   testUser,
@@ -71,6 +73,23 @@ export interface WorldOptions {
   grants?: GrantSpec[];
   /** Server options (limits, …); `unencrypted_dir` is set here. */
   server?: ServerOptions;
+  /**
+   * Relayed services of fs 1 (spec/svc.md), each a `tcp` service on a free
+   * port. A service id is the topic id of its path, which only an unlocked
+   * fs can compute: the server is restarted with them once the fs exists.
+   */
+  services?: WorldService[];
+}
+
+/** A relayed service of the test world. */
+export interface WorldService {
+  name: string;
+  /** Its topic path (conventionally `['svc', name]`). */
+  path: string[];
+  /** Output by key reveal, so handlers can take over (default true). */
+  resume?: boolean;
+  /** Other `[[service]]` settings. */
+  more?: Record<string, number | boolean | string>;
 }
 
 /** A running world. */
@@ -87,6 +106,8 @@ export interface World {
   admin: Session;
   /** A user by name. */
   user(name: string): WorldUser;
+  /** The port of a relayed service (`WorldOptions.services`). */
+  servicePort(name: string): number;
   /** The URL of an app's page (`query` without `?`). */
   appUrl(app: string, query?: string): string;
   /** Stop the server and delete its data and the device files. */
@@ -99,10 +120,12 @@ const PASSPHRASE = 'apps passphrase';
 export async function startWorld(o: WorldOptions = {}): Promise<World> {
   await initWasm();
   const names = o.users ?? ['alice', 'bob'];
-  const server = await spawnServer({
+  const serverOpts: ServerOptions = {
     ...o.server,
     top: { unencrypted_dir: DIST, ...o.server?.top },
-  });
+  };
+  let server = await spawnServer(serverOpts);
+  const ports = new Map<string, number>();
   const origin = `http://localhost:${server.port}`;
   const files = await mkdtemp(join(tmpdir(), 'zen-apps-'));
   try {
@@ -137,6 +160,25 @@ export async function startWorld(o: WorldOptions = {}): Promise<World> {
     await session.acl.update(admin.identity, (doc) => {
       doc.grants.push(...grants);
     });
+    if (o.services?.length) {
+      const specs = [];
+      for (const sv of o.services) {
+        const port = await freePort();
+        ports.set(sv.name, port);
+        specs.push({
+          name: sv.name,
+          fs: 1,
+          id: ufs.topic(...sv.path).id,
+          port,
+          ...(sv.resume !== undefined ? { resume: sv.resume } : {}),
+          ...(sv.more ? { more: sv.more } : {}),
+        });
+      }
+      server = await server.restart({
+        ...serverOpts,
+        extra: `${serverOpts.extra ?? ''}\n${serviceToml(specs)}`,
+      });
+    }
     ufs.close();
     const users: WorldUser[] = [];
     for (const p of people) {
@@ -165,6 +207,11 @@ export async function startWorld(o: WorldOptions = {}): Promise<World> {
         const u = users.find((x) => x.name === name);
         if (!u) throw new Error(`no user ${name}`);
         return u;
+      },
+      servicePort(name) {
+        const p = ports.get(name);
+        if (p === undefined) throw new Error(`no service ${name}`);
+        return p;
       },
       appUrl: (app, query) => `${origin}/unencrypted/${app}/index.html${query ? `?${query}` : ''}`,
       async stop() {
