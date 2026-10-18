@@ -287,8 +287,9 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * the full zen-server and zen-proto suites on embedded
     * the dev wasm build (`Frame`'s `ok` gains `conn`)
     * `npm run check`
-    * `npx vitest run apps/echo/test/connect.test.ts` (5 tests) and `packages/client/test/svcconnect.test.ts` (3 tests)
-    * pending: `npx vitest run` 3×, `npx playwright test`, CI
+    * `npx vitest run` 3×: 481 passed each time, 7 skipped (the opt-in benches). This includes `apps/echo/test/connect.test.ts` (5) and `packages/client/test/svcconnect.test.ts` (3).
+    * `npx playwright test`: smoke and apps, 16 specs, unchanged
+    * pending: CI on the PR
 
 ### CI fix in step 5.5.10: a stale typing indicator in the chat app
 
