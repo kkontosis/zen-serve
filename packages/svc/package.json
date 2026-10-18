@@ -18,7 +18,8 @@
   },
   "dependencies": {
     "@zen/client": "0.1.0",
-    "@zen/db": "0.1.0"
+    "@zen/db": "0.1.0",
+    "@zen/svc-wasm": "0.1.0"
   },
   "sideEffects": false
 }
