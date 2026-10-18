@@ -82,7 +82,20 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * the full zen-core, zen-proto and zen-server suites on embedded
     * zen-server on FDB: all passed but `dump.rs` `a_started_server_counts_as_empty`, which once got `too_old` in `dump::is_empty` (two one-item range reads, so a stalled transaction on the loaded local cluster); `tests/dump.rs` then passed 3× on FDB
     * the dev wasm build declares `SvcStep` for `Commit.svc`
-* **Step 5.5.4** (stream push): planned, PR #40. Restarted from main after PR #39 merged (CI green on its head); the plan is below. Next: on "go", the `spec:` commit, then the code.
+* **Step 5.5.4** (stream push): done, PR #40. Commits: `docs: milestone 5.5 step 4 plan`; `spec: svc stream push details`; `server: svc stream push (svc_sub, svc_in, svc_reveal)`; `server: an import target with relay keys counts as empty`; the docs and this log.
+  * As planned, plus details settled while building:
+    * `svc_sub`'s checks (the service, `consume`, the lease) run before the `ok`, so a refusal is an `err` with the subscription's `id` and nothing is spawned.
+    * A subscription keeps each doorbell watch armed until it fires, rather than re-arming every turn, so a queue ring is never lost while input is being pushed. With input left over (more than `max_range_bytes` for a connection, or 1,000 log entries), the next turn starts at once, and a fired queue watch still sends its `svc_ready`.
+    * The rescan reads the log's newest key before paging `rx`, so input logged during the rescan is read on the next turn.
+    * A socket runs at most 8 `svc_reveal` requests at once; more wait, which slows the socket's reads.
+    * `log_input` in `svc/mod.rs` writes an `rli` entry; the reader and `claim_some` share it.
+  * Measured locally (embedded): push latency from the peer's write, worst of 10, about 10 ms; 100 connections' lines pushed in about 120 ms.
+  * Verified:
+    * fmt; clippy default, `--no-default-features` and `--all-features`
+    * `tests/svc.rs` (24 tests) 3× on embedded and once on FDB; `tests/multinode.rs` and `tests/dump.rs` on FDB
+    * the full zen-server suite on embedded and on FDB, and zen-proto
+    * the dev wasm build (the `Frame` type gains the five variants) and `npm run check`
+  * Next: plan step 5.5.5 (`@zen/svc`, raw) after PR #40 merges.
 
 ## Step 5.5.4 in detail: stream push
 
