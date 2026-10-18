@@ -119,12 +119,12 @@ impl Service {
 
     /// Count an open connection, unless at `max_conns`.
     fn open(&self) -> bool {
-        let max = self.cfg.max_conns as usize;
-        self.open
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .is_ok()
+        if self.open.fetch_add(1, Ordering::AcqRel) < self.cfg.max_conns as usize {
+            true
+        } else {
+            self.open.fetch_sub(1, Ordering::AcqRel);
+            false
+        }
     }
 
     fn close(&self) {

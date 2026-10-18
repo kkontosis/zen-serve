@@ -65,6 +65,7 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * operations.md §4: every node needs the same service table, and the ports must be reachable.
     * OPS.md §2.2: stale test executables in `target/debug/deps`.
   * Verified: fmt; clippy default, `--all-features` and `--no-default-features`; `tests/svc.rs` (9 tests) 3× on embedded and on FDB; the full zen-store and zen-server suites on FDB and embedded.
+  * CI fix: CI's newer stable toolchain deprecates `AtomicUsize::fetch_update` (renamed `try_update`), and `-D warnings` failed the Rust jobs on it. `Service::open` now uses `fetch_add`, then `fetch_sub` when over `max_conns`. Commit `server: max_conns count without fetch_update`.
   * (next) step 5.5.3 (the step, reveal, the writer): plan in detail after PR #38 merges.
 
 ## Step 5.5.2 in detail: the relay core, input side
