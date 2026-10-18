@@ -289,7 +289,139 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npm run check`
     * `npx vitest run` 3×: 481 passed each time, 7 skipped (the opt-in benches). This includes `apps/echo/test/connect.test.ts` (5) and `packages/client/test/svcconnect.test.ts` (3).
     * `npx playwright test`: smoke and apps, 16 specs, unchanged
-    * pending: CI on the PR
+  * CI green on PR #48's head f893d8a: all 8 checks across both runs, `openssh-pq` skipped. Merged at 2061b38.
+* **Step 5.5.12** (the sealed inbox): planned below. Next: on "go", implement it.
+
+## Step 5.5.12 in detail: the sealed inbox
+
+A service with `inbox` (an X-Wing public key) never stores its input in plaintext. The owning node encapsulates once per connection, stores the ciphertext in the connection record, and seals every input chunk at rest (svc.md §9, formats.md §13.3). Handlers hold the decapsulation seed, which the app keeps sealed in the fs, and open the chunks. A step can set the sticky `unseal` flag (after STARTTLS the input is TLS ciphertext anyway), and the node then stores plain chunks. zen-core already has the crypto and its vectors (`inbox_public`, `inbox_encaps`, `inbox_decaps`, `InboxKey::seal_chunk`/`open_chunk`, `spec/test-vectors/svc.json` `inbox`). The proto has every field: `SvcInfo.inbox`, `SvcClaim.inbox_ct`, `SvcChunk.sealed`, `SvcStep.unseal`, `svc_in.sealed`. This step turns it on end to end.
+
+**Commits:**
+1. `docs: milestone 5.5 step 12 plan` (also logs step 5.5.11's CI and merge)
+2. `spec: sealed inbox details (svc.md §9, api.md §14)`
+3. `server: the sealed inbox (config, sealing, unseal)`
+4. `wasm: inbox bindings`
+5. `svc: sealed input in serve(), and RawStep.unseal()`
+6. `apps: echo with a sealed inbox`
+7. the docs and the log
+
+### Facts from the survey
+* **Config:** `ServiceConfig` (`config.rs:317`, `deny_unknown_fields`) has no `inbox`. The test at `config.rs:784` expects `inbox = "00"` to be refused as an unknown field. `validate_services` is at :627. The struct literals in `tests/svc.rs:27`, `tests/multinode.rs:493` and `tests/dump.rs:206` need the new field.
+* **The server leaves the inbox off everywhere:**
+  * `ConnRec.inbox: Option<Inbox{v, ct}>` (`svc/mod.rs:458`) is always `None` (`conn.rs` `accept`).
+  * `append` always stores the prefix byte 0.
+  * `api.rs` `info` sets `inbox: None`.
+  * `claim_of` already passes `rc.inbox` on as `inbox_ct`.
+  * `step.rs:171` ORs `RA_UNSEAL` into `ra`, but nothing reads it.
+* **A latent bug for sealed chunks.** The read path (`api.rs:299, 301, 311`) and the push path (`push.rs:278`) take `data.len()` as the chunk's plaintext length and as the `max_bytes` budget. A sealed chunk is 16 bytes longer (the tag). `step.rs:202` `chunk_len` already subtracts 17.
+* **Exports leave relay keys out** (`dump::export`, test `export_skips_relay_keys`). So "no plaintext at rest" is checked by scanning the live store's `r*` values. `relay_data` (`tests/svc.rs:204`) returns keys only.
+* **Client:**
+  * zen-wasm binds nothing of the inbox.
+  * `serve.ts:546` releases a connection with `close` on a sealed chunk ("not supported yet").
+  * Input is joined by offset in `input.ts` (`Input.add`); `early` buffers pushes for connections not claimed yet; `repair()` reads after a gap.
+  * `build()` never sets `unseal`.
+  * `RawStep` (`layer.ts:26`) has no `unseal`, and `Finished` (`layer.ts:74`) has no field for it.
+* **Where secrets live:** apps keep keys in sealed zen-db rows. The echo app's `certs` table holds the TLS key and the SSH host key; `tlsLayer` and `sshLayer` read them before `serve()`.
+* **Test config:** `ServiceSpec.more` and `WorldService.more` pass any `[[service]]` setting, so `more: {inbox: hex}` works once the server takes the field.
+
+### spec (`spec:`)
+* **svc.md §2:** `inbox` is the X-Wing public key in hex, 1,216 bytes; another length is refused at start.
+* **svc.md §9:**
+  * The node notices `unseal` when it stores a batch: it reads `ra` with the batch. It stores later batches plain. A batch it was already storing stays sealed.
+  * `unseal` on a service without `inbox` is a no-op.
+  * The quota counts input bytes as plaintext, as `in_head` does. The 17 bytes a sealed chunk adds aren't counted, as the state's framing isn't.
+  * A handler without the seed can't serve the service: it releases a connection that has `inbox_ct` with `close`.
+  * A resent batch (after `commit_unknown`) seals the same bytes at the same offset under the same key, so it gives the same chunk. This is already formats.md §13.3; the step only cross-references it.
+* **api.md:**
+  * §14.1 `inbox` is present when configured.
+  * §14.6: `max_bytes` and chunk lengths count plaintext bytes. A sealed chunk's `data` is 16 bytes longer.
+  * §14.5 `unseal`: sticky; a no-op without an inbox.
+
+### Server (`crates/zen-server`)
+* **`config.rs`:**
+  * `inbox: Option<Vec<u8>>`, hex (an `Option` variant of `de_hex`).
+  * `validate_services` checks the length against `zen_core::svc::INBOX_PUBLIC_LEN`.
+  * The `inbox = "00"` test becomes a length refusal, plus a valid-key test.
+  * The example configs gain a commented `# inbox = "…"` line, explained.
+* **`svc/conn.rs`:**
+  * At accept, with `cfg.inbox`: `inbox_encaps(pk, fs, svc, conn, OsRng)`. The ciphertext goes into `rc.inbox = {v: 1, ct}`, and `Conn` keeps the `InboxKey` and a `sealing` flag.
+  * `append`, in its transaction, snapshot-reads `ra` while sealing. If `RA_UNSEAL` is set, sealing stops from that batch on (sticky). Otherwise the batch is stored as `1 ‖ key.seal_chunk(in_head, data)`. The quota still adds `len`.
+  * A failed encapsulation fails the accept, as a storage error does today.
+* **`svc/api.rs`:** `info` returns `cfg.inbox`. In `chunks`/`chunk`, a chunk's plaintext length is `data.len() − 16` when it is sealed: for the next offset, and for the `max_bytes` budget.
+* **`svc/push.rs:278`:** the same plaintext length for `next`.
+* **Tests (`tests/svc.rs`, embedded and FDB):**
+  * **`inbox_seals_input`:**
+    * `info` shows the key, and the claim carries `inbox_ct`.
+    * A peer writes lines holding a marker. `read` returns sealed chunks; decapsulating with the seed and opening each at its offset gives exactly the input, contiguous.
+    * A scan of every `r*` value in the store finds no marker.
+    * Reads with a small `max_bytes` across sealed chunks advance by plaintext length, with no gap or overlap.
+    * A `svc_sub` push of sealed chunks has consecutive offsets.
+  * **`unseal_stops_sealing`:**
+    * A step with `unseal: true`.
+    * Input written after it is eventually stored plain (`sealed: false`), and opens or reads as written.
+    * A chunk sealed in between still opens.
+    * The handler sees one contiguous stream across the switch.
+  * Config validation (a bad length).
+
+### zen-wasm (`crates/zen-wasm`)
+* `inboxPublic(seed: Uint8Array) → Uint8Array`
+* `InboxKey.decaps(seed, ct, fsId, svc, conn) → InboxKey`, with `openChunk(off: bigint, sealed: Uint8Array) → Uint8Array` and `free()`. Errors are `ZenCryptoError` `format` and `decrypt`, as the other bindings.
+* Also `InboxKey.encaps(public, fsId, svc, conn) → {ct, key}` and `sealChunk`, for tests that play the server's part.
+* The vector test in `packages/client/test/svcvectors.test.ts` covers the `inbox` vectors: the public key, decapsulation, and the two chunks.
+
+### `@zen/svc`
+* **`ServeOptions.inbox?: Uint8Array`:** the 32-byte decapsulation seed.
+* **Loading a claim with `inbox_ct`:**
+  * With a seed: `InboxKey.decaps(...)`, kept with the connection and freed when it is forgotten.
+  * Without one: `onError` ("the service seals its input: serve() needs its inbox seed"), and the connection is released with `close`.
+* **Sealed chunks** (pushed, read after a gap, or buffered early) are opened at their offset before `Input.add`. A chunk that doesn't open is a bad record: `onError`, and the connection is released with `close`. Contiguity is `Input`'s offset joining (the nonce binds the offset, so a moved chunk doesn't open).
+* **`RawStep.unseal()`:** sets the sticky flag. The step that carries it sends `unseal: true`. The connection remembers it was sent, so the flag isn't sent again.
+  * `Finished` gains `unseal`. `raw()` and `tls()` pass it from their `Step`.
+  * SSH has no use for it; the TLS layer has no STARTTLS (5.5.13).
+* **Tests:** `packages/svc/test/input.test.ts`, or a new `inbox.test.ts` against a `TestServer` with an inbox service, driving `serve()`:
+  * sealed input echoed
+  * a seed-less `serve()` releases with `close` and reports it
+  * `unseal()` sent once
+
+### Echo with a sealed inbox
+* **`apps/echo/src/schema.ts`:** `putInboxSeed(db, seed)` puts the seed in `certs` under `inbox` (sealed like every row); `inboxSeed(db)` reads it.
+* **`echo.ts`:**
+  * `INBOX_SERVICE = ['svc', 'echo-inbox']`.
+  * The echo handler gains one command: the line `STARTTLS` gets its reply and calls `c.unseal()`. It stands in for the real STARTTLS of 5.5.13: after it, the client's bytes would be TLS ciphertext and need no sealing.
+* **`workers/handler.ts`:** `ECHO_LAYER=inbox` serves `echo-inbox` with the seed from `certs`.
+* **Harness:** nothing new. The test computes `inboxPublic(seed)` before `startWorld` and passes it as `more: {inbox: hex}`.
+* **Vitest (`apps/echo/test/inbox.test.ts`):**
+  1. In-process: lines echoed and stored as rows; the peer's FIN gives `bye`.
+  2. `STARTTLS` mid-stream: the lines after it are still echoed in order.
+  3. A worker SIGKILLed mid-stream (lease TTL 1 s): the successor decapsulates again and continues. Every line comes back once and in order, and the table holds exactly the lines.
+  4. A `serve()` without the seed: `onError` reports it, and the peer's connection closes.
+* Playwright: none (the browser path is unchanged but for the WASM binding, which vitest covers).
+
+### Docs
+* `docs/CLIENT.md` §11:
+  * the inbox: how an admin makes the seed (`zw.randomBytes(32)`) and the configuration's key (`bytes.hex(zw.inboxPublic(seed))`)
+  * where the seed lives (a sealed row)
+  * `serve({inbox})` and `c.unseal()`
+  * what the inbox protects: at rest, not from the server process
+  * The "Not yet" line drops the inbox.
+* `apps/README.md`: echo's inbox service.
+* The example configs.
+* **TECH_DEBT TD-SVC-INBOX-ROTATION:** changing a service's inbox key needs the old seed until the connections opened under it end. There is no rotation helper.
+* The log in both plan copies.
+
+### Out of scope
+* STARTTLS in the TLS layer (raw, then TLS on the same connection) and the line helper: 5.5.13, with `apps/mail`.
+* Inbox key rotation tooling (TD).
+* Delegating the seed to a worker without fs access.
+
+### Verification
+* `cargo fmt --check`; clippy `--all-targets -D warnings`: default, `--no-default-features` and `--all-features`
+* `cargo test -p zen-server --test svc` 3× on embedded and once on FDB; the full zen-server suite once; `cargo test -p zen-core` (unchanged vectors)
+* `scripts/build-wasm.sh --dev`; clippy on zen-wasm for wasm32
+* `npm run check`; `npx vitest run` 3×; `npx playwright test` once
+* CI green on the PR
+
+Housekeeping before "go": the self check-in scheduled for 22:52 UTC (PR #48's CI) is obsolete now that the PR is merged; delete it if it hasn't fired.
 
 ### CI fix in step 5.5.10: a stale typing indicator in the chat app
 
