@@ -96,7 +96,12 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * the full zen-server suite on embedded and on FDB, and zen-proto
     * the dev wasm build (the `Frame` type gains the five variants) and `npm run check`
   * CI green on PR #40's head (all 8 checks).
-* **Step 5.5.5** (`@zen/svc`, raw): planned, PR #41. Restarted from main after PR #40 merged; the plan is below. Next: on "go", the code.
+* **Step 5.5.5** (`@zen/svc`, raw): planned, PR #41. Restarted from main after PR #40 merged; the plan is below.
+  * CI fix done before "go": one `client` run on the plan commit failed the kanban offline test (the index didn't follow a move within 15 s). Commit `db: a delivery whose commit failed on the network is retried, not nacked`, as in "CI fix first" below.
+    * `packages/db/test/network.test.ts` failed on the old code (the second event of the key didn't arrive within 10 s) and passes with the fix in about 3 s.
+    * Verified: `npm run check`; `packages/db` and `apps/kanban`; the kanban offline test 5×; the whole vitest suite 3×.
+    * Seen once, in the first of those three full runs: the kanban test "deleting a card moves its attachment directory to TRASH" failed an assertion in 55 ms. It involves no consumer and no network error, so this fix doesn't reach it. It didn't recur in 3 kanban-only runs, 4 parallel runs of that test, or the 2 other full runs. Not yet investigated: watch CI for it.
+  * Next: on "go", the code.
 
 ## Step 5.5.5 in detail: `@zen/svc`, raw
 
@@ -104,13 +109,49 @@ This step gives handlers a TypeScript runtime: `serve(db, {service, handler})` h
 
 **Commits:**
 1. `docs: milestone 5.5 step 5 plan`
-2. `wasm: svc seals and the svc request codecs`
-3. `client: svc_sub on the stream; a svc step makes a transaction non-empty`
-4. `svc: @zen/svc, the raw handler runtime`
-5. `apps: echo, a relayed line service`
-6. the docs and the log
+2. `db: a delivery whose commit failed on the network is retried, not nacked` (the CI fix below, done before "go")
+3. `wasm: svc seals and the svc request codecs`
+4. `client: svc_sub on the stream; a svc step makes a transaction non-empty`
+5. `svc: @zen/svc, the raw handler runtime`
+6. `apps: echo, a relayed line service`
+7. the docs and the log
 
 No `spec:` commit is expected; if the code finds a gap in svc.md, it gets one.
+
+### CI fix first: the kanban offline test (PR #41's `client` job)
+On the plan commit, one of the two `client` runs failed:
+* **The test:** `apps/kanban/test/kanban.test.ts:380`, "offline edits merge field by field", timed out after 15 s waiting for "the index to follow the move".
+* **Its log** shows `consume $index: network: offline (test)`.
+* The other run on the same commit passed, and the PR changes only docs. The failure isn't new code's, but its cause is real, in `@zen/db`.
+
+**Root cause** (`packages/db/src/broker.ts`, `ConsumerHandle.one`):
+1. The CRDT indexer is a `per_key` consumer (`$index`, `ixer.ts:96`). When the test switches the workers' sessions offline, a delivery the indexer is handling at that moment fails its commit with `network`.
+2. `one()` then nacks it (`:742`), and the nack fails with `network` too (`nack()` only reports it).
+3. So the claim stays on the key until `claim_ttl_ms` (default 30 s; the apps harness keeps the default).
+4. `per_key` delivers a key's events in order, so the card's later change events wait behind the stale claim for up to 30 s. The test waits 15 s.
+5. It passes when no delivery was in flight at the moment the sessions went offline.
+
+The same happens in production: a short network failure while a handler commits stalls that key until the claim TTL.
+
+**Fix:**
+* In `one()`, when the handler's transaction fails with `network` (the transport failed, not the handler), run the delivery again with the loop's backoff (100 ms doubling to 5 s) instead of nacking. It stops when the stop signal fires or on any other error.
+* This is safe because the step carries the claim token:
+  * If an earlier attempt's commit did apply, the retry's consume step gets `claim_lost` or `cursor_moved`, which `dropped()` already treats as done. Nothing is applied twice.
+  * Once the server has redelivered the event, the stale token gets `claim_lost` the same way.
+* `attempts` isn't counted for a network failure, so an outage can't dead-letter a message.
+* `nack()` also retries on `network`, with the same backoff, for the case where the handler really failed but the nack can't reach the server.
+* `one()` gets the loop's `signal`.
+
+**Test:**
+* A new `packages/db/test/network.test.ts`, with its own `world()` at the default 30 s claim TTL, and a local `net()` offline switch like the one in `crdtoffline.test.ts`.
+* Setup: a `per_key` consumer handles two events of one key. During the first one, the handler switches the session offline, so that commit fails with `network`, and switches it back on 500 ms later.
+* Expected: both events are handled, each exactly once in the table, within 5 s. Without the fix, the second event waits for the 30 s claim TTL.
+* The test is written and run first, and must fail on the current code before the fix goes in.
+
+**Verify:**
+* the new test, plus `packages/db` and `apps/kanban` (the kanban offline test 5×)
+* `npm run check`
+* push to PR #41, and CI green on both runs
 
 **Out of scope:**
 * the TLS and SSH layers, and the second wasm module (5.5.7–5.5.10)
