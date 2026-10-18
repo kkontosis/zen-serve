@@ -4,7 +4,9 @@
 // `lines`, committed in one transaction with the reply. The same handler
 // serves `echo-tls` behind `tls()`, with the certificate from `certs`; and
 // `mirror`, which sends back whatever arrives, serves `mirror-tls`. Over
-// SSH (ssh.ts), `sshEcho` serves `echo-ssh`.
+// SSH (ssh.ts), `sshEcho` serves `echo-ssh`. `echo-auth` and
+// `echo-ssh-auth` are the same as `tcp-auth` services, which members reach
+// through zen-serve (`zen-connect`).
 import { bytes } from '@zen/client';
 import type { Db } from '@zen/db';
 import {
@@ -27,7 +29,14 @@ export {
   putSshKey,
   type SshKey,
 } from './schema.js';
-export { SSH_SERVICE, STUB_COMMIT, STUB_REFS, sshEcho, sshLayer } from './ssh.js';
+export {
+  SSH_AUTH_SERVICE,
+  SSH_SERVICE,
+  STUB_COMMIT,
+  STUB_REFS,
+  sshEcho,
+  sshLayer,
+} from './ssh.js';
 
 /** The service's topic path: its topic id is the service id. */
 export const SERVICE = ['svc', 'echo'];
@@ -37,6 +46,9 @@ export const TLS_SERVICE = ['svc', 'echo-tls'];
 
 /** The mirror service over TLS (bulk transfers). */
 export const MIRROR_SERVICE = ['svc', 'mirror-tls'];
+
+/** The echo service as `tcp-auth`: members connect through zen-serve. */
+export const AUTH_SERVICE = ['svc', 'echo-auth'];
 
 const text = new TextDecoder();
 

@@ -19,6 +19,9 @@ import { type Cert, SSH_HOST_KEY, type SshKey } from './schema.js';
 /** The echo service over SSH. */
 export const SSH_SERVICE = ['svc', 'echo-ssh'];
 
+/** The echo service over SSH, as `tcp-auth`. */
+export const SSH_AUTH_SERVICE = ['svc', 'echo-ssh-auth'];
+
 /** The stub repository's one commit, and what `git ls-remote` shows. */
 export const STUB_COMMIT = '5d1e8c6bd2f4e7a6c3b0a9f8e7d6c5b4a3928170';
 export const STUB_REFS = ['HEAD', 'refs/heads/main'];
