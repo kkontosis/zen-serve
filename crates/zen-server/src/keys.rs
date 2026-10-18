@@ -458,3 +458,91 @@ pub fn crdt_objects(fs: u32) -> Key {
 pub fn crdt_gc(fs: u32) -> Key {
     Key::new().str("cd").int(fs.into())
 }
+
+// ---- relayed services (keyspace.md §3.9)
+
+/// Every relay key's first element: transient, never exported.
+pub const RELAY_TAGS: [&str; 20] = [
+    "rc", "rh", "rw", "ra", "rm", "rz", "ri", "ro", "rv", "rs", "rq", "rqh", "rl", "rx", "rld",
+    "rli", "rk", "rn", "rnq", "rnc",
+];
+
+/// The packed first element of every relay key. A packed text element ends
+/// in its terminator, so `"rc"` doesn't match `"rcx"`.
+pub fn relay_prefixes() -> Vec<Vec<u8>> {
+    RELAY_TAGS
+        .iter()
+        .map(|t| Key::new().str(t).finish())
+        .collect()
+}
+
+/// `(tag, fs, svc)`.
+pub fn svc_key(tag: &str, fs: u32, svc: &[u8]) -> Key {
+    Key::new().str(tag).int(fs.into()).bytes(svc)
+}
+
+/// `(tag, fs, svc, conn)`: a connection's `rc rh rw ra rm rz rs` key, or
+/// the prefix of its `ri ro rv` entries (then `.int(off)`).
+pub fn conn_key(tag: &str, fs: u32, svc: &[u8], conn: &[u8]) -> Key {
+    svc_key(tag, fs, svc).bytes(conn)
+}
+
+/// A connection's single key (`rc rh rw ra rm rz rs`).
+pub fn conn(tag: &str, fs: u32, svc: &[u8], conn: &[u8]) -> Vec<u8> {
+    conn_key(tag, fs, svc, conn).finish()
+}
+
+/// `("rq", fs, svc)`: the ready queue.
+pub fn svc_queue(fs: u32, svc: &[u8]) -> Key {
+    svc_key("rq", fs, svc)
+}
+
+/// The queue doorbell.
+pub fn svc_queue_bell(fs: u32, svc: &[u8]) -> Vec<u8> {
+    svc_key("rqh", fs, svc).finish()
+}
+
+/// A handler lease: `("rl", fs, svc, lease)`.
+pub fn svc_lease(fs: u32, svc: &[u8], lease: &[u8]) -> Vec<u8> {
+    svc_key("rl", fs, svc).bytes(lease).finish()
+}
+
+/// `("rx", fs, svc, lease)`: the connections claimed under a lease.
+pub fn svc_claims(fs: u32, svc: &[u8], lease: &[u8]) -> Key {
+    svc_key("rx", fs, svc).bytes(lease)
+}
+
+/// A lease's doorbell.
+pub fn svc_lease_bell(fs: u32, svc: &[u8], lease: &[u8]) -> Vec<u8> {
+    svc_key("rld", fs, svc).bytes(lease).finish()
+}
+
+/// `("rli", fs, svc, lease)`: a lease's input log.
+pub fn svc_lease_input(fs: u32, svc: &[u8], lease: &[u8]) -> Key {
+    svc_key("rli", fs, svc).bytes(lease)
+}
+
+/// `("rk")`, then `.bytes(node)`: node leases.
+pub fn node_leases() -> Key {
+    Key::new().str("rk")
+}
+
+/// A node lease.
+pub fn node_lease(node: &[u8]) -> Vec<u8> {
+    node_leases().bytes(node).finish()
+}
+
+/// A node's doorbell.
+pub fn node_bell(node: &[u8]) -> Vec<u8> {
+    Key::new().str("rn").bytes(node).finish()
+}
+
+/// `("rnq", node)`: work for a node's writer.
+pub fn node_work(node: &[u8]) -> Key {
+    Key::new().str("rnq").bytes(node)
+}
+
+/// `("rnc", node)`: a node's connections, then `(fs, svc, conn)`.
+pub fn node_conns(node: &[u8]) -> Key {
+    Key::new().str("rnc").bytes(node)
+}

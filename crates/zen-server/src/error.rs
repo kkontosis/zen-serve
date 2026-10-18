@@ -56,8 +56,10 @@ ctor!(name_taken, CONFLICT, "name_taken");
 ctor!(cursor_moved, PRECONDITION_FAILED, "cursor_moved");
 ctor!(not_leader, PRECONDITION_FAILED, "not_leader");
 ctor!(claim_lost, PRECONDITION_FAILED, "claim_lost");
+ctor!(conn_closed, PRECONDITION_FAILED, "conn_closed");
 ctor!(too_large, PAYLOAD_TOO_LARGE, "too_large");
 ctor!(quota, TOO_MANY_REQUESTS, "quota");
+ctor!(window, TOO_MANY_REQUESTS, "window");
 ctor!(not_implemented, NOT_IMPLEMENTED, "not_implemented");
 ctor!(internal, INTERNAL_SERVER_ERROR, "internal");
 

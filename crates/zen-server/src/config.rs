@@ -57,6 +57,10 @@ pub struct Config {
     /// FoundationDB native backup.
     #[serde(default)]
     pub backup: BackupConfig,
+    /// Relayed services (spec/svc.md §2). Every node carries the same
+    /// table; only `listen` may differ.
+    #[serde(default)]
+    pub service: Vec<ServiceConfig>,
 }
 
 /// Storage backend kind.
@@ -289,6 +293,115 @@ pub struct FsConfig {
     pub id: u32,
 }
 
+/// How a relayed service's connections arrive (spec/svc.md §2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SvcMode {
+    /// A public port.
+    Tcp,
+    /// Members connect over `/v1/svc/connect`.
+    TcpAuth,
+}
+
+impl SvcMode {
+    /// The name in the config and the API.
+    pub fn name(self) -> &'static str {
+        match self {
+            SvcMode::Tcp => "tcp",
+            SvcMode::TcpAuth => "tcp-auth",
+        }
+    }
+}
+
+/// One relayed service: `[[service]]` (spec/svc.md §2).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
+    /// Unique name, for logs.
+    pub name: String,
+    /// The fs the service belongs to.
+    pub fs: u32,
+    /// The service id: a topic id (16·n bytes), in hex.
+    #[serde(deserialize_with = "de_hex")]
+    pub id: Vec<u8>,
+    /// How connections arrive.
+    pub mode: SvcMode,
+    /// The address to accept on (`tcp` only).
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// Open connections per node.
+    #[serde(default = "default_max_conns")]
+    pub max_conns: u32,
+    /// Accepts per second per peer address and node (0: no limit).
+    #[serde(default = "default_per_ip_rate")]
+    pub per_ip_rate: u32,
+    /// Burst of accepts per peer address and node.
+    #[serde(default = "default_per_ip_burst")]
+    pub per_ip_burst: u32,
+    /// Unacked input bytes per connection.
+    #[serde(default = "default_window")]
+    pub window: u32,
+    /// Committed, unwritten output bytes per connection.
+    #[serde(default = "default_out_window")]
+    pub out_window: u32,
+    /// A connection not claimed within this time is aborted.
+    #[serde(default = "default_accept_wait_ms")]
+    pub accept_wait_ms: u32,
+    /// A connection without a committed step this long is aborted.
+    #[serde(default = "default_handshake_secs")]
+    pub handshake_secs: u32,
+    /// A connection without input or output this long is aborted (0: off).
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u32,
+    /// Output is released by key reveal, so handlers can take over.
+    #[serde(default = "yes")]
+    pub resume: bool,
+}
+
+/// The smallest `window` and `out_window`.
+pub const MIN_SVC_WINDOW: u32 = 65_536;
+
+fn default_max_conns() -> u32 {
+    1024
+}
+fn default_per_ip_rate() -> u32 {
+    10
+}
+fn default_per_ip_burst() -> u32 {
+    50
+}
+fn default_window() -> u32 {
+    262_144
+}
+fn default_out_window() -> u32 {
+    1_048_576
+}
+fn default_accept_wait_ms() -> u32 {
+    10_000
+}
+fn default_handshake_secs() -> u32 {
+    30
+}
+fn default_idle_secs() -> u32 {
+    300
+}
+
+fn de_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    let s = String::deserialize(d)?;
+    parse_hex(&s).ok_or_else(|| serde::de::Error::custom(format!("{s:?} is not hex")))
+}
+
+/// Decode lowercase or uppercase hex.
+pub fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// What one ephemeral message costs against its device's rate limit on top
 /// of its data: the topic id (at most 256 bytes), the sender and the ring
 /// entry's key.
@@ -417,6 +530,7 @@ impl Config {
             storage: StorageConfig::default(),
             fdb: FdbConfig::default(),
             backup: BackupConfig::default(),
+            service: Vec::new(),
         }
     }
 
@@ -507,7 +621,54 @@ impl Config {
                 return Err(format!("duplicate fs id {}", f.id));
             }
         }
+        self.validate_services()
+    }
+
+    fn validate_services(&self) -> Result<(), String> {
+        let mut names = std::collections::HashSet::new();
+        let mut ids = std::collections::HashSet::new();
+        let mut listens = std::collections::HashSet::new();
+        for s in &self.service {
+            let at = format!("service {:?}", s.name);
+            if s.name.is_empty() || !names.insert(&s.name) {
+                return Err(format!("{at}: the name must be unique and non-empty"));
+            }
+            if !self.has_fs(s.fs) {
+                return Err(format!("{at}: fs {} is not configured", s.fs));
+            }
+            if s.id.is_empty() || !s.id.len().is_multiple_of(16) || s.id.len() > 256 {
+                return Err(format!("{at}: id must be 16·n bytes, 1 ≤ n ≤ 16"));
+            }
+            if !ids.insert((s.fs, &s.id)) {
+                return Err(format!("{at}: another service has this fs and id"));
+            }
+            match (s.mode, s.listen) {
+                (SvcMode::Tcp, None) => return Err(format!("{at}: mode tcp needs listen")),
+                (SvcMode::TcpAuth, Some(_)) => {
+                    return Err(format!("{at}: mode tcp-auth takes no listen"));
+                }
+                (SvcMode::Tcp, Some(l)) => {
+                    if l.port() != 0 && (l == self.listen || !listens.insert(l)) {
+                        return Err(format!("{at}: listen {l} is already in use"));
+                    }
+                }
+                (SvcMode::TcpAuth, None) => {}
+            }
+            if s.window < MIN_SVC_WINDOW || s.out_window < MIN_SVC_WINDOW {
+                return Err(format!(
+                    "{at}: window and out_window must be at least {MIN_SVC_WINDOW}"
+                ));
+            }
+            if s.max_conns == 0 {
+                return Err(format!("{at}: max_conns must be at least 1"));
+            }
+        }
         Ok(())
+    }
+
+    /// The service `id` of `fs`, if configured.
+    pub fn service(&self, fs: u32, id: &[u8]) -> Option<&ServiceConfig> {
+        self.service.iter().find(|s| s.fs == fs && s.id == id)
     }
 
     /// Whether `fs` is configured.
@@ -526,6 +687,15 @@ mod tests {
         for name in ["zen-serve.toml", "zen-serve-fdb.toml"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             Config::from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // The commented `[[service]]` example parses once uncommented.
+            let at = text.find("# [[service]]").expect("a service example");
+            let svc: String = text[at..]
+                .lines()
+                .map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l)))
+                .collect();
+            let c = Config::from_toml(&format!("{}{svc}", &text[..at]))
+                .unwrap_or_else(|e| panic!("{name} with its service: {e}"));
+            assert_eq!(c.service.len(), 1);
         }
     }
 
@@ -560,6 +730,118 @@ mod tests {
         assert!(Config::from_toml(t).is_err());
         let t = "data_dir = \"/tmp/x\"\n[auth]\npasskey_rp_id = \"example.org\"";
         assert!(Config::from_toml(t).is_ok());
+    }
+
+    const SVC: &str = "data_dir = \"/tmp/x\"\n[[fs]]\nid = 1\n";
+
+    fn svc(extra: &str) -> Result<Config, String> {
+        Config::from_toml(&format!(
+            "{SVC}[[service]]\nname = \"a\"\nfs = 1\nid = \"{}\"\n{extra}",
+            "ab".repeat(16)
+        ))
+    }
+
+    #[test]
+    fn services_parse_with_defaults() {
+        let c = svc("mode = \"tcp\"\nlisten = \"127.0.0.1:2222\"").unwrap();
+        let s = &c.service[0];
+        assert_eq!(s.id, vec![0xab; 16]);
+        assert_eq!(s.mode, SvcMode::Tcp);
+        assert_eq!(
+            (
+                s.max_conns,
+                s.per_ip_rate,
+                s.per_ip_burst,
+                s.window,
+                s.out_window
+            ),
+            (1024, 10, 50, 262_144, 1_048_576)
+        );
+        assert_eq!(
+            (s.accept_wait_ms, s.handshake_secs, s.idle_secs),
+            (10_000, 30, 300)
+        );
+        assert!(s.resume);
+        assert!(c.service(1, &[0xab; 16]).is_some());
+        assert!(c.service(2, &[0xab; 16]).is_none());
+        assert!(svc("mode = \"tcp-auth\"").is_ok());
+    }
+
+    #[test]
+    fn services_are_validated() {
+        let tcp = "mode = \"tcp\"\nlisten = \"127.0.0.1:2222\"\n";
+        for (extra, why) in [
+            ("mode = \"tcp\"", "tcp without listen"),
+            (
+                "mode = \"tcp-auth\"\nlisten = \"127.0.0.1:2222\"",
+                "tcp-auth with listen",
+            ),
+            (&format!("{tcp}window = 1000"), "small window"),
+            (&format!("{tcp}out_window = 1000"), "small out_window"),
+            (&format!("{tcp}max_conns = 0"), "no connections"),
+            ("mode = \"udp\"", "unknown mode"),
+            (&format!("{tcp}inbox = \"00\""), "unknown field"),
+            (
+                "mode = \"tcp\"\nlisten = \"127.0.0.1:8080\"",
+                "the API's address",
+            ),
+        ] {
+            assert!(svc(extra).is_err(), "{why}");
+        }
+        let base = format!("{SVC}[[service]]\nname = \"a\"\nmode = \"tcp-auth\"\n");
+        for (rest, why) in [
+            (
+                format!("fs = 2\nid = \"{}\"", "ab".repeat(16)),
+                "unknown fs",
+            ),
+            (
+                format!("fs = 1\nid = \"{}\"", "ab".repeat(15)),
+                "id not 16·n",
+            ),
+            ("fs = 1\nid = \"zz\"".to_string(), "id not hex"),
+            (
+                format!("fs = 1\nid = \"{}\"", "ab".repeat(272)),
+                "id too long",
+            ),
+        ] {
+            assert!(
+                Config::from_toml(&format!("{base}{rest}")).is_err(),
+                "{why}"
+            );
+        }
+        let two = |a: &str, b: &str| {
+            Config::from_toml(&format!(
+                "{SVC}[[service]]\n{a}\nfs = 1\nmode = \"tcp\"\nlisten = \"127.0.0.1:2222\"\n\
+                 [[service]]\n{b}\nfs = 1\nmode = \"tcp\"\nlisten = \"127.0.0.1:2223\"\n"
+            ))
+        };
+        let (x, y) = ("ab".repeat(16), "cd".repeat(16));
+        assert!(
+            two(
+                &format!("name = \"a\"\nid = \"{x}\""),
+                &format!("name = \"b\"\nid = \"{y}\"")
+            )
+            .is_ok()
+        );
+        assert!(
+            two(
+                &format!("name = \"a\"\nid = \"{x}\""),
+                &format!("name = \"a\"\nid = \"{y}\"")
+            )
+            .is_err()
+        );
+        assert!(
+            two(
+                &format!("name = \"a\"\nid = \"{x}\""),
+                &format!("name = \"b\"\nid = \"{x}\"")
+            )
+            .is_err()
+        );
+        let same_port = format!(
+            "{SVC}[[service]]\nname = \"a\"\nfs = 1\nid = \"{x}\"\nmode = \"tcp\"\nlisten = \"127.0.0.1:2222\"\n\
+             [[service]]\nname = \"b\"\nfs = 1\nid = \"{y}\"\nmode = \"tcp\"\nlisten = \"127.0.0.1:2222\"\n"
+        );
+        assert!(Config::from_toml(&same_port).is_err());
     }
 
     #[test]

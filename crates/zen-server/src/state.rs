@@ -58,6 +58,8 @@ pub struct AppState {
     /// (`opaque::setup`).
     pub opaque_setup:
         Mutex<Option<Arc<zen_core::opaque::opaque_ke::ServerSetup<zen_core::opaque::Suite>>>>,
+    /// Relayed services: this node's relay (spec/svc.md).
+    pub svc: crate::svc::Svc,
 }
 
 /// Shared handle.
@@ -79,6 +81,7 @@ impl AppState {
             ),
             params_key: Mutex::new(None),
             opaque_setup: Mutex::new(None),
+            svc: crate::svc::Svc::new(&cfg),
             eph: EphHub::new(
                 store.clone(),
                 cfg.limits.ephemeral_bytes_per_sec,

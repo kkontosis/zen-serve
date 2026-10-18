@@ -2872,6 +2872,332 @@ pub struct Pages {
     pub pages: Vec<PageData>,
 }
 
+// ---------------------------------------------------------------- relayed services
+
+/// `POST /v1/svc/info` request (api.md §14.1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcInfoRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id (a topic id).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+}
+
+/// `POST /v1/svc/info` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcInfo {
+    /// `"tcp"` or `"tcp-auth"`.
+    pub mode: String,
+    /// Unacked input bytes per connection.
+    pub window: u32,
+    /// Committed, unwritten output bytes per connection.
+    pub out_window: u32,
+    /// Output is released by key reveal (svc.md §5).
+    pub resume: bool,
+    /// The inbox's X-Wing public key (formats.md §13.3).
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub inbox: Option<Vec<u8>>,
+    /// A connection not claimed within this time is aborted.
+    pub accept_wait_ms: u32,
+    /// A connection without a committed step this long is aborted.
+    pub handshake_secs: u32,
+    /// A connection without input or output this long is aborted (0: off).
+    pub idle_secs: u32,
+}
+
+/// `POST /v1/svc/lease` request (api.md §14.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcLeaseRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// Lease id (16 bytes, chosen by the handler).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub lease: Vec<u8>,
+    /// Lease lifetime (default 5,000 ms, at most 60,000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub ttl_ms: Option<u32>,
+    /// End the lease now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub release: Option<bool>,
+}
+
+/// `POST /v1/svc/lease` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcLeaseResult {
+    /// Expiry version (0 once released).
+    pub expires_version: u64,
+}
+
+/// `POST /v1/svc/next` request (api.md §14.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcNextRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// The caller's live lease.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub lease: Vec<u8>,
+    /// Most connections to claim (default 1, at most 64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub limit: Option<u32>,
+    /// Long-poll up to this long (at most 30,000 ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub wait_ms: Option<u32>,
+}
+
+/// The remote end of a relayed connection: `addr` for `tcp`, `user` and
+/// `device` for `tcp-auth`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcPeer {
+    /// Peer address (`tcp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub addr: Option<String>,
+    /// Connector's user fingerprint (`tcp-auth`).
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub user: Option<Vec<u8>>,
+    /// Connector's device (`tcp-auth`).
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub device: Option<Vec<u8>>,
+}
+
+/// A committed output record whose key is not revealed yet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcPending {
+    /// The record's output offset.
+    pub off: u64,
+    /// Its key escrow, sealed kind 10 (formats.md §13.1).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub escrow: Vec<u8>,
+}
+
+/// A claimed connection (api.md §14.3), also `POST /v1/svc/state`'s
+/// response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcClaim {
+    /// Connection id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub conn: Vec<u8>,
+    /// Claim token.
+    pub token: u64,
+    /// The remote end.
+    pub peer: SvcPeer,
+    /// Accept time, unix milliseconds.
+    pub accepted_ms: u64,
+    /// Input acked by steps.
+    pub in_acked: u64,
+    /// Input received.
+    pub in_head: u64,
+    /// Output committed.
+    pub out_head: u64,
+    /// Output written to the socket.
+    pub written_to: u64,
+    /// EOF (1) | step flags << 1 (keyspace.md §3.9).
+    pub flags: u8,
+    /// The sealed state (kind 9).
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub state: Option<Vec<u8>>,
+    /// The inbox's X-Wing ciphertext.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub inbox_ct: Option<Vec<u8>>,
+    /// Committed records not yet revealed, in offset order.
+    pub pending: Vec<SvcPending>,
+}
+
+/// `POST /v1/svc/next` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcClaims {
+    /// Claimed connections.
+    pub conns: Vec<SvcClaim>,
+}
+
+/// `POST /v1/svc/state` request (api.md §14.4).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcStateRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// Connection id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub conn: Vec<u8>,
+    /// Claim token.
+    pub token: u64,
+}
+
+/// `POST /v1/svc/read` request (api.md §14.6).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcReadRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// Connection id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub conn: Vec<u8>,
+    /// Claim token.
+    pub token: u64,
+    /// Input offset to read from (at least `in_acked`).
+    pub from: u64,
+    /// Most bytes (default and cap: `max_range_bytes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub max_bytes: Option<u32>,
+    /// Long-poll up to this long (at most 30,000 ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub wait_ms: Option<u32>,
+}
+
+/// An input chunk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcChunk {
+    /// Input offset of the chunk's first byte.
+    pub off: u64,
+    /// The bytes, or the sealed chunk (formats.md §13.3) when `sealed`.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub data: Vec<u8>,
+    /// Sealed by the inbox.
+    pub sealed: bool,
+}
+
+/// `POST /v1/svc/read` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcReadResult {
+    /// Chunks in offset order.
+    pub chunks: Vec<SvcChunk>,
+    /// Input received.
+    pub in_head: u64,
+    /// Output written to the socket.
+    pub written_to: u64,
+    /// As in [`SvcClaim::flags`].
+    pub flags: u8,
+}
+
+/// `POST /v1/svc/release` request (api.md §14.8).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct SvcReleaseRequest {
+    /// fs_id.
+    pub fs: u32,
+    /// Service id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub svc: Vec<u8>,
+    /// The lease the connection is claimed under.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub lease: Vec<u8>,
+    /// Connection id.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub conn: Vec<u8>,
+    /// Claim token.
+    pub token: u64,
+    /// Abort the connection instead of requeueing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub close: Option<bool>,
+}
+
 // ---------------------------------------------------------------- admin
 
 /// `POST /v1/admin/status` (admins only).

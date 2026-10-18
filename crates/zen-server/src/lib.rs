@@ -31,6 +31,7 @@ pub mod statics;
 pub mod stream;
 #[cfg(feature = "fdb")]
 pub mod supervisor;
+pub mod svc;
 pub mod tls;
 pub mod token;
 pub mod tree;
@@ -284,6 +285,12 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/crdt/get", post(crdt::get))
         .route("/v1/crdt/range", post(crdt::range))
         .route("/v1/crdt/versions", post(crdt::versions))
+        .route("/v1/svc/info", post(svc::api::info))
+        .route("/v1/svc/lease", post(svc::api::lease))
+        .route("/v1/svc/next", post(svc::api::next))
+        .route("/v1/svc/state", post(svc::api::state))
+        .route("/v1/svc/read", post(svc::api::read))
+        .route("/v1/svc/release", post(svc::api::release))
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/admin/origins/get", post(origin::admin_get))
         .route("/v1/admin/origins/set", post(origin::admin_set))
@@ -334,7 +341,8 @@ fn claim_token(cfg: &Config) -> std::io::Result<String> {
 }
 
 /// Background housekeeping (G13): expired idempotency records, sessions,
-/// consumed challenges, API tokens and the ephemeral ring. Every node runs it; each
+/// consumed challenges, API tokens, the ephemeral ring and relayed
+/// connections of dead nodes and handlers. Every node runs it; each
 /// sweep is an idempotent transaction.
 async fn sweeper(st: Shared) {
     let period = Duration::from_secs(st.cfg.limits.sweep_interval_secs.max(1));
@@ -370,6 +378,7 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
     for f in &st.cfg.fs {
         st.eph.sweep(f.id, cutoff).await?;
     }
+    svc::sweep(st, now).await?;
     Ok(())
 }
 
@@ -427,9 +436,10 @@ pub struct Server {
 }
 
 impl Server {
-    /// Stop serving.
+    /// Stop serving, and drop this node's relayed connections.
     pub fn abort(&self) {
         self.task.abort();
+        self.state.svc.abort();
     }
 }
 
@@ -477,7 +487,9 @@ pub async fn start(cfg: Config) -> Result<Server, String> {
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let relay = svc::listen::bind(&cfg).await?;
     let st: Shared = Arc::new(AppState::new(cfg, store, acl, claim.clone(), challenge_key));
+    svc::listen::start(&st, relay).await?;
     tokio::spawn(acl::follow(st.clone()));
     tokio::spawn(sweeper(st.clone()));
     // Every handler can see its connection: the peer address, and on TLS

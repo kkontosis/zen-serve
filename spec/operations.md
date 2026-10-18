@@ -132,6 +132,7 @@ Any number of zen-serve nodes can serve one cluster: nodes set up with `join`, o
 * **Challenges** are MACs under a cluster-wide key, so any node can check one. Each is single-use across the cluster.
 * **Ephemeral messages** pass through a short-lived ring in the keyspace (api.md §9.1).
 * Subscriptions, long-polls and fencing work across nodes: they only use storage.
+* **Relayed services** (svc.md) need the same `[[service]]` table on every node; only `listen` may differ. Each `tcp` service's `listen` port must be reachable by its peers on every node that should accept connections. A connection lives on the node that accepted it, but any node serves its handlers.
 
 Every node runs the sweeper. Each sweep is idempotent.
 

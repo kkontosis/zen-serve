@@ -78,6 +78,7 @@ From fastest-growing to slowest (rates and retention in STATS.md §2–3):
 
 * **Use `CARGO_INCREMENTAL=0`**: incremental caches are large and rarely worth it with LTO-free debug builds of this size.
 * **Delete `target/debug/incremental`** when space runs low; it is the first thing to go.
+* **Stale test executables pile up in `target/debug/deps`**: each integration test binary is ~200 MB, and every feature set or dependency change links a new one beside the old. Deleting the ones not built today (`find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.*' ! -newermt today -delete`) freed 13 GB once; cargo relinks what it needs.
 * **Don't build in several worktrees at once**; each one needs its own ~8 GB `target/`.
 * **A full disk kills the FoundationDB test cluster**, and the next test run then **hangs silently** on a database that isn't there (the test process sits idle at 0 % CPU). Check `df` and `fdbcli status` before suspecting the code.
 

@@ -58,9 +58,12 @@ fn io(e: std::io::Error) -> String {
 /// cluster: the embedded backend's version clock and the cluster's
 /// challenge key. It is never exported or imported, and doesn't make a
 /// target count as holding data, so a server that was only ever started can
-/// be imported into without `--force`.
+/// be imported into without `--force`. Relay keys (§3.9) are transient: a
+/// socket can't move with the data.
 fn private(k: &[u8]) -> bool {
-    k.starts_with(&keys::meta_prefix())
+    static RELAY: std::sync::LazyLock<Vec<Vec<u8>>> =
+        std::sync::LazyLock::new(keys::relay_prefixes);
+    k.starts_with(&keys::meta_prefix()) || RELAY.iter().any(|p| k.starts_with(p))
 }
 
 /// Stream every pair in key order to `f`, reading in chunks. One
