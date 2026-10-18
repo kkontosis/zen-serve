@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # Started by hand: the openssh-pq job (TD-SVC-SSH-PQ-CI).
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,7 +66,9 @@ jobs:
   # The SSH engine against OpenSSH built from source (10.6p1): the hybrid
   # key exchange mlkem768x25519-sha256, which the runners' OpenSSH (9.6)
   # doesn't have, and the rest of the OpenSSH tests on a newer release.
+  # Only when the workflow is started by hand (TD-SVC-SSH-PQ-CI).
   openssh-pq:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
