@@ -1,6 +1,7 @@
 // The handler runtime of a relayed service (spec/svc.md §3–§8, §10): a
 // handler lease, claims, pushed input, one zen-db transaction per step,
 // reveals after the commit, and re-reveals and rollback checks on a claim.
+// A layer (layer.ts: raw, or TLS) sits between the bytes and the handler.
 import {
   bytes,
   isCode,
@@ -14,13 +15,19 @@ import {
 } from '@zen/client';
 import type { Db, DbTransaction, DbTxnOptions } from '@zen/db';
 import type { SvcClaim, SvcInfo, SvcPeer, SvcReveal, SvcStep } from '@zen/wasm';
+import { SVC_ABORT, SVC_CLOSE, SVC_FIN } from './flags.js';
 import { Input } from './input.js';
+import {
+  type Engine,
+  type Finished,
+  type HandlerOut,
+  type Layer,
+  type LayerConn,
+  type Prepared,
+  raw,
+  type TlsInfo,
+} from './layer.js';
 import { decodeState, encodeState } from './state.js';
-
-/** Record flags (formats.md §13.1). */
-export const SVC_FIN = 1;
-export const SVC_CLOSE = 2;
-export const SVC_ABORT = 8;
 
 /** Claim flags: EOF, then the step flags of `ra` shifted by one (keyspace.md §3.9). */
 const C_EOF = 1;
@@ -31,6 +38,8 @@ const C_RESUMABLE = 16;
 
 /** The bytes a sealed record adds to its raw bytes, with room to spare (api.md §14.5). */
 const RECORD_ROOM = 130;
+
+const EMPTY = new Uint8Array(0);
 
 /** One step of a connection, as the handler sees it. */
 export interface RawStep {
@@ -52,6 +61,8 @@ export interface RawStep {
   close(): void;
   /** Reset the connection. */
   abort(): void;
+  /** Under `tls()`: the connection's TLS parameters. */
+  readonly tls?: TlsInfo;
 }
 
 /** A raw handler: runs inside the step's transaction; its db writes commit with the step. */
@@ -62,6 +73,8 @@ export interface ServeOptions {
   /** The service's topic path, e.g. `['svc', 'echo']`: its topic id is the service id. */
   service: (string | Uint8Array)[];
   handler: RawHandler;
+  /** Between the bytes and the handler: `raw()` (the default) or `tls(…)`. */
+  layer?: Layer;
   /** Connections held at once (default 64). */
   maxConns?: number;
   /** Lease lifetime (default 5,000 ms): how long a takeover waits after this handler dies. */
@@ -105,16 +118,30 @@ interface Conn {
   due: boolean;
   busy: boolean;
   gone: boolean;
+  /** Since when input past a gap has waited (local ms; 0: no gap). */
+  gapAt: number;
   /** When the connection last changed (local ms). */
   at: number;
   /** Reveals of this connection, in order. */
   reveals: Promise<void>;
+  /** The layer's side of the connection. */
+  layer: LayerConn;
+  /** A step prepared and not committed yet (reused when it runs again). */
+  prep: Step0 | undefined;
+}
+
+/** A prepared step, with the input it was prepared from. */
+interface Step0 extends Prepared {
+  inEnd: bigint;
+  rawEof: boolean;
 }
 
 /** Input pushed for a connection whose claim hasn't arrived yet. */
 interface Early {
   at: number;
-  bytes: number;
+  /** The offsets the chunks span (pushes repeat bytes, so not their sum). */
+  lo: bigint;
+  hi: bigint;
   chunks: Extract<SvcPush, { type: 'input' }>[];
 }
 
@@ -149,6 +176,7 @@ class Step implements RawStep {
     public state: Uint8Array | null,
     private readonly finSent: boolean,
     private readonly outWindow: number,
+    readonly tls: TlsInfo | undefined,
   ) {}
 
   ack(n: number): void {
@@ -203,6 +231,7 @@ export class ServeHandle {
   private stopped = false;
   private readonly unOwner: () => void;
   private readonly svc: Service;
+  private engine: Engine | undefined;
   private info: SvcInfo | undefined;
   private maxRaw = 0;
   private stream: Stream | undefined;
@@ -255,7 +284,10 @@ export class ServeHandle {
     await this.sub?.close().catch(() => {});
     this.stream?.close();
     if (this.lease) await this.svc.releaseLease(this.lease).catch(() => {});
+    for (const c of this.held.values()) c.layer.free();
     this.held.clear();
+    this.engine?.close();
+    this.engine = undefined;
     this.svc.close();
   }
 
@@ -309,6 +341,9 @@ export class ServeHandle {
 
   private async run(signal: AbortSignal): Promise<void> {
     try {
+      // A layer that can't start (a bad certificate) claims nothing.
+      this.engine ??= await (this.opts.layer ?? raw()).open();
+      if (signal.aborted) return;
       const setup = await this.retry(signal, async () => {
         const info = await this.svc.info();
         const limits = (await this.db.fs.session.client.info()).limits;
@@ -375,7 +410,10 @@ export class ServeHandle {
     this.report(
       why instanceof Error ? why : new ZenError(0, 'not_leader', 'the handler lease was lost'),
     );
-    for (const c of this.held.values()) c.gone = true;
+    for (const c of this.held.values()) {
+      c.gone = true;
+      c.layer.free();
+    }
     this.held.clear();
     this.lease = undefined;
     this.sub = undefined;
@@ -454,12 +492,15 @@ export class ServeHandle {
       due: c.in_acked === 0n && c.out_head === 0n && !c.state,
       busy: false,
       gone: false,
+      gapAt: 0,
       at: Date.now(),
       reveals: Promise.resolve(),
+      layer: this.engine!.conn(),
+      prep: undefined,
     };
     this.held.set(key, conn);
     try {
-      this.load(conn, c);
+      this.load(conn, c, c.in_acked === 0n && c.out_head === 0n);
     } catch (e) {
       this.report(e, c.conn);
       void this.giveUp(conn, true);
@@ -471,8 +512,11 @@ export class ServeHandle {
     this.schedule(conn, signal);
   }
 
-  /** Apply a claim (or `/v1/svc/state`) to a connection. Throws when it can't be served. */
-  private load(conn: Conn, c: SvcClaim): void {
+  /**
+   * Apply a claim (or `/v1/svc/state`) to a connection; `same`: its cursors
+   * are those this side last saw. Throws when it can't be served.
+   */
+  private load(conn: Conn, c: SvcClaim, same: boolean): void {
     const seen = this.seen.get(conn.key);
     if (seen && (c.in_acked < seen.inAcked || c.out_head < seen.outHead)) {
       throw new ZenError(
@@ -482,6 +526,7 @@ export class ServeHandle {
       );
     }
     this.see(conn.key, c.in_acked, c.out_head);
+    conn.prep = undefined;
     conn.token = c.token;
     conn.flags = c.flags;
     conn.outHead = c.out_head;
@@ -491,10 +536,14 @@ export class ServeHandle {
     if (c.state) {
       const pt = this.svc.keysFor(c.state).openState(conn.conn, c.in_acked, c.out_head, c.state);
       const st = decodeState(pt);
-      if (st.engine !== 'raw')
-        throw new ZenError(0, 'format', `a ${st.engine} state on a raw handler`);
+      const engine = this.engine!.name;
+      if (st.engine !== engine)
+        throw new ZenError(0, 'format', `a ${st.engine} state on a ${engine} handler`);
+      conn.layer.load(st.engineState.length ? st.engineState : null, same);
       conn.app = st.app;
       conn.hasState = true;
+    } else {
+      conn.layer.load(null, same);
     }
     if (c.flags & (C_CLOSE | C_ABORT)) {
       // Closing already: nothing more to do but the reveals.
@@ -522,6 +571,7 @@ export class ServeHandle {
   /** Release a connection (with `close`: abort it) and forget it. */
   private async giveUp(conn: Conn, close: boolean): Promise<void> {
     conn.gone = true;
+    conn.layer.free();
     this.held.delete(conn.key);
     const lease = this.lease;
     if (lease) {
@@ -534,6 +584,7 @@ export class ServeHandle {
 
   private forget(conn: Conn): void {
     conn.gone = true;
+    conn.layer.free();
     if (this.held.get(conn.key) === conn) this.held.delete(conn.key);
     if (this.ctl) void this.claim(this.ctl.signal);
   }
@@ -549,14 +600,22 @@ export class ServeHandle {
     const conn = this.held.get(key);
     if (!conn) {
       // Input for a claim whose response hasn't arrived: keep it briefly.
+      // A push starts at `in_acked` and holds at most `window` bytes, but
+      // pushes repeat bytes and may start a little before the claim's
+      // `in_acked`: the bound is on the span. A chunk dropped here leaves a
+      // gap, which `repair` reads again.
+      const end = p.off + BigInt(p.data.length);
       let e = this.early.get(key);
       if (!e) {
-        e = { at: Date.now(), bytes: 0, chunks: [] };
+        e = { at: Date.now(), lo: p.off, hi: end, chunks: [] };
         this.early.set(key, e);
       }
-      if (e.bytes + p.data.length <= (this.info?.window ?? 0)) {
+      const lo = p.off < e.lo ? p.off : e.lo;
+      const hi = end > e.hi ? end : e.hi;
+      if (hi - lo <= BigInt(2 * (this.info?.window ?? 0))) {
         e.chunks.push(p);
-        e.bytes += p.data.length;
+        e.lo = lo;
+        e.hi = hi;
       }
       return;
     }
@@ -576,6 +635,32 @@ export class ServeHandle {
     conn.at = Date.now();
     if (p.data.length) conn.input.add(p.off, p.data);
     if (p.flags & C_EOF && p.data.length === 0) conn.eofAt = p.off;
+    if (conn.input.pending === 0) conn.gapAt = 0;
+    else if (!conn.gapAt) conn.gapAt = Date.now();
+  }
+
+  /**
+   * Read input that a lost push left missing (input past a gap for over a
+   * second): the server keeps everything from `in_acked`.
+   */
+  private async repair(conn: Conn): Promise<void> {
+    const r = await this.svc.read(conn.conn, conn.token, conn.input.end, {
+      maxBytes: this.info?.window ?? 0,
+    });
+    if (conn.gone) return;
+    for (const c of r.chunks) {
+      this.input(conn, {
+        type: 'input',
+        conn: conn.conn,
+        off: c.off,
+        data: c.data,
+        sealed: c.sealed,
+        flags: 0,
+      });
+    }
+    // Pushes resume past what was read; a gap left now is new.
+    if (conn.input.pending === 0) conn.gapAt = 0;
+    else conn.gapAt = Date.now();
   }
 
   /** Drop stale early input, and check on connections that went quiet. */
@@ -583,6 +668,21 @@ export class ServeHandle {
     const now = Date.now();
     for (const [k, e] of this.early) if (now - e.at > 10_000) this.early.delete(k);
     for (const c of this.held.values()) {
+      if (!c.busy && c.gapAt && now - c.gapAt > 1000) {
+        c.busy = true;
+        void this.track(
+          this.repair(c)
+            .catch((e) => {
+              if (!isCode(e, 'claim_lost') && !isCode(e, 'conn_closed')) throw e;
+              this.forget(c);
+            })
+            .finally(() => {
+              c.busy = false;
+              this.schedule(c, signal);
+            }),
+        );
+        continue;
+      }
       if (c.busy || now - c.at < 10_000) continue;
       // The server reaps a connection (a reset, a timeout) without telling
       // the holder: ask, so its slot frees.
@@ -628,6 +728,16 @@ export class ServeHandle {
           this.forget(conn);
           return;
         }
+        // A handshake step whose outcome isn't known can't be redone: the
+        // handshake has moved on in memory (svc.md §7.1).
+        if (
+          conn.prep?.fragile &&
+          (isCode(e, 'cursor_moved') || isCode(e, 'commit_unknown') || isCode(e, 'network'))
+        ) {
+          this.report(e, conn.conn);
+          await this.giveUp(conn, true);
+          return;
+        }
         if (isCode(e, 'window')) {
           await pause(backoff, signal);
           backoff = Math.min(backoff * 2, 500);
@@ -656,7 +766,7 @@ export class ServeHandle {
     try {
       const c = await this.retry(signal, () => this.svc.state(conn.conn, conn.token));
       if (!c || conn.gone) return;
-      this.load(conn, c);
+      this.load(conn, c, c.in_acked === conn.input.base && c.out_head === conn.outHead);
     } catch (e) {
       if (!(isCode(e, 'claim_lost') || isCode(e, 'conn_closed'))) this.report(e, conn.conn);
       if (isCode(e, 'rollback') || isCode(e, 'decrypt') || isCode(e, 'format')) {
@@ -667,31 +777,58 @@ export class ServeHandle {
     }
   }
 
+  /** Prepare a step from the input, outside the transaction (the layer's part). */
+  private prepare(conn: Conn): Step0 {
+    const inEnd = conn.input.end;
+    const rawEof = conn.eofAt !== undefined && inEnd >= conn.eofAt;
+    const p = conn.layer.prepare(conn.input.bytes(), rawEof, (conn.flags & C_FIN) !== 0);
+    if (p.error) this.report(p.error, conn.conn);
+    return { ...p, inEnd, rawEof };
+  }
+
   /** Run the handler and commit its step, in one transaction. */
   private async step(conn: Conn): Promise<void> {
-    const input = conn.input.bytes();
-    const inEnd = conn.input.end;
-    const eof = conn.eofAt !== undefined && inEnd >= conn.eofAt;
+    conn.prep ??= this.prepare(conn);
+    const p = conn.prep;
+    const finSent = (conn.flags & C_FIN) !== 0;
     let built: Built | undefined;
+    let fin: Finished | undefined;
+    let h: HandlerOut = { acked: 0, writes: EMPTY, endFlag: 0 };
     let committed = false;
     await this.db.transaction(async (tx) => {
       built = undefined;
       committed = false;
-      const s = new Step(
-        conn.conn,
-        conn.peer,
-        input,
-        eof,
-        conn.app,
-        (conn.flags & C_FIN) !== 0,
-        this.info!.out_window,
-      );
+      h = { acked: 0, writes: EMPTY, endFlag: 0 };
+      let app = conn.app;
+      if (p.call) {
+        const s = new Step(
+          conn.conn,
+          conn.peer,
+          p.input,
+          p.eof,
+          conn.app,
+          finSent,
+          conn.layer.room(p, this.info!.out_window),
+          p.tls,
+        );
+        try {
+          await this.opts.handler(s, tx);
+        } catch (e) {
+          throw new HandlerError(e);
+        }
+        app = s.state;
+        h = {
+          acked: s.acked,
+          writes: s.out.length === 1 ? s.out[0]! : concatAll(s.out, s.outBytes),
+          endFlag: s.endFlag,
+        };
+      }
       try {
-        await this.opts.handler(s, tx);
+        fin = conn.layer.finish(p, h);
       } catch (e) {
         throw new HandlerError(e);
       }
-      const b = this.build(conn, s);
+      const b = this.build(conn, fin, app, p.established);
       built = b;
       if (b.step) {
         const raw = tx.raw;
@@ -701,34 +838,36 @@ export class ServeHandle {
         });
       }
     }, this.opts.txn);
-    conn.seenTo = inEnd;
-    conn.seenEof = eof;
+    conn.seenTo = p.inEnd;
+    conn.seenEof = p.rawEof;
     conn.due = false;
     const b = built!;
-    if (!b.step) {
-      conn.app = b.app;
-      return;
-    }
-    if (!committed) return;
-    conn.at = Date.now();
-    this.see(conn.key, b.inTo, b.outHead);
-    conn.input.advance(b.inTo);
-    conn.outHead = b.outHead;
+    if (b.step && !committed) return;
+    conn.prep = undefined;
+    conn.layer.committed(p, fin!, h);
     conn.app = b.app;
-    conn.hasState ||= b.sealed;
-    conn.flags |= b.flags;
-    if (b.reveals.length) this.reveal(conn, b.reveals);
+    // Records held back behind the plaintext: the handler made room.
+    if (p.held && h.acked > 0) conn.due = true;
+    if (b.step) {
+      conn.at = Date.now();
+      this.see(conn.key, b.inTo, b.outHead);
+      conn.input.advance(b.inTo);
+      conn.outHead = b.outHead;
+      conn.hasState ||= b.sealed;
+      conn.flags |= b.flags;
+      if (b.reveals.length) this.reveal(conn, b.reveals);
+    }
     const done =
       b.flags & (C_CLOSE | C_ABORT) ||
-      (conn.flags & C_FIN && eof && conn.input.base >= (conn.eofAt ?? -1n));
+      (conn.flags & C_FIN && p.rawEof && conn.input.base >= (conn.eofAt ?? -1n));
     if (done) this.forget(conn);
   }
 
-  /** Turn a handler run into a step: records, the ack, the state. */
-  private build(conn: Conn, s: Step): Built {
+  /** Turn a step's output into the commit's step: records, the ack, the state. */
+  private build(conn: Conn, f: Finished, app: Uint8Array | null, resumable: boolean): Built {
     const info = this.info!;
-    const inTo = conn.input.base + BigInt(s.acked);
-    const writes = s.out.length === 1 ? s.out[0]! : concatAll(s.out, s.outBytes);
+    const inTo = conn.input.base + BigInt(f.inAck);
+    const writes = f.bytes;
     const out: Uint8Array[] = [];
     const reveals: SvcReveal[] = [];
     let off = conn.outHead;
@@ -745,18 +884,19 @@ export class ServeHandle {
     };
     for (let at = 0; at < writes.length; at += this.maxRaw) {
       const raw = writes.subarray(at, Math.min(at + this.maxRaw, writes.length));
-      record(at + raw.length >= writes.length ? s.endFlag : 0, raw);
+      record(at + raw.length >= writes.length ? f.endFlag : 0, raw);
     }
-    if (writes.length === 0 && s.endFlag) record(s.endFlag, new Uint8Array(0));
+    if (writes.length === 0 && f.endFlag) record(f.endFlag, new Uint8Array(0));
     const moved = inTo !== conn.input.base || off !== conn.outHead;
-    const changed = !sameState(s.state, conn.app);
-    const firstResumable = info.resume && !(conn.flags & C_RESUMABLE);
-    const needState = conn.hasState || s.state !== null;
+    const changed = !sameState(app, conn.app) || f.engineChanged;
+    // TLS: resumable once the handshake is done, with the state it gives.
+    const firstResumable = info.resume && resumable && !(conn.flags & C_RESUMABLE);
+    const needState = conn.hasState || app !== null || f.engineState !== null;
     const sealState = needState && (moved || changed || !conn.hasState);
     const flags =
-      (s.endFlag === SVC_FIN ? C_FIN : 0) |
-      (s.endFlag === SVC_CLOSE ? C_CLOSE : 0) |
-      (s.endFlag === SVC_ABORT ? C_ABORT : 0) |
+      (f.endFlag === SVC_FIN ? C_FIN : 0) |
+      (f.endFlag === SVC_CLOSE ? C_CLOSE : 0) |
+      (f.endFlag === SVC_ABORT ? C_ABORT : 0) |
       (firstResumable ? C_RESUMABLE : 0);
     if (!(moved || out.length || sealState || firstResumable)) {
       return {
@@ -764,7 +904,7 @@ export class ServeHandle {
         reveals,
         inTo,
         outHead: off,
-        app: s.state,
+        app,
         sealed: false,
         flags: 0,
       };
@@ -780,19 +920,21 @@ export class ServeHandle {
       ...(out.length ? { out } : {}),
       ...(sealState
         ? {
-            state: this.svc
-              .sealKeys()
-              .sealState(
-                conn.conn,
-                inTo,
-                off,
-                encodeState({ engine: 'raw', engineState: new Uint8Array(0), app: s.state }),
-              ),
+            state: this.svc.sealKeys().sealState(
+              conn.conn,
+              inTo,
+              off,
+              encodeState({
+                engine: this.engine!.name,
+                engineState: f.engineState ?? EMPTY,
+                app,
+              }),
+            ),
           }
         : {}),
       ...(firstResumable ? { resumable: true } : {}),
     };
-    return { step, reveals, inTo, outHead: off, app: s.state, sealed: sealState, flags };
+    return { step, reveals, inTo, outHead: off, app, sealed: sealState, flags };
   }
 
   // ---------------------------------------------------------------- reveals

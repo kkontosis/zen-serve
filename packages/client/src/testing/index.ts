@@ -1,6 +1,7 @@
 // @zen/client/testing: utilities for tests (not for production use).
 export { SoftAuthenticator, type SoftAuthenticatorOptions } from './authenticator.js';
 export { type CborItem, CborMap, cbor } from './cbor.js';
+export { type TestCerts, type TestKeyKind, testCerts } from './certs.js';
 export { type TestUser, testUser } from './fixtures.js';
 export {
   freePort,

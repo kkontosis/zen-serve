@@ -1,0 +1,20 @@
+{
+  "name": "@zen/svc-wasm",
+  "version": "0.1.0",
+  "description": "zen-serve protocol engines for relayed services (the TLS engine), compiled to WASM (built by scripts/build-wasm.sh)",
+  "license": "MIT",
+  "type": "module",
+  "main": "pkg/zen_svc_wasm.js",
+  "types": "pkg/zen_svc_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/zen_svc_wasm.d.ts",
+      "default": "./pkg/zen_svc_wasm.js"
+    },
+    "./zen_svc_wasm_bg.wasm": "./pkg/zen_svc_wasm_bg.wasm"
+  },
+  "files": [
+    "pkg"
+  ],
+  "sideEffects": false
+}

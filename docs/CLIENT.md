@@ -9,7 +9,8 @@ The TypeScript client of zen-serve, for Node 22+ and browsers (`packages/client`
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version <the wasm-bindgen version in Cargo.lock> --locked
-scripts/build-wasm.sh          # crates/zen-wasm → packages/zen-wasm/pkg
+scripts/build-wasm.sh          # crates/zen-wasm → packages/zen-wasm/pkg,
+                               # crates/zen-svc-wasm → packages/svc-wasm/pkg
 npm ci
 npm run build -w @zen/client   # packages/client/dist
 ```
@@ -292,7 +293,31 @@ await h.stop();                                      // the server requeues its 
 * **State.** `c.state` (bytes, or null) is sealed with the step (kind 9, bound to the connection's cursors) and comes back in the next step, also on another handler. Ack only whole protocol units: what isn't acked comes back as input.
 * **Takeover.** `serve` holds a handler lease (`leaseTtlMs`, default 5 s, renewed every second). When the handler dies, its connections move to another handler once the lease lapses, and that one continues from the last committed step: the output of a committed step is revealed by whichever handler holds the connection (its keys are escrowed under the service key), and the input not acked is pushed again. On a `resume: false` service, output is plain and a connection whose handler dies is closed.
 * **Where it runs.** Like consumers, `serve` runs while the database is the owner, so of a browser's tabs one serves. Keys come from the unlocked fs (`fs.service(...path).keysAt(epoch)`).
-* **Not yet:** TLS and SSH layers, `tcp-auth`, the sealed inbox (a sealed input chunk closes the connection), and a line helper: milestone 5.5 steps 7–13.
+* **Not yet:** the SSH layer, `tcp-auth`, the sealed inbox (a sealed input chunk closes the connection), and a line helper: milestone 5.5 steps 9–13.
+
+### TLS: `tls()`
+
+A layer sits between the connection's bytes and the handler: `raw()` (the default) hands them through; `tls(…)` terminates TLS 1.3 and 1.2 in the handler (svc.md §7.1), so the server relays ciphertext it can't read. The handler is the same `RawHandler`: it sees plaintext, and `c.tls` tells it the connection's TLS parameters.
+
+```ts
+import { serve, tls } from '@zen/svc';
+
+const cert = await db.table('certs').get('imap');   // kept wherever the app keeps it
+const h = serve(db, {
+  service: ['svc', 'imaps'],
+  layer: tls({ cert: cert.chain, key: cert.key, alpn: ['imap'] }),
+  handler: async (c, tx) => {
+    // c.input: plaintext; c.tls: {version, suite, sni, alpn, truncated}
+    // c.write() is encrypted; c.end() and c.close() send close_notify first
+  },
+});
+```
+
+* **Certificates.** `cert` is the PEM chain, leaf first; `key` its PEM key, PKCS#8 or SEC1: ECDSA P-256 or P-384, or Ed25519 (RSA server keys aren't supported, TD-TLS-RSA-SERVER-KEY). One certificate per service, no SNI-based choice and no client certificates. The echo app keeps its certificate in a table, sealed like every row; an admin helper and ACME are later work (TD-SVC-ACME). A bad certificate or key is reported through `onError` when `serve` starts, and nothing is claimed.
+* **Versions.** `versions: ['1.3']` turns 1.2 off. 1.2 offers only the ECDHE-ECDSA AEAD suites and requires the extended master secret; there are no tickets, no resumption, no early data and no renegotiation.
+* **The module.** The engine is a second WASM module, `@zen/svc-wasm` (about 1 MB, 0.4 MB gzipped), loaded the first time a service uses `tls()`. Node reads it from `node_modules`; a browser fetches `zen_svc_wasm_bg.wasm` next to the glue (`scripts/build-apps.mjs` copies it next to an app's bundle), or from `tls({wasm})`.
+* **When the handler runs.** On the step that finishes the handshake (so a server-first protocol can greet), and then on new plaintext or an EOF it hasn't seen. `c.eof` is set on close_notify, and on an EOF without it, which `c.tls.truncated` tells apart. `c.end()` sends close_notify, then FIN; `c.close()` close_notify, then closes; `c.abort()` resets without close_notify.
+* **What a takeover keeps.** Once the handshake is done, the engine state (keys, sequence numbers, the plaintext not acked) is sealed with every step, and a successor restores it and continues the live connection; the step that finishes the handshake also makes the connection resumable. A handshake can't be serialized: if its handler dies, or a handshake step's commit outcome is unknown, the connection is aborted (TD-SVC-TLS-HANDSHAKE-RESUME), and the client connects again.
 
 ## 12. Security notes
 

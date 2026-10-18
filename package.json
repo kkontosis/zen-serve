@@ -4,6 +4,7 @@
   "type": "module",
   "workspaces": [
     "packages/zen-wasm",
+    "packages/svc-wasm",
     "packages/client",
     "packages/fuse",
     "packages/db",

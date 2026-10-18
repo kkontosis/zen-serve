@@ -2,7 +2,7 @@
 
 Five small web apps on `@zen/db`, `@zen/fs` and `@zen/loro`, specified in [`docs/EXAMPLES.md`](../docs/EXAMPLES.md) and built in milestone 5 step 10, plus `hello`, the smallest app, which is the template of the others and the smoke test of the app build.
 
-`echo` (milestone 5.5 step 5) is a relayed TCP service on `@zen/svc` (spec/svc.md): each line a peer sends on the service's port is answered with `<n>: <line>` and stored in `lines`, in one transaction. Its handler runs as a Node worker (`workers/handler.ts`) or in the page (the Serve button). The tests kill handler workers mid-stream and check that every line is answered and stored exactly once, in order.
+`echo` (milestone 5.5 step 5) is a relayed TCP service on `@zen/svc` (spec/svc.md): each line a peer sends on the service's port is answered with `<n>: <line>` and stored in `lines`, in one transaction. Its handler runs as a Node worker (`workers/handler.ts`) or in the page (the Serve button). The tests kill handler workers mid-stream and check that every line is answered and stored exactly once, in order. Since step 8 the same handler also serves `echo-tls` behind `tls()` (TLS 1.3 and 1.2, the certificate in the `certs` table; the page's Serve TLS button, or `ECHO_LAYER=tls` for the worker), and a `mirror` handler serves `mirror-tls`: a worker killed mid-stream leaves the TLS connection going, one killed mid-handshake leaves a connection the server aborts, and 20 MB come back intact through two kills.
 
 ## Layout of an app
 

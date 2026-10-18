@@ -1,39 +1,31 @@
 // The echo app: a relayed line service (spec/svc.md) whose handler runs on
 // a member's client. Each line `l` a peer sends gets the reply `<n>: l`,
 // with `n` counting the connection's lines, and a row `{conn, n, line}` in
-// `lines`, committed in one transaction with the reply.
+// `lines`, committed in one transaction with the reply. The same handler
+// serves `echo-tls` behind `tls()`, with the certificate from `certs`; and
+// `mirror`, which sends back whatever arrives, serves `mirror-tls`.
 import { bytes } from '@zen/client';
-import type { Db, DbOptions } from '@zen/db';
-import { type RawHandler, type ServeHandle, type ServeOptions, serve } from '@zen/svc';
+import type { Db } from '@zen/db';
+import {
+  type Layer,
+  type RawHandler,
+  type ServeHandle,
+  type ServeOptions,
+  serve,
+  tls,
+} from '@zen/svc';
+import type { Cert, Line } from './schema.js';
 
-/** The database namespace. */
-export const NS = 'echo';
+export { type Cert, DB_OPTIONS, type Line, NS, putCert } from './schema.js';
 
 /** The service's topic path: its topic id is the service id. */
 export const SERVICE = ['svc', 'echo'];
 
-/** A line, as stored. */
-export type Line = {
-  /** The connection id, hex. */
-  conn: string;
-  n: number;
-  line: string;
-};
+/** The echo service over TLS. */
+export const TLS_SERVICE = ['svc', 'echo-tls'];
 
-export const DB_OPTIONS: DbOptions = {
-  schema: 1,
-  migrations: {
-    1: async (m) => {
-      await m.createTable('lines', { pk: ['conn', 'n'] });
-      await m.createIndex('lines', 'by_conn_n', {
-        fields: [
-          ['conn', 'text'],
-          ['n', 'int'],
-        ],
-      });
-    },
-  },
-};
+/** The mirror service over TLS (bulk transfers). */
+export const MIRROR_SERVICE = ['svc', 'mirror-tls'];
 
 const text = new TextDecoder();
 
@@ -68,8 +60,22 @@ export const echo: RawHandler = async (c, tx) => {
   c.state = bytes.utf8(String(n));
 };
 
+/** The mirror: every byte that arrives goes back; the peer's EOF ends it. */
+export const mirror: RawHandler = (c) => {
+  if (c.input.length) c.write(c.input);
+  c.ack(c.input.length);
+  if (c.eof) c.end();
+};
+
+/** A `tls()` layer with the stored certificate `name`. */
+export async function tlsLayer(db: Db, name = 'echo'): Promise<Layer> {
+  const c = await db.table<Cert>('certs').get(name);
+  if (!c) throw new Error(`no certificate ${name} in certs`);
+  return tls({ cert: c.chain, key: c.key });
+}
+
 /** Serve the echo service from `db` (until `stop()`). */
-export function serveEcho(db: Db, opts: Partial<Omit<ServeOptions, 'handler'>> = {}): ServeHandle {
+export function serveEcho(db: Db, opts: Partial<ServeOptions> = {}): ServeHandle {
   return serve(db, { service: SERVICE, handler: echo, ...opts });
 }
 

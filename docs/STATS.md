@@ -109,8 +109,9 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 
 | Artifact | Size |
 |---|---|
-| `zen_wasm_bg.wasm` (release, LTO, no wasm-opt) | **2.14 MB**, 589 KB gzipped (1.86 MB at milestone 4; the growth is zen-db's keyed primitives, CRDT rows and paged files) |
+| `zen_wasm_bg.wasm` (release, LTO, no wasm-opt) | **2.42 MB**, 645 KB gzipped at milestone 5.5 step 8 (2.14 MB at milestone 5, 1.86 MB at milestone 4; the growth is zen-db's keyed primitives, CRDT rows and paged files, then the svc seals and request codecs) |
 | WASM JS glue and declarations | 311 KB and 109 KB |
+| `zen_svc_wasm_bg.wasm` (`@zen/svc-wasm`, the TLS engine: rustls and the RustCrypto provider; release, no wasm-opt), loaded only by services that use `tls()` | **1.05 MB**, 403 KB gzipped; glue 23 KB, declarations 7 KB |
 | `@zen/client` npm package (compiled TS) | 112 KB packed, 475 KB unpacked |
 | `@zen/db` | 171 KB packed, 783 KB unpacked |
 | `@zen/fs` | 46 KB packed, 217 KB unpacked |

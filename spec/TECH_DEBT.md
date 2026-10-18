@@ -169,7 +169,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Status:** open
 * **Context:** The WASM module of `@zen/client` is 1.86 MB (525 KB gzipped), built with the release profile and not post-processed.
 * **Why deferred:** `wasm-opt` (binaryen) isn't part of the build, and size wasn't a milestone-4 goal.
-* **What it would take:** Run `wasm-opt -Oz` in `scripts/build-wasm.sh` when present (or a size profile with `opt-level = "z"` for zen-wasm), measure the size and the Argon2id and ML-DSA timings before and after, and update docs/STATS.md §4.1. Consider splitting OPAQUE into a second module loaded on demand.
+* **What it would take:** Run `wasm-opt -Oz` in `scripts/build-wasm.sh` when present (or a size profile with `opt-level = "z"` for zen-wasm), measure the size and the Argon2id and ML-DSA timings before and after, and update docs/STATS.md §4.1. Consider splitting OPAQUE into a second module loaded on demand. The same applies to the second module, `@zen/svc-wasm` (the TLS engine, 1.05 MB, 403 KB gzipped, milestone 5.5 step 8), with the TLS throughput measured before and after.
 
 ## TD-FUSE-REPLICA
 
