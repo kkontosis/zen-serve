@@ -293,23 +293,27 @@ describe('starttls()', () => {
     const c1 = engine.conn();
     c1.load(switched, false);
     c1.free();
-    // Start the handshake, then look at the state its first step sealed.
+    // Start the handshake, and take the state its first step sealed. Not
+    // `d.sealed`, the latest: the handshake may finish (phase 3) before a
+    // poll sees phase 2.
     const client = connect({ socket: sock, ca: certs.ca, servername: 'localhost' });
     client.on('error', () => {});
+    const handshaking = () => d.steps.find((f) => phase(f.engineState) === 2)?.engineState;
     await until(
-      () => phase(d.sealed) === 2,
+      () => handshaking() !== undefined,
       () =>
         `a handshake step (phase ${phase(d.sealed)}; steps ${JSON.stringify(
           d.steps.map((f) => [f.inAck, f.bytes.length, f.endFlag, phase(f.engineState)]),
         )}; pending ${d.pending.length}; errors ${d.errors.map(String)})`,
     );
+    const st = handshaking()!;
     for (const same of [false, true]) {
       const c = engine.conn();
-      expect(() => c.load(d.sealed, same)).toThrow(/during its handshake/);
+      expect(() => c.load(st, same)).toThrow(/during its handshake/);
       c.free();
     }
-    // The handshake is left unfinished: stop serving first, so the client's
-    // going away isn't reported as a failed handshake.
+    // Stop serving first, so the client's going away, maybe mid-handshake,
+    // isn't reported as a failed handshake.
     d.stop();
     client.destroy();
   });
