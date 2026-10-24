@@ -386,6 +386,7 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
         * the app tests (43) with the shared build
         * `npx vitest run` 3× (508 passed each time, 7 skipped)
         * `npx playwright test` (16)
+      * CI green on c1e9fb1: both runs (push and pull request) passed every check on their first attempt, with nothing re-run. The ledger failure and `push_input`'s 1 s remain open, with their diagnostics in place.
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
