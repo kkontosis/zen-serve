@@ -347,9 +347,158 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * The PR doesn't touch `zen-server`; the test passed in the same commit's pull-request run and in every run since step 5.5.4. It ran next to `many_connections` (5,000 connections) in the same test binary.
       * Per the CI rules: one PR comment saying so, and one re-run of the failed job, which passed (attempt 2: success).
       * The only 1 s delay on that path is the reader's re-check after a batch fails to store (`RECHECK` in `svc/conn.rs`); nothing showed that happened. If it recurs, it gets root-caused there.
+    * **CI on 0319025:** both runs red, each in `client`. Pursued per "the reds on 0319025" below. Commits: `svc: the starttls() test takes the handshake state from its step`; `apps: build the apps once per test run`; `apps: ZEN_APPS_BUILT skips the test run's build`; `server: a test that a resent short-mode commit replays`; `apps: ledger: a failed balance check prints what disagrees`; `store: a cancelled blocking task is a shutdown, not a storage error`; this log.
+      * **The starttls handshake test: cause found and fixed.**
+        * The new diagnostics showed the handshake ran. Its phase-2 state was sealed and then replaced by phase 3 before the 5 ms poll looked. The 71f69b5 failure is the same race.
+        * Waiting for the handshake to finish before the check reproduced the CI message exactly, steps included.
+        * The test now takes the state from the step that sealed it. It passes with the race forced, and 20 of 20 runs.
+      * **The echo worker `MODULE_NOT_FOUND`: cause found and fixed.**
+        * Seven test files rebuilt their app in `beforeAll`, and the build empties `apps/dist/<app>` first. During eight rebuilds, `handler.mjs` was missing in 70 of 130 checks, so a parallel file starting a worker could fail. CI also built all apps before vitest, which hid nothing.
+        * A vitest `globalSetup` (`scripts/vitest-setup.ts`) now builds the apps and zen-connect once, before any file. No test file builds.
+        * A single-file run still builds (checked with `apps/dist/mail` deleted). `ZEN_APPS_BUILT=1` skips the build, for several local runs at once.
+      * **The ledger sum (403, not 400): not reproduced, cause not found.**
+        * The failing check was the one right after `tradeAll(10, 2)` in the third test.
+        * 134 local runs of the ledger test, two and three at once under the 50 MB SSH load, all passed. Five more failed only on concurrent app builds, my harness, not the ledger.
+        * A scratch stress test (four sessions, four loops each, 2,000 transfers over three accounts, 5 runs) kept the sum every time.
+        * Read without finding a flaw:
+          * `transfer`
+          * zen-db's row cache: versions and fields are kept together; a cached row in a write becomes an `expect`; a read-only transaction re-checks cached versions
+          * the client commit
+          * the server's `expect` (a normal read, so a conflict range) and its `txn_loop!` (no retry of a conflict when the client gave a read version)
+          * the embedded store's conflict check
+        * The check now prints each account's balance against its entries, transfers with unbalanced entries, and committed transfers without entries. A recurrence will tell a lost update on an account row from split entries. **Open.**
+      * **The suspected commit-replay bug: not a bug.**
+        * A new test resends a short-mode commit that applied, and gets the stored result. Applying it again would be a lost update.
+        * `commit.rs` looks the `commit_id` record up at the latest version when a commit conflicts, which covers the resend. The test stays, since no test covered that case.
+      * **`push_input`:** still not reproduced. The noise that misled the first look is gone: a blocking store task cancelled at runtime shutdown is now `Error::Shutdown`, logged at debug (0 such ERRORs in 3 runs, about 10 per run before). The test prints all ten push times when its bound fails.
+      * **Found while verifying: the chat typing spec failed again.** It failed in 1 of 5 local runs of `apps/chat`'s Playwright spec, and in a full run.
+        * Carol's line read "alice, bob typing…" until both indicators ended, never "bob typing…": the same as step 10's CI failure.
+        * Step 10's fix drops indicators older than 3 s when they arrive, but one that arrived 1–2 s late still showed for 3 s from its arrival. Alice's indicators, held while Carol was offline, came in like that, and overlapped the next spec.
+        * Fix (commit `apps: chat: a typing indicator shows until its time after it was sent`): `onTyping` passes the send time, and the page shows an indicator until 3 s after it was sent (`showFor`). An older indicator arriving late doesn't shorten a newer one. The unit test checks `showFor`.
+        * After: 15 of 15 chat spec runs, and the full Playwright run (16).
+      * **FDB:** the local cluster had stopped; it was restarted.
+        * Right after the restart, one run of `tests/api.rs` failed `per_key_many_claims_do_not_hide_ready_keys` (an `unwrap` at line 1391; the error was cut from the output).
+        * It passed alone, and `tests/api.rs` and `tests/svc.rs` passed twice in full with `--no-fail-fast`. Not pursued further: an existing milestone-4 test, seen once, on a cluster that had just started.
+      * Verified:
+        * `npm run check`
+        * clippy on zen-store and zen-server `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`)
+        * `tests/svc.rs` 3× (33) and `tests/api.rs` (18) on embedded, and twice each on FDB; zen-store, on embedded and FDB
+        * the app tests (43) with the shared build
+        * `npx vitest run` 3× (508 passed each time, 7 skipped)
+        * `npx playwright test` (16)
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13a: the reds on 0319025, pursued to their causes
+
+**Context.** Both CI runs on 0319025 (a docs-only commit) are red, each in the `client` job with something different. The diagnostics added in dc37e1a named one cause. These failures, and the earlier ones that were only re-run, are pursued here until each has a cause, a fix, and evidence for both.
+
+**1. starttls: "a state in the handshake is refused…" (push run).** **Cause found.**
+* The new message reads: `phase 3; steps [[0,0,0,null],[10,8,0,1],[1586,2254,0,2],[80,37,0,3]]; errors (none)`.
+  * The handshake did run: the client's hello was consumed and the phase-2 state sealed. Then the client's Finished completed it, and phase 3 replaced phase 2 in `d.sealed`.
+  * The test polls `d.sealed` every 5 ms, so on a busy runner it can miss a state that lasts only one round trip.
+  * The earlier failure (71f69b5, 5 s timeout) is the same race.
+* **Fix (test):** take the state from the step that produced it, not from the latest. Wait until `d.steps.some((f) => phase(f.engineState) === 2)`, and load that step's `engineState`.
+  * That state is exactly what a successor would have claimed mid-handshake, whatever happened after.
+  * The `until` diagnostics stay.
+* **Proof:** make the race happen on purpose (load a handshake state only after the handshake has finished; the old code then times out). Run the test 20×.
+
+**2. Echo worker `Cannot find module …/apps/dist/echo/workers/handler.mjs` (push run).** **Cause found.**
+* Five echo test files (`echo`, `tls`, `ssh`, `connect`, `inbox`), plus `mail` and `checkout`, each run `scripts/build-apps.mjs <app>` in their `beforeAll`. That build starts with `rm -rf apps/dist/<app>`.
+* Vitest runs files in parallel worker processes (`pool: 'forks'`), so one file's rebuild deletes the worker another file is about to start. The step 5.5.8 log already saw this ("two more runs failed only because the copies rebuilt apps/dist/echo at the same moment"), but it wasn't fixed.
+* **Fix:** build the apps once per vitest run, before any file starts.
+  * A `globalSetup` in `vitest.config.ts` (`scripts/vitest-setup.ts`) runs `node scripts/build-apps.mjs` for the apps that have workers.
+  * The seven per-file `execFileSync(… build-apps …)` calls are removed.
+  * `build-zen-connect.mjs` (only `connect.test.ts` uses it) moves into the same setup, so `connect.test.ts`'s build goes too.
+  * Running a single test file still builds first, through the same setup.
+* **Proof:**
+  * Reproduce the race first: two copies of one echo test file at once fail with `MODULE_NOT_FOUND` before the fix.
+  * After the fix, nothing builds during a run: `grep` for `build-apps` in the test files is empty.
+  * The full vitest run 3×.
+
+**3. Ledger: "the projection stopped mid-stream and restarted elsewhere…": the 4 accounts' balances sum to 403, not 400 (pull-request run).**
+* Money appeared, which means a lost update: two transfers each debited a source from the same old balance and both committed. Or a read in the check was stale.
+* Read so far, without finding the flaw:
+  * `transfer` (`apps/ledger/src/ledger.ts`)
+  * zen-db's row cache (`useCached` makes an `expect`; `read` adds a read conflict at the transaction's read version; read-only transactions check cached versions in `finish`)
+  * the client commit (`kv.ts` `build`)
+  * the server's commit (`commit.rs`: `expect` uses `t.get`, which adds a read conflict; `txn_loop!` doesn't retry a conflict when the client gave a read version)
+  * the embedded store's conflict check (`commit_blocking`)
+* **Steps:**
+  1. **Make a recurrence name the cause.** When `checkLedger`'s sum check fails, print for each account its balance, the sum of its entries and its newest entry time. Also print the transfers whose two entries don't balance, and the `done` transfers missing entries.
+     * Balances off but entries summing to 400 means a lost update on an account row: entries are inserts, never lost.
+     * Entries off too means an entry pair split.
+  2. **Reproduce:** loop `apps/ledger/test/ledger.test.ts` locally 50× with load (two copies at once, plus the echo SSH 50 MB test).
+  3. **Root-cause from the dump,** with a regression test in the layer that failed (`packages/db` or `crates/zen-server`). Then fix it.
+  4. If it doesn't reproduce in those runs, say so. The dump stays, and the log records what was ruled out.
+
+**4. A related finding to verify: a resent commit can be answered `conflict` instead of its stored result.**
+* `commit.rs` checks the `commit_id` record (`t.get(&cid_key)`) inside `txn_loop!(st.store, req.read_version, …)`, so at the **client's read version**.
+* `sendCommit` (`packages/client/src/kv.ts`) resends the same body after `network` or `commit_unknown`. If the first attempt did commit (its response was lost), the resend reads the record at a version from before that commit and doesn't see it. It then fails its read conflicts against the first attempt's own writes, and returns `conflict`.
+* The client then re-runs the whole transaction: a second application, against api.md §6 ("If `commit_id` already committed, the stored result is returned and nothing is applied again").
+* **Verify** with a Rust test (`tests/api.rs` or similar): a commit with a `read_version` and writes on keys it read, then the same body again. Expected: the stored result. Suspected today: 409 `conflict`.
+* **Fix if confirmed:** when a commit fails with `Conflict`, read the `commit_id` record at the latest version. If it's there, return its stored result (`Outcome::Replay`). This also covers a resend that races the first attempt. Plus a client test through `sendCommit`, with the first response dropped.
+
+**5. `push_input`'s 1.048 s** (unchanged since the last report, not reproduced).
+* Ruled out: a failed append followed by the 1 s re-check. 30 loaded runs showed no failed append during the test; the only ones were cancellations at runtime shutdown.
+* Fix that noise: a store task cancelled at shutdown (`task … was cancelled`) is logged as an ERROR "storage error" (`error.rs`), which misled this investigation. Log it at debug instead.
+* When the bound fails, the test prints each push's time (all 10, not just the worst), so a recurrence shows whether one push stalled or everything was slow.
+
+### Order and commits
+1. `svc: the starttls() test takes the handshake state from its step` (item 1)
+2. `apps: build the apps once per test run` (item 2)
+3. item 4's test, and the fix if it fails: `server: a resent commit finds its record at the latest version`, with a `spec:` note in api.md §6 if the wording needs it
+4. `apps: ledger: a failed balance check prints what disagrees` (item 3.1), then the fix once found
+5. `server: a cancelled store task isn't an error; push_input prints its pushes` (item 5)
+6. the log in both plan copies
+
+### Verification
+* Each fix shown failing before and passing after, as described per item.
+* `npm run check`; `npx vitest run` 3×; Rust `fmt`, clippy (three variants), `tests/svc.rs` and the commit test file 3× on embedded and once on FDB.
+* Push; CI green on both runs. Any failure that remains: a cause, or a written account of what was tried, not a re-run.
+
+## Step 5.5.13a: root-cause the two CI failures that were only re-run
+
+**Context.** PR #50 is green on 50f05a9, but two of its three CI failures have no root cause yet:
+* **The teardown race** (43b3448): solved. It was reproduced on demand (bytes after `engine.close()`) and fixed (section below).
+* **A. The starttls "handshake step" timeout** (push run on 71f69b5): `packages/svc/test/starttls.test.ts`, "a state in the handshake is refused…", waited 5 s for the first handshake step's sealed state (phase 2) and never saw it.
+  * Not reproduced in 34 local runs (6 copies at once, and alone).
+  * The response was diagnostics (phase, steps, pending input and errors printed on timeout) and 15 s waits. The runs since passed, which proves nothing.
+  * It appeared right after the teardown fix, which began recording `run()` failures in `d.errors` instead of throwing them. So a hidden throw is the leading suspect.
+* **B. `push_input` at 1.048 s** (`crates/zen-server/tests/svc.rs`, `rust` job on 50f05a9's push run): the worst of 10 input pushes took 1.048 s against its 1 s bound; normal is about 10 ms. One re-run passed.
+  * Leading suspect: the input reader in `crates/zen-server/src/svc/conn.rs`. When `append` returns `Err`, the batch is kept (`held`), the reader counts as `blocked`, and it retries only after `RECHECK` (1 s).
+  * `txn_loop!` (`crates/zen-server/src/txn.rs`) retries conflicts up to 20 times with backoff of at most 32 ms (about 0.5 s in total), then returns the error.
+  * So "one failed append, then a 1 s wait" gives exactly 1.0x s. The test ran beside `many_connections` (5,000 connections) in the same binary, which can make storage slow enough for that.
+  * Unconfirmed: nothing logged it, since tests install no tracing subscriber.
+
+The goal is a cause for each, and a fix in code where the cause is in code, not a green that depends on timing.
+
+### A. The starttls handshake timeout
+1. **Make a hidden failure loud.** The test already fails on recorded errors after each test. Add to the timeout message, for both ends:
+   * the client socket's `bytesWritten`
+   * the driver socket's `bytesRead`
+   * whether the TLS client emitted `error` or `close`
+
+   This tells apart three cases: the client never sent its ClientHello; the driver got it but the step consumed nothing; or `run()` threw.
+2. **Reproduce under CI-like load.** Run the file in a loop next to the heavy suites (`apps/echo/test/ssh.test.ts`'s 50 MB transfer, `apps/mail`), e.g. a script that starts both and repeats until a failure or 200 iterations.
+   * Also try the race in the test's own setup: the handshake test is the only one that calls `connect()` without awaiting `secureConnect`. And `nextDriver` is never reset, so a stray connection would be handed to the next `open()`.
+3. **Fix by finding:**
+   * If `run()` threw: fix the cause in the layer (`packages/svc/src/tls.ts`), with a unit test of that path.
+   * If the ClientHello never left the client: fix the test's use of the socket (await the client's `secureConnect` or `error`, or write through it).
+   * If the engine consumed nothing from a complete ClientHello: a bug in `TlsConn.prepare`'s SWITCHED path. Add a test that feeds a ClientHello in one, two and N pieces.
+4. If it doesn't reproduce in 200 loaded runs, say so plainly. Keep the diagnostics, and record it in the log as open with what was tried.
+
+### B. `push_input`'s 1 s
+1. **Instrument, locally only.** Log `append`'s error code and duration in the reader (the `Err(e)` arm already logs through `tracing::warn!`), and the time from the bell rung to the `svc_in` sent in `push.rs`. Run the test binary with a tracing subscriber (`RUST_LOG`, if the test harness installs one; otherwise a temporary `tracing_subscriber::fmt().init()` in `setup`).
+2. **Reproduce.** Run `cargo test -p zen-server --test svc` 30× normally, then 30× with two or three copies at once, recording `push_input`'s worst latency and any `storing relayed input` warning.
+3. **Fix by finding:**
+   * **A failed append, then `RECHECK`:** the 1 s wait is a real latency bug, since a transient storage error stalls a connection's input for a second. Retry a failed append promptly with a short backoff (for example 10 ms doubling to 500 ms), and keep `RECHECK` for the window and the quota, which only an ack or a quota change can clear. Then find which error escaped `txn_loop!` (a conflict on `rm` with a claim or reap, or a storage timeout) and say in svc.md §3 how input storage is retried, if the spec names a delay. Add a test: an append that fails once is stored within 100 ms (by injecting a storage failure, if zen-store's test hooks allow it; otherwise by a conflict forced on `rm`).
+   * **No error, just a slow run:** the bound measures the runner, not the server. Measure the distribution under load. Then either keep 1 s with the measured p99 recorded as why, or assert on the median (well under 100 ms) and keep 1 s only as a hang guard. Not changed without the numbers.
+4. Rust checks: `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); `tests/svc.rs` 3× on embedded and once on FDB.
+
+### Then
+* `npm run check`; the affected vitest files and `packages/svc` 3×; push; CI green on both runs. The log in both plan copies says what each cause was, or what was tried if one wasn't found.
 
 ## CI fix in step 5.5.13a: the starttls() layer test's teardown
 
