@@ -335,6 +335,14 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * Reproduced locally by forcing the mechanism: a driver that has switched receives bytes after `engine.close()`, which gave the same two errors. Timing alone (a 500 ms wait after closing) didn't reproduce it here.
       * Fix: drivers are tracked; `stop()` destroys the socket and frees the layer, and `run()` does nothing once stopped. An `afterEach` stops the test's drivers, and `afterAll` stops the rest before `engine.close()`. Failures of `run()` are recorded in the driver's `errors`.
       * Verified: the forced trigger gives no error with the fix; the test file 10×; `packages/svc` 3× (39); `npm run check`; the whole `npx vitest run` (508 passed, no errors).
+    * **CI on 71f69b5:** the pull-request run is green (all checks). The push run's `client` job failed one test: `starttls.test.ts` "a state in the handshake is refused…" timed out after 5 s waiting for the handshake step's sealed state (phase 2). Every other test passed.
+      * Not reproduced locally: the file 24 times, 6 copies at once, and 10 times alone.
+      * Since the teardown fix, a failure inside a driver's `run()` is recorded in `d.errors` and that test never looked at it, so the cause isn't in the log. Commit `svc: the starttls() test reports its drivers' errors`:
+        * after each test, any error a driver recorded fails the test (the pipelined test, which expects one, clears it)
+        * the handshake wait reports the phase, each step's ack, output, end flag and phase, the pending input and the driver's errors when it times out
+        * waits allow 15 s, not 5 s, for loaded runners
+        * the handshake test stops its driver before destroying the client, so the unfinished handshake isn't reported as an error
+      * If it recurs, the log names the cause.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
 
