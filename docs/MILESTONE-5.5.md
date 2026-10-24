@@ -436,9 +436,236 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * **CI green on 7497111:** both runs passed every check on their first attempt.
         * Still open, with their diagnostics: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test. They are listed in **TD-TEST-OPEN-FAILURES** (spec/TECH_DEBT.md), with where each was seen, what was ruled out and what it prints now.
     * Merged at 7497111 (merge commit e636e7c). The log commit, c5b90c0, was pushed 33 s after the merge, so it isn't in main. It opens step 5.5.13b's PR, together with the TD entry.
-    * Next: plan 5.5.13b.
-  * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
+    * The TD entry (TD-TEST-OPEN-FAILURES) and the cherry-picked log are PR #51's first two commits (5251155, d6e20f2); CI green on d6e20f2, both runs.
+  * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. PR #51. Planned below ("Step 5.5.13b in detail").
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13b in detail: waking handlers, IMAP with IDLE, the inbox page
+
+**Context.** 13a stores inbound mail. 13b lets people read it:
+* over IMAP (a subset of RFC 3501 with IDLE, RFC 2177), logging in with app passwords kept in zen-db;
+* in an inbox page.
+
+IDLE needs something the runtime can't do yet: run a step with no new input when something else changed (a message arrived, a flag changed elsewhere), so the handler can send `* 3 EXISTS`. A large FETCH needs the same thing: a 10 MB literal doesn't fit in one step (`out_window`, 1 MiB), so the handler must be called again to continue it.
+
+As before, a reply is released only with the commit of what it reports. A handler killed mid-FETCH or mid-IDLE is continued by another.
+
+**Commits** (on PR #51, after its two docs commits):
+1. `docs: milestone 5.5 step 13b plan`
+2. `svc: wake a handler without input (wakeOn, wake, again)`
+3. `apps: mail: header fields, modseq, app passwords and expunge`
+4. `apps: mail, IMAP with IDLE`
+5. `apps: mail: the inbox page`
+6. the docs and the log
+
+No `spec:` commit. Waking is in the runtime and changes nothing on the wire or in the state (svc.md is unchanged). IMAP is an app.
+
+### Facts from the survey
+* **When a step runs** (`serve.ts` `schedule`): on input the handler hasn't seen, on an EOF it hasn't seen, or when `due` is set (a fresh connection, or a layer's `Finished.again`).
+  * `step()` clears `due` after its transaction, so a wake that came during the step would be lost.
+  * A claim of a connection that already has a state starts no step until input comes.
+* **Whether the handler is called** is the layer's choice (`Prepared.call`):
+  * `raw()` always calls it, and `ssh()` does whenever the engine hasn't ended.
+  * `tls()`/`starttls()` (`tls.ts` `after`) call it only on the handshake's end, new plaintext, or an unseen EOF. A wake with no new plaintext wouldn't reach the handler.
+* **`Step`** (`layer.ts`) keeps its `room` (the bytes a step may write) private. Nothing in it lets a handler ask to run again.
+* **zen-db:**
+  * `db.on(topic, fn)` delivers new events (`start: 'now'`), the way the apps' pages refresh.
+  * A table's change events can only be turned on in `createTable`, and `mail`'s tables were created without them. So mailbox changes are announced with explicit events, like `mail/received`.
+  * Migrations can add tables and indexes.
+* **The 13a schema** (`apps/mail/src/schema.ts`, version 1):
+  * `messages {user, uid → draft, size, from, to, received, head, flags}` keeps envelope fields only, nothing parsed from the header.
+  * `counters {user → next}`.
+  * Parts are filled to exactly 64 KiB, so a body offset gives its part: `seq = ⌊off / 65,536⌋`.
+  * One draft's parts are shared by every recipient's copy.
+* **Service defaults** (svc.md §2): `out_window` is 1 MiB and `idle_secs` 300. RFC 2177 has clients re-IDLE within 29 minutes, and RFC 3501 §5.4 wants an autologout timer of at least 30 minutes. So the IMAP service is configured with `idle_secs = 1860`.
+* **Python 3.11/3.12's imaplib** has `IMAP4_SSL` but no `idle()` (that came in 3.14). So IDLE, literals and the kill tests use a small Node TLS client.
+* **The page harness:** `boot()` gives `ctx.user`. `openApp(page, w, app, user)`. Apps are found by glob, so `apps/mail/ui` needs no wiring.
+
+### `@zen/svc`: waking a handler without input
+* **`RawStep`** gains three things:
+  * `wakeOn(...keys: string[])`: the connection is woken by `ServeHandle.wake(k)` for these keys. They replace the keys of earlier steps; `wakeOn()` clears them. The last attempt's keys apply once its transaction ends, whether or not it committed a step.
+  * `again()`: step again at once, without new input (output larger than one step).
+  * `readonly room: number`: the bytes this step may still write.
+* **`ServeHandle.wake(key)`:** every connection held here whose keys include `key` gets a step. Its handler is called even without new input.
+* **The runtime (`serve.ts`):**
+  * A connection carries a `wake` flag: the handler must be called.
+    * It is set by `wake()`, by `again()`, and on **every claim**. A successor calls the handler once, so it registers its keys again and reports what changed during the takeover.
+    * Keys aren't stored on the server, so the state format is unchanged.
+  * **No wake is lost.** `wake(k)` increments a counter and records the key's latest count, keeping a bounded map. A step notes the counter before its transaction. Afterwards, if any of its keys was woken since then, the connection is due again.
+    * This covers a wake during the step, and a change committed after the step's read version whose event arrived before the step registered its keys.
+  * **Layers:** `LayerConn.prepare(input, eof, finSent, wake)`.
+    * `tls()` calls the handler on a wake once established. `raw()` and `ssh()` already call it.
+    * `Finished.again` is the layer's or the handler's.
+  * `SshStep` doesn't get `wakeOn` (no use yet).
+* **Tests** (`apps/echo/test/wake.test.ts`, on the echo world). The handler registers `WATCH <k>` lines and writes `woke <n>` when called with no input.
+  * a wake reaches the connections watching its key and no others, over raw and TLS
+  * `wakeOn()` clears the keys
+  * a wake while the handler runs (it blocks on a promise the test releases) leads to one more step
+  * the race: a wake fired after the transaction's read and before the keys are registered (a test hook in the handler) still reaches it
+  * `again()` steps without input until the handler stops asking, and `room` shrinks as it writes
+  * after a SIGKILL, the successor calls the handler once on its claim, with no input, and a later `wake` reaches it
+  * idle connections cost no steps (counted)
+
+### `apps/mail`: schema 2, SMTP, and the helpers both protocols share
+* **Schema 2** (a migration):
+  * index `messages.by_draft` (`draft`), to know whether an expunged message's parts are still shared
+  * table `app_passwords {user, id → label, hash, created}`
+* **New fields on messages** (13a's rows lack them; missing means 0 or empty):
+  * `modseq`: the user's change counter when the row last changed
+  * `hdr`: the header section's length in the stored message (head included, through the blank line)
+  * `fields`: `{from, to, cc, subject, date, messageId}`, unfolded and as sent (no RFC 2047 decoding)
+* **Counters** gain `modseq` and `validity` (UIDVALIDITY, set when the row is made). UIDs are never reused.
+* **Topic `mail/changed`:** `{user, kind: 'flags' | 'expunge'}`, keyed by user.
+* **SMTP (`smtp.ts`):**
+  * `stage` finds the header's end as DATA arrives (`d.hdr`, carrying the last three bytes across steps).
+  * At the end, `store` reads the parts the header spans (when it is within 64 KiB) to fill `fields`, and sets `modseq` from the counter.
+  * The 13a tests keep passing; new checks cover `hdr` and `fields`.
+* **`mail.ts`**, used by IMAP and the page:
+  * `setFlags(tx, user, uids, op, flags)`: bumps `modseq` per message changed, and emits `changed`.
+  * `expunge(tx, user, uids)`: deletes the rows, deletes a draft's parts once no copy references it (`by_draft`), and emits `changed`.
+  * `bodyRange(tx, m, from, len)`: reads only the parts covering a range.
+  * `createAppPassword(db, user, label) → {id, password}`, `appPasswords`, `revokeAppPassword`:
+    * the password is 16 random bytes, shown as four groups of base32
+    * `hash` is SHA-256 of the password: it's random, so a slow hash adds nothing (TD-MAIL-SCOPE notes that members can read the hashes)
+  * `wakeOnMail(db, h)`: `db.on` on `received` and `changed` calls `h.wake(user)`.
+
+### `apps/mail`: IMAP (`src/imap.ts`)
+**Transport.** Implicit TLS (RFC 8314) with `tls()` on `svc/imaps`, using the same `certs` row as SMTP. STARTTLS on 143 is left out (TD-MAIL-SCOPE).
+
+**Capabilities:** `IMAP4rev1 LITERAL+ IDLE`.
+
+**Commands:**
+* Any state: `CAPABILITY`, `NOOP`, `LOGOUT`.
+* Not authenticated: `LOGIN user password`.
+  * The user is a zen login name, or one of its addresses in `mailboxes`. The password is one of that user's app passwords.
+  * A failure gets `NO [AUTHENTICATIONFAILED]`. The third failure gets `* BYE` and closes.
+  * `AUTHENTICATE` gets `NO`.
+* Authenticated:
+  * `SELECT`/`EXAMINE INBOX`: `FLAGS`, `PERMANENTFLAGS`, `EXISTS`, `RECENT 0`, `UIDVALIDITY`, `UIDNEXT`, `UNSEEN`.
+  * `LIST`/`LSUB`: INBOX only.
+  * `STATUS INBOX`.
+  * `CREATE`/`DELETE`/`RENAME`/`APPEND` get `NO`.
+* Selected:
+  * **`FETCH`/`UID FETCH`** items:
+    * `FLAGS`, `UID`, `INTERNALDATE`, `RFC822.SIZE`
+    * `RFC822`, `RFC822.HEADER`, `RFC822.TEXT`
+    * `BODY[]` and `BODY.PEEK[]` with sections `HEADER`, `TEXT`, `HEADER.FIELDS (…)` and `HEADER.FIELDS.NOT (…)`, and `<o.n>` partials
+    * the macro `FAST`
+    * `ENVELOPE`, `BODYSTRUCTURE`, `BODY` and `ALL`/`FULL` get `BAD` (TD)
+    * A non-PEEK fetch of a body sets `\Seen` (outside EXAMINE), with `FLAGS` in that message's response.
+  * **`STORE`/`UID STORE`:** `FLAGS`, `+FLAGS` and `-FLAGS`, with `.SILENT`. The flags are `\Seen \Answered \Flagged \Deleted \Draft`; keywords get `BAD`.
+  * **`SEARCH`/`UID SEARCH`:**
+    * sets and `UID`
+    * the flag keys and their `UN…` forms; `NEW`, `OLD`, `RECENT`
+    * `FROM`, `TO`, `CC`, `SUBJECT` (substring of `fields`, ignoring case)
+    * `LARGER`, `SMALLER`, `BEFORE`, `ON`, `SINCE` (internal date)
+    * `NOT`, `OR`, parentheses
+    * `CHARSET` UTF-8 or US-ASCII
+    * `BODY`, `TEXT` and `HEADER` get `NO` (TD)
+  * `EXPUNGE`, `CLOSE` (expunges silently, unless EXAMINE), `CHECK`, `IDLE`.
+
+**The session** is the connection's state (JSON):
+* `{user, pw, fails, sel: {ro, view, modseq}, idle?, cont?, out?}`, where `view` is the session's UIDs as ranges, so sequence numbers stay what the client knows between updates.
+* **Bounded:** a session whose state would pass 32 KiB (a very fragmented mailbox) gets `* BYE [ALERT]` (TD).
+
+**Updates (a sync)** happen on `NOOP`, `CHECK`, at `SELECT`, and on every call while idling. These are the points where RFC 3501 §7.4.1 allows `EXPUNGE`. A sync lists the user's `(uid, flags, modseq)` and sends:
+* `* n EXPUNGE` for UIDs gone from the view, from the highest sequence number down
+* `* N EXISTS` for new UIDs
+* `* n FETCH (UID u FLAGS (…))` for rows whose `modseq` passed the session's
+
+The session's own `STORE` and `EXPUNGE` update its view and `modseq` as they reply, so it doesn't repeat itself.
+
+**Every step:**
+* checks that the session's app password still exists; if it was revoked, `* BYE` and close
+* applies the step's flag changes and expunges in its own transaction, so a reply never reports a change that didn't commit
+
+**Parsing:**
+* A tokenizer for atoms, quoted strings, literals, lists, sequence sets and fetch attributes.
+* A command is acked only when complete. A synchronizing literal `{n}` gets `+ Ready` once; `cont` counts the continuations already sent for the command at the input's start. `{n+}` (LITERAL+) gets none.
+* A command over 65,536 bytes gets `BAD` and closes.
+* While a FETCH response is pending, no new commands are read.
+
+**Large responses:**
+* A FETCH's responses are built one message at a time, each as text pieces plus body ranges. They are kept in `out` with an offset: the remaining UIDs as ranges, and the current message's pieces (its flags are fixed when it is built).
+* Each step writes up to `min(room, 256 KiB)`, reading only the parts it needs, then calls `again()`.
+* Under a full window the server answers `window` and the runtime backs off.
+* `\Seen` set by a fetch commits in the step that builds that message's response.
+
+**IDLE:**
+* `+ idling`, then `c.wakeOn(user)`. Each call syncs.
+* `DONE` gets `tag OK IDLE terminated`, and the keys are cleared. Any other line gets `BAD` and ends the IDLE.
+
+**The worker** (`workers/imap.ts`):
+* Serves `svc/imaps` with `tls()` and `wakeOnMail`.
+* `MAIL_LEASE_TTL_MS` as for SMTP.
+* `MAIL_STALL=fetch` prints `stall` and hangs in the step after the first FETCH chunk, for the kill tests.
+
+`mail.ts` gains `IMAP_SERVICE = ['svc', 'imaps']`, `serveImap(db, opts)` and `imapLayer(db)`.
+
+### The inbox page (`apps/mail/ui`)
+* **For the signed-in user:**
+  * their addresses (read only)
+  * the inbox: from, subject, date and size; unread rows bold, a star for `\Flagged`; newest first
+* **A message view:** the stored bytes as text in a `<pre>`. Opening it sets `\Seen` (`setFlags`).
+* **Buttons:** flag or unflag, mark unread, delete (`expunge`).
+* **App passwords:** a label field and **create** (the password shown once, `#new-password`), the list, and **revoke**.
+* **Live:** `db.on` `received` and `changed` re-render the list.
+* `app.inbox()` is exposed for the spec.
+
+### Tests
+* **`apps/mail/test/imap.test.ts`:**
+  * The world has `smtp` (plain, no inbox, for speed) and `imaps` (`idle_secs = 1860`). Handlers run in-process, and as workers for the kill tests. Mail is sent through the SMTP handler.
+  * Clients:
+    * `test/imapclient.py` (`python3 -I`): imaplib `IMAP4_SSL` with the test CA. It runs a JSON list of calls and prints each result as a JSON line.
+    * a Node TLS line client, for IDLE, literals and kills
+  1. **LOGIN:** an app password works, and so does the user's address. A wrong password gets `NO [AUTHENTICATIONFAILED]`; the third gets `BYE`. Bob's password opens Bob's mailbox only.
+  2. **SELECT** gives its responses. **FETCH:**
+     * `1:*` with `(UID FLAGS RFC822.SIZE INTERNALDATE)`
+     * `BODY.PEEK[]` equals `messageBytes`
+     * `HEADER`, `TEXT`, `HEADER.FIELDS (SUBJECT FROM)` and a partial
+     * `BODY[]` sets `\Seen`; EXAMINE doesn't
+  3. **STORE:** `+FLAGS`, `-FLAGS` and `.SILENT`, and the UID forms.
+  4. **SEARCH:** `UNSEEN`, `FLAGGED`, `SUBJECT`, `FROM`, `SINCE`, `OR`/`NOT`, and `UID SEARCH`.
+  5. **EXPUNGE:** `\Deleted` and `EXPUNGE` give `* n EXPUNGE` in the right order. A message sent to two users keeps its parts until both copies are expunged.
+  6. **IDLE** (Node client). Each update arrives within 2 s:
+     * new mail through SMTP: `* N EXISTS`
+     * `STORE` from another session: `* n FETCH (FLAGS …)`
+     * `EXPUNGE` from another session: `* n EXPUNGE`
+     * then `DONE` gets `OK`
+  7. **Literals:** `LOGIN {5}` with its continuation, `{n+}` without one, and a command over the limit.
+  8. **Large FETCH:** a 3 MB message's `BODY[]` crosses steps and matches by SHA-256.
+  9. **Kills:**
+     * a worker SIGKILLed mid-FETCH of a 10 MB message (`MAIL_STALL=fetch`): the successor continues the literal, the bytes match, and `\Seen` is set once
+     * a worker killed while a client idles: the successor's claim call syncs, and the next new message reaches the client as `EXISTS`
+  10. **A revoked app password:** the session's next command gets `* BYE`.
+* **`apps/mail/test/smtp.test.ts`:** checks of `hdr`, `fields` and `modseq`.
+* **Unit tests (`apps/mail/test/imapparse.test.ts`):** the tokenizer, sequence sets, fetch attributes, the search evaluator and view ranges.
+* **Playwright (`apps/mail/e2e/mail.spec.ts`).** SMTP and IMAP run as workers. Alice's page:
+  1. creates an app password, read from `#new-password`
+  2. a message sent through SMTP appears in the list (live)
+  3. a Node IMAP client logs in with the password and IDLEs. Opening the message in the page gives the client `FETCH (… FLAGS (\Seen))`.
+  4. a second message shows in the page, and the client gets `EXISTS`
+  5. deleting the first in the page gives the client `* 1 EXPUNGE`
+
+### Docs
+* **`docs/CLIENT.md` §11:** waking (`wakeOn`, `wake`, `again`, `room`, the call on claim). The "Not yet" line goes.
+* **`apps/README.md`:** IMAP, the page, app passwords, `idle_secs`.
+* **TD-MAIL-SCOPE** gains the IMAP limits:
+  * INBOX only; no `APPEND`, `ENVELOPE`, `BODYSTRUCTURE`, keywords, CONDSTORE/QRESYNC or STARTTLS on 143
+  * `SEARCH` without `BODY`/`TEXT`/`HEADER`; no RFC 2047 decoding
+  * the 32 KiB session view
+  * app password hashes readable by members
+* The log in both plan copies.
+
+### Out of scope
+* `wakeOn` for `ssh()`
+* IMAP keepalive (`* OK` during long IDLEs)
+* submission (587) and outbound mail (TD-MAIL-SCOPE)
+
+### Verification
+* `npm run check`; `npx vitest run` 3×; `npx playwright test` (17 specs)
+* `cargo test -p zen-server --test svc` once (the server is unchanged)
+* CI green on both runs of PR #51
 
 ## Step 5.5.13a: a TD entry for the failures still open, then compaction
 
