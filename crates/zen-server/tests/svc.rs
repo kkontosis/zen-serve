@@ -49,6 +49,16 @@ fn service(f: impl FnOnce(&mut ServiceConfig)) -> impl FnOnce(&mut Config) {
 /// A server with the service, claimed by Alice. Returns Alice's token and
 /// the service's address.
 async fn setup(f: impl FnOnce(&mut ServiceConfig)) -> (Harness, Vec<u8>, SocketAddr) {
+    // The server's warnings, captured with each test's output: a failing
+    // test shows them (a relayed input batch that didn't store, a reap
+    // that failed). RUST_LOG overrides the level.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "zen_server=warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let h = Harness::start_with(service(f)).await;
     let alice = User::new(1);
     h.claim(&alice, &[]).await;
