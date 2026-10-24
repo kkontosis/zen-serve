@@ -8,11 +8,14 @@
 import { bytes } from '@zen/client';
 import type { DbTransaction } from '@zen/db';
 import { LineReader, type RawHandler, type RawStep } from '@zen/svc';
+import { parseFields, scanHeaderEnd } from './header.js';
 import {
   type Counter,
   type Draft,
+  type HeaderFields,
   type Mailbox,
   type Message,
+  newValidity,
   PART_BYTES,
   type Part,
   type Received,
@@ -124,6 +127,10 @@ interface Data {
   over: boolean;
   /** Swept while it arrived (`sweepDrafts`): the rest is read and dropped. */
   lost?: boolean;
+  /** The header's length in the body, through its blank line (-1: not ended yet). */
+  hdr?: number;
+  /** How much of CRLF CRLF the last body bytes matched (`scanHeaderEnd`). */
+  hm?: number;
 }
 
 /** The session, as the connection's state. */
@@ -319,7 +326,7 @@ export function smtp(opts: SmtpOptions): RawHandler {
         await tx
           .table<Draft>('drafts')
           .insert({ draft, conn: bytes.hex(c.conn), started: Date.now() });
-        s.data = { draft, seq: 0, len: 0, size: 0, dec: D_LINE, over: false };
+        s.data = { draft, seq: 0, len: 0, size: 0, dec: D_LINE, over: false, hdr: -1, hm: 2 };
         c.write(reply(354, 'End data with <CR><LF>.<CR><LF>'));
         return false;
       }
@@ -361,6 +368,11 @@ function path(p: string): string {
 /** Append decoded body bytes to the draft's parts; past the limit, drop them all. */
 async function stage(tx: DbTransaction, d: Data, data: Uint8Array, maxSize: number): Promise<void> {
   if (d.over || data.length === 0) return;
+  if ((d.hdr ?? -1) < 0) {
+    const h = scanHeaderEnd(d.hm ?? 2, data);
+    d.hm = h.m;
+    if (h.end >= 0) d.hdr = d.size + h.end;
+  }
   d.size += data.length;
   if (d.size > maxSize) {
     d.over = true;
@@ -419,10 +431,21 @@ async function store(
   const tls = c.tls ? ` (${c.tls.version}:${c.tls.suite})` : '';
   const proto = `${s.esmtp ? 'ESMTP' : 'SMTP'}${c.tls ? 'S' : ''}`;
   const peer = c.peer.addr ?? 'unknown';
+  // Without a blank line, the whole message is its header.
+  const hdr = (d.hdr ?? -1) >= 0 ? d.hdr! : d.size;
+  const fields = await headerFields(tx, d.draft, hdr);
   for (const r of s.rcpt!) {
     const counters = tx.table<Counter>('counters');
-    const uid = (await counters.get(r.user))?.next ?? 1;
-    await counters.put({ user: r.user, next: uid + 1 });
+    const ctr = await counters.get(r.user);
+    const uid = ctr?.next ?? 1;
+    const modseq = (ctr?.modseq ?? 0) + 1;
+    const validity = ctr ? ctr.validity : newValidity();
+    await counters.put({
+      user: r.user,
+      next: uid + 1,
+      modseq,
+      ...(validity === undefined ? {} : { validity }),
+    });
     const head =
       `Received: from ${s.helo} ([${peer}])\r\n` +
       `\tby ${host} with ${proto}${tls} id ${d.draft}\r\n` +
@@ -437,6 +460,9 @@ async function store(
       received: now,
       head,
       flags: [],
+      modseq,
+      hdr: bytes.utf8(head).length + hdr,
+      fields,
     });
     tx.emit(
       receivedTopic(tx.db),
@@ -446,6 +472,13 @@ async function store(
     );
   }
   return reply(250, `2.0.0 Ok: queued as ${d.draft}`);
+}
+
+/** The header's fields, when the header lies within the first part. */
+async function headerFields(tx: DbTransaction, draft: string, hdr: number): Promise<HeaderFields> {
+  const p =
+    hdr > 0 && hdr <= PART_BYTES ? await tx.table<Part>('parts').get([draft, 0]) : undefined;
+  return parseFields(p ? p.data.subarray(0, hdr) : new Uint8Array(0));
 }
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];

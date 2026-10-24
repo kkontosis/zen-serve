@@ -46,11 +46,44 @@ export type Message = {
   received: number;
   /** The trace header put before the body (`Received: …`). */
   head: string;
+  /** IMAP system flags (`\Seen`, `\Flagged`, …). */
   flags: string[];
+  /** The user's change counter when the row last changed (schema 2; missing: 0). */
+  modseq?: number;
+  /** The header section's length in the stored message, `head` included, through the blank line (schema 2). */
+  hdr?: number;
+  /** Header fields, unfolded and as sent (schema 2). */
+  fields?: HeaderFields;
 };
 
-/** A user's next uid. */
-export type Counter = { user: string; next: number };
+/** A message's header fields, unfolded, as sent (no RFC 2047 decoding). */
+export type HeaderFields = {
+  from: string;
+  to: string;
+  cc: string;
+  subject: string;
+  date: string;
+  messageId: string;
+};
+
+/**
+ * A user's counters: the next uid, the change counter (`modseq`, schema 2)
+ * and the mailbox's UIDVALIDITY (schema 2; missing: 1). Uids are never
+ * reused.
+ */
+export type Counter = { user: string; next: number; modseq?: number; validity?: number };
+
+/** An app password: what IMAP clients log in with. Only its hash is kept. */
+export type AppPassword = {
+  user: string;
+  /** Hex. */
+  id: string;
+  label: string;
+  /** SHA-256 of the password, normalized (`normalizePassword`), hex. */
+  hash: string;
+  /** Unix milliseconds. */
+  created: number;
+};
 
 /** A certificate, as stored (PEM), or the inbox seed (`key` its hex). */
 export type Cert = {
@@ -63,6 +96,9 @@ export type Cert = {
 /** What `mail/received` carries for each message stored. */
 export type Received = { user: string; uid: number; size: number };
 
+/** What `mail/changed` carries: a user's flags changed, or messages were expunged. */
+export type Changed = { user: string; kind: 'flags' | 'expunge' };
+
 /** The most body bytes a part holds. */
 export const PART_BYTES = 65_536;
 
@@ -73,7 +109,7 @@ export const TLS_CERT = 'smtp';
 export const INBOX_SEED = 'inbox';
 
 export const DB_OPTIONS: DbOptions = {
-  schema: 1,
+  schema: 2,
   migrations: {
     1: async (m) => {
       await m.createTable('mailboxes', { pk: ['address'] });
@@ -95,11 +131,26 @@ export const DB_OPTIONS: DbOptions = {
       await m.createTable('counters', { pk: ['user'] });
       await m.createTable('certs', { pk: ['name'] });
     },
+    2: async (m) => {
+      // Whether an expunged message's parts are still shared.
+      await m.createIndex('messages', 'by_draft', { fields: [['draft', 'text']] });
+      await m.createTable('app_passwords', { pk: ['user', 'id'] });
+      await m.createIndex('app_passwords', 'by_user', { fields: [['user', 'text']] });
+    },
   },
 };
 
 /** Where each stored message is announced (`message` events, keyed by user). */
 export const receivedTopic = (db: Db): Topic => db.topic('mail', 'received');
+
+/** Where flag changes and expunges are announced (`changed` events, keyed by user). */
+export const changedTopic = (db: Db): Topic => db.topic('mail', 'changed');
+
+/** The UIDVALIDITY of a counters row (13a's rows have none: 1). */
+export const validityOf = (c: Counter | undefined): number => c?.validity ?? 1;
+
+/** A new counters row's UIDVALIDITY: the time in seconds, as RFC 3501 §2.3.1.1 suggests. */
+export const newValidity = (): number => Math.max(1, Math.floor(Date.now() / 1000) % 2 ** 32);
 
 /** Deliver mail for `address` to `user`. */
 export async function putMailbox(db: Db, address: string, user: string): Promise<void> {
