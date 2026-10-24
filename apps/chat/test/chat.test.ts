@@ -28,6 +28,8 @@ import {
   sendMessage,
   sendPhoto,
   servePresence,
+  showFor,
+  TYPING_SHOW_MS,
   Typing,
   whoIsOnline,
 } from '../src/chat.js';
@@ -243,9 +245,13 @@ describe('typing and presence', () => {
     const [a, b] = [await signIn('alice'), await signIn('bob')];
     const room = newRoom();
     const fresh: string[] = [];
+    const sent: number[] = [];
     const strict: string[] = [];
     const subs = [
-      await onTyping(b.db, room, (from) => fresh.push(from)),
+      await onTyping(b.db, room, (from, sentMs) => {
+        fresh.push(from);
+        sent.push(sentMs);
+      }),
       // A bound a minute below zero: every indicator counts as too old,
       // whatever the two clocks say.
       await onTyping(b.db, room, (from) => strict.push(from), -60_000),
@@ -255,6 +261,10 @@ describe('typing and presence', () => {
     await sleep(300);
     expect(fresh).toEqual(['alice']);
     expect(strict).toEqual([]);
+    // It shows until its display time after it was sent, not after it arrived.
+    const left = showFor(b.db, sent[0]!);
+    expect(left).toBeLessThanOrEqual(TYPING_SHOW_MS - 300);
+    expect(showFor(b.db, sent[0]! - TYPING_SHOW_MS)).toBeLessThanOrEqual(0);
     for (const s of subs) await s.close();
     await signOut(a);
     await signOut(b);

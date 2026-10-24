@@ -27,6 +27,7 @@ import {
   sendMessage,
   sendPhoto,
   servePresence,
+  showFor,
   TYPING_SHOW_MS,
   Typing,
   whoIsOnline,
@@ -185,17 +186,23 @@ addEventListener('online', () => void follow().catch(fail));
 
 // ------------------------------------------------------------ typing
 
-const typists = new Map<string, ReturnType<typeof setTimeout>>();
-function showTyping(from: string): void {
+// Each member typing, until their newest indicator's time is up.
+const typists = new Map<string, { until: number; timer: ReturnType<typeof setTimeout> }>();
+function showTyping(from: string, sentMs: number): void {
   if (from === user) return;
-  clearTimeout(typists.get(from));
-  typists.set(
-    from,
-    setTimeout(() => {
+  const left = showFor(db, sentMs);
+  const until = sentMs + TYPING_SHOW_MS;
+  const t = typists.get(from);
+  // An older indicator, arriving late, doesn't shorten a newer one.
+  if (left <= 0 || (t && t.until >= until)) return;
+  if (t) clearTimeout(t.timer);
+  typists.set(from, {
+    until,
+    timer: setTimeout(() => {
       typists.delete(from);
       drawTyping();
-    }, TYPING_SHOW_MS),
-  );
+    }, left),
+  });
   drawTyping();
 }
 function drawTyping(): void {

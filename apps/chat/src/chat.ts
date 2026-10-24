@@ -323,27 +323,34 @@ export class Typing {
   }
 }
 
-/** How long a typing indicator shows after it arrives. */
+/** How long a typing indicator shows after it was sent. */
 export const TYPING_SHOW_MS = 3000;
 
 /**
- * Call `fn` with the name of each member typing in a room, from now on.
- * An indicator sent more than `maxAgeMs` ago (by its sender's clock,
- * against this session's corrected clock) is dropped: one that arrives
- * late, after a reconnect, would show a member typing who no longer is.
+ * Call `fn` with the name of each member typing in a room, from now on, and
+ * when its indicator was sent (Unix ms, the sender's clock). An indicator
+ * sent more than `maxAgeMs` ago (against this session's corrected clock) is
+ * dropped: one that arrives late, after a reconnect, would show a member
+ * typing who no longer is. One that arrives late but in time shows only
+ * for what is left of its time (`showFor`).
  */
 export function onTyping(
   db: Db,
   room: string,
-  fn: (from: string) => void,
+  fn: (from: string, sentMs: number) => void,
   maxAgeMs = TYPING_SHOW_MS,
 ): Promise<SourceSub> {
   return db.onEphemeral<TypingBody>(typingTopic(db, room), (m: EphemeralMsg<TypingBody>) => {
     if (m.type !== 'typing' || typeof m.body?.from !== 'string') return;
     const sentMs = Number(m.hlc >> 16n);
     if (db.fs.session.clock.now() - sentMs > maxAgeMs) return;
-    fn(m.body.from);
+    fn(m.body.from, sentMs);
   });
+}
+
+/** How much longer an indicator sent at `sentMs` shows: until `TYPING_SHOW_MS` after it was sent. */
+export function showFor(db: Db, sentMs: number): number {
+  return sentMs + TYPING_SHOW_MS - db.fs.session.clock.now();
 }
 
 // ------------------------------------------------------------ presence
