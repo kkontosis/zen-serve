@@ -34,6 +34,8 @@ export interface TestServer {
   origin: string;
   port: number;
   dataDir: string;
+  /** The server process's id (for measuring it). */
+  pid: number;
   /** The claim token, until the server is claimed. */
   claimToken: string;
   /** Stop the process and delete its data directory. */
@@ -183,6 +185,7 @@ export async function startIn(dataDir: string, opts: ServerOptions = {}): Promis
     origin: url,
     port,
     dataDir,
+    pid: child.pid!,
     claimToken,
     kill,
     log,
