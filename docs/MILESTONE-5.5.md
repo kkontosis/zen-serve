@@ -484,6 +484,7 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx playwright test`: 17 passed
     * the benches with `ZEN_BENCH=1`, against release builds
     * a script checking the new and changed docs: every relative link, every anchor, and every `TD-` name as a heading of TECH_DEBT
+  * CI green on PR #52's head a39aef6: both runs (push 40141584231, pull request 40141587583) passed every check on their first attempt, with `openssh-pq` skipped as it should be.
 
 ## Step 5.5.14 in detail: docs, measurements, the outcome
 
