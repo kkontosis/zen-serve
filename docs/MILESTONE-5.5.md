@@ -407,9 +407,53 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
         * Not proven that CI saw such a stall: nothing recorded the renewals then. A recurrence would now show it.
       * **CI green on cad1bf6:** both runs passed every check on their first attempt.
         * Open, with diagnostics that name what went wrong: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test.
+      * **CI on a6fff93 (docs only): three reds, each with a cause and a fix.** Commits: `server: the inbox test stores each line before writing the next`; `server: dump reads again when storage lags (TooOld)`; `apps: chat: the typing spec prints every indicator sent and received`; `apps: chat: a message ends its sender's typing indicator`.
+        * **`tests/svc.rs` `inbox_seals_input` (push run, `pure-rust`): a test assumption.**
+          * The test wrote 8 lines 30 ms apart and expected several stored chunks. All 8 landed in one chunk at offset 0, with no failed append in the log.
+          * The connection task reads only after `accept` commits, and a read takes everything already waiting. In CI, 33 tests share the process, one of them with 5,000 connections, so a first read later than about 210 ms stores every line at once.
+          * A forced 300 ms sleep before the read loop gave CI's exact message.
+          * The test now claims first, then writes each line and reads it back before the next: 8 chunks whatever the scheduling. It passes with the forced sleep, 20 of 20 runs alone, and `tests/svc.rs` 3× on embedded and once on FDB.
+        * **`tests/dump.rs` `a_started_server_counts_as_empty` (pull-request run, `fdb`): a real bug, seen for the second time (step 5.5.3 saw it once).**
+          * `dump::is_empty` read in one bare transaction, and `copy` read each chunk the same way. The first `TooOld` failed an import or a migrate. On FDB, `TooOld` covers every retryable error: too old, future version, process behind, throttling and recovery.
+          * The tests had retries of their own around these calls; the code didn't. Line 257 called `is_empty` bare while the other dump tests imported in parallel.
+          * Fix: both read again after `TooOld` (`retrying` in `dump.rs`), backing off to 1 s, for about half a minute. The test helper that retried `is_empty` is gone.
+          * A new test, `a_lagging_store_is_read_again`, wraps the store so its first range reads give `TooOld`. It failed with CI's "read version too old" before the fix.
+          * Verified: `tests/dump.rs` on embedded, and 3× on FDB.
+        * **The chat typing spec (pull-request run, `client`): a bug in the app, found from a new log.**
+          * The first failure gave no cause. So each page now logs the indicators it sent and received, with both clocks, and the spec prints the logs on failure (773a9ee).
+          * 12 local runs under full CPU load passed. On 773a9ee the push run was green and the pull-request run failed again, this time with the logs.
+          * The logs showed CI ran the first test in 1.6 s:
+            * Alice's indicator for her last message, already sent, was still within its 3 s, so Carol showed her typing.
+            * Bob's new keystrokes came within 1 s of his last indicator, so the throttle announced nothing.
+            * His old indicator ran out half a second after Alice's, between two of Playwright's checks.
+          * This is also the cause of step 10's and 0319025's failures of this spec.
+          * Fix in the app:
+            * `ChatMsg.sentMs`, from the event's hlc.
+            * `Typists` (`chat.ts`): a message ends its sender's indicator, and an indicator sent before the sender's latest message is ignored when it arrives late. The page drives its timers from it and starts a new one per room.
+            * `Typing.reset()` after a send, so the next keystroke is announced at once.
+          * The spec now has Alice and Bob send just before Bob types. With the old page code it failed 3 of 3 times as in CI; with the fix it passed 5 of 5, and 5 of 5 under full CPU load.
+          * Unit tests cover the `Typists` rules, `reset()` and `sentMs`. Also verified: `npm run check`, `apps/chat` vitest (10), and the full Playwright run (16).
+      * **CI green on 7497111:** both runs passed every check on their first attempt.
+        * Still open, with their diagnostics: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test.
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13a: the red on a6fff93 (svc: the sealed inbox's chunks)
+
+**Context.** On a6fff93 (a docs-only commit) the push run's `pure-rust` job failed one test: `crates/zen-server/tests/svc.rs` › `inbox_seals_input` (step 5.5.12), at `assert!(chunks.len() > 1, "several chunks: [(0, true)]")`. When checked, the pull-request run was still in progress.
+* **What the output shows.** All 8 lines (152 bytes) were stored as one sealed chunk at offset 0, and the bytes were right. There was no `storing relayed input` warning, which the subscriber added last round would print, so no append failed and was held back.
+* **The test's assumption.** It writes 8 lines 30 ms apart (about 210 ms in all) and expects the server to store them as separate batches. The connection task (`conn.rs` `run`) reads only after `accept` commits. Its first read then gathers for 5 ms more (`GATHER`), and since `timeout_at` polls the read before the deadline, it also takes whatever already sits in the kernel buffer.
+* **The cause.** So if the task first reads more than about 210 ms after the connect, every line is already waiting and one batch takes them all. In CI the 33 tests of `tests/svc.rs` run in one process at once, `many_connections` (5,000 connections) among them. The test's server started at 32.014 and the test failed at 32.628. Dependencies are built at `opt-level = 3`, so the encapsulation in `accept` is fast; the delay is the scheduling of a loaded runtime.
+* **The server is fine.** How bytes split into chunks is the server's choice (svc.md §3: batches of up to 32 KiB or 5 ms). Only the test's expectation is wrong.
+* **The other inbox tests don't depend on timing.** `unseal_stops_sealing` waits for its first chunk to be stored before it steps, and `unseal_without_inbox_is_a_no_op` checks only the bytes.
+
+**Plan** (commit `server: the inbox test stores each line before writing the next`, test only):
+1. **Prove the mechanism first.** In a scratch change that isn't committed, sleep 300 ms in `Conn::run` before the read loop. The current test must then fail with exactly `several chunks: [(0, true)]`.
+2. **Make the chunks deterministic.** Claim the connection first: the claim exists only once `accept` has committed. Then, for each line, write it and read it back with `read_open` from where the last line ended, which waits until that line is stored. Each line is then its own chunk: 8 chunks, contiguous and sealed. The later checks (reads from each chunk's offset, `max_bytes` over two chunks, pushes, a chunk opened at a wrong offset) are unchanged and get a fixed layout.
+3. **Show the fix holds under the same delay:** the test passes with the scratch sleep, then the sleep is removed.
+
+**Verification:** `cargo fmt --all --check`; clippy on zen-server `--all-targets -D warnings` (default and `--no-default-features`); `tests/svc.rs` 3× on embedded and once on FDB; `inbox_seals_input` alone 20×. Read the pull-request run's result on a6fff93 too, and treat any red the same way. Log it in both plan copies, push, and get CI green on both runs.
 
 ## Step 5.5.13a: the red on 8806071 (log: a leader renews while it runs)
 
