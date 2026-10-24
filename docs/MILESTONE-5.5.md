@@ -400,9 +400,27 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
           * Both messages were checked by forcing the failures.
         * An observation from the forced run: locally all 12 messages reach Bob after the last reconnect, as history, not live, since the reconnects every four sends keep his stream reconnecting. A failure that names the messages that never came will show whether a resubscribe misses a range.
         * **Open**, with the diagnostics in place.
+      * **CI on 8806071:** the pull-request run green; the push run's `client` failed `packages/client/test/log.test.ts` › "leaders › renews while it runs" (milestone 4).
+        * The test gave its leaders a 300 ms TTL. Renewals chain, each sent a third of the TTL after the previous one finished, so one round trip over about 200 ms on a loaded runner lets the lease lapse and the second leader take it. That is the lease working as specified, with a window too small for the runner.
+        * Commit `client: the leader renewal test has a TTL a slow runner can't outlast`: a 1.5 s TTL over a 4 s window, with `lb` trying every 300 ms. On failure it prints when the holder renewed and when the other won.
+        * Checked: 20 of 20 runs pass. A renewal held back 2 s on purpose fails the test, and the message shows the gap (`la` renewed at 1015 ms, `lb` won at 2741 ms).
+        * Not proven that CI saw such a stall: nothing recorded the renewals then. A recurrence would now show it.
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13a: the red on 8806071 (log: a leader renews while it runs)
+
+**Context.** On 8806071 the pull-request run is green and the push run's `client` job failed one test: `packages/client/test/log.test.ts` › "leaders › renews while it runs". `lb.acquire()` returned `true` while `la` should still have held the lease.
+* The test (milestone 4) gives both leaders `ttlMs: 300`. For 1.5 s, `lb` tries to take the lease every 150 ms and must fail.
+* `Leader` (`packages/client/src/log.ts`) renews by chaining: each `renew()` schedules the next `ttlMs / 3` (100 ms) after its own request finishes. So the server sees renewals 100 ms plus one round trip apart.
+* A round trip over about 200 ms lets the lease lapse, and `lb` then takes it, correctly. On a runner running three test files at once, one 200 ms stall in 1.5 s is plausible. Locally it never happens.
+* So the likely cause is a margin too small for the runner, not a defect in leases. The test's intent is that a holder keeps renewing, not that it does so within 200 ms under any load. Not yet proven: nothing recorded the renewal gaps.
+
+**Plan:**
+1. **Record the renewals.** Wrap `la.renew` in the test to timestamp each call and its outcome, and wrap `lb.acquire` to timestamp each attempt. When `lb` gets the lease, the message prints the gaps between `la`'s renewals and when `lb` succeeded. That shows a stall (a gap over the TTL) or a lease lost within its TTL, which would be a real bug.
+2. **Give the margin the test means.** `ttlMs: 1500` (renewals every 500 ms, so 1 s of slack), checked over 4 s (about 2.5 TTLs and 8 renewals) with `lb` trying every 300 ms. A holder that stopped renewing still loses the lease within the window, so the test still tests renewal.
+3. **Verify:** run the test 20 times. Then make a renewal stall on purpose (a delay in the wrapped `renew` over the TTL): `lb` must win, and the message must show the gap. `npm run check`; push; CI.
 
 ## Step 5.5.13a: the red on 84c8c02 (chat: a dropped connection resumes)
 
