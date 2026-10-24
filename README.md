@@ -10,12 +10,13 @@ Building blocks:
 * a **filesystem whose tree and file versions the server merges as CRDTs**, on ciphertext
 * plaintext **`/unencrypted`** static serving for the app bootstrap
 * **zen-db and an in-app broker** in one client class, where rows, messages and files commit in one transaction, with CRDT tables the server merges, a local filesystem replica that works offline, and Loro documents ([`spec/zendb.md`](spec/zendb.md), [`docs/DB.md`](docs/DB.md))
+* **relayed services**: SSH, SMTP, IMAP and other TCP protocols served by handlers on member clients, through a server that relays the bytes blind; each protocol step commits with the handler's rows, and another handler takes over a live connection when one dies ([`docs/SVC.md`](docs/SVC.md))
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| [`docs/`](docs/) | Design discussion and decisions (`DESIGN*.md`, `API.md`, `GAPS.md`, `EXAMPLES.md`) |
+| [`docs/`](docs/) | Design discussion and decisions (`DESIGN*.md`, `API.md`, `GAPS.md`, `EXAMPLES.md`), the client and service guides (`CLIENT.md`, `DB.md`, `SVC.md`) and measurements (`STATS.md`) |
 | [`spec/`](spec/) | **Normative** specification: formats, labels, suites, glossary, test vectors |
 | [`crates/zen-core`](crates/zen-core) | Client-side crypto core (Rust, native + `wasm32`) |
 | [`crates/zen-proto`](crates/zen-proto) | Wire types of the API (CBOR), shared by server and clients (native + `wasm32`) |
@@ -30,7 +31,7 @@ Building blocks:
 | [`packages/fs`](packages/fs) | `@zen/fs`: a local replica of a filesystem tree (the node table, content on demand, offline writes), under `zen-mount` too ([`docs/CLIENT.md`](docs/CLIENT.md) §8) |
 | [`packages/loro`](packages/loro) | `@zen/loro`: [Loro](https://loro.dev) documents kept on a topic, with snapshots and offline edits ([`docs/DB.md`](docs/DB.md) §20) |
 | [`packages/svc`](packages/svc) | `@zen/svc`: handlers of relayed TCP services, each step in one transaction with the handler's writes, raw, behind `tls()` or behind `ssh()` ([`spec/svc.md`](spec/svc.md), [`docs/CLIENT.md`](docs/CLIENT.md) §11) |
-| [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger), `hello`, and `echo` (a relayed line service), on `@zen/db`, `@zen/fs`, `@zen/loro` and `@zen/svc` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
+| [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger), `hello`, `echo` (a relayed line service over raw TCP, TLS, SSH and `tcp-auth`) and `mail` (inbound SMTP, IMAP with IDLE, and an inbox page), on `@zen/db`, `@zen/fs`, `@zen/loro` and `@zen/svc` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
 
@@ -43,7 +44,7 @@ Building blocks:
 * Milestone 4 (`@zen/client` and `zen-mount`, [`docs/MILESTONE-4.md`](docs/MILESTONE-4.md), [`docs/CLIENT.md`](docs/CLIENT.md)): done.
 * Milestone 4.5 (zen-db and the in-app broker, specs only, [`spec/zendb.md`](spec/zendb.md), [`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): done.
 * Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
-* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md)): in progress. Done: the spec, the server relay, stream push, `@zen/svc` with raw handlers, the TLS engine and the `tls()` layer, the SSH engine and the `ssh()` layer (steps 1–10).
+* Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md), outcome at its end, [`docs/SVC.md`](docs/SVC.md)): done.
 
 ## Building
 

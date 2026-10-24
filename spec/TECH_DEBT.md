@@ -330,6 +330,20 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** Connections are short next to a key's lifetime, and an admin can change the key at a quiet moment, or restart the handlers once the old connections are gone. Nothing in milestone 5.5 needs a change while connections are open.
 * **What it would take:** `serve({inbox})` taking several seeds, tried by the claim's ciphertext (X-Wing decapsulation doesn't fail on a wrong key, so a key id: the first bytes of a hash of the public key, stored with `inbox_ct` in `rc.inbox`, keyspace.md §3.9). Then a helper that adds a new seed to the app's row, and a test that changes the key with a connection open.
 
+## TD-SVC-ACME
+
+* **Status:** open
+* **Context:** A relayed service that terminates TLS (`tls()`, `starttls()`) uses a certificate and key that the admin obtained and stored in the fs, where the handler reads them before `serve()` (docs/SVC.md §4). Nothing obtains or renews them: an expired certificate is replaced by hand, and the handlers restarted. This is separate from TD-TLS-ACME, which is about zen-serve's own listener: the server never holds a relayed service's key.
+* **Why deferred:** Milestone 5.5 builds the relay and its engines; certificates come from outside, as they do for most servers behind a separate ACME client. The apps' tests make their own.
+* **What it would take:** An ACME client (RFC 8555) run by a handler, so the account key and the certificate's key stay with the members. The challenge is answered through a relayed service: HTTP-01 through a `tcp` service on port 80, or TLS-ALPN-01 (RFC 8737) by the `tls()` layer on the service's own port, answering `acme-tls/1` with the challenge certificate. Renewal runs under a leader lease (one handler of the fs renews), writes the new pair to the app's row, and `serve()` picks it up for new connections without a restart (a layer that re-reads its certificate). Tested against Pebble.
+
+## TD-SVC-UDP
+
+* **Status:** open
+* **Context:** Relayed services are TCP only (svc.md §2: `tcp` and `tcp-auth`). DNS, QUIC (HTTP/3), WireGuard, SIP over UDP and other datagram protocols can't be served.
+* **Why deferred:** The relay's model is an ordered byte stream per connection with acks at protocol boundaries, a durable queue and a takeover at a step. Datagrams have no connection, no order and no retransmission by the transport, and their protocols expect replies within milliseconds, below what a commit per step costs (STATS §5.5).
+* **What it would take:** A datagram mode with its own model: a flow keyed by the peer's address and port, datagrams stored as records with a bounded queue and dropped (not acked) when it is full, replies released without the key reveal (as `resume: false`), and an idle timeout per flow. QUIC would need its engine in the handler, with connection ids rather than addresses keying the flow. Measure first whether a step's latency suits the protocol.
+
 ## TD-MAIL-SCOPE
 
 * **Status:** open

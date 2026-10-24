@@ -183,29 +183,49 @@ async fn push(
             w_lease.as_mut().expect("armed"),
             w_queue.as_mut().expect("armed"),
         );
-        if log_left || !again.is_empty() {
+        let (lease_rang, queue_rang) = if log_left || !again.is_empty() {
             // More to push: another turn without waiting, but a queue
             // change is still reported.
-            let (lease_rang, queue_rang) = (wl.now_or_never(), wq.now_or_never());
-            if lease_rang.is_some() {
-                w_lease = None;
+            let (l, q) = (wl.now_or_never(), wq.now_or_never());
+            (l.is_some(), q.is_some())
+        } else {
+            tokio::select! {
+                _ = wl => (true, false),
+                _ = wq => (false, true),
             }
-            if queue_rang.is_some() {
-                w_queue = None;
-                if !send(out, Frame::SvcReady { id }).await {
-                    return Ok(());
-                }
-            }
-            continue;
+        };
+        if lease_rang {
+            w_lease = None;
         }
-        tokio::select! {
-            _ = wl => w_lease = None,
-            _ = wq => {
-                w_queue = None;
-                if !send(out, Frame::SvcReady { id }).await {
-                    return Ok(());
-                }
+        if queue_rang {
+            // Arm the watch again before telling the handler. A connection
+            // queued after the handler's next read then fires the new
+            // watch; one queued before it is in that read. Telling first
+            // would lose a connection queued between the two.
+            #[cfg(feature = "test-utils")]
+            testing::rearm_pause().await;
+            w_queue = Some(st.store.watch(&queue_bell).await?);
+            if !send(out, Frame::SvcReady { id }).await {
+                return Ok(());
             }
+        }
+    }
+}
+
+/// Test hooks (feature `test-utils`).
+#[cfg(feature = "test-utils")]
+pub mod testing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A pause after the ready queue's watch fires, before it is armed
+    /// again: it widens the window a lost wake-up would need.
+    pub static QUEUE_REARM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) async fn rearm_pause() {
+        let ms = QUEUE_REARM_PAUSE_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
         }
     }
 }

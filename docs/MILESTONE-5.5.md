@@ -460,7 +460,139 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * `npx vitest run` 3×: 548 passed each time, 7 skipped (the opt-in benches), no errors
       * `npx playwright test`: smoke and apps, 17 specs (`apps/mail/e2e/mail.spec.ts` new)
       * `cargo test -p zen-server --test svc` (33; the server is unchanged)
+    * CI green on PR #51's head 85d3132: both runs (push and pull request) passed every check on their first attempt. Merged at 22:10:36 UTC (merge commit 1af803b). This entry isn't in main: it goes into step 5.5.14's plan commit.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+* **Step 5.5.14** (docs, measurements, the outcome): done, PR #52. Restarted from main after PR #51 merged. Commits: `docs: milestone 5.5 step 14 plan`; `server: svc_sub arms the queue watch again before it sends svc_ready`; `svc: an opt-in bench of relayed services`; `docs: relayed services (docs/SVC.md), measurements, tech debt`; `docs: milestone 5.5 outcome`; this log.
+  * As planned, plus details settled while building:
+    * **The bench found a server bug: a lost wake-up in `svc_sub`.**
+      * The symptom: in 2 of 4 runs that came after the throughput case, 13 of the 1,000 idle connections were never claimed.
+      * The cause: when the ready queue's watch fired, the push loop (`svc/push.rs`) sent `svc_ready` first and armed a new watch only on its next turn. A connection queued after the handler's `/v1/svc/next` read and before that arming fired nothing. The store's watch is armed when it is made (zen-store's contract), so such a connection waited unannounced until `accept_wait_ms` closed it.
+      * The fix: arm the watch, then send `svc_ready`.
+      * The test: `tests/svc_ready.rs`, a binary of its own, with a test-only pause after a fire (`svc::push::testing`, feature `test-utils`). With the old order it fails ("round 0: 1 of 2 connections claimed, and no svc_ready for the rest"); with the fix it passes 5 of 5.
+      * `/v1/svc/next`'s long poll already armed its watch before reading.
+    * **Release builds.** The numbers in STATS §5.5 are from a release server (`ZEN_SERVE_BIN`) and release WASM. The local WASM had been a `--dev` build, about 1.5 to 3 times slower on these paths. The debug figures are noted there too.
+    * **IMAP's part of the bench** is in `apps/mail/test/bench.test.ts`, on the mail world, rather than in the echo bench.
+    * **TD-SVC-ACME** is separate from the existing TD-TLS-ACME, which covers zen-serve's own listener.
+    * **spec/OPS.md** also drops the old advice to run `npm run build:apps` before vitest: the global setup builds the apps since 13a.
+    * **TD-TEST-OPEN-FAILURES:** none recurred in 13b's CI or in this step's local runs. Unchanged.
+  * Verified:
+    * `cargo fmt --all --check`; clippy on zen-server `--all-targets -D warnings`, default, `--no-default-features` and `--all-features`
+    * `tests/svc.rs` 3× on embedded (33)
+    * `tests/svc.rs`, `tests/svc_ready.rs` and `tests/multinode.rs` on FDB. The local cluster had stopped; it was restarted with the binary built `--features fdb`.
+    * `npm run check`
+    * `npx vitest run`: 548 passed, 12 skipped (the benches)
+    * `npx playwright test`: 17 passed
+    * the benches with `ZEN_BENCH=1`, against release builds
+    * a script checking the new and changed docs: every relative link, every anchor, and every `TD-` name as a heading of TECH_DEBT
+  * CI green on PR #52's head a39aef6: both runs (push 40141584231, pull request 40141587583) passed every check on their first attempt, with `openssh-pq` skipped as it should be.
+
+## Step 5.5.14 in detail: docs, measurements, the outcome
+
+**Context.** Every piece of milestone 5.5 is built and merged (steps 1–13b). What's left closes the milestone:
+* a guide for whoever runs or writes a relayed service, instead of the spec plus §11 of CLIENT.md
+* measured costs, the way STATS §5.4 has them for zen-db
+* the remaining tech-debt entries
+* the README status and an Outcome section
+
+No new behaviour. A bug the measurements find gets its own commit and a test.
+
+**Restart from main** after PR #51's merge (`git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`). This plan commit carries 13b's CI and merge entry, which isn't in main.
+
+**Commits** (one PR):
+1. `docs: milestone 5.5 step 14 plan`
+2. `svc: an opt-in bench of relayed services`
+3. `docs: relayed services (docs/SVC.md), measurements, tech debt`
+4. `docs: milestone 5.5 outcome`
+
+### Facts from the survey
+* **README** line 46 says milestone 5.5 is in progress with steps 1–10 done. Line 33 lists the apps without `mail`.
+* **`docs/API.md`** is the design-era outline ("draft", "provisional"), with no `/v1/svc/*` rows. spec/api.md §14 is the normative list.
+* **docs/STATS.md** ends at §5.4. The bench pattern is `packages/db/test/bench.test.ts`: `ZEN_BENCH=1`, skipped otherwise, medians of N runs against a local embedded server.
+* **spec/OPS.md** covers building, disk, the FDB pitfalls and advice. It has no section on relayed services. spec/operations.md §4 has the service table rules.
+* **docs/GAPS.md** is the design-gap list (G1–G26), all accepted. G18 (ACME) is the nearest to this milestone.
+* **TECH_DEBT** already has TD-SVC-STATE-ROLLBACK, -TLS-HANDSHAKE-RESUME (from 5.5.7), -SSH-SCOPE, -SSH-PQ-CI, -CONNECT-BACKPRESSURE, -INBOX-ROTATION, TD-MAIL-SCOPE and TD-TEST-OPEN-FAILURES. TD-SVC-ACME and TD-SVC-UDP are named in this plan but don't exist.
+* **The Outcome shape** is `docs/MILESTONE-5.md`'s "## Outcome":
+  * Done, and the differences from the plan
+  * Tests, with counts per package and times
+  * Tech debt, resolved and new
+* **The test harness:** `startWorld` with services and `spawnWorker`; `TestServer` spawns the binary (`packages/client/src/testing/server.ts:144`) but doesn't expose its pid.
+
+### The bench (`apps/echo/test/bench.test.ts`, `ZEN_BENCH=1`, not in CI)
+On the echo world (embedded backend, one machine), it prints a table that goes into STATS §5.5:
+* **Step latency:** a Node peer sends a line and times the reply. Median and p90 of 50, for:
+  * raw `resume: true` and `resume: false`
+  * TLS
+  * SSH (`lines` over one exec channel, timed per line from the client)
+  * a `tcp-auth` connection through `svcConnect`
+  * The handler runs in-process.
+* **Throughput:** `mirror` raw and `mirror-tls`, 20 MB each way; SSH `cat` of 20 MB. In MB/s, in-process.
+* **The takeover pause:** a worker with a 1 s lease TTL is SIGKILLed while a peer sends a line every 5 ms. Measure the longest gap between replies, median of 5. It is about the TTL plus a claim; the bench shows by how much.
+* **An idle connection's cost:**
+  * 1,000 idle raw connections held by one handler: the server's RSS before and after (from `/proc/<pid>/status`; `TestServer` gains `pid`)
+  * the handler's heap delta (`process.memoryUsage().heapUsed`)
+  * the steps run while they sit for 10 s (expected 0)
+* **IMAP:** NOOP latency, and a 10 MB FETCH (MB/s).
+
+### Docs
+* **`docs/SVC.md`** (new): the guide.
+  1. What a relayed service is, and the modes (`tcp`, `tcp-auth`)
+  2. Configuring `[[service]]`:
+     * every setting, with the defaults
+     * `window` for SSH and `idle_secs` for IMAP
+     * the same table on every node
+     * ports
+  3. Writing a handler:
+     * `serve()`, the step, state, layers
+     * `LineReader`, `starttls()`
+     * waking and `again()`
+     * worked from the echo and mail apps, with links to CLIENT.md §11 for the API
+  4. Keys and secrets: certificates, host keys, the inbox seed and app passwords, all as sealed rows; ACME isn't there (TD-SVC-ACME)
+  5. Takeover: what is kept per layer (raw: everything; TLS: after the handshake; SSH: everything); the pause; `resume: false`
+  6. What the server sees, from svc.md §12 in plain words: addresses and timing, and plaintext in transit for non-TLS protocols even with the inbox
+  7. Costs: a pointer to STATS §5.5
+  8. Limits: links to the TD entries
+* **STATS §5.5:** the bench table and how to read it.
+* **spec/OPS.md:**
+  * §2.1: relay bytes in what fills the disk (bounded by `max_conns × window`, counted in the quota)
+  * a new section on the relayed-service tests' tools: `ssh`, `openssl`, `python3`, `ZEN_APPS_BUILT=1`, the OpenSSH-from-source job
+* **docs/API.md:** a "Relayed services" table of the `/v1/svc/*` routes pointing to spec/api.md §14, and a note that spec/api.md is normative.
+* **docs/GAPS.md:** none of G1–G26 changes status. Add a sentence to G18 that relayed services' certificates are brought by the admin (TD-SVC-ACME).
+* **docs/CLIENT.md §11:** a link to SVC.md at its top.
+* **README:**
+  * status: milestone 5.5 done, linking the Outcome
+  * the apps row gains `mail`
+  * the docs list gains SVC.md
+* **DESIGN-3 §6:** 5.5 marked done.
+* **TECH_DEBT:**
+  * **TD-SVC-ACME** (new): certificates are brought by the admin; an ACME client run by a handler, with the challenge served through a relayed `tcp` service on port 80 or TLS-ALPN on 443, would renew them
+  * **TD-SVC-UDP** (new): TCP only; DNS, QUIC and others need datagrams, a different relay model
+  * **TD-TEST-OPEN-FAILURES:** reviewed; any that recurred in steps 13b–14 CI are pursued then
+
+### The Outcome (`docs/MILESTONE-5.5.md`, "## Outcome")
+* **Done,** and what was built, in the M5 shape.
+* **The differences from the plan, condensed from the step logs:**
+  * the step split (13a/13b, plus the CI-fix work in 13a)
+  * the four STARTTLS phases
+  * the SSH bounds and the read-ahead
+  * the windows
+  * waking on claim
+  * 4000 for every WebSocket reset
+  * the sealed inbox's plaintext lengths
+  * app passwords at 160 bits
+* **Tests:**
+  * Rust per crate: zen-svc (tls, ssh, openssh, openssl) and zen-server `svc.rs`
+  * Node per package and app, and Chromium specs, with counts and times from this step's runs
+  * the CI jobs
+* **Measurements:** a pointer to STATS §5.5.
+* **Tech debt:**
+  * new: the TD-SVC-* entries, TD-MAIL-SCOPE, TD-TEST-OPEN-FAILURES
+  * resolved within the milestone: none, or those found
+* **README** links it. The log line for step 14 in both plan copies.
+
+### Verification
+* `npm run check`; the bench run once (`ZEN_BENCH=1`) for the numbers; `npx vitest run` once (the bench is skipped); `npx playwright test` once (unchanged)
+* Links in the new and changed docs checked with a script: each relative path exists, and each `TD-` name is a heading in TECH_DEBT
+* CI green on both runs of the PR
 
 ## Step 5.5.13b in detail: waking handlers, IMAP with IDLE, the inbox page
 
@@ -2479,3 +2611,72 @@ interface RawStep {
 * **SSH engine scope:** it's the largest piece, so it is kept to the subset OpenSSH needs.
 * **Latency:** about 6–10 ms per output step with `resume: true`. Interactive SSH may want `resume: false` per service.
 * **Storage churn:** every byte is a durable write and delete. Bounded by `max_conns × window` and the quota.
+
+## Outcome
+
+Done. Milestone 5.5 made zen-serve a blind TCP relay. The server accepts connections on public ports (`tcp`) or from members over a WebSocket (`tcp-auth`), and keeps each connection's bytes in a durable queue it never reads. Handlers on member clients, Node workers or browser tabs, serve the protocol: each step commits in one transaction with the handler's zen-db rows. When a handler dies, another continues the live connection, TLS and SSH sessions included.
+
+What was built:
+* **The spec:** spec/svc.md, api.md §14, keyspace.md §3.9, seal kinds 9 and 10, the sealed inbox, with vectors.
+* **The server relay:** accept, the input queue and its window, handler leases and claims, the step in `/v1/commit`, release by key reveal, the writer, timers, reaping, and pushed input over the stream.
+* **`tcp-auth` and `zen-connect`:** connections from members, with a CLI that serves as a local port or an ssh `ProxyCommand`.
+* **The sealed inbox:** plaintext input sealed at rest to a key only the handlers hold.
+* **Engines,** sans-IO and resumable from their sealed state (`crates/zen-svc`, built for wasm as `@zen/svc-wasm`):
+  * TLS 1.3 and 1.2, on a RustCrypto provider moved into its own crate (`zen-tls-rustcrypto`)
+  * an SSH server with `mlkem768x25519-sha256` and strict kex
+* **`@zen/svc`:**
+  * `serve()` with the `raw()`, `tls()`, `starttls()` and `ssh()` layers
+  * `LineReader`
+  * waking handlers without input (`wakeOn`, `wake`, `again`)
+* **Two apps:**
+  * `echo`: a line service over raw TCP, TLS, SSH (with a git upload-pack stub), `tcp-auth` and a sealed inbox
+  * `mail`: inbound SMTP with STARTTLS, IMAP with IDLE, app passwords, and an inbox page
+* **The guide** (docs/SVC.md) and **measurements** (docs/STATS.md §5.5).
+
+Differences from the plan above:
+* **Steps.**
+  * Step 13 became two PRs: 13a (STARTTLS, inbound SMTP) and 13b (waking, IMAP, the page).
+  * 13a also carried the CI work of its PR: three test races and two real bugs found from CI reds (`dump` didn't retry `TooOld`; the chat app showed stale typing indicators), plus diagnostics for failures seen once (TD-TEST-OPEN-FAILURES).
+  * Step 14's bench found a lost wake-up in `svc_sub`. When the queue's watch fired, the push loop sent `svc_ready` and only then armed a new watch, so a connection queued in between waited unannounced until `accept_wait_ms` closed it (13 of 1,000 in a burst). The watch is now armed first, with a regression test that widens the window.
+* **TLS 1.2 nonces.** The 1.2 AES-GCM explicit nonce carries a random 32-bit prefix drawn per batch of records, so a rolled-back sequence number repeats a nonce only with probability 2^-32.
+* **STARTTLS has four phases,** not three: a connection switched but whose handshake hasn't begun is still resumable, so the window between the `220` and the ClientHello survives a takeover.
+* **SSH bounds** are across channels, sized to the state's 90,000 bytes: 32 KiB unread, 16 KiB queued, packets up to 35,000 bytes. Because of that read bound, a server rekey can stall behind unread channel data. The engine therefore decrypts ahead during its own key exchange, without consuming, to find the client's KEXINIT.
+* **Windows.** The SSH channel window is 96 KiB (the plan said 2 MiB), so that ten channels and 64 KiB fit an SSH service's 1 MiB input `window`.
+* **Every claim calls the handler once,** with no input. A successor then registers its wake keys again and tells its client what changed during the takeover.
+* **`tcp-auth` resets** close with 4000, an oversized frame included (the plan said 1009 for that).
+* **The sealed inbox** counts plaintext lengths in reads, pushes and quotas. A read from the end of a sealed chunk returned that chunk again before this was fixed.
+* **App passwords** are 160 random bits (four groups of eight base32 letters), not 128.
+* **Not built, as decided:** ACME for relayed services (TD-SVC-ACME), UDP (TD-SVC-UDP), handshake resumption (TD-SVC-TLS-HANDSHAKE-RESUME), real git (milestone 10), outbound mail (TD-MAIL-SCOPE).
+
+Tests (at step 14):
+* **Rust:**
+  * zen-svc:
+    * `tests/tls.rs` 23 and `tests/openssl.rs` 6 (OpenSSL's `s_client`)
+    * `tests/ssh.rs` 18 and `tests/openssh.rs` 10 (OpenSSH 9.6)
+    * `tests/openssh_pq.rs` 2, against OpenSSH 10.6p1 built from source, on demand
+    * 11 unit tests
+    * The tests restore the engine from its state after every input: every record or packet boundary is a takeover point.
+  * zen-tls-rustcrypto: 14 unit tests, including RFC 8448, and 3 handshake tests.
+  * zen-core: the svc seals and their vectors.
+  * zen-server:
+    * `tests/svc.rs` 33 (accept, claims, the window, steps, reveals, takeover, timers, 5,000 idle connections, pushes, `tcp-auth`, the inbox)
+    * `tests/svc_ready.rs` 1
+    * `tests/multinode.rs`: the socket on one node, the handler on another
+    * on both backends
+* **Node (`npx vitest run`: 548 passed, 12 skipped (the opt-in benches), 61 files, about 125 s):**
+  * `@zen/svc` 39: input joining, lines, the TLS and SSH bindings, the `ssh()` and `starttls()` layers
+  * `@zen/client`'s svc tests 13: vectors, the stream subscription, `svcConnect`
+  * echo 39, over raw, TLS, SSH, `tcp-auth`, the inbox and waking:
+    * workers SIGKILLed mid-stream, mid-handshake and mid-key-exchange
+    * 20 MB across two kills (TLS) and 50 MB across two kills with rekeys (SSH)
+  * mail 37: SMTP with Python's `smtplib`, IMAP with `imaplib` and a Node client, workers killed between DATA and its reply, mid-FETCH and while idling
+* **Chromium (Playwright, 17 specs, about 27 s):** a tab serving the echo service raw, over TLS and over SSH, and the mail inbox page with an idling IMAP client.
+* **CI:** `rust`, `pure-rust`, `fdb` and `client` run them on every push. `openssh-pq` is on demand.
+* **Measurements:** an opt-in bench (`ZEN_BENCH=1`), results in docs/STATS.md §5.5. With release builds, a step (a line and its reply) takes 16–20 ms, and a takeover pauses a connection for about the lease TTL (1 s in the bench). An idle connection costs about 127 KiB on the server and no steps.
+
+Tech debt:
+* **Resolved within the milestone:** none of the earlier entries.
+* **New, open:**
+  * TD-SVC-STATE-ROLLBACK, TD-SVC-TLS-HANDSHAKE-RESUME, TD-SVC-SSH-SCOPE, TD-SVC-SSH-PQ-CI
+  * TD-SVC-CONNECT-BACKPRESSURE, TD-SVC-INBOX-ROTATION, TD-SVC-ACME, TD-SVC-UDP
+  * TD-MAIL-SCOPE, TD-TEST-OPEN-FAILURES
