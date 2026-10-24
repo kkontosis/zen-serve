@@ -4,7 +4,7 @@
 // inbox (svc.md §9). Handlers run in-process and as Node workers, which
 // are SIGKILLed between the end of DATA and the reply, and mid-DATA: every
 // message is stored exactly once, with its exact bytes.
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { type Socket, connect as tcp } from 'node:net';
@@ -58,10 +58,6 @@ const seed = new Uint8Array(32);
 const events: Received[] = [];
 
 beforeAll(async () => {
-  execFileSync(process.execPath, ['scripts/build-apps.mjs', 'mail'], {
-    cwd: ROOT_DIR,
-    stdio: 'inherit',
-  });
   await initWasm();
   seed.set(zw.randomBytes(32));
   certs = testCerts();

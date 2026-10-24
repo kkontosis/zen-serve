@@ -1,10 +1,9 @@
 // The checkout saga in Node (EXAMPLES.md §4, the milestone 5 demo): the
 // services run as Node workers (one member, one device each), killed with
 // SIGKILL at will; the test places orders as the customer.
-import { execFileSync } from 'node:child_process';
 import type { Db } from '@zen/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ROOT_DIR, sleep, startWorld, until } from '../../shared/harness.js';
+import { sleep, startWorld, until } from '../../shared/harness.js';
 import { signInWorker, type WorkerContext } from '../../shared/node.js';
 import {
   CATALOG,
@@ -23,12 +22,7 @@ import {
 import { GRANTS } from './grants.js';
 import { providerCharges, SCHEDULER, Services, startProvider, USERS } from './services.js';
 
-beforeAll(() => {
-  execFileSync(process.execPath, ['scripts/build-apps.mjs', 'checkout'], {
-    cwd: ROOT_DIR,
-    stdio: 'inherit',
-  });
-});
+beforeAll(() => {});
 
 /** A world, the customer's database and the services. */
 async function shop(opts: { scheduler: boolean }) {

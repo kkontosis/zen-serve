@@ -2,7 +2,7 @@
 // the client: handlers in-process and as Node workers killed with
 // SIGKILL, mid-transfer (with rekeys) and mid-key-exchange; the session
 // goes on with the next handler. And `git ls-remote` against the stub.
-import { execFile, execFileSync, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type Server, type Socket, connect as tcp } from 'node:net';
 import { promisify } from 'node:util';
@@ -15,7 +15,6 @@ import {
   testSshKeys,
 } from '../../../packages/client/src/testing/index.js';
 import {
-  ROOT_DIR,
   sleep,
   spawnWorker,
   startWorld,
@@ -47,10 +46,6 @@ let port: number;
 const run = promisify(execFile);
 
 beforeAll(async () => {
-  execFileSync(process.execPath, ['scripts/build-apps.mjs', 'echo'], {
-    cwd: ROOT_DIR,
-    stdio: 'inherit',
-  });
   w = await startWorld({
     grants: GRANTS,
     // 10 channels' windows and 64 KiB fit the relay's input window (svc.md §7.2).

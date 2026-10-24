@@ -2,14 +2,12 @@
 // each input chunk at rest, and handlers open them with the inbox seed,
 // kept in a `certs` row. A `STARTTLS` line stops the sealing. Handlers
 // in-process and as Node workers killed with SIGKILL.
-import { execFileSync } from 'node:child_process';
 import { type Socket, connect as tcp } from 'node:net';
 import { bytes, initWasm, isCode, zw } from '@zen/client';
 import type { Db } from '@zen/db';
 import { serve } from '@zen/svc';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
-  ROOT_DIR,
   sleep,
   spawnWorker,
   startWorld,
@@ -36,10 +34,6 @@ let db: Db;
 const seed = new Uint8Array(32);
 
 beforeAll(async () => {
-  execFileSync(process.execPath, ['scripts/build-apps.mjs', 'echo'], {
-    cwd: ROOT_DIR,
-    stdio: 'inherit',
-  });
   await initWasm();
   seed.set(zw.randomBytes(32));
   w = await startWorld({
