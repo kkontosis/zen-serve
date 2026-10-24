@@ -1,6 +1,6 @@
 # zen-serve: API outline (draft)
 
-Based on DESIGN.md, DESIGN-2.md and DESIGN-3.md. All names are provisional.
+Based on DESIGN.md, DESIGN-2.md and DESIGN-3.md. All names are provisional. This is the design-era outline; the normative API is [spec/api.md](../spec/api.md), which is what the server implements.
 
 ## 1. zen-serve HTTP / WebSocket API
 
@@ -66,6 +66,22 @@ This replaces the per-device `device_seq` gap rule from DESIGN-2 §2.3, so concu
 
 ### Static
 `GET /unencrypted/*`, the root aliases (`/`, `/favicon.ico`, …) and the SPA fallback (DESIGN-3 §4.2).
+
+### Relayed services (milestone 5.5)
+Handlers on member clients serve TCP connections the server relays blind ([SVC.md](SVC.md); normative: spec/api.md §14, spec/svc.md). Rights are topic rights on the service id: `consume` to handle, `append` to connect.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/svc/info` | the service's mode, windows, `resume` and inbox key (§14.1) |
+| POST | `/v1/svc/lease` | take, renew or release a handler lease (§14.2) |
+| POST | `/v1/svc/next` | claim queued connections, long-polling (§14.3) |
+| POST | `/v1/svc/state` | a held connection's cursors, state and pending records again (§14.4) |
+| POST | `/v1/commit` (`svc`) | a step: ack input, append output, set the state, atomically with the rest of the commit (§14.5) |
+| POST | `/v1/svc/read` | input from an offset (§14.6) |
+| POST | `/v1/svc/reveal` | release committed output by its key (§14.7) |
+| POST | `/v1/svc/release` | give a connection back, requeued or closed (§14.8) |
+| WS | `/v1/svc/connect` | a `tcp-auth` connection, as a member (§14.9) |
+| WS | `/v1/stream` | `svc_sub`: input and `svc_ready` pushed for a lease; `svc_reveal` (§14.10) |
 
 ---
 

@@ -208,3 +208,44 @@ Reading it:
 * **CRDT writes** are queued: they resolve in microseconds, and the queue sends them after `crdtBatchMs` (10 ms by default), which is most of the 14 ms "waiting" figure. Their commits carry the change event too.
 * **The broker.** The emit-to-handler latency is a commit plus the stream's watch wake-up. `per_key` with 8 handlers in flight doubles sequential throughput, from one client.
 * These are single-client numbers against a local server: they show relative costs and the round trips, not the throughput of a server under load.
+
+### 5.5 Relayed service costs (measured)
+
+`ZEN_BENCH=1 npx vitest run apps/echo/test/bench.test.ts apps/mail/test/bench.test.ts` (opt-in, not in CI), on the echo and mail apps' worlds, at milestone 5.5 step 14:
+* a local zen-serve on the embedded backend, **release build** (`ZEN_SERVE_BIN`), with release WASM modules
+* 4 cores, with the peers, the handler and the server on one machine
+* handlers in the test's process, except for the takeover, which uses Node workers
+
+| Step latency (a line and its reply; each step also inserts a row) | median ms | p90 ms |
+|---|---|---|
+| raw, `resume: true` | 17.6 | 21.5 |
+| raw, `resume: false` | 15.6 | 18.8 |
+| TLS 1.3 | 18.1 | 21.9 |
+| SSH (`lines` on one exec channel) | 19.6 | 23.0 |
+| `tcp-auth` (`svcConnect`) | 19.0 | 23.2 |
+| IMAP `NOOP` (TLS 1.3) | 18.0 | 23.1 |
+
+| Throughput | MB/s |
+|---|---|
+| raw mirror, 20 MB each way | 5.6 |
+| TLS mirror, 20 MB each way | 2.5 |
+| SSH `cat`, 20 MB each way | 2.7 |
+| IMAP `FETCH BODY.PEEK[]` of a 9.6 MB message (output only) | 11.3 |
+
+| Takeover (raw echo, a line every 5 ms, the holder SIGKILLed, a successor already running, lease TTL 1 s) | ms |
+|---|---|
+| the longest wait for a reply, median of 5 rounds | 1,036 (973–1,168) |
+
+| 1,000 idle raw connections held by one handler | |
+|---|---|
+| server RSS | +124 MiB, about 127 KiB per connection |
+| handler heap (Node) | about 7 KiB per connection |
+| handler calls during 10 s idle | 0 |
+
+Reading it:
+* **A step is a few round trips.** A line goes from the socket into storage (a commit), is pushed to the handler, runs in a step (the handler's transaction, a commit), and with `resume: true` its output is released by a reveal (an HTTP request) before the server writes it. `resume: false` skips the reveal and saves about 2 ms. The layers add their engines' work: TLS about half a millisecond, SSH two. `tcp-auth` adds the WebSocket hop.
+* **Throughput** is one step in flight per connection, each taking what input arrived since the last one (at most `window`). TLS and SSH halve it: their engines run in WASM, and each step restores the engine from its sealed state. A large IMAP FETCH writes 256 KiB a step without waiting for input, which is why it is faster than the mirrors.
+* **The takeover pause** is the lease's TTL plus a claim: the successor claims within a few milliseconds of the lease lapsing, and the peer sees a pause, not an error. A shorter TTL takes over faster and renews more often (every second by default).
+* **An idle connection** costs the server a task, its socket and buffers (the input reader keeps a 32 KiB buffer), and its records in storage; the handler keeps its keys and cursors. It costs no steps: nothing runs until input or a wake-up comes.
+* **Debug builds** are slower: the debug server with development WASM measured 22.6 ms for a raw step, and 2.7, 0.8 and 1.1 MB/s for the three mirrors.
+* As with §5.4, these are single-client figures on one machine: they show what a step costs, not a server under load.

@@ -38,10 +38,10 @@ Pitfalls:
 
 | You want | Command |
 |---|---|
-| Every Node test | `npx vitest run` (the apps' scenarios need `npm run build:apps` first: their workers run from `apps/dist`) |
+| Every Node test | `npx vitest run` (it builds the apps and `zen-connect` once first, `scripts/vitest-setup.ts`: their workers run from `apps/dist`) |
 | One file | `npx vitest run packages/db/test/txn.test.ts` |
 | The browser tests | `npx playwright test` (builds the apps first); one project: `--project=apps` |
-| The measurements | `ZEN_BENCH=1 npx vitest run packages/db/test/bench.test.ts packages/loro/test/bench.test.ts` (docs/STATS.md §5.4) |
+| The measurements | `ZEN_BENCH=1 npx vitest run packages/db/test/bench.test.ts packages/loro/test/bench.test.ts` (docs/STATS.md §5.4); relayed services: `ZEN_BENCH=1 npx vitest run apps/echo/test/bench.test.ts apps/mail/test/bench.test.ts` (§5.5, measured with `ZEN_SERVE_BIN` set to a release build) |
 
 Pitfalls:
 * **A server per test file.** Each file spawns its own zen-serve in `beforeAll`; tests in one file share it, so give each test its own database name or topic.
@@ -49,6 +49,22 @@ Pitfalls:
 * **Await your own work before closing.** `Db.close()` waits up to 5 s for running transactions, which then fail `closed`; a test that fires writes without awaiting them sees those failures. Keep the promises and await them (`Promise.allSettled`) before a restart.
 * **Poll with a deadline** (`until`), never a fixed sleep: consumers, the indexer and the stream run in the background.
 * **Kill only the processes you spawned** (app workers, servers), by PID, never `pkill -f`.
+* **Several runs at once:** set `ZEN_APPS_BUILT=1` on all but one (or on all, after a build): the build empties `apps/dist/<app>` first, and a worker starting meanwhile fails with `MODULE_NOT_FOUND`. After changing an app's sources, rebuild it (`node scripts/build-apps.mjs <app>`), or its workers run the old code.
+
+### 1.3 Relayed-service tests
+
+The relayed services' tests (`crates/zen-svc`, `apps/echo`, `apps/mail`, `packages/svc`) run real clients, and say which one is missing:
+
+| Tool | Used by | Install (Ubuntu) |
+|---|---|---|
+| `openssl` | `s_client` against the TLS engine; the test certificates (`testCerts`) | `openssl` |
+| `ssh`, `ssh-keygen` | OpenSSH against the SSH engine and the `ssh()` layer; `zen-connect` as a `ProxyCommand` | `openssh-client` |
+| `python3` | `smtplib` and `imaplib` against the mail app (run as `python3 -I`) | `python3` |
+| `git` | `git ls-remote` against the echo app's upload-pack stub | `git` |
+
+* **OpenSSH 9.6** (Ubuntu 24.04) has no `mlkem768x25519-sha256`. `tests/openssh_pq.rs` is ignored unless `ZEN_TEST_SSH` names an OpenSSH 9.9 or later: `scripts/build-openssh.sh <prefix>` builds 10.6p1 from source in about 10 s. CI's `openssh-pq` job does this, on demand only (`workflow_dispatch`).
+* **Ports.** Each test world gives its services free ports on 127.0.0.1; nothing listens on a fixed port.
+* **Takeover tests** SIGKILL handler workers and wait out a 1 s lease. A loaded machine stretches them; their bounds leave room for that, so a failure there is worth reading, not re-running.
 
 ## 2. What fills the disk
 
@@ -63,6 +79,7 @@ From fastest-growing to slowest (rates and retention in STATS.md §2–3):
 6. **The embedded file never shrinks**: freed pages are reused, but the file keeps its peak size (`TD-STORE-COMPACTION`).
 7. **FoundationDB trace logs:** about 100 MB per `fdbserver` process.
 8. **Replication:** `double` and `triple` store every byte two or three times across nodes.
+9. **Relayed connections:** input waits in storage until a handler acks it, output until it is written. Each connection holds at most `window` plus `out_window` bytes, so a service holds at most `max_conns × (window + out_window)` per node (1,024 × 1.25 MiB, about 1.3 GB, by default), counted in the fs quota. It is freed as the bytes move: a handler that stops acking holds its connections' share until they time out.
 
 **FoundationDB stops accepting writes when a disk is nearly full.** Everything stalls: reads and status calls time out (`fdbcli status` hangs), and transactions in flight end with `commit_unknown`. Free space and it recovers by itself within seconds. **Watch free disk, and alert well before 10 %.**
 

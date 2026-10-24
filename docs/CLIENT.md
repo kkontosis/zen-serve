@@ -269,6 +269,8 @@ await session.logout(); await vault.forget();             // sign-out
 
 ## 11. Relayed services (`@zen/svc`)
 
+[SVC.md](SVC.md) is the guide to running and writing relayed services (configuration, keys, takeover, what the server sees, costs); this section is the API.
+
 A relayed service (spec/svc.md) is a TCP port of zen-serve whose connections are served by handlers on member clients: the server stores each connection's bytes and never reads them. The service id is the topic id of a path, conventionally `svc/<name>`, and the server's `[[service]]` table names it; serving needs topic `consume` on it.
 
 ```ts
