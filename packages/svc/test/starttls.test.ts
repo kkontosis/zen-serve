@@ -1,13 +1,13 @@
 // The `starttls()` layer, driven as the runtime drives it but without a
-// zen server, against Node's TLS client over an in-memory socket. The
-// client speaks plain, sends STARTTLS, then wraps the same socket in TLS.
+// zen server, against Node's TLS client over TCP. The client speaks
+// plain, sends STARTTLS, then wraps the same socket in TLS.
 // After every committed step outside the handshake the layer is dropped
 // and a new one loads the committed engine state, as a successor would.
 import { createServer, type Server, type Socket, connect as tcp } from 'node:net';
 import { connect, type TLSSocket } from 'node:tls';
 import { cbor } from '@zen/db';
 import type { SvcInfo } from '@zen/wasm';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { type TestCerts, testCerts } from '../../client/src/testing/index.js';
 import { SVC_CLOSE } from '../src/flags.js';
 import { type Engine, type Finished, type LayerConn, type RawStep, raw } from '../src/layer.js';
@@ -19,6 +19,8 @@ let engine: Engine<RawStep>;
 let server: Server;
 let port = 0;
 let nextDriver: ((d: Driver) => void) | undefined;
+/** The drivers of the running test: stopped after it, before the engine is closed. */
+const drivers = new Set<Driver>();
 const info = { resume: true, window: 1 << 18, out_window: 1 << 16 } as unknown as SvcInfo;
 
 beforeAll(async () => {
@@ -28,8 +30,13 @@ beforeAll(async () => {
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   port = (server.address() as { port: number }).port;
 });
+afterEach(() => {
+  for (const d of drivers) d.stop();
+});
 afterAll(() => {
   server?.close();
+  for (const d of drivers) d.stop();
+  // Late socket events find their drivers stopped: nothing uses the config now.
   engine?.close();
 });
 
@@ -99,11 +106,13 @@ class Driver {
   errors: unknown[] = [];
   takeovers = 0;
   ended = false;
+  private stopped = false;
   private busy = false;
   private more = false;
   readonly seen: string[] = [];
 
   constructor(readonly sock: Socket) {
+    drivers.add(this);
     this.lc = engine.conn();
     this.lc.load(null, true);
     sock.on('data', (chunk: Buffer) => {
@@ -111,17 +120,33 @@ class Driver {
       n.set(this.pending);
       n.set(chunk, this.pending.length);
       this.pending = n;
-      void this.run();
+      this.kick();
     });
     sock.on('end', () => {
       this.eof = true;
-      void this.run();
+      this.kick();
     });
     sock.on('error', () => {});
-    void this.run();
+    this.kick();
+  }
+
+  /** Run the steps due; a failure is recorded, for the test to see. */
+  private kick(): void {
+    this.run().catch((e) => this.errors.push(e));
+  }
+
+  /** Stop serving: the socket is destroyed and the layer freed. */
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.ended = true;
+    drivers.delete(this);
+    this.sock.destroy();
+    this.lc.free();
   }
 
   async run(): Promise<void> {
+    if (this.stopped) return;
     if (this.busy) {
       this.more = true;
       return;
