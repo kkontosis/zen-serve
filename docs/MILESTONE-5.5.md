@@ -387,6 +387,9 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
         * `npx vitest run` 3× (508 passed each time, 7 skipped)
         * `npx playwright test` (16)
       * CI green on c1e9fb1: both runs (push and pull request) passed every check on their first attempt, with nothing re-run. The ledger failure and `push_input`'s 1 s remain open, with their diagnostics in place.
+      * **More information for next time** (the user asked whether a recurrence would tell more).
+        * Commit `apps: ledger: a failed balance check names the transfer that went wrong`: each committed transfer records its trader and the balances and times it wrote. On a failed sum, each account's transfers are replayed in time order, and one that didn't build on the balance before it is named, with its trader and the transfer before it. Checked by making a recorded transfer stale on purpose.
+        * Commit `server: the svc tests show the server's warnings when they fail`: a tracing subscriber (`zen_server=warn`, captured per test). A failing `push_input` shows any `storing relayed input` warning next to its ten push times. Checked by forcing its bound to fail.
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
