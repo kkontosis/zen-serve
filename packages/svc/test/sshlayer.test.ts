@@ -61,7 +61,7 @@ async function layerServer(
         for (let again = true; again && !closed; ) {
           more = false;
           stats.steps++;
-          const p = lc.prepare(pending, eof, false);
+          const p = lc.prepare(pending, eof, false, false);
           const live = lc.open(p, {
             conn: new Uint8Array(16),
             peer: { addr: '127.0.0.1', port: 0 } as never,

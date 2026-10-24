@@ -107,6 +107,13 @@ interface Conn<S> {
   seenEof: boolean;
   /** A step is due even without new input (a fresh connection: the server may speak first). */
   due: boolean;
+  /**
+   * The handler must be called even without new input: a wake, `again()`,
+   * or a claim (a successor registers its wake keys again).
+   */
+  wake: boolean;
+  /** The handler's wake keys (`wakeOn`). */
+  keys: Set<string>;
   busy: boolean;
   gone: boolean;
   /** Since when input past a gap has waited (local ms; 0: no gap). */
@@ -128,6 +135,9 @@ interface Step0 extends Prepared {
   inEnd: bigint;
   rawEof: boolean;
 }
+
+/** Keys of recent wakes remembered (`ServeHandle.wake`): older ones count as woken. */
+const WOKEN_KEYS = 4096;
 
 /** Input pushed for a connection whose claim hasn't arrived yet. */
 interface Early {
@@ -174,6 +184,11 @@ export class ServeHandle<S = RawStep> {
   private readonly busy = new Set<Promise<unknown>>();
   private claiming = false;
   private claimAgain = false;
+  /** Wakes so far, and each key's latest (bounded: see `wokeSince`). */
+  private wakes = 0;
+  private readonly woken = new Map<string, number>();
+  /** The latest wake forgotten from `woken`. */
+  private forgotten = 0;
   /** Ends the current lease's generation. */
   private lost: ((e: unknown) => void) | undefined;
 
@@ -219,6 +234,38 @@ export class ServeHandle<S = RawStep> {
     this.engine?.close();
     this.engine = undefined;
     this.svc.close();
+  }
+
+  /**
+   * Wake the connections whose handler registered `key` (`c.wakeOn`): each
+   * gets a step, and its handler is called even without new input. A wake
+   * that comes while a step runs is not lost: if the keys that step leaves
+   * include `key`, the connection steps again.
+   */
+  wake(key: string): void {
+    const n = ++this.wakes;
+    this.woken.delete(key);
+    this.woken.set(key, n);
+    if (this.woken.size > WOKEN_KEYS) {
+      const [k, m] = this.woken.entries().next().value as [string, number];
+      this.woken.delete(k);
+      this.forgotten = m;
+    }
+    const signal = this.ctl?.signal;
+    for (const c of this.held.values()) {
+      if (!c.keys.has(key)) continue;
+      c.wake = true;
+      if (signal) this.schedule(c, signal);
+    }
+  }
+
+  /** Whether any of `keys` was woken after wake number `since`. */
+  private wokeSince(keys: Set<string>, since: number): boolean {
+    if (keys.size === 0) return false;
+    // A key forgotten since then may have been woken: assume it was.
+    if (this.forgotten > since) return true;
+    for (const k of keys) if ((this.woken.get(k) ?? 0) > since) return true;
+    return false;
   }
 
   private get maxConns(): number {
@@ -421,6 +468,10 @@ export class ServeHandle<S = RawStep> {
       seenTo: c.in_acked,
       seenEof: false,
       due: c.in_acked === 0n && c.out_head === 0n && !c.state,
+      // A successor calls the handler once: its wake keys were in the
+      // process that held the connection before.
+      wake: true,
+      keys: new Set(),
       busy: false,
       gone: false,
       gapAt: 0,
@@ -656,7 +707,7 @@ export class ServeHandle<S = RawStep> {
   private schedule(conn: Conn<S>, signal: AbortSignal): void {
     if (conn.busy || conn.gone || signal.aborted) return;
     const eof = conn.eofAt !== undefined && conn.input.end >= conn.eofAt;
-    if (!(conn.due || conn.input.end > conn.seenTo || (eof && !conn.seenEof))) return;
+    if (!(conn.due || conn.wake || conn.input.end > conn.seenTo || (eof && !conn.seenEof))) return;
     conn.busy = true;
     void this.track(
       this.stepLoop(conn, signal).finally(() => {
@@ -735,7 +786,7 @@ export class ServeHandle<S = RawStep> {
   private prepare(conn: Conn<S>): Step0 {
     const inEnd = conn.input.end;
     const rawEof = conn.eofAt !== undefined && inEnd >= conn.eofAt;
-    const p = conn.layer.prepare(conn.input.bytes(), rawEof, (conn.flags & C_FIN) !== 0);
+    const p = conn.layer.prepare(conn.input.bytes(), rawEof, (conn.flags & C_FIN) !== 0, conn.wake);
     if (p.error) this.report(p.error, conn.conn);
     return { ...p, inEnd, rawEof };
   }
@@ -744,6 +795,8 @@ export class ServeHandle<S = RawStep> {
   private async step(conn: Conn<S>): Promise<void> {
     conn.prep ??= this.prepare(conn);
     const p = conn.prep;
+    // Wakes after this one reach the step's keys (see below).
+    const wakes = this.wakes;
     const finSent = (conn.flags & C_FIN) !== 0;
     let built: Built | undefined;
     let fin: Finished | undefined;
@@ -796,12 +849,19 @@ export class ServeHandle<S = RawStep> {
     conn.seenTo = p.inEnd;
     conn.seenEof = p.rawEof;
     conn.due = false;
+    // The last attempt's keys apply. A wake for them during the step (its
+    // handler may have read before the change it announces) steps again.
+    if (fin?.wakeOn) conn.keys = new Set(fin.wakeOn);
+    conn.wake = this.wokeSince(conn.keys, wakes);
     const b = built!;
     if (b.step && !committed) return;
     conn.prep = undefined;
     conn.layer.committed(p, fin!, live!);
     conn.app = b.app;
-    if (fin!.again) conn.due = true;
+    if (fin!.again) {
+      conn.due = true;
+      conn.wake = true;
+    }
     if (b.step) {
       conn.at = Date.now();
       this.see(conn.key, b.inTo, b.outHead);

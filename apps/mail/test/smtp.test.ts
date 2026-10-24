@@ -26,22 +26,35 @@ import {
 } from '../../shared/harness.js';
 import { signInWorker, type WorkerContext } from '../../shared/node.js';
 import {
+  appPasswords,
+  bodyRange,
+  type Changed,
+  type Counter,
+  changedTopic,
+  checkAppPassword,
+  createAppPassword,
   DB_OPTIONS,
   type Draft,
   decodeData,
+  expunge,
+  headerLength,
+  loginUser,
   type Message,
   messageBytes,
   messages,
   NS,
   type Part,
+  parseFields,
   putCert,
   putInboxSeed,
   putMailbox,
   type Received,
   receivedTopic,
+  revokeAppPassword,
   SMTP_SERVICE,
   type SmtpOptions,
   serveSmtp,
+  setFlags,
   sweepDrafts,
 } from '../src/mail.js';
 import { GRANTS } from './grants.js';
@@ -302,6 +315,23 @@ describe('inbound SMTP in process (Python smtplib)', () => {
           expect(m!.from).toBe('sender@remote.test');
           expect(m!.head).toMatch(/^Received: from client\.test \(\[127\.0\.0\.1/);
           expect(m!.head).toContain(tls ? `with ESMTPS (TLSv${tls}:` : 'with ESMTP id');
+          // The header section, through its blank line, and its fields.
+          const text = new TextDecoder().decode(data);
+          expect(m!.hdr).toBe(
+            new TextEncoder().encode(m!.head).length + text.indexOf('\r\n\r\n') + 4,
+          );
+          expect(m!.fields).toEqual({
+            from: 'sender@remote.test',
+            to: 'alice@example.test',
+            cc: '',
+            subject,
+            date: '',
+            messageId: '',
+          });
+          const ctr = await db.table<Counter>('counters').get(user);
+          expect(m!.modseq).toBeGreaterThan(0);
+          expect(m!.modseq).toBeLessThanOrEqual(ctr!.modseq!);
+          expect(ctr!.validity).toBeGreaterThan(1);
           await until(
             () => events.some((e) => e.user === user && e.uid === m!.uid),
             10_000,
@@ -560,5 +590,128 @@ describe('drafts', () => {
       expect(await db.table<Draft>('drafts').get(draft)).toBeUndefined();
       expect(await partsOf(draft)).toEqual([]);
     });
+  });
+});
+
+describe('what IMAP and the page share', () => {
+  /** Store one message to these recipients; their copies, by user. */
+  async function deliver(to: string[], data: Uint8Array): Promise<Map<string, Message>> {
+    const subject = subjectOf(data);
+    await serving(async () => {
+      const r = await py([{ from: 'sender@remote.test', to, data }]);
+      expect(r.find((x) => x.cmd === 'data')).toMatchObject({ code: 250 });
+    });
+    const out = new Map<string, Message>();
+    for (const addr of to) {
+      const user = addr.startsWith('bob') ? 'bob' : 'alice';
+      const [m] = await copies(user, subject);
+      out.set(user, m!);
+    }
+    return out;
+  }
+
+  it('header fields: folded, the first of each, and a header without a body', () => {
+    const enc = new TextEncoder();
+    const f = parseFields(
+      enc.encode(
+        'Subject: one\r\n two\r\nFrom: "A" <a@x>\r\nSubject: later\r\nMessage-ID: <id@x>\r\nCC: c@x\r\n\r\n',
+      ),
+    );
+    expect(f).toEqual({
+      from: '"A" <a@x>',
+      to: '',
+      cc: 'c@x',
+      subject: 'one two',
+      date: '',
+      messageId: '<id@x>',
+    });
+  });
+
+  it('setFlags and expunge: modseq, the changed events, parts kept while a copy is left', async () => {
+    const changed: Changed[] = [];
+    const sub = await db.on<Changed>(changedTopic(db), (m) => void changed.push(m.body));
+    try {
+      const data = letter(`shared ${Date.now()}`, 'x'.repeat(200_000));
+      const both = await deliver(['alice@example.test', 'bob@example.test'], data);
+      const a = both.get('alice')!;
+      const b = both.get('bob')!;
+      expect(a.draft).toBe(b.draft);
+      const ch = await db.transaction((tx) =>
+        setFlags(tx, 'alice', [a.uid, 99_999], 'add', ['\\Flagged', '\\Seen']),
+      );
+      expect(ch).toEqual([
+        { uid: a.uid, flags: ['\\Seen', '\\Flagged'], modseq: expect.any(Number) },
+      ]);
+      expect(ch[0]!.modseq).toBeGreaterThan(a.modseq!);
+      // No change, no new modseq and no event.
+      expect(
+        await db.transaction((tx) => setFlags(tx, 'alice', [a.uid], 'add', ['\\Seen'])),
+      ).toEqual([]);
+      expect(
+        await db.transaction((tx) => setFlags(tx, 'alice', [a.uid], 'remove', ['\\Seen'])),
+      ).toMatchObject([{ flags: ['\\Flagged'] }]);
+      await until(() => changed.filter((c) => c.user === 'alice').length === 2, 10_000, 'events');
+      expect(changed).toEqual([
+        { user: 'alice', kind: 'flags' },
+        { user: 'alice', kind: 'flags' },
+      ]);
+      const nParts = (await partsOf(a.draft)).length;
+      expect(nParts).toBe(4);
+      expect(await db.transaction((tx) => expunge(tx, 'alice', [a.uid]))).toEqual([a.uid]);
+      expect(await db.table<Message>('messages').get(['alice', a.uid])).toBeUndefined();
+      expect((await partsOf(a.draft)).length).toBe(nParts);
+      expect(await db.transaction((tx) => expunge(tx, 'bob', [b.uid]))).toEqual([b.uid]);
+      expect(await partsOf(a.draft)).toEqual([]);
+      await until(() => changed.length === 4, 10_000, 'the expunge events');
+      expect(changed.slice(2)).toEqual([
+        { user: 'alice', kind: 'expunge' },
+        { user: 'bob', kind: 'expunge' },
+      ]);
+    } finally {
+      await sub.close();
+    }
+  }, 60_000);
+
+  it('bodyRange reads any range across parts; headerLength for rows without hdr', async () => {
+    const body = Array.from({ length: 3000 }, (_, i) => `line ${i} ${'y'.repeat(40)}\r\n`).join('');
+    const data = letter(`range ${Date.now()}`, body);
+    const m = (await deliver(['alice@example.test'], data)).get('alice')!;
+    const all = await messageBytes(db, 'alice', m.uid);
+    expect(all.length).toBe(m.size);
+    const head = new TextEncoder().encode(m.head).length;
+    for (const [from, len] of [
+      [0, m.size],
+      [0, 10],
+      [head - 3, 10],
+      [65_536 + head - 5, 10],
+      [65_536 * 2, 70_000],
+      [m.size - 4, 100],
+      [m.size, 10],
+    ] as const) {
+      const got = await db.transaction((tx) => bodyRange(tx, m, from, len));
+      expect(bytes.hex(got)).toBe(bytes.hex(all.subarray(from, from + len)));
+    }
+    const { hdr, ...old } = m;
+    expect(await db.transaction((tx) => headerLength(tx, old))).toBe(hdr);
+  }, 60_000);
+
+  it('app passwords: made, checked, listed and revoked; login by name or address', async () => {
+    const p = await createAppPassword(db, 'alice', 'phone');
+    expect(p.password).toMatch(/^[a-z2-7]{8}(-[a-z2-7]{8}){3}$/);
+    const list = await appPasswords(db, 'alice');
+    expect(list.find((x) => x.id === p.id)).toMatchObject({ label: 'phone', user: 'alice' });
+    expect(JSON.stringify(list)).not.toContain(p.password);
+    const check = (login: string, pw: string) =>
+      db.transaction(async (tx) => checkAppPassword(tx, await loginUser(tx, login), pw));
+    expect(await check('alice', p.password)).toBe(p.id);
+    // Dashes, spaces and case don't matter.
+    expect(await check('Alice@Example.test', p.password.replace(/-/g, ' ').toUpperCase())).toBe(
+      p.id,
+    );
+    expect(await check('bob', p.password)).toBeUndefined();
+    expect(await check('nobody@example.test', p.password)).toBeUndefined();
+    expect(await check('alice', 'wrong')).toBeUndefined();
+    expect(await revokeAppPassword(db, 'alice', p.id)).toBe(true);
+    expect(await check('alice', p.password)).toBeUndefined();
   });
 });

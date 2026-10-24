@@ -299,7 +299,16 @@ await h.stop();                                      // the server requeues its 
   for (let l = r.nextText(); l !== null; l = r.nextText()) { … }   // next() gives bytes
   c.ack(r.consumed);                                   // r.rest(): what follows; r.tooLong
   ```
-* **Not yet:** waking a handler without new input (IMAP IDLE), and IMAP: milestone 5.5 step 13b.
+* **Waking a handler without input.** A handler runs when input arrives, but some protocols must speak when something else changed: IMAP's IDLE tells a client of new mail. A step registers keys with `c.wakeOn(...keys)` (they replace the keys of earlier steps; `c.wakeOn()` clears them), and `h.wake(key)` gives each connection held under those keys a step whose handler is called with no new input, under `tls()` too:
+  ```ts
+  const h = serve(db, { service: ['svc', 'imaps'], layer, handler: async (c, tx) => {
+    // … read commands; while idling: tell the client what changed, then
+    c.wakeOn(user);
+  } });
+  await db.on(receivedTopic(db), (m) => h.wake(m.body.user));
+  ```
+  A wake that comes while a step runs is not lost: if the keys that step leaves include it, the connection steps again. Keys live only in the process that holds the connection: a successor calls the handler once when it claims a connection, with no input, so the handler registers them again (and tells its client what changed during the takeover). An idle connection costs no steps.
+* **Output larger than a step.** A step writes at most `c.room` bytes (`out_window`, less what the layer adds). A handler with more to send writes part of it, keeps its place in `c.state` and calls `c.again()`: the next step follows at once, without new input. IMAP sends a 10 MB message this way, 256 KiB a step, and a successor continues the literal where the last committed step left it.
 
 ### TLS: `tls()`
 

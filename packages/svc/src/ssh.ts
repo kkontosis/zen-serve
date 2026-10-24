@@ -219,7 +219,7 @@ class SshLayerConn implements LayerConn<SshStep> {
     if (this.state || !same) throw new ZenError(0, 'format', 'an SSH connection without a state');
   }
 
-  prepare(input: Uint8Array, eof: boolean): SshPrepared {
+  prepare(input: Uint8Array, eof: boolean, _finSent: boolean, _wake: boolean): SshPrepared {
     const sw = this.e.sw;
     const c = this.state
       ? sw.SshConn.restore(this.e.config, this.state)
