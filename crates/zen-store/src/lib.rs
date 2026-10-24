@@ -65,6 +65,8 @@ pub enum Error {
     CommitUnknown,
     /// Backend I/O or corruption.
     Io(String),
+    /// The runtime is shutting down: the operation never ran.
+    Shutdown,
 }
 
 impl std::fmt::Display for Error {
@@ -75,6 +77,7 @@ impl std::fmt::Display for Error {
             Error::Unreadable => write!(f, "key has an unreadable pending mutation"),
             Error::CommitUnknown => write!(f, "commit result unknown"),
             Error::Io(e) => write!(f, "storage I/O: {e}"),
+            Error::Shutdown => write!(f, "storage shutting down"),
         }
     }
 }

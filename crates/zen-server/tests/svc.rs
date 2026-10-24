@@ -1467,7 +1467,7 @@ async fn push_input() {
     let mut p = Pushed::default();
     assert_eq!(p.until(&mut ws, &c.conn, 0, 5).await, b"hello");
 
-    let mut worst = Duration::ZERO;
+    let mut each = Vec::new();
     for i in 0..10 {
         let t0 = Instant::now();
         let line = format!("line {i}\n");
@@ -1475,12 +1475,14 @@ async fn push_input() {
         let have = p.data[&c.conn].len();
         let got = p.until(&mut ws, &c.conn, 0, have + line.len()).await;
         assert!(got.ends_with(line.as_bytes()));
-        worst = worst.max(t0.elapsed());
+        each.push(t0.elapsed());
     }
+    let worst = each.iter().max().copied().unwrap_or_default();
     println!("push latency, worst of 10: {worst:?}");
+    // All ten on failure: one stalled push, or every one slow (a loaded runner).
     assert!(
         worst < Duration::from_secs(1),
-        "pushed within 1 s: {worst:?}"
+        "pushed within 1 s: {each:?}"
     );
 
     peer.shutdown().await.unwrap();

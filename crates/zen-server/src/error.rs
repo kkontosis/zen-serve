@@ -71,6 +71,11 @@ impl From<zen_store::Error> for ApiError {
             zen_store::Error::CommitUnknown => {
                 commit_unknown("the commit may or may not have been applied")
             }
+            // Not an error of the storage: the server is stopping.
+            zen_store::Error::Shutdown => {
+                tracing::debug!("storage shutting down");
+                internal("storage shutting down")
+            }
             other => {
                 tracing::error!(error = %other, "storage error");
                 internal("storage error")
