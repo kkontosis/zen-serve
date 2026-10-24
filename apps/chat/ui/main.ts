@@ -27,9 +27,9 @@ import {
   sendMessage,
   sendPhoto,
   servePresence,
-  showFor,
   TYPING_SHOW_MS,
   Typing,
+  Typists,
   whoIsOnline,
 } from '../src/chat.js';
 
@@ -141,6 +141,7 @@ function onMsg(g: number, m: ChatMsg): void {
   if (g !== gen) return;
   shown.push(m);
   last = m.offset;
+  messageFrom(m.from, m.sentMs);
   list.append(msgItem(m));
   list.scrollTop = list.scrollHeight;
   toMark = { room: m.room, offset: m.offset };
@@ -171,6 +172,9 @@ async function openRoom(id: string): Promise<void> {
   last = START;
   render(list);
   render(typingLine);
+  typists = new Typists();
+  for (const t of typingTimers.values()) clearTimeout(t);
+  typingTimers.clear();
   typing = new Typing(db, room, user);
   typingSub = await onTyping(db, room, showTyping);
   await follow();
@@ -186,31 +190,37 @@ addEventListener('online', () => void follow().catch(fail));
 
 // ------------------------------------------------------------ typing
 
-// Each member typing, until their newest indicator's time is up.
-const typists = new Map<string, { until: number; timer: ReturnType<typeof setTimeout> }>();
-// The indicators this page sent and received (wall and corrected clock
-// times), for the spec's failure messages.
+// Each member typing, until their indicator's time is up or their message
+// arrives; a timer per member ends it.
+let typists = new Typists();
+const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// The indicators this page sent and received, and the messages that ended
+// one (wall and corrected clock times), for the spec's failure messages.
 const typingLog: Record<string, unknown>[] = [];
 function showTyping(from: string, sentMs: number): void {
   if (from === user) return;
-  const left = showFor(db, sentMs);
-  typingLog.push({ from, sentMs, now: db.fs.session.clock.now(), wall: Date.now(), left });
-  const until = sentMs + TYPING_SHOW_MS;
-  const t = typists.get(from);
-  // An older indicator, arriving late, doesn't shorten a newer one.
-  if (left <= 0 || (t && t.until >= until)) return;
-  if (t) clearTimeout(t.timer);
-  typists.set(from, {
-    until,
-    timer: setTimeout(() => {
-      typists.delete(from);
-      drawTyping();
-    }, left),
-  });
+  const now = db.fs.session.clock.now();
+  typingLog.push({ from, sentMs, now, wall: Date.now(), left: sentMs + TYPING_SHOW_MS - now });
+  const until = typists.typing(from, sentMs, now);
+  if (until === undefined) return;
+  clearTimeout(typingTimers.get(from));
+  typingTimers.set(
+    from,
+    setTimeout(() => {
+      if (typists.end(from, until)) drawTyping();
+    }, until - now),
+  );
+  drawTyping();
+}
+function messageFrom(from: string, sentMs: number): void {
+  if (!typists.sent(from, sentMs)) return;
+  typingLog.push({ message: from, sentMs, now: db.fs.session.clock.now() });
+  clearTimeout(typingTimers.get(from));
+  typingTimers.delete(from);
   drawTyping();
 }
 function drawTyping(): void {
-  const names = [...typists.keys()];
+  const names = typists.names;
   render(typingLine, names.length ? `${names.join(', ')} typing…` : '');
 }
 input.addEventListener('input', () => {
@@ -329,6 +339,7 @@ render(
               await sendMessage(db, room, user, text);
             }
             input.value = '';
+            typing.reset();
             render(errorLine);
           } catch (err) {
             fail(err);
@@ -355,7 +366,7 @@ ready(ctx, {
   /** The offsets shown (hex), to check for repeats. */
   offsets: () => shown.map((m) => bytes.hex(m.offset)),
   room: () => room,
-  typists: () => [...typists.keys()],
+  typists: () => typists.names,
   typingLog: () => typingLog,
   whoIsOnline: () => whoIsOnline(db),
 });

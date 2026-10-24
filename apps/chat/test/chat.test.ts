@@ -31,6 +31,7 @@ import {
   showFor,
   TYPING_SHOW_MS,
   Typing,
+  Typists,
   whoIsOnline,
 } from '../src/chat.js';
 import { GRANTS } from './grants.js';
@@ -98,6 +99,8 @@ describe('messages', () => {
     expect(seen[0]!.id).toBe(first);
     expect(seen[1]).toMatchObject({ id: photo.id, photo: photo.blob });
     expect(seen[2]!.reply_to).toBe(photo.id);
+    // Each carries when it was sent, on the sender's clock.
+    for (const m of seen) expect(Math.abs(m.sentMs - Date.now())).toBeLessThan(60_000);
     // The room's photos, through the fast index, and the file's bytes.
     const photos = await roomPhotos(b.db, room);
     expect(photos.map((p) => [p.id, p.name, p.size])).toEqual([[photo.blob, 'beach.jpg', 150_000]]);
@@ -239,6 +242,9 @@ describe('typing and presence', () => {
     await until(() => typing.length === 2, 15_000, 'a second one');
     expect(typing).toEqual(['alice', 'alice']);
     await sendMessage(a.db, room, 'alice', 'done typing');
+    // After a message, the next keystroke begins another: announced at once.
+    t.reset();
+    expect(await t.notify()).toBe(true);
     // The log: no event on the typing topic, and only `msg` on the room's.
     const typingLog = [];
     for await (const e of b.ctx.fs.topic('chat', room, 'typing').read()) typingLog.push(e);
@@ -279,6 +285,32 @@ describe('typing and presence', () => {
     for (const s of subs) await s.close();
     await signOut(a);
     await signOut(b);
+  });
+
+  it("a message ends its sender's typing indicator, and one sent before it stays ended", () => {
+    const t = new Typists();
+    const now = 1_000_000;
+    expect(t.typing('alice', now - 100, now)).toBe(now - 100 + TYPING_SHOW_MS);
+    expect(t.typing('bob', now, now)).toBe(now + TYPING_SHOW_MS);
+    expect(t.names).toEqual(['alice', 'bob']);
+    // Alice's message, sent after her indicator, ends it.
+    expect(t.sent('alice', now + 50)).toBe(true);
+    expect(t.names).toEqual(['bob']);
+    // Her indicator from before it, arriving late, doesn't bring it back;
+    // one sent after it is for her next message.
+    expect(t.typing('alice', now + 40, now + 60)).toBeUndefined();
+    expect(t.typing('alice', now + 80, now + 90)).toBe(now + 80 + TYPING_SHOW_MS);
+    // A message sent before Bob's newest indicator leaves it.
+    expect(t.sent('bob', now - 10)).toBe(false);
+    expect(t.names).toEqual(['bob', 'alice']);
+    // An indicator already over, or older than the one shown, changes nothing.
+    expect(t.typing('carol', now - TYPING_SHOW_MS, now)).toBeUndefined();
+    expect(t.typing('bob', now - 5, now)).toBeUndefined();
+    // The timer of a replaced indicator doesn't end the newer one.
+    const later = t.typing('bob', now + 500, now + 500);
+    expect(t.end('bob', now + TYPING_SHOW_MS)).toBe(false);
+    expect(t.end('bob', later!)).toBe(true);
+    expect(t.names).toEqual(['alice']);
   });
 
   it("who's online: every running instance answers, and a closed one no longer", async () => {

@@ -81,6 +81,12 @@ test('offline, then back: every message exactly once, in order', async () => {
 
 test("typing reaches the others and never the log; who's online counts every page", async () => {
   const { alice, bob, carol } = pages as Record<string, Page>;
+  // Both have just typed and sent: a message ends its sender's indicator,
+  // and Bob's next keystroke is announced at once (no 1 s wait since the
+  // last one). CI once ran the previous test fast enough to leave exactly
+  // this, and Carol showed Alice typing with Bob's old indicator.
+  await send(alice!, 'one more');
+  await send(bob!, 'and me');
   await bob!.locator('#msg-text').pressSequentially('typing something', { delay: 30 });
   try {
     await expect(alice!.locator('#typing')).toHaveText('bob typing…');

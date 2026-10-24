@@ -70,6 +70,8 @@ export interface ChatMsg {
   room: string;
   /** The event offset (for receipts). */
   offset: Uint8Array;
+  /** When it was sent: Unix ms, the sender's clock (its event's hlc). */
+  sentMs: number;
 }
 
 /** The offset before every event: `after` it is the whole history. */
@@ -241,7 +243,7 @@ export async function markRead(
 
 function chatMsg(room: string, m: Message<MsgBody>): ChatMsg | undefined {
   if (m.type !== 'msg' || typeof m.body?.text !== 'string') return undefined;
-  return { ...m.body, id: bytes.hex(m.id), room, offset: m.offset };
+  return { ...m.body, id: bytes.hex(m.id), room, offset: m.offset, sentMs: Number(m.hlc >> 16n) };
 }
 
 /**
@@ -321,6 +323,11 @@ export class Typing {
     await this.db.publishEphemeral(typingTopic(this.db, this.room), 'typing', body);
     return true;
   }
+
+  /** A message was sent: the next keystroke begins another, announced at once. */
+  reset(): void {
+    this.last = Number.NEGATIVE_INFINITY;
+  }
 }
 
 /** How long a typing indicator shows after it was sent. */
@@ -351,6 +358,53 @@ export function onTyping(
 /** How much longer an indicator sent at `sentMs` shows: until `TYPING_SHOW_MS` after it was sent. */
 export function showFor(db: Db, sentMs: number): number {
   return sentMs + TYPING_SHOW_MS - db.fs.session.clock.now();
+}
+
+/**
+ * Who is typing in a room, as a page shows it: each member until
+ * `TYPING_SHOW_MS` after their newest indicator was sent. A message ends
+ * its sender's indicator, and an indicator sent before the sender's latest
+ * message is ignored: it arrived after the message it announced. Times are
+ * Unix ms; `now` is the session's corrected clock.
+ */
+export class Typists {
+  /** When each member's indicator ends, in the order they began typing. */
+  private readonly ends = new Map<string, number>();
+  /** When each member's latest message was sent. */
+  private readonly quiet = new Map<string, number>();
+
+  /** An indicator from `from` sent at `sentMs`: when it ends, if it shows. */
+  typing(from: string, sentMs: number, now: number): number | undefined {
+    if (sentMs <= (this.quiet.get(from) ?? Number.NEGATIVE_INFINITY)) return undefined;
+    const until = sentMs + TYPING_SHOW_MS;
+    // Over already, or an older indicator arriving after a newer one.
+    if (until <= now || (this.ends.get(from) ?? Number.NEGATIVE_INFINITY) >= until)
+      return undefined;
+    this.ends.set(from, until);
+    return until;
+  }
+
+  /** A message from `from` sent at `sentMs`: whether it ended their indicator. */
+  sent(from: string, sentMs: number): boolean {
+    if (sentMs > (this.quiet.get(from) ?? Number.NEGATIVE_INFINITY)) this.quiet.set(from, sentMs);
+    const until = this.ends.get(from);
+    // An indicator sent after the message is for the next one.
+    if (until === undefined || until - TYPING_SHOW_MS > sentMs) return false;
+    this.ends.delete(from);
+    return true;
+  }
+
+  /** The indicator that ends at `until` is over: whether it was still shown. */
+  end(from: string, until: number): boolean {
+    if (this.ends.get(from) !== until) return false;
+    this.ends.delete(from);
+    return true;
+  }
+
+  /** The members typing. */
+  get names(): string[] {
+    return [...this.ends.keys()];
+  }
 }
 
 // ------------------------------------------------------------ presence
