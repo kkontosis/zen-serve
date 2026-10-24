@@ -57,7 +57,7 @@ pub async fn info(
         window: c.window,
         out_window: c.out_window,
         resume: c.resume,
-        inbox: None,
+        inbox: c.inbox.clone(),
         accept_wait_ms: c.accept_wait_ms,
         handshake_secs: c.handshake_secs,
         idle_secs: c.idle_secs,
@@ -296,9 +296,9 @@ pub(crate) async fn chunks(
         .next()
     {
         let c = chunk(&k, v)?;
-        if c.off + c.data.len() as u64 > from {
+        if c.off + plain_len(&c) > from {
             start = key_after(&k);
-            bytes += c.data.len() as u64;
+            bytes += plain_len(&c);
             out.push(c);
         }
     }
@@ -308,14 +308,21 @@ pub(crate) async fn chunks(
             .await?
         {
             let c = chunk(&k, v)?;
-            if !out.is_empty() && bytes + c.data.len() as u64 > max {
+            if !out.is_empty() && bytes + plain_len(&c) > max {
                 break;
             }
-            bytes += c.data.len() as u64;
+            bytes += plain_len(&c);
             out.push(c);
         }
     }
     Ok(out)
+}
+
+/// The input bytes a chunk holds: a sealed chunk's `data` carries a
+/// 16-byte tag (formats.md §13.3).
+pub(crate) fn plain_len(c: &SvcChunk) -> u64 {
+    let n = c.data.len() as u64;
+    if c.sealed { n.saturating_sub(16) } else { n }
 }
 
 /// An `ri` entry: `u8 sealed ‖ data`.

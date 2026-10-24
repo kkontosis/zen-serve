@@ -293,7 +293,7 @@ await h.stop();                                      // the server requeues its 
 * **State.** `c.state` (bytes, or null) is sealed with the step (kind 9, bound to the connection's cursors) and comes back in the next step, also on another handler. Ack only whole protocol units: what isn't acked comes back as input.
 * **Takeover.** `serve` holds a handler lease (`leaseTtlMs`, default 5 s, renewed every second). When the handler dies, its connections move to another handler once the lease lapses, and that one continues from the last committed step: the output of a committed step is revealed by whichever handler holds the connection (its keys are escrowed under the service key), and the input not acked is pushed again. On a `resume: false` service, output is plain and a connection whose handler dies is closed.
 * **Where it runs.** Like consumers, `serve` runs while the database is the owner, so of a browser's tabs one serves. Keys come from the unlocked fs (`fs.service(...path).keysAt(epoch)`).
-* **Not yet:** the sealed inbox (a sealed input chunk closes the connection) and a line helper: milestone 5.5 steps 12–13.
+* **Not yet:** a line helper, and STARTTLS in `tls()`: milestone 5.5 step 13.
 
 ### TLS: `tls()`
 
@@ -390,6 +390,33 @@ Host git.zen
 * **Rights are checked once**, when the connection opens, as a TCP peer is admitted once. Removing a member's `append` doesn't end their open connections; the handler knows who is connected and can end them itself.
 * **Backpressure.** Writes pause the local source while more than 1 MiB waits in the WebSocket. What the service sends can't be paused (the standard WebSocket has no way to): a local reader slower than the service makes zen-connect buffer it. SSH's own windows bound that; other protocols may not (TD-SVC-CONNECT-BACKPRESSURE).
 * **The address bucket.** `per_ip_rate` and `per_ip_burst` apply to the WebSocket client's address. Behind a reverse proxy every connector has the proxy's address: set `per_ip_rate = 0` there.
+
+### The sealed inbox
+
+Over TLS or SSH, the input the server stores is ciphertext. A plaintext protocol (SMTP before STARTTLS, a line protocol) would leave the peer's bytes at rest in the keyspace and its backups. A service with an `inbox` seals them (svc.md §9): the owning node encapsulates to the inbox's X-Wing key once per connection and stores each input chunk sealed under the derived key. Only handlers holding the inbox's seed can read them.
+
+```ts
+// The admin, once: a seed, kept in a sealed row; its public key goes in the config.
+const seed = zw.randomBytes(32);
+await db.table('certs').put({ name: 'inbox', key: bytes.hex(seed) });
+console.log(`inbox = "${bytes.hex(zw.inboxPublic(seed))}"`);  // [[service]] … inbox = "…"
+
+// Each handler:
+serve(db, {
+  service: ['svc', 'smtp'],
+  inbox: seed,                      // read back from the row
+  handler: (c, tx) => {
+    // … on STARTTLS, once the reply is written:
+    c.unseal();                     // what follows is TLS ciphertext: stop sealing it
+  },
+});
+```
+
+* **The handler sees plaintext as usual.** The runtime opens each chunk at its offset, so a chunk moved, dropped or altered fails, and the connection is released with `close`. A successor handler decapsulates again from the claim's ciphertext.
+* **Without the seed** a handler can't serve the service: it reports an `inbox` error through `onError` and releases each connection with `close`.
+* **`c.unseal()`** is sticky and sent once, with the step. The server stores plain chunks from the next batch it stores after the step commits; chunks sealed before that still open.
+* **What it protects:** input at rest (the keyspace, backups, exports). The server process still sees the bytes in transit, as it reads them from the socket.
+* **Changing the key** needs the old seed until the connections opened under it end: there is no rotation helper yet (TD-SVC-INBOX-ROTATION).
 
 ## 12. Security notes
 

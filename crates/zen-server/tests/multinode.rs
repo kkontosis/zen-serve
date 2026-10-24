@@ -505,6 +505,7 @@ async fn relay_nodes_in(mode: zen_server::config::SvcMode) -> (Harness, Harness,
             handshake_secs: 30,
             idle_secs: 300,
             resume: true,
+            inbox: None,
         })
     })
     .await;

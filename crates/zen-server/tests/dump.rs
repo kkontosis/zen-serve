@@ -218,6 +218,7 @@ async fn relay_keys_count_as_empty() {
             handshake_secs: 30,
             idle_secs: 300,
             resume: true,
+            inbox: None,
         })
     })
     .await;

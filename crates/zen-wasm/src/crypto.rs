@@ -685,6 +685,57 @@ pub fn plain_record(flags: u8, raw: &[u8]) -> R<Vec<u8>> {
     svc::plain_record(flags, raw).map_err(core_err)
 }
 
+/// The public key of a sealed inbox from its 32-byte decapsulation seed
+/// (formats.md §13.3): what goes in the service's `inbox`.
+#[wasm_bindgen(js_name = inboxPublic)]
+pub fn inbox_public(seed: &[u8]) -> R<Vec<u8>> {
+    Ok(svc::inbox_public(&arr(seed)?))
+}
+
+/// The key of one connection's sealed input (spec/svc.md §9). Secret.
+#[wasm_bindgen]
+pub struct InboxKey {
+    key: svc::InboxKey,
+    ct: Option<Vec<u8>>,
+}
+
+#[wasm_bindgen]
+impl InboxKey {
+    /// Decapsulate a claim's `inbox_ct` with the inbox seed.
+    pub fn decaps(seed: &[u8], ct: &[u8], fs_id: u32, svc: &[u8], conn: &[u8]) -> R<InboxKey> {
+        let key =
+            svc::inbox_decaps(&arr(seed)?, ct, fs_id, svc, &conn_id(conn)?).map_err(core_err)?;
+        Ok(InboxKey { key, ct: None })
+    }
+
+    /// Encapsulate to an inbox public key, as the owning node does (for
+    /// tests); the ciphertext is `ct`.
+    pub fn encaps(public: &[u8], fs_id: u32, svc: &[u8], conn: &[u8]) -> R<InboxKey> {
+        let (ct, key) =
+            svc::inbox_encaps(public, fs_id, svc, &conn_id(conn)?, &mut OsRng).map_err(core_err)?;
+        Ok(InboxKey { key, ct: Some(ct) })
+    }
+
+    /// The ciphertext, for a key made by `encaps`.
+    #[wasm_bindgen(getter)]
+    pub fn ct(&self) -> Option<Vec<u8>> {
+        self.ct.clone()
+    }
+
+    /// Open the sealed chunk at plaintext offset `off`.
+    #[wasm_bindgen(js_name = openChunk)]
+    pub fn open_chunk(&self, off: u64, sealed: &[u8]) -> R<Vec<u8>> {
+        self.key.open_chunk(off, sealed).map_err(core_err)
+    }
+
+    /// Seal the chunk at plaintext offset `off`, as the owning node does
+    /// (for tests).
+    #[wasm_bindgen(js_name = sealChunk)]
+    pub fn seal_chunk(&self, off: u64, data: &[u8]) -> R<Vec<u8>> {
+        self.key.seal_chunk(off, data).map_err(core_err)
+    }
+}
+
 // ------------------------------------------------------------------ keyslots
 
 /// A passphrase keyslot (type 1).

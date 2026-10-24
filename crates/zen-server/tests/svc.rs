@@ -2,7 +2,7 @@
 //! backpressure, closing, admission, leases, rights, dead nodes and export;
 //! then the output side: steps, reveals, the writer, takeover and timers;
 //! then pushed input and reveals over `/v1/stream`; then `tcp-auth`
-//! connections over `/v1/svc/connect`.
+//! connections over `/v1/svc/connect`; then the sealed inbox.
 
 mod common;
 
@@ -39,6 +39,7 @@ fn service(f: impl FnOnce(&mut ServiceConfig)) -> impl FnOnce(&mut Config) {
             handshake_secs: 30,
             idle_secs: 300,
             resume: true,
+            inbox: None,
         };
         f(&mut s);
         c.service.push(s);
@@ -105,6 +106,17 @@ async fn read(
     from: u64,
     wait_ms: u32,
 ) -> Result<SvcReadResult, ApiErr> {
+    read_max(h, tok, c, from, None, wait_ms).await
+}
+
+async fn read_max(
+    h: &Harness,
+    tok: &[u8],
+    c: &SvcClaim,
+    from: u64,
+    max_bytes: Option<u32>,
+    wait_ms: u32,
+) -> Result<SvcReadResult, ApiErr> {
     h.call(
         "/v1/svc/read",
         Some(tok),
@@ -114,7 +126,7 @@ async fn read(
             conn: c.conn.clone(),
             token: c.token,
             from,
-            max_bytes: None,
+            max_bytes,
             wait_ms: Some(wait_ms),
         },
     )
@@ -2113,4 +2125,203 @@ async fn connect_takeover() {
     reveal(&h, &b, &hb.conn, &keys).await.unwrap();
     assert_eq!(ws_reads(&mut ws, 9).await, b"l0\nl1\nl2\n");
     assert!(ws_next(&mut ws, Duration::from_millis(300)).await.is_none());
+}
+
+// ---------------------------------------------------------------- sealed inbox
+
+/// The inbox's decapsulation seed in these tests.
+const INBOX_SEED: [u8; 32] = [0x1B; 32];
+
+/// A service with an inbox.
+async fn inbox_setup() -> (Harness, Vec<u8>, SocketAddr) {
+    setup(|s| s.inbox = Some(zsvc::inbox_public(&INBOX_SEED))).await
+}
+
+/// The claim's inbox key, from its ciphertext.
+fn inbox_key(c: &SvcClaim) -> zsvc::InboxKey {
+    let ct = c.inbox_ct.as_deref().expect("the claim carries inbox_ct");
+    assert_eq!(ct.len(), zsvc::INBOX_CT_LEN);
+    let conn: [u8; 16] = c.conn.as_slice().try_into().unwrap();
+    zsvc::inbox_decaps(&INBOX_SEED, ct, 1, &SVC, &conn).unwrap()
+}
+
+/// A chunk's input bytes: opened at its offset when sealed.
+fn open_chunk(key: &zsvc::InboxKey, off: u64, data: &[u8], sealed: bool) -> Vec<u8> {
+    if sealed {
+        key.open_chunk(off, data)
+            .expect("a sealed chunk opens at its offset")
+    } else {
+        data.to_vec()
+    }
+}
+
+/// Read exactly `n` input bytes from `from`, opening sealed chunks; every
+/// chunk must start where the last one ended. Returns the bytes and each
+/// chunk's `(off, sealed)`.
+async fn read_open(
+    h: &Harness,
+    tok: &[u8],
+    c: &SvcClaim,
+    key: &zsvc::InboxKey,
+    from: u64,
+    n: usize,
+) -> (Vec<u8>, Vec<(u64, bool)>) {
+    let (mut out, mut chunks) = (Vec::new(), Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while out.len() < n {
+        assert!(Instant::now() < deadline, "input arrives");
+        let r = read(h, tok, c, from + out.len() as u64, 5_000)
+            .await
+            .unwrap();
+        for ch in r.chunks {
+            let at = from + out.len() as u64;
+            assert_eq!(ch.off, at, "chunks are contiguous");
+            out.extend(open_chunk(key, ch.off, &ch.data, ch.sealed));
+            chunks.push((ch.off, ch.sealed));
+        }
+    }
+    (out, chunks)
+}
+
+/// Every relay value in the store.
+async fn relay_values(store: &dyn Storage) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for tag in [
+        "rc", "rh", "rw", "ra", "rm", "rz", "ri", "ro", "rv", "rs", "rq", "rl", "rx", "rli", "rnq",
+        "rnc",
+    ] {
+        let p = Key::new().str(tag).finish();
+        let mut t = store.begin(None).await.unwrap();
+        for (_, v) in t
+            .snapshot_get_range(&p, &keys::end_of(&p), 10_000, false)
+            .await
+            .unwrap()
+        {
+            out.push(v);
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbox_seals_input() {
+    let (h, tok, addr) = inbox_setup().await;
+    let store = h.server.state.store.clone();
+    let pk = zsvc::inbox_public(&INBOX_SEED);
+    let info: SvcInfo = h
+        .call(
+            "/v1/svc/info",
+            Some(&tok),
+            &SvcInfoRequest {
+                fs: 1,
+                svc: SVC.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.inbox.as_deref(), Some(&pk[..]));
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    // Written apart, so the input is several chunks.
+    let mut sent = Vec::new();
+    for i in 0..8 {
+        let line = format!("PLAINMARKER-{i:02}\n");
+        peer.write_all(line.as_bytes()).await.unwrap();
+        sent.extend_from_slice(line.as_bytes());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let c = claim(&h, &tok, 1).await;
+    let key = inbox_key(&c);
+    let (got, chunks) = read_open(&h, &tok, &c, &key, 0, sent.len()).await;
+    assert_eq!(got, sent);
+    assert!(chunks.len() > 1, "several chunks: {chunks:?}");
+    assert!(chunks.iter().all(|(_, sealed)| *sealed));
+    let st = state(&h, &tok, &c).await.unwrap();
+    assert_eq!(st.in_head, sent.len() as u64, "in_head counts plaintext");
+
+    // Nothing of the input is stored in plaintext.
+    for v in relay_values(store.as_ref()).await {
+        assert!(
+            !v.windows(11).any(|w| w == b"PLAINMARKER"),
+            "plaintext at rest"
+        );
+    }
+
+    // Reads start at the chunk holding `from`: a chunk ending at `from`
+    // isn't returned, though its data (with the tag) is longer.
+    for &(off, _) in &chunks[1..] {
+        let r = read(&h, &tok, &c, off, 0).await.unwrap();
+        assert_eq!(r.chunks[0].off, off);
+    }
+    // `max_bytes` counts plaintext: two chunks' worth returns two chunks.
+    let two = chunks[2].0;
+    let r = read_max(&h, &tok, &c, 0, Some(two as u32), 0)
+        .await
+        .unwrap();
+    assert_eq!(r.chunks.len(), 2);
+    assert_eq!(r.chunks[1].off, chunks[1].0);
+
+    // Pushes are contiguous in plaintext offsets.
+    let mut ws = svc_sub(&h, &tok, 1).await;
+    let mut pushed = Vec::new();
+    while pushed.len() < sent.len() {
+        let Frame::SvcIn {
+            off, data, sealed, ..
+        } = next_push(&mut ws).await
+        else {
+            panic!("expected svc_in");
+        };
+        assert!(sealed);
+        assert_eq!(off, pushed.len() as u64, "pushes are contiguous");
+        pushed.extend(open_chunk(&key, off, &data, sealed));
+    }
+    assert_eq!(pushed, sent);
+
+    // A chunk doesn't open at another offset.
+    let r = read(&h, &tok, &c, 0, 0).await.unwrap();
+    assert!(key.open_chunk(1, &r.chunks[0].data).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unseal_stops_sealing() {
+    let (h, tok, addr) = inbox_setup().await;
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"STARTTLS\n").await.unwrap();
+    let c = claim(&h, &tok, 1).await;
+    let key = inbox_key(&c);
+    let (got, chunks) = read_open(&h, &tok, &c, &key, 0, 9).await;
+    assert_eq!(got, b"STARTTLS\n");
+    assert!(chunks.iter().all(|(_, sealed)| *sealed));
+
+    // A step that acks nothing and sets `unseal`.
+    let mut held = Held::of(&c);
+    let (mut s, _) = sealed_step(&svc_keys(), &held, 0, &[], None);
+    s.unseal = Some(true);
+    step(&h, &tok, &mut held, s).await.unwrap();
+
+    peer.write_all(b"after\n").await.unwrap();
+    let (got, chunks) = read_open(&h, &tok, &c, &key, 0, 15).await;
+    // One stream across the switch: the sealed chunk still opens.
+    assert_eq!(got, b"STARTTLS\nafter\n");
+    assert!(chunks[0].1);
+    assert!(!chunks.last().unwrap().1, "stored plain after unseal");
+    let r = read(&h, &tok, &c, 9, 0).await.unwrap();
+    assert_eq!(r.chunks[0].data, b"after\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unseal_without_inbox_is_a_no_op() {
+    let (h, tok, addr) = setup(|_| {}).await;
+    lease(&h, &tok, 1, None).await.unwrap();
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"a\n").await.unwrap();
+    let c = claim(&h, &tok, 1).await;
+    assert_eq!(c.inbox_ct, None);
+    let mut held = Held::of(&c);
+    let (mut s, _) = sealed_step(&svc_keys(), &held, 0, &[], None);
+    s.unseal = Some(true);
+    step(&h, &tok, &mut held, s).await.unwrap();
+    peer.write_all(b"b\n").await.unwrap();
+    assert_eq!(read_n(&h, &tok, &c, 0, 4).await, b"a\nb\n");
 }

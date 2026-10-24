@@ -32,7 +32,7 @@ A service is a `[[service]]` table in the server configuration. **Every node car
 | `handshake_secs` | a connection with no committed step this long after accept is aborted | 30 |
 | `idle_secs` | a connection with no input and no output for this long, and no bytes waiting, is aborted; `0` turns it off | 300 |
 | `resume` | output is released by key reveal (§5), so another handler can take over (§6) | true |
-| `inbox` | an X-Wing public key (hex, formats.md §13.3): input is sealed at rest (§9) | none |
+| `inbox` | an X-Wing public key (hex, 1,216 bytes, formats.md §13.3): input is sealed at rest (§9). Another length is refused at start | none |
 
 * **Rights** are topic rights on `id` (api.md §1, formats.md §3.3): `consume` to handle, `append` to connect over `tcp-auth`. Topic grants are prefix grants, so a grant on `svc/` covers every service of the fs.
 * **The service key.** `K_svc = KDF("zen/v1/svc-aead", D_svc, "")`, where `D_svc` is the topic data key of `id` at the epoch (formats.md §3.3). It seals the state (kind 9) and the output-key escrows (kind 10). Giving a worker the topic keys of `svc/<name>` delegates exactly that service, as with events.
@@ -302,8 +302,14 @@ Without `inbox`, input is stored as it arrives. For TLS and SSH that is cipherte
 With `inbox`:
 * The owning node encapsulates once per connection to the service's X-Wing key. The ciphertext goes in the connection record.
 * The node seals every input chunk under the derived key (formats.md §13.3). Chunks carry a sealed bit, and offsets count plaintext bytes.
-* The handler opens chunks with the inbox's decapsulation seed, which the admin keeps sealed in the fs. It checks that chunks are contiguous (each one's offset is the previous offset plus its length).
-* **Turning sealing off** (`unseal`, for example after STARTTLS, when the input becomes TLS ciphertext). A step sets the sticky `unseal` flag. Chunks the node seals before it notices are still sealed. Handlers accept both kinds at any time, so no coordination is needed.
+  * `in_head`, the input window, reads (`max_bytes`, api.md §14.6) and the fs byte quota all count plaintext bytes. The 17 bytes a sealed chunk adds (the sealed bit and the tag) aren't counted, as a record's framing isn't.
+  * A batch re-sent after `commit_unknown` (§3, step 3) is the same bytes at the same offset under the same key, so it is the same chunk.
+* The handler opens chunks with the inbox's decapsulation seed, which the admin keeps sealed in the fs. It checks that chunks are contiguous (each one's offset is the previous offset plus its length). The nonce binds the offset, so a chunk moved to another offset doesn't open.
+* **A handler without the seed** can't serve the service. It releases a connection whose claim carries `inbox_ct` with `close` (§6).
+* **Turning sealing off** (`unseal`, for example after STARTTLS, when the input becomes TLS ciphertext). A step sets the sticky `unseal` flag in `ra`.
+  * The node notices it when it stores a batch: the batch's transaction reads `ra` (by snapshot), and from the first batch that sees the flag on, the node stores plain chunks. A batch it was already storing stays sealed.
+  * Handlers accept both kinds at any time, so no coordination is needed.
+  * `unseal` on a service without `inbox` sets the flag and changes nothing else.
 * **The limit.** The inbox protects input **at rest**: in the keyspace, in backups, in exports. It doesn't protect it from the server process, which receives the plaintext from the socket in transit.
 
 ## 10. Liveness and wake-ups

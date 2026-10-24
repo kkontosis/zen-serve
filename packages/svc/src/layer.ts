@@ -42,6 +42,13 @@ export interface RawStep {
   close(): void;
   /** Reset the connection. */
   abort(): void;
+  /**
+   * Stop sealing this connection's input from now on, on a service with an
+   * inbox (svc.md §9): for example after STARTTLS, when the input becomes
+   * TLS ciphertext. Sticky; input stored sealed before the server notices
+   * is still opened.
+   */
+  unseal(): void;
   /** Under `tls()`: the connection's TLS parameters. */
   readonly tls?: TlsInfo;
 }
@@ -84,6 +91,8 @@ export interface Finished {
   engineChanged: boolean;
   /** Step again at once, without new input (the handler made room for held input). */
   again: boolean;
+  /** The handler called `unseal()`. */
+  unseal?: boolean;
 }
 
 /** @internal One attempt at a step, inside the transaction. */
@@ -154,6 +163,7 @@ export class Step implements RawStep {
   readonly out: Uint8Array[] = [];
   outBytes = 0;
   endFlag = 0;
+  unsealed = false;
 
   constructor(
     readonly conn: Uint8Array,
@@ -205,6 +215,10 @@ export class Step implements RawStep {
     this.endFlag = SVC_ABORT;
   }
 
+  unseal(): void {
+    this.unsealed = true;
+  }
+
   /** Close or abort may replace this step's FIN, not an earlier step's. */
   private closing(what: string): void {
     if (this.endFlag && this.endFlag !== SVC_FIN) throw new Error(`${what} after close or abort`);
@@ -251,6 +265,7 @@ class RawConn implements LayerConn<RawStep> {
         engineState: null,
         engineChanged: false,
         again: false,
+        unseal: s.unsealed,
       }),
       dispose: () => {},
     };

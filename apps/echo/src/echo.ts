@@ -6,7 +6,8 @@
 // `mirror`, which sends back whatever arrives, serves `mirror-tls`. Over
 // SSH (ssh.ts), `sshEcho` serves `echo-ssh`. `echo-auth` and
 // `echo-ssh-auth` are the same as `tcp-auth` services, which members reach
-// through zen-serve (`zen-connect`).
+// through zen-serve (`zen-connect`). `echo-inbox` is the line echo with a
+// sealed inbox: its input is sealed at rest until a `STARTTLS` line.
 import { bytes } from '@zen/client';
 import type { Db } from '@zen/db';
 import {
@@ -22,10 +23,12 @@ import type { Cert, Line } from './schema.js';
 export {
   type Cert,
   DB_OPTIONS,
+  inboxSeed,
   type Line,
   NS,
   putCert,
   putHostKey,
+  putInboxSeed,
   putSshKey,
   type SshKey,
 } from './schema.js';
@@ -50,12 +53,18 @@ export const MIRROR_SERVICE = ['svc', 'mirror-tls'];
 /** The echo service as `tcp-auth`: members connect through zen-serve. */
 export const AUTH_SERVICE = ['svc', 'echo-auth'];
 
+/** The echo service with a sealed inbox (svc.md §9). */
+export const INBOX_SERVICE = ['svc', 'echo-inbox'];
+
 const text = new TextDecoder();
 
 /**
  * The handler. Input is acked up to the last newline, so a partial line
  * waits for the rest; the line count is the connection's state. At the
- * peer's EOF, a last partial line counts too, then `bye` and FIN.
+ * peer's EOF, a last partial line counts too, then `bye` and FIN. The line
+ * `STARTTLS` is echoed like any other and stops the sealing of the input
+ * that follows (`unseal()`): it stands in for a real STARTTLS, after which
+ * the input would be TLS ciphertext.
  */
 export const echo: RawHandler = async (c, tx) => {
   let n = c.state ? Number(text.decode(c.state)) : 0;
@@ -66,6 +75,7 @@ export const echo: RawHandler = async (c, tx) => {
     n++;
     c.write(`${n}: ${l}\n`);
     await tx.table('lines').insert({ conn, n, line: l });
+    if (l === 'STARTTLS') c.unseal();
   };
   let at = 0;
   for (let nl = input.indexOf(10); nl >= 0; nl = input.indexOf(10, at)) {

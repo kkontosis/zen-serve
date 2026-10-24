@@ -356,6 +356,9 @@ pub struct ServiceConfig {
     /// Output is released by key reveal, so handlers can take over.
     #[serde(default = "yes")]
     pub resume: bool,
+    /// The inbox's X-Wing public key, in hex: input is sealed at rest.
+    #[serde(default, deserialize_with = "de_hex_opt")]
+    pub inbox: Option<Vec<u8>>,
 }
 
 /// The smallest `window` and `out_window`.
@@ -389,6 +392,10 @@ fn default_idle_secs() -> u32 {
 fn de_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     let s = String::deserialize(d)?;
     parse_hex(&s).ok_or_else(|| serde::de::Error::custom(format!("{s:?} is not hex")))
+}
+
+fn de_hex_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+    de_hex(d).map(Some)
 }
 
 /// Decode lowercase or uppercase hex.
@@ -662,6 +669,14 @@ impl Config {
             if s.max_conns == 0 {
                 return Err(format!("{at}: max_conns must be at least 1"));
             }
+            if let Some(k) = &s.inbox
+                && k.len() != zen_core::svc::INBOX_PUBLIC_LEN
+            {
+                return Err(format!(
+                    "{at}: inbox must be an X-Wing public key ({} bytes)",
+                    zen_core::svc::INBOX_PUBLIC_LEN
+                ));
+            }
         }
         Ok(())
     }
@@ -763,9 +778,14 @@ mod tests {
             (10_000, 30, 300)
         );
         assert!(s.resume);
+        assert_eq!(s.inbox, None);
         assert!(c.service(1, &[0xab; 16]).is_some());
         assert!(c.service(2, &[0xab; 16]).is_none());
         assert!(svc("mode = \"tcp-auth\"").is_ok());
+        let pk = zen_core::svc::inbox_public(&[7; 32]);
+        let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+        let c = svc(&format!("mode = \"tcp-auth\"\ninbox = \"{hex}\"")).unwrap();
+        assert_eq!(c.service[0].inbox.as_deref(), Some(&pk[..]));
     }
 
     #[test]
@@ -781,7 +801,9 @@ mod tests {
             (&format!("{tcp}out_window = 1000"), "small out_window"),
             (&format!("{tcp}max_conns = 0"), "no connections"),
             ("mode = \"udp\"", "unknown mode"),
-            (&format!("{tcp}inbox = \"00\""), "unknown field"),
+            (&format!("{tcp}inbox = \"00\""), "inbox too short"),
+            (&format!("{tcp}inbox = \"zz\""), "inbox not hex"),
+            (&format!("{tcp}color = \"red\""), "unknown field"),
             (
                 "mode = \"tcp\"\nlisten = \"127.0.0.1:8080\"",
                 "the API's address",

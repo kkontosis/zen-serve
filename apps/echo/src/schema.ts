@@ -1,5 +1,5 @@
 // The echo app's database: its namespace, tables, the certificate row, the
-// SSH host key and the users' SSH keys. Kept apart from echo.ts so that
+// SSH host key, the inbox seed and the users' SSH keys. Kept apart from echo.ts so that
 // code without @zen/svc (the Playwright spec, which puts the keys) can use
 // it.
 import type { Db, DbOptions } from '@zen/db';
@@ -35,6 +35,9 @@ export type SshKey = {
 /** The `certs` row that holds the SSH host key: `key` is its PEM, `chain` its public line. */
 export const SSH_HOST_KEY = 'ssh';
 
+/** The `certs` row that holds the sealed inbox's seed: `key` is its hex. */
+export const INBOX_SEED = 'inbox';
+
 export const DB_OPTIONS: DbOptions = {
   schema: 3,
   migrations: {
@@ -64,6 +67,19 @@ export async function putCert(db: Db, cert: Cert): Promise<void> {
 /** Store the SSH host key (OpenSSH PEM, Ed25519) with its public line. */
 export async function putHostKey(db: Db, pem: string, line: string): Promise<void> {
   await putCert(db, { name: SSH_HOST_KEY, chain: line, key: pem });
+}
+
+/** Store the sealed inbox's 32-byte decapsulation seed (svc.md §9). */
+export async function putInboxSeed(db: Db, seed: Uint8Array): Promise<void> {
+  const hex = Array.from(seed, (b) => b.toString(16).padStart(2, '0')).join('');
+  await putCert(db, { name: INBOX_SEED, chain: '', key: hex });
+}
+
+/** The sealed inbox's seed, if stored. */
+export async function inboxSeed(db: Db): Promise<Uint8Array | undefined> {
+  const c = await db.table<Cert>('certs').get(INBOX_SEED);
+  if (!c) return undefined;
+  return Uint8Array.from(c.key.match(/../g) ?? [], (h) => Number.parseInt(h, 16));
 }
 
 /** A public line's fingerprint, `SHA256:…` as `ssh-keygen -l` prints it. */

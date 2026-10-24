@@ -701,7 +701,7 @@ A service relays TCP connections to handlers on member clients. The semantics ar
 
 ### 14.1 `POST /v1/svc/info`
 
-`{fs, svc}` → `{mode: "tcp" | "tcp-auth", window: u32, out_window: u32, resume: bool, inbox?: bytes, accept_wait_ms: u32, handshake_secs: u32, idle_secs: u32}`. `inbox` is the X-Wing public key (formats.md §13.3). Needs topic `consume` or `append`.
+`{fs, svc}` → `{mode: "tcp" | "tcp-auth", window: u32, out_window: u32, resume: bool, inbox?: bytes, accept_wait_ms: u32, handshake_secs: u32, idle_secs: u32}`. `inbox` is the X-Wing public key (formats.md §13.3), present when the service has one (svc.md §9). Needs topic `consume` or `append`.
 
 ### 14.2 `POST /v1/svc/lease`
 
@@ -764,7 +764,7 @@ The checks, in order, and the effects are normative in svc.md §4. In short:
 * **412 `conn_closed`:** the connection is reaped, or has an abort request pending, or has closed. Records after a FIN also get it.
 * **429 `window`:** the output would exceed `out_window`.
 
-Effects: input below `in_to` is cleared, the records are stored and the cursors advanced, the state is replaced, and the owning node is woken. A replayed `commit_id` returns the stored result and applies nothing, so its records and keys are fixed (svc.md §5).
+Effects: input below `in_to` is cleared, the records are stored and the cursors advanced, the state is replaced, and the owning node is woken. `unseal` stops the node sealing input from its next batch on (svc.md §9); on a service without `inbox` it changes nothing else. A replayed `commit_id` returns the stored result and applies nothing, so its records and keys are fixed (svc.md §5).
 
 ### 14.6 `POST /v1/svc/read`
 
@@ -773,7 +773,8 @@ Effects: input below `in_to` is cleared, the records are stored and the cursors 
 → {chunks: [{off: u64, data: bytes, sealed: bool}], in_head: u64, written_to: u64, flags: u8}
 ```
 
-* Returns input chunks from the one containing `from`, in order, up to `max_bytes` (default and cap: `max_range_bytes`). A first chunk that starts before `from` is returned whole. `data` is formats.md §13.3's sealed chunk when `sealed`, else the raw bytes.
+* Returns input chunks from the one containing `from`, in order, up to `max_bytes` (default and cap: `max_range_bytes`). A first chunk that starts before `from` is returned whole. `data` is formats.md §13.3's sealed chunk (ciphertext and tag) when `sealed`, else the raw bytes.
+* Offsets, `in_head` and `max_bytes` count plaintext bytes: a sealed chunk's length is its `data` less the 16-byte tag, and the next chunk starts at `off` plus that length. The same holds for `svc_in` pushes (§14.10).
 * `from < in_acked` returns 412 `cursor_moved`. 412 `claim_lost` and `conn_closed` as in §14.4.
 * **Long-polling.** With `wait_ms` (≤ 30,000) and no input at or after `from`, waits for the holder's lease doorbell (svc.md §10).
 * `flags` is as in `Claim`.
