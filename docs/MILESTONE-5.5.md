@@ -437,7 +437,29 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
         * Still open, with their diagnostics: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test. They are listed in **TD-TEST-OPEN-FAILURES** (spec/TECH_DEBT.md), with where each was seen, what was ruled out and what it prints now.
     * Merged at 7497111 (merge commit e636e7c). The log commit, c5b90c0, was pushed 33 s after the merge, so it isn't in main. It opens step 5.5.13b's PR, together with the TD entry.
     * The TD entry (TD-TEST-OPEN-FAILURES) and the cherry-picked log are PR #51's first two commits (5251155, d6e20f2); CI green on d6e20f2, both runs.
-  * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. PR #51. Planned below ("Step 5.5.13b in detail").
+  * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page: done, PR #51. Commits: `docs: milestone 5.5 step 13b plan`; `svc: wake a handler without input (wakeOn, wake, again)`; `apps: mail: header fields, modseq, app passwords and expunge`; `apps: mail, IMAP with IDLE`; `apps: mail: the inbox page`; the docs and this log. No `spec:` commit.
+    * As planned, plus details settled while building:
+      * **The runtime.** `Step` gains `wakeOn`, `again()` and `room` (its private `room` became `limit`). `LayerConn.prepare` takes `wake`; `tls()` ORs it into the handler's `fresh` test, and `raw()` and `ssh()` already call the handler. `Finished` gains `wakeOn`, and `again` is the layer's or the handler's: either sets both `due` and `wake`.
+      * **No wake is lost.** `ServeHandle.wake(key)` numbers each wake and remembers each key's latest number, up to 4,096 keys. A forgotten key counts as woken for any step that began before it was forgotten, so a wake is never missed, only repeated. A step notes the number before its transaction. Afterwards, the keys of its last attempt apply, and the connection is due again if one of them was woken since.
+        * Both race tests fail with that check turned off: a wake during a blocked step, and one fired from inside the step before it registers its key.
+      * **Every claim calls the handler once**, with no input. Raw handlers saw no-input calls only on fresh connections before. The existing echo, TLS, SSH, tcp-auth, inbox and SMTP tests pass unchanged.
+      * **The takeover test in `wake.test.ts`** stops the first `serve()` (its lease is released, so the connection is requeued) rather than SIGKILLing a worker. The successor takes the same claim path. The IMAP tests SIGKILL workers.
+      * **Shared helpers live in `src/store.ts`**, with `mail.ts` re-exporting them, for two reasons: `imap.ts` imports them without a cycle through `mail.ts`, and the page's bundle carries no handler code (no `@zen/svc-wasm`). `messageBytes` and `messages` moved there too.
+      * **Schema 2** also indexes `mailboxes` by user, for the page (it warned of a full scan), and `app_passwords` by user.
+      * **The header's end** is found as DATA arrives by a CRLF CRLF match state (`hm`, 2 at the start, so a body that begins with CRLF has an empty header), instead of carrying the last three bytes. 13a's rows have no `hdr`: `headerLength` scans their first part.
+      * **App passwords** are 20 random bytes (160 bits), as four groups of eight base32 letters. The plan said 16 bytes, which don't split into equal groups. The hash is over the password without dashes or spaces, lowercased, so it can be typed either way.
+      * **A session's own changes aren't told back to it.** Its STOREs and FETCH-set `\Seen` take consecutive modseqs in one transaction, kept as ranges (`own`, at most 64) until the next sync. A sync skips rows whose modseq is in them. Forgetting a range only repeats a FETCH.
+      * **Literals.** A synchronizing literal that would pass 65,536 bytes is refused with `BAD` before the client sends it, and the connection goes on. A LITERAL+ one can't be refused, so it gets `* BYE`. While a FETCH is being written, no command is read. When `room` is short, the rest of the pipelined commands wait for the next step.
+      * **A FETCH's state** is the remaining uids as ranges, plus the current message's uid, sequence number, flags (fixed when it began) and bytes written. Each step rebuilds that message's response from its row and skips what was written, so `HEADER.FIELDS` bytes are never kept in the state.
+      * **A message expunged by another session in the middle of its literal** resets the connection, since the literal can't be finished (TD-MAIL-SCOPE).
+      * **imaplib** returns `NO` as a result and raises only on `BAD`. Python 3.11 here, 3.12 on the runners.
+      * **The IDLE test's bound** is 5 s per update, not the plan's 2 s, to leave room for loaded runners. Locally each update arrived in well under a second.
+    * Verified:
+      * `npm run check`
+      * `apps/echo/test/wake.test.ts` (14: 7 cases over raw and TLS); `apps/mail` (37: `smtp.test.ts` 16 with 4 new, `imap.test.ts` 11, `imapparse.test.ts` 10)
+      * `npx vitest run` 3×: 548 passed each time, 7 skipped (the opt-in benches), no errors
+      * `npx playwright test`: smoke and apps, 17 specs (`apps/mail/e2e/mail.spec.ts` new)
+      * `cargo test -p zen-server --test svc` (33; the server is unchanged)
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
 
 ## Step 5.5.13b in detail: waking handlers, IMAP with IDLE, the inbox page
