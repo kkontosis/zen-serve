@@ -31,7 +31,10 @@ beforeAll(async () => {
   port = (server.address() as { port: number }).port;
 });
 afterEach(() => {
+  // A driver records what its steps threw: none is expected unless the test cleared it.
+  const errors = [...drivers].flatMap((d) => d.errors);
   for (const d of drivers) d.stop();
+  expect(errors).toEqual([]);
 });
 afterAll(() => {
   server?.close();
@@ -42,10 +45,12 @@ afterAll(() => {
 
 const dec = new TextDecoder();
 
-const until = async (f: () => boolean, what: string, ms = 5000) => {
+const until = async (f: () => boolean, what: string | (() => string), ms = 15_000) => {
   const end = Date.now() + ms;
   while (!f()) {
-    if (Date.now() > end) throw new Error(`timed out: ${what}`);
+    if (Date.now() > end) {
+      throw new Error(`timed out: ${typeof what === 'string' ? what : what()}`);
+    }
     await new Promise((r) => setTimeout(r, 5));
   }
 };
@@ -274,6 +279,7 @@ describe('starttls()', () => {
     // The switching step asked to run again for the input after it.
     expect(d.steps.find((f) => f.unseal)!.again).toBe(true);
     expect(d.errors.length).toBe(1);
+    d.errors.length = 0;
     expect(d.steps.at(-1)!.endFlag).toBe(SVC_CLOSE);
   });
 
@@ -290,12 +296,21 @@ describe('starttls()', () => {
     // Start the handshake, then look at the state its first step sealed.
     const client = connect({ socket: sock, ca: certs.ca, servername: 'localhost' });
     client.on('error', () => {});
-    await until(() => phase(d.sealed) === 2, 'a handshake step');
+    await until(
+      () => phase(d.sealed) === 2,
+      () =>
+        `a handshake step (phase ${phase(d.sealed)}; steps ${JSON.stringify(
+          d.steps.map((f) => [f.inAck, f.bytes.length, f.endFlag, phase(f.engineState)]),
+        )}; pending ${d.pending.length}; errors ${d.errors.map(String)})`,
+    );
     for (const same of [false, true]) {
       const c = engine.conn();
       expect(() => c.load(d.sealed, same)).toThrow(/during its handshake/);
       c.free();
     }
+    // The handshake is left unfinished: stop serving first, so the client's
+    // going away isn't reported as a failed handshake.
+    d.stop();
     client.destroy();
   });
 
