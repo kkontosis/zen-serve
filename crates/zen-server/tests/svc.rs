@@ -2234,19 +2234,21 @@ async fn inbox_seals_input() {
     assert_eq!(info.inbox.as_deref(), Some(&pk[..]));
     lease(&h, &tok, 1, None).await.unwrap();
     let mut peer = TcpStream::connect(addr).await.unwrap();
-    // Written apart, so the input is several chunks.
-    let mut sent = Vec::new();
+    let c = claim(&h, &tok, 1).await;
+    let key = inbox_key(&c);
+    // Each line is stored before the next is written, so each is a chunk of
+    // its own. Lines written apart in time could still share a batch: the
+    // server reads whatever is waiting.
+    let (mut sent, mut chunks) = (Vec::new(), Vec::new());
     for i in 0..8 {
         let line = format!("PLAINMARKER-{i:02}\n");
         peer.write_all(line.as_bytes()).await.unwrap();
+        let (got, ch) = read_open(&h, &tok, &c, &key, sent.len() as u64, line.len()).await;
+        assert_eq!(got, line.as_bytes());
         sent.extend_from_slice(line.as_bytes());
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        chunks.extend(ch);
     }
-    let c = claim(&h, &tok, 1).await;
-    let key = inbox_key(&c);
-    let (got, chunks) = read_open(&h, &tok, &c, &key, 0, sent.len()).await;
-    assert_eq!(got, sent);
-    assert!(chunks.len() > 1, "several chunks: {chunks:?}");
+    assert_eq!(chunks.len(), 8, "a chunk per line: {chunks:?}");
     assert!(chunks.iter().all(|(_, sealed)| *sealed));
     let st = state(&h, &tok, &c).await.unwrap();
     assert_eq!(st.in_head, sent.len() as u64, "in_head counts plaintext");
