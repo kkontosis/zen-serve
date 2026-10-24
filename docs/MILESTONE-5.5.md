@@ -312,6 +312,7 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx vitest run` 3×: 486 passed each time, 7 skipped (the opt-in benches). This includes `packages/client/test/svcvectors.test.ts` (7, inbox vectors new) and `apps/echo/test/inbox.test.ts` (4).
     * `npx playwright test`: 16 specs, unchanged
   * The local FDB cluster had stopped (a container restart); it was restarted with the binary rebuilt `--features fdb`. Stale test executables were pruned (4 GB).
+  * CI green on PR #49's head a798c2e: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), `openssh-pq` skipped. Next: once PR #49 merges, plan step 5.5.13 (`apps/mail`: STARTTLS in `tls()`, the line helper, SMTP and IMAP).
 
 ## Step 5.5.12 in detail: the sealed inbox
 
