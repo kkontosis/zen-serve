@@ -2588,3 +2588,72 @@ interface RawStep {
 * **SSH engine scope:** it's the largest piece, so it is kept to the subset OpenSSH needs.
 * **Latency:** about 6–10 ms per output step with `resume: true`. Interactive SSH may want `resume: false` per service.
 * **Storage churn:** every byte is a durable write and delete. Bounded by `max_conns × window` and the quota.
+
+## Outcome
+
+Done. Milestone 5.5 made zen-serve a blind TCP relay. The server accepts connections on public ports (`tcp`) or from members over a WebSocket (`tcp-auth`), and keeps each connection's bytes in a durable queue it never reads. Handlers on member clients, Node workers or browser tabs, serve the protocol: each step commits in one transaction with the handler's zen-db rows. When a handler dies, another continues the live connection, TLS and SSH sessions included.
+
+What was built:
+* **The spec:** spec/svc.md, api.md §14, keyspace.md §3.9, seal kinds 9 and 10, the sealed inbox, with vectors.
+* **The server relay:** accept, the input queue and its window, handler leases and claims, the step in `/v1/commit`, release by key reveal, the writer, timers, reaping, and pushed input over the stream.
+* **`tcp-auth` and `zen-connect`:** connections from members, with a CLI that serves as a local port or an ssh `ProxyCommand`.
+* **The sealed inbox:** plaintext input sealed at rest to a key only the handlers hold.
+* **Engines,** sans-IO and resumable from their sealed state (`crates/zen-svc`, built for wasm as `@zen/svc-wasm`):
+  * TLS 1.3 and 1.2, on a RustCrypto provider moved into its own crate (`zen-tls-rustcrypto`)
+  * an SSH server with `mlkem768x25519-sha256` and strict kex
+* **`@zen/svc`:**
+  * `serve()` with the `raw()`, `tls()`, `starttls()` and `ssh()` layers
+  * `LineReader`
+  * waking handlers without input (`wakeOn`, `wake`, `again`)
+* **Two apps:**
+  * `echo`: a line service over raw TCP, TLS, SSH (with a git upload-pack stub), `tcp-auth` and a sealed inbox
+  * `mail`: inbound SMTP with STARTTLS, IMAP with IDLE, app passwords, and an inbox page
+* **The guide** (docs/SVC.md) and **measurements** (docs/STATS.md §5.5).
+
+Differences from the plan above:
+* **Steps.**
+  * Step 13 became two PRs: 13a (STARTTLS, inbound SMTP) and 13b (waking, IMAP, the page).
+  * 13a also carried the CI work of its PR: three test races and two real bugs found from CI reds (`dump` didn't retry `TooOld`; the chat app showed stale typing indicators), plus diagnostics for failures seen once (TD-TEST-OPEN-FAILURES).
+  * Step 14's bench found a lost wake-up in `svc_sub`. When the queue's watch fired, the push loop sent `svc_ready` and only then armed a new watch, so a connection queued in between waited unannounced until `accept_wait_ms` closed it (13 of 1,000 in a burst). The watch is now armed first, with a regression test that widens the window.
+* **TLS 1.2 nonces.** The 1.2 AES-GCM explicit nonce carries a random 32-bit prefix drawn per batch of records, so a rolled-back sequence number repeats a nonce only with probability 2^-32.
+* **STARTTLS has four phases,** not three: a connection switched but whose handshake hasn't begun is still resumable, so the window between the `220` and the ClientHello survives a takeover.
+* **SSH bounds** are across channels, sized to the state's 90,000 bytes: 32 KiB unread, 16 KiB queued, packets up to 35,000 bytes. Because of that read bound, a server rekey can stall behind unread channel data. The engine therefore decrypts ahead during its own key exchange, without consuming, to find the client's KEXINIT.
+* **Windows.** The SSH channel window is 96 KiB (the plan said 2 MiB), so that ten channels and 64 KiB fit an SSH service's 1 MiB input `window`.
+* **Every claim calls the handler once,** with no input. A successor then registers its wake keys again and tells its client what changed during the takeover.
+* **`tcp-auth` resets** close with 4000, an oversized frame included (the plan said 1009 for that).
+* **The sealed inbox** counts plaintext lengths in reads, pushes and quotas. A read from the end of a sealed chunk returned that chunk again before this was fixed.
+* **App passwords** are 160 random bits (four groups of eight base32 letters), not 128.
+* **Not built, as decided:** ACME for relayed services (TD-SVC-ACME), UDP (TD-SVC-UDP), handshake resumption (TD-SVC-TLS-HANDSHAKE-RESUME), real git (milestone 10), outbound mail (TD-MAIL-SCOPE).
+
+Tests (at step 14):
+* **Rust:**
+  * zen-svc:
+    * `tests/tls.rs` 23 and `tests/openssl.rs` 6 (OpenSSL's `s_client`)
+    * `tests/ssh.rs` 18 and `tests/openssh.rs` 10 (OpenSSH 9.6)
+    * `tests/openssh_pq.rs` 2, against OpenSSH 10.6p1 built from source, on demand
+    * 11 unit tests
+    * The tests restore the engine from its state after every input: every record or packet boundary is a takeover point.
+  * zen-tls-rustcrypto: 14 unit tests, including RFC 8448, and 3 handshake tests.
+  * zen-core: the svc seals and their vectors.
+  * zen-server:
+    * `tests/svc.rs` 33 (accept, claims, the window, steps, reveals, takeover, timers, 5,000 idle connections, pushes, `tcp-auth`, the inbox)
+    * `tests/svc_ready.rs` 1
+    * `tests/multinode.rs`: the socket on one node, the handler on another
+    * on both backends
+* **Node (`npx vitest run`: 548 passed, 12 skipped (the opt-in benches), 61 files, about 125 s):**
+  * `@zen/svc` 39: input joining, lines, the TLS and SSH bindings, the `ssh()` and `starttls()` layers
+  * `@zen/client`'s svc tests 13: vectors, the stream subscription, `svcConnect`
+  * echo 39, over raw, TLS, SSH, `tcp-auth`, the inbox and waking:
+    * workers SIGKILLed mid-stream, mid-handshake and mid-key-exchange
+    * 20 MB across two kills (TLS) and 50 MB across two kills with rekeys (SSH)
+  * mail 37: SMTP with Python's `smtplib`, IMAP with `imaplib` and a Node client, workers killed between DATA and its reply, mid-FETCH and while idling
+* **Chromium (Playwright, 17 specs, about 27 s):** a tab serving the echo service raw, over TLS and over SSH, and the mail inbox page with an idling IMAP client.
+* **CI:** `rust`, `pure-rust`, `fdb` and `client` run them on every push. `openssh-pq` is on demand.
+* **Measurements:** an opt-in bench (`ZEN_BENCH=1`), results in docs/STATS.md §5.5. With release builds, a step (a line and its reply) takes 16–20 ms, and a takeover pauses a connection for about the lease TTL (1 s in the bench). An idle connection costs about 127 KiB on the server and no steps.
+
+Tech debt:
+* **Resolved within the milestone:** none of the earlier entries.
+* **New, open:**
+  * TD-SVC-STATE-ROLLBACK, TD-SVC-TLS-HANDSHAKE-RESUME, TD-SVC-SSH-SCOPE, TD-SVC-SSH-PQ-CI
+  * TD-SVC-CONNECT-BACKPRESSURE, TD-SVC-INBOX-ROTATION, TD-SVC-ACME, TD-SVC-UDP
+  * TD-MAIL-SCOPE, TD-TEST-OPEN-FAILURES
