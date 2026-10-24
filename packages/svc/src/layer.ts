@@ -1,9 +1,10 @@
 // Layers: what sits between a connection's bytes and the handler (svc.md
-// §7). `raw()` hands the bytes through; `tls()` (tls.ts) terminates TLS and
-// `ssh()` (ssh.ts) SSH. The runtime prepares each step outside its
-// transaction, then opens it inside, where it may run again on a conflict:
-// the layer gives the handler its view of the step (a `RawStep`, an
-// `SshStep`) and turns what the handler did into the step's output.
+// §7). `raw()` hands the bytes through; `tls()` and `starttls()` (tls.ts)
+// terminate TLS and `ssh()` (ssh.ts) SSH. The runtime prepares each step
+// outside its transaction, then opens it inside, where it may run again on
+// a conflict: the layer gives the handler its view of the step (a
+// `RawStep`, an `SshStep`) and turns what the handler did into the step's
+// output.
 import { bytes } from '@zen/client';
 import type { SvcInfo, SvcPeer } from '@zen/wasm';
 import { SVC_ABORT, SVC_CLOSE, SVC_FIN } from './flags.js';
@@ -49,7 +50,15 @@ export interface RawStep {
    * is still opened.
    */
   unseal(): void;
-  /** Under `tls()`: the connection's TLS parameters. */
+  /**
+   * Under `starttls()`, in the plain phase: switch to TLS after this step
+   * (svc.md §7.1). The step's writes go out in plain first (the protocol's
+   * go-ahead); the input after what the step acks is TLS, and input sealing
+   * stops. Throws under the other layers, after the switch, and with
+   * `end()`, `close()` or `abort()`.
+   */
+  startTls(): void;
+  /** Under `tls()`, and `starttls()` after the switch: the connection's TLS parameters. */
   readonly tls?: TlsInfo;
 }
 
@@ -164,6 +173,8 @@ export class Step implements RawStep {
   outBytes = 0;
   endFlag = 0;
   unsealed = false;
+  /** `startTls()` was called. */
+  starting = false;
 
   constructor(
     readonly conn: Uint8Array,
@@ -174,6 +185,8 @@ export class Step implements RawStep {
     private readonly finSent: boolean,
     private readonly room: number,
     readonly tls: TlsInfo | undefined,
+    /** `startTls()` is allowed (`starttls()`'s plain phase). */
+    private readonly startable = false,
   ) {}
 
   ack(n: number): void {
@@ -202,21 +215,36 @@ export class Step implements RawStep {
 
   end(): void {
     this.open('end');
+    if (this.starting) throw new Error('end after startTls');
     this.endFlag = SVC_FIN;
   }
 
   close(): void {
     this.closing('close');
+    if (this.starting) throw new Error('close after startTls');
     this.endFlag = SVC_CLOSE;
   }
 
   abort(): void {
     this.closing('abort');
+    if (this.starting) throw new Error('abort after startTls');
     this.endFlag = SVC_ABORT;
   }
 
   unseal(): void {
     this.unsealed = true;
+  }
+
+  startTls(): void {
+    if (!this.startable) {
+      throw new Error(
+        this.tls
+          ? 'startTls: the connection is TLS already'
+          : 'startTls needs the starttls() layer',
+      );
+    }
+    this.open('startTls');
+    this.starting = true;
   }
 
   /** Close or abort may replace this step's FIN, not an earlier step's. */

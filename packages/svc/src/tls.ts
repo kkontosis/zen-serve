@@ -1,9 +1,11 @@
-// The `tls()` layer (svc.md §7.1): the TLS engine of @zen/svc-wasm between
-// the relay's bytes and the handler. During the handshake the engine lives
-// in memory only, so a takeover then loses the connection; once the
-// handshake is done, its state is sealed with every step and a successor
-// continues the live connection from it.
+// The `tls()` and `starttls()` layers (svc.md §7.1): the TLS engine of
+// @zen/svc-wasm between the relay's bytes and the handler. During the
+// handshake the engine lives in memory only, so a takeover then loses the
+// connection; once the handshake is done, its state is sealed with every
+// step and a successor continues the live connection from it. `starttls()`
+// begins in plain, as `raw()`, until the handler calls `startTls()`.
 import { bytes, ZenError } from '@zen/client';
+import { cbor } from '@zen/db';
 import type * as SW from '@zen/svc-wasm';
 import { SVC_CLOSE, SVC_FIN } from './flags.js';
 import {
@@ -44,8 +46,25 @@ export interface TlsLayerOptions {
  * claimed.
  */
 export function tls(opts: TlsLayerOptions): Layer<RawStep> {
+  return tlsLayer(opts, false);
+}
+
+/**
+ * Begin in plain, as `raw()`, and switch to TLS when the handler calls
+ * `c.startTls()` (SMTP's STARTTLS, RFC 3207). The step that calls it sends
+ * its writes in plain (the go-ahead); the input after what it acks is TLS,
+ * so plaintext a client sent after the command is never read as a command
+ * (CVE-2011-0411), and input sealing stops (svc.md §9). After the
+ * handshake the handler runs again with `c.tls` set, as under `tls()`.
+ */
+export function starttls(opts: TlsLayerOptions): Layer<RawStep> {
+  return tlsLayer(opts, true);
+}
+
+function tlsLayer(opts: TlsLayerOptions, plainFirst: boolean): Layer<RawStep> {
+  const name = plainFirst ? 'starttls' : 'tls';
   return {
-    engine: 'tls',
+    engine: name,
     open: async () => {
       const sw = await loadSvcWasm(opts.wasm);
       const versions = opts.versions ?? ['1.2', '1.3'];
@@ -56,17 +75,17 @@ export function tls(opts: TlsLayerOptions): Layer<RawStep> {
         tls13: versions.includes('1.3'),
         ...(opts.keyLimit === undefined ? {} : { keyLimit: opts.keyLimit }),
       });
-      return new TlsEngine(sw, config);
+      return new TlsEngine(name, sw, config, plainFirst);
     },
   };
 }
 
 class TlsEngine implements Engine<RawStep> {
-  readonly name = 'tls';
-
   constructor(
+    readonly name: string,
     readonly sw: SvcWasm,
     readonly config: SW.TlsConfig,
+    readonly plainFirst: boolean,
   ) {}
 
   conn(): LayerConn<RawStep> {
@@ -83,12 +102,24 @@ function failure(f: SW.TlsFailure): ZenError {
   return new ZenError(0, `tls_${f.code}`, `TLS: ${f.detail}`);
 }
 
+function handshakeLost(): ZenError {
+  return new ZenError(0, 'format', 'a TLS connection taken over during its handshake');
+}
+
 const EMPTY = new Uint8Array(0);
 
 const latin1 = new TextDecoder('latin1');
 
-/** A TLS step prepared from the input. */
+/** `starttls()`'s phases (svc.md §7.1); `tls()` begins at SWITCHED. */
+const PLAIN = 0;
+const SWITCHED = 1;
+const HANDSHAKE = 2;
+const ESTABLISHED = 3;
+
+/** A step prepared from the input. */
 interface TlsPrepared extends Prepared {
+  /** The phase after the input (PLAIN: the input is handed over as it is). */
+  phase: number;
   /** Input bytes the engine consumed (whole records): the step's ack. */
   consumed: number;
   /** Bytes to send before the handler's: handshake flights, alerts, KeyUpdates. */
@@ -99,47 +130,82 @@ interface TlsPrepared extends Prepared {
   tls?: TlsInfo;
   /** Complete records wait behind the plaintext held: once the handler acks, step again. */
   held: boolean;
-  /** The engine state after the input (null: handshaking). */
+  /** The TLS engine's state after the input (null: plain or handshaking). */
   engineState: Uint8Array | null;
 }
 
-/** An attempt at a TLS step. */
+/** An attempt at a step. */
 interface TlsLive extends Live<RawStep> {
   readonly view: Step;
+  /** What the attempt's `finish()` made: the phase after the step, and the TLS state. */
+  next?: { phase: number; tls: Uint8Array | null };
 }
 
 class TlsConn implements LayerConn<RawStep> {
   /** The handshake, in memory until it is done. */
   private hs: SW.TlsConn | undefined;
-  /** The committed engine state, once established. */
+  /** The committed TLS state, once established. */
   private state: Uint8Array | null = null;
+  /** The committed phase. */
+  private phase: number;
+  /** The committed engine state, as sealed (`tls()`: the TLS state itself). */
+  private sealed: Uint8Array | null = null;
   /** What the handler saw last: the plaintext it left unacked, and the EOF (-1: nothing yet). */
   private seenPlain = -1;
   private seenEof = false;
 
-  constructor(private readonly e: TlsEngine) {}
+  constructor(private readonly e: TlsEngine) {
+    this.phase = e.plainFirst ? PLAIN : SWITCHED;
+  }
 
   load(engineState: Uint8Array | null, same: boolean): void {
     this.seenPlain = -1;
     this.seenEof = false;
-    if (engineState?.length) {
+    const st = engineState?.length ? engineState : null;
+    let phase: number;
+    let tlsState: Uint8Array | null;
+    if (this.e.plainFirst) {
+      ({ phase, tls: tlsState } = decodeOuter(st));
+    } else if (st) {
+      phase = ESTABLISHED;
+      tlsState = st;
+    } else {
+      // `tls()` keeps no state until the handshake is done.
+      if (this.state || !same) throw handshakeLost();
+      phase = this.phase;
+      tlsState = null;
+    }
+    // svc.md §7.1: a handshake can't be continued elsewhere.
+    if (phase === HANDSHAKE && !(same && this.phase === HANDSHAKE)) throw handshakeLost();
+    if (tlsState) {
       // Check it restores now, so a bad state releases the connection.
       try {
-        this.e.sw.TlsConn.restore(this.e.config, engineState).free();
+        this.e.sw.TlsConn.restore(this.e.config, tlsState).free();
       } catch (e) {
         throw new ZenError(0, 'format', `a TLS state that doesn't restore (${String(e)})`);
       }
-      this.state = engineState;
-      this.dropHandshake();
-      return;
     }
-    if (this.state || !same) {
-      // svc.md §7.1: a handshake can't be continued elsewhere.
-      throw new ZenError(0, 'format', 'a TLS connection taken over during its handshake');
-    }
+    if (phase !== HANDSHAKE) this.dropHandshake();
+    this.phase = phase;
+    this.state = tlsState;
+    this.sealed = st;
   }
 
   prepare(input: Uint8Array, eof: boolean, finSent: boolean): TlsPrepared {
+    if (this.phase === PLAIN) {
+      return {
+        phase: PLAIN,
+        established: true,
+        call: true,
+        input,
+        eof,
+        consumed: 0,
+        out: EMPTY,
+        held: false,
+        engineState: null,
+        fragile: false,
+      };
+    }
     if (this.state) {
       const c = this.e.sw.TlsConn.restore(this.e.config, this.state);
       try {
@@ -152,7 +218,10 @@ class TlsConn implements LayerConn<RawStep> {
     const p = this.hs.input(input, eof);
     if (p.error || !p.established) {
       if (p.error) this.dropHandshake();
+      // Once it has consumed or sent anything, the handshake can't be redone.
+      const begun = this.phase === HANDSHAKE || p.consumed > 0 || p.out.length > 0;
       return {
+        phase: begun ? HANDSHAKE : this.phase,
         consumed: p.consumed,
         out: p.out,
         established: false,
@@ -162,7 +231,7 @@ class TlsConn implements LayerConn<RawStep> {
         ...(p.error ? { error: failure(p.error) } : {}),
         held: false,
         engineState: null,
-        fragile: true,
+        fragile: begun || p.error !== undefined,
       };
     }
     const q = this.after(this.hs, p, finSent, true);
@@ -188,6 +257,7 @@ class TlsConn implements LayerConn<RawStep> {
     const fresh =
       p.established || input.length > this.seenPlain || (eof && !this.seenEof && !finSent);
     return {
+      phase: ESTABLISHED,
       consumed: p.consumed,
       out: p.out,
       established: true,
@@ -203,6 +273,7 @@ class TlsConn implements LayerConn<RawStep> {
   }
 
   open(p: TlsPrepared, ctx: StepContext): TlsLive {
+    const plain = p.phase === PLAIN;
     const s = new Step(
       ctx.conn,
       ctx.peer,
@@ -210,26 +281,65 @@ class TlsConn implements LayerConn<RawStep> {
       p.eof,
       ctx.state,
       ctx.finSent,
-      room(p, ctx.outWindow),
+      plain ? ctx.outWindow : room(p, ctx.outWindow),
       p.tls,
+      plain,
     );
-    return {
+    const live: TlsLive = {
       view: s,
       app: () => s.state,
-      finish: () => this.finish(p, s),
+      finish: () => {
+        const f = plain ? this.finishPlain(p, s) : this.finish(p, s);
+        live.next = f.next;
+        return f.f;
+      },
       dispose: () => {},
+    };
+    return live;
+  }
+
+  /** The engine state to seal: `tls()`'s is the TLS state; `starttls()` wraps it with the phase. */
+  private outer(phase: number, tlsState: Uint8Array | null): Uint8Array | null {
+    if (!this.e.plainFirst) return tlsState;
+    return cbor.encode(tlsState ? { v: 1, phase, tls: tlsState } : { v: 1, phase });
+  }
+
+  private changed(s: Uint8Array | null): boolean {
+    return s !== null && !(this.sealed !== null && bytes.equal(this.sealed, s));
+  }
+
+  /** A plain step: the handler's bytes as they are, and the switch if it asked for it. */
+  private finishPlain(p: TlsPrepared, s: Step): { f: Finished; next: TlsLive['next'] } {
+    const engineState = s.starting ? this.outer(SWITCHED, null) : null;
+    return {
+      f: {
+        inAck: s.acked,
+        bytes: s.writes(),
+        endFlag: s.endFlag,
+        engineState,
+        engineChanged: this.changed(engineState),
+        // Input after the command is TLS: hand it to the engine at once,
+        // so a handshake that begins with plaintext fails now.
+        again: s.starting && s.acked < p.input.length,
+        unseal: s.unsealed || s.starting,
+      },
+      next: { phase: s.starting ? SWITCHED : PLAIN, tls: null },
     };
   }
 
-  private finish(p: TlsPrepared, s: Step): Finished {
+  private finish(p: TlsPrepared, s: Step): { f: Finished; next: TlsLive['next'] } {
     if (p.error || !p.engineState) {
+      const engineState = this.outer(p.phase, p.engineState);
       return {
-        inAck: p.consumed,
-        bytes: p.out,
-        endFlag: p.error ? SVC_CLOSE : 0,
-        engineState: p.engineState,
-        engineChanged: p.engineState !== null && !this.same(p.engineState),
-        again: false,
+        f: {
+          inAck: p.consumed,
+          bytes: p.out,
+          endFlag: p.error ? SVC_CLOSE : 0,
+          engineState,
+          engineChanged: this.changed(engineState),
+          again: false,
+        },
+        next: { phase: p.phase, tls: p.engineState },
       };
     }
     const c = this.e.sw.TlsConn.restore(this.e.config, p.engineState);
@@ -248,29 +358,33 @@ class TlsConn implements LayerConn<RawStep> {
         }
       }
       if (endFlag === SVC_FIN || endFlag === SVC_CLOSE) parts.push(c.close());
-      const state = c.state() ?? null;
+      const tlsState = c.state() ?? null;
+      const engineState = this.outer(ESTABLISHED, tlsState);
       return {
-        inAck: p.consumed,
-        bytes: concat(parts),
-        endFlag,
-        engineState: state,
-        engineChanged: state !== null && !this.same(state),
-        // Records held back behind the plaintext: the handler made room.
-        again: p.held && s.acked > 0,
-        unseal: s.unsealed,
+        f: {
+          inAck: p.consumed,
+          bytes: concat(parts),
+          endFlag,
+          engineState,
+          engineChanged: this.changed(engineState),
+          // Records held back behind the plaintext: the handler made room.
+          again: p.held && s.acked > 0,
+          unseal: s.unsealed,
+        },
+        next: { phase: ESTABLISHED, tls: tlsState },
       };
     } finally {
       c.free();
     }
   }
 
-  private same(s: Uint8Array): boolean {
-    return this.state !== null && bytes.equal(this.state, s);
-  }
-
   committed(p: TlsPrepared, f: Finished, live: TlsLive): void {
-    if (f.engineState) this.state = f.engineState;
-    if (p.call) {
+    if (live.next) {
+      this.phase = live.next.phase;
+      if (live.next.tls) this.state = live.next.tls;
+    }
+    if (f.engineState) this.sealed = f.engineState;
+    if (p.call && p.phase !== PLAIN) {
       this.seenPlain = p.input.length - live.view.acked;
       this.seenEof = p.eof;
     }
@@ -285,6 +399,33 @@ class TlsConn implements LayerConn<RawStep> {
     this.dropHandshake();
     this.state = null;
   }
+}
+
+/** `starttls()`'s engine state (svc.md §7.1); none is the plain phase. */
+function decodeOuter(st: Uint8Array | null): { phase: number; tls: Uint8Array | null } {
+  if (!st) return { phase: PLAIN, tls: null };
+  let m: Record<string, unknown> | null;
+  try {
+    m = cbor.decode(st) as Record<string, unknown> | null;
+  } catch {
+    m = null;
+  }
+  const phase = m?.phase;
+  const tls = m?.tls;
+  if (
+    !m ||
+    typeof m !== 'object' ||
+    m.v !== 1 ||
+    typeof phase !== 'number' ||
+    !Number.isInteger(phase) ||
+    phase < PLAIN ||
+    phase > ESTABLISHED ||
+    (phase === ESTABLISHED) !== tls instanceof Uint8Array ||
+    (tls !== undefined && !(tls instanceof Uint8Array))
+  ) {
+    throw new ZenError(0, 'format', 'not a version-1 starttls state');
+  }
+  return { phase, tls: (tls as Uint8Array | undefined) ?? null };
 }
 
 /** Most plaintext a step may write so its records fit `outWindow`. */

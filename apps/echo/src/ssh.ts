@@ -13,7 +13,7 @@
 // command and progress live in the application state.
 import { bytes } from '@zen/client';
 import type { Db, DbTransaction } from '@zen/db';
-import { type Layer, type SshChannel, type SshStep, ssh } from '@zen/svc';
+import { type Layer, LineReader, type SshChannel, type SshStep, ssh } from '@zen/svc';
 import { type Cert, SSH_HOST_KEY, type SshKey } from './schema.js';
 
 /** The echo service over SSH. */
@@ -134,17 +134,17 @@ async function run(c: SshStep, tx: DbTransaction, ch: SshChannel, st: Chan): Pro
       return;
     }
     case 'lines': {
-      const data = ch.data;
-      let at = 0;
-      for (let nl = data.indexOf(10); nl >= 0 && !st.out; nl = data.indexOf(10, at)) {
+      const r = new LineReader(ch.data);
+      // Stop at output the client's window didn't take: it goes first.
+      while (!st.out) {
+        const l = r.nextText();
+        if (l === null) break;
         st.n = (st.n ?? 0) + 1;
-        const l = text.decode(data.subarray(at, nl));
         say(ch, st, `${st.n}: ${l}\n`);
         await tx.table('lines').insert({ conn: `${bytes.hex(c.conn)}/${ch.id}`, n: st.n, line: l });
-        at = nl + 1;
       }
-      ch.ack(at);
-      if (ch.eof && at === data.length && !st.out) {
+      ch.ack(r.consumed);
+      if (ch.eof && r.rest().length === 0 && !st.out) {
         say(ch, st, 'bye\n');
         st.exit = 0;
       }

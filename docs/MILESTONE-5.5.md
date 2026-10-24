@@ -312,7 +312,192 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx vitest run` 3×: 486 passed each time, 7 skipped (the opt-in benches). This includes `packages/client/test/svcvectors.test.ts` (7, inbox vectors new) and `apps/echo/test/inbox.test.ts` (4).
     * `npx playwright test`: 16 specs, unchanged
   * The local FDB cluster had stopped (a container restart); it was restarted with the binary rebuilt `--features fdb`. Stale test executables were pruned (4 GB).
-  * CI green on PR #49's head a798c2e: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), `openssh-pq` skipped. Next: once PR #49 merges, plan step 5.5.13 (`apps/mail`: STARTTLS in `tls()`, the line helper, SMTP and IMAP).
+  * CI green on PR #49's head a798c2e: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), `openssh-pq` skipped. Merged at 0185426.
+* **Step 5.5.13** (`apps/mail`) is split in two PRs (the user's decision):
+  * **5.5.13a**: STARTTLS, the line reader and inbound SMTP: done, PR #50. Commits: `docs: milestone 5.5 step 13a plan`; `spec: STARTTLS (svc.md §7.1)`; `svc: a line reader, and starttls()`; `apps: mail, inbound SMTP`; the docs and this log.
+    * As planned, plus details settled while building:
+      * **Four phases, not three.** The `starttls` engine state's `phase` is 0 plain, 1 switched (the handshake not begun), 2 handshake, 3 TLS. A connection switched but whose handshake hasn't consumed or sent anything is still resumable: a successor begins the handshake. So the window between the `220` and the client's ClientHello survives a takeover.
+      * **Input after the command is read at once.** The switching step sets `again` when input follows what it acked, so pipelined or injected plaintext reaches the TLS engine without waiting for more input, and the handshake fails on it then.
+      * **`TlsConn` carries the phase** for both layers. `tls()` begins at "switched" and seals the bare TLS state, as before; `starttls()` wraps it in `{v, phase, tls?}`. `RawStep.startTls()` comes from the `Step` class (allowed only in `starttls()`'s plain phase).
+      * **`LineReader.next()` gives bytes and `nextText()` UTF-8 text**; `max` counts the terminator, and a line over it, complete or not, sets `tooLong`.
+      * **The DATA decoder** treats only CRLF as a line end: a dot after a bare LF stays, and `\n.\n` never ends a message (no SMTP smuggling). A dot that starts a line is always dropped, as RFC 5321 §4.5.2 says.
+      * **Parts are filled to 64 KiB**: each step appends to the last part (read, concatenate, put) before starting the next, so a 10 MB message is at most 160 rows whatever the step sizes.
+      * **Drafts:** a client's EOF mid-DATA deletes its draft at once; only a connection that dies without one (a reset, a handler that never steps again) leaves one for `sweepDrafts`. A draft swept while its message still arrives makes the end reply `451` (try again), not a truncated message.
+      * **The Python client** sets smtplib's `_host` after `connect()`: `starttls()` checks the certificate against the host given to the constructor, which `connect()` alone leaves unset.
+      * **The layer test** (`packages/svc/test/starttls.test.ts`) drives the layer over real TCP sockets. Over an in-memory Duplex that had been read in plain first, Node's TLS client never finished a 1.3 handshake (1.2 worked); with a `net.Socket`, as real STARTTLS clients use, both do.
+    * Verified:
+      * `npm run check`
+      * `npx vitest run` 3×: 508 passed each time, 7 skipped (the opt-in benches). This includes `packages/svc/test/lines.test.ts` (4), `starttls.test.ts` (6) and `apps/mail/test/smtp.test.ts` (12); the mail suite also passed 3 more times alone.
+      * `npx playwright test`: 16 specs, unchanged
+      * `cargo test -p zen-server --test svc` (33; the server is unchanged)
+    * **CI fix:** on head 43b3448 the `client` job failed in both runs. Every test passed (508), but Vitest caught 2 unhandled rejections from `packages/svc/test/starttls.test.ts`: `null pointer passed to rust` in `TlsConn.start` and `TlsConn.restore`. Commit `svc: the starttls() test closes its connections before the engine` (plan below).
+      * Cause, a race in the test's teardown: `afterAll` freed the `TlsConfig` (`engine.close()`) while sockets from earlier tests could still deliver bytes to their drivers, whose `void this.run()` then used the freed config with nothing to catch the rejection.
+      * Reproduced locally by forcing the mechanism: a driver that has switched receives bytes after `engine.close()`, which gave the same two errors. Timing alone (a 500 ms wait after closing) didn't reproduce it here.
+      * Fix: drivers are tracked; `stop()` destroys the socket and frees the layer, and `run()` does nothing once stopped. An `afterEach` stops the test's drivers, and `afterAll` stops the rest before `engine.close()`. Failures of `run()` are recorded in the driver's `errors`.
+      * Verified: the forced trigger gives no error with the fix; the test file 10×; `packages/svc` 3× (39); `npm run check`; the whole `npx vitest run` (508 passed, no errors).
+    * **CI on 71f69b5:** the pull-request run is green (all checks). The push run's `client` job failed one test: `starttls.test.ts` "a state in the handshake is refused…" timed out after 5 s waiting for the handshake step's sealed state (phase 2). Every other test passed.
+      * Not reproduced locally: the file 24 times, 6 copies at once, and 10 times alone.
+      * Since the teardown fix, a failure inside a driver's `run()` is recorded in `d.errors` and that test never looked at it, so the cause isn't in the log. Commit `svc: the starttls() test reports its drivers' errors`:
+        * after each test, any error a driver recorded fails the test (the pipelined test, which expects one, clears it)
+        * the handshake wait reports the phase, each step's ack, output, end flag and phase, the pending input and the driver's errors when it times out
+        * waits allow 15 s, not 5 s, for loaded runners
+        * the handshake test stops its driver before destroying the client, so the unfinished handshake isn't reported as an error
+      * If it recurs, the log names the cause.
+  * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
+  * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## CI fix in step 5.5.13a: the starttls() layer test's teardown
+
+**The failure.** On PR #50's head 43b3448 the `client` job failed in both runs. Vitest passed every test (508 passed, 7 skipped), but it caught 2 unhandled rejections and failed the run: `Error: null pointer passed to rust`. One came from `TlsConn.start` (`tls.ts` `prepare`), the other from `TlsConn.restore` (`tls.ts` `finish`), both called from `Driver.run` in `packages/svc/test/starttls.test.ts`. The `rust`, `pure-rust` and `fdb` jobs are green.
+
+**Root cause.** It's a race in the test's teardown, not in the layer:
+* `afterAll` calls `engine.close()`, which frees the `TlsConfig`, while sockets of earlier tests' drivers can still deliver data or EOF. The handshake-refusal test, for example, leaves a TLS client mid-handshake and only calls `client.destroy()`.
+* The test's drivers run `void this.run()` on every `data` and `end` event. A late event then calls `TlsConn.start` or `restore` on the freed config, and the rejection has no handler.
+* Locally the late events happened to come before `afterAll`; on the runners they came after.
+
+**Fix** (commit `svc: the starttls() test closes its connections before the engine`, test only):
+* Keep every `Driver` in a set. `Driver.stop()` sets `ended`, destroys its socket, and frees its layer once no step is running.
+* `run()` returns at once when stopped, and the drivers catch `run()` failures and record them in `errors` instead of leaving them unhandled, so a test that expects none fails with the cause.
+* An `afterEach` stops the test's drivers. `afterAll` closes the server, stops whatever is left, then calls `engine.close()`.
+
+**Verify:**
+* `npx vitest run packages/svc/test/starttls.test.ts` 10×, and the svc package 3×. To show the race is gone, also run with a delay in `afterAll` before `engine.close()` reversed (close first, then wait 500 ms for late events), confirming no unhandled rejection.
+* `npm run check`; then the whole `npx vitest run` once.
+* Push, then CI green on both runs of PR #50. Log it in both plan copies.
+
+## Step 5.5.13a in detail: STARTTLS, the line reader, inbound SMTP
+
+An inbound mail server (RFC 5321) as a relayed service. A message is accepted, stored, its event emitted and `250` sent in **one commit**, so a handler killed at any point, even between the end of DATA and the reply, never loses or doubles a message. Sessions may switch to TLS with STARTTLS (RFC 3207), which `@zen/svc` gains as a layer. Before the switch, the sealed inbox (5.5.12) keeps the plaintext sealed at rest. Text protocols get a line reader.
+
+**Commits:**
+1. `docs: milestone 5.5 step 13a plan` (also logs step 5.5.12's CI and merge)
+2. `spec: STARTTLS (svc.md §7.1)`
+3. `svc: a line reader, and starttls()`
+4. `apps: mail, inbound SMTP`
+5. the docs and the log
+
+### Facts from the survey
+* **`tls()`** (`packages/svc/src/tls.ts`) assumes TLS from the first byte.
+  * Its `TlsConn` holds the handshake in memory (`hs`) and the committed state once established.
+  * `load()` refuses a connection taken over mid-handshake.
+  * `prepare()` runs `after()` on an established engine; the handler is called on the step that finishes the handshake, on new plaintext, or on an unseen EOF.
+  * The engine holds at most 16 KiB of unconsumed plaintext and stops decrypting there, so a handler must consume as it reads.
+* **The runtime** (`serve.ts`): a fresh connection gets a first step without input (`due`), so a server-first protocol can greet. The raw layer is resumable from the first step; `Finished.unseal` (5.5.12) sets the inbox's sticky flag.
+* **No line splitting is shared:** echo's raw handler (`apps/echo/src/echo.ts`) and its SSH `lines` command (`ssh.ts`) repeat the same `indexOf(10)` loop.
+* **zen-db:**
+  * A row's large fields are split into parts automatically (`packages/db/src/row.ts` `layoutRow`), but a commit carries at most 8 MB, so a 10 MB message can't be written in one commit.
+  * `tx.emit(topic, type, body, {key, id})` emits an event in the transaction (`txn.ts:166`).
+  * A conflict re-runs the transaction, so a counter row read-modify-write is safe (`db.ts:547`).
+  * Indexes: `createIndex(table, name, {fields, unique})`.
+* **Apps are found by globs** (`scripts/build-apps.mjs` `appNames`, `apps/tsconfig.json`, `vitest.config.ts`, `playwright.config.ts`): `apps/mail` needs no wiring.
+  * The harness: `startWorld({grants, services: [{name, path, mode, resume, more}]})`, `w.servicePort`, `spawnWorker`, `workerEnv`, `waitFor`, `kill`.
+  * `testCerts()` gives a P-256 chain for `localhost` and `127.0.0.1` (needs `openssl`).
+* **Python** 3.11 here, 3.12 on the runners (preinstalled on `ubuntu-latest`), with `smtplib` and `ssl`. Only `packages/fuse/test/mount.test.ts` runs Python today (`python3 -c`).
+
+### spec: svc.md §7.1 (`spec:`)
+* §7's engine list gains `"starttls"`.
+* **A new paragraph, STARTTLS.** A connection that starts plain and switches to TLS in mid-stream.
+  * **The switch.** A step of the plain phase may end it: its records go out in plain (the protocol's go-ahead reply), and the input from its `in_to` on is TLS.
+  * **Plaintext the client sent after the command** (pipelined, or injected, CVE-2011-0411) is handed to the TLS engine as TLS input. So it is never read as a command after the switch: a handshake that begins with it fails, and the connection closes.
+  * **Sealing:** the step that switches sets `unseal` (§9): what follows is TLS ciphertext.
+  * **Resumability:** the plain phase is resumable from the first step, as raw; the handshake isn't (as in `tls`); the TLS phase is again. A successor that finds the handshake phase releases the connection with `close`.
+  * **The state:** `engine_state` is `{v: 1, phase: 0 plain | 1 handshake | 2 tls, tls?: <§7.1's engine_state>}`, absent in the plain phase until the switch.
+
+### `@zen/svc` (`svc:`)
+* **`LineReader`** (`packages/svc/src/lines.ts`):
+  ```ts
+  const r = new LineReader(c.input, { max: 1000 });   // max line, with its terminator
+  for (let l = r.next(); l !== null; l = r.next()) { … }  // a line without its CRLF (or bare LF)
+  r.consumed;     // bytes of whole lines read: what to ack
+  r.rest();       // the bytes after them (e.g. message data after DATA)
+  r.tooLong;      // no terminator within `max` bytes
+  ```
+  * Echo's two loops use it.
+* **`starttls(opts: TlsLayerOptions): Layer<RawStep>`**, engine `starttls`:
+  * Plain phase: as `raw()`, plus `c.startTls()`. The step's writes go out in plain; the switch happens after them.
+  * TLS phase: as `tls()`, with `c.tls` set; the handler is called when the handshake finishes, so a protocol that has the server speak again can.
+  * `RawStep.startTls()` throws under the other layers and after the switch.
+* **Refactor:**
+  * `tls.ts`'s `TlsConn` gains a starting phase.
+  * `tls()` is `TlsConn` started in TLS; `starttls()` starts it plain.
+  * The `Step` class gets the `startTls` hook.
+  * `Finished.unseal` is set on the switching step.
+* **Tests:**
+  * `packages/svc/test/lines.test.ts`: CRLF and bare LF, a partial last line, `max`, `rest()` after a line.
+  * `packages/svc/test/starttls.test.ts`, driving the layer as `serve()` does with no server (the pattern of `sshlayer.test.ts`), against Node's `tls.connect` over an in-memory socket, restoring from the committed state at every step:
+    * a plain exchange, the switch, data both ways, close_notify, on 1.2 and 1.3
+    * pipelined plaintext after the command fails the handshake
+    * a handshake-phase state refused by `load`
+    * `unseal` on the switching step
+
+### `apps/mail`: inbound SMTP (`apps:`)
+* **`src/schema.ts`, namespace `mail`:**
+  * `mailboxes {address → user}`: the local addresses
+  * `drafts {draft, conn, started}` and `parts {draft, seq → data}`: DATA staged as it arrives
+  * `messages {user, uid → draft, size, from, to, received, head, flags}`, with index `by_user_uid`
+  * `counters {user → next}`: UIDs
+  * `certs`: the TLS chain and key, and the inbox seed, as echo keeps them
+  * The topic `mail/received`.
+* **`src/smtp.ts`, the handler (RFC 5321 subset, with RFC 3207 and RFC 1870):**
+  * **The greeting** `220 <host> ESMTP zen` on the first step.
+  * **Commands:**
+    * `EHLO`/`HELO`: `EHLO` lists `PIPELINING`, `SIZE 10485760`, `8BITMIME`, and `STARTTLS` before the switch
+    * `MAIL FROM:<…> [SIZE=n]`: over the limit gives `552`
+    * `RCPT TO:<…>`: an address not in `mailboxes` gives `550`; at most 100 recipients
+    * `DATA`, `RSET`, `NOOP`, `QUIT`, `VRFY` (`252`), `STARTTLS` (`220`, then `c.startTls()`)
+    * anything else: `500`/`502`; out of order: `503`
+  * After the switch the session starts over (RFC 3207 §4.2): the state forgets EHLO and the envelope.
+  * Pipelined commands are answered in order within one step. A line over 1,000 bytes gets `500` and closes.
+  * **DATA:**
+    * At `DATA`, a draft row is created, and `354` is sent.
+    * Each later step decodes what arrived with a streaming decoder (dot-unstuffing, the end `CRLF.CRLF` across steps, no line limit), appends it as `parts` rows of at most 64 KiB, and acks it, in the same commit. The decoder's position and the draft's counters live in the state.
+    * At the end, one commit does the rest, then replies `250 2.0.0 Ok <id>`:
+      * for each recipient, a `messages` row with the next UID of its user and a `Received:` header (peer, HELO, TLS version and suite, time) in `head`; the parts are shared
+      * the draft row is deleted
+      * `tx.emit(received, 'message', {user, uid, size}, {key: user})`
+    * Over 10 MB: the rest is read and dropped, the staged parts are deleted, and the reply is `552`.
+    * `RSET`, or a new `MAIL`, deletes a staged draft's parts.
+  * **Exactly once:** the reply is released only after its commit (svc.md §5). A successor continues from the last committed step: the staged parts, the decoder state and the envelope.
+* **`src/mail.ts`:**
+  * `SMTP_SERVICE = ['svc', 'smtp']`
+  * `putMailbox(db, address, user)`
+  * `messageBytes(db, user, uid)`: head plus parts, for the tests and for 5.5.13b
+  * `sweepDrafts(db, olderThanMs)`: deletes drafts left by connections that died mid-DATA, with their parts
+* **`workers/smtp.ts`:** serves `svc/smtp` with `starttls()` and the inbox seed from `certs`, and sweeps drafts every 10 minutes. `MAIL_STALL=data-end` makes the handler print `stall` and hang inside the transaction at the end of DATA, for the kill tests.
+* **`test/client.py`** (run as `python3 -I`): `smtplib` with options for plain, STARTTLS on 1.2 or 1.3, a CA file, the messages to send (a JSON file) and a timeout. It prints each reply as a JSON line.
+* **Vitest (`apps/mail/test/smtp.test.ts`).** The service has `inbox` set (5.5.12); the certificates are `testCerts()`.
+  1. **In process, with Python:**
+     * one message plain, one over STARTTLS 1.3, one over 1.2
+     * each lands once for each recipient, with its exact bytes (`messageBytes`) and an event on `mail/received`
+     * the `Received:` header names the TLS version
+  2. **Refusals:** an unknown recipient (`550`); `SIZE=` over the limit (`552`); a body over the limit (`552`, and no parts left behind); out of order (`503`); `RSET` mid-transaction.
+  3. **Pipelining and injection:** a Node `net` client.
+     * `MAIL`, `RCPT` and `DATA` in one write get three replies.
+     * `STARTTLS\r\nNOOP\r\n` in one write: `NOOP` is never answered, and the connection closes when the handshake fails.
+  4. **A kill between DATA and the reply:**
+     * a worker with `MAIL_STALL=data-end` prints `stall` and is SIGKILLed
+     * a fresh worker (lease TTL 1 s) takes over, and Python gets `250`
+     * the message is stored exactly once
+     * done plain (sealed inbox) and over STARTTLS 1.3 (the TLS state resumes)
+  5. **A kill mid-DATA:** a 3 MB message over STARTTLS 1.2; the worker is killed after some parts are staged. The successor continues, the stored bytes' SHA-256 equals the sent one, and no draft is left.
+  6. **`sweepDrafts`:** a connection dropped mid-DATA leaves a draft, which the sweep removes.
+
+### Docs
+* `docs/CLIENT.md` §11: `starttls()` and `c.startTls()`, `LineReader`, the injection rule; the "Not yet" line becomes IMAP and waking handlers (5.5.13b).
+* `apps/README.md`: the mail app.
+* TECH_DEBT **TD-MAIL-SCOPE**: inbound only.
+  * No SPF, DKIM or DMARC checks, no outbound delivery, no submission port or SMTP AUTH, no `CHUNKING`/`BDAT` or `SMTPUTF8`.
+  * Members of the fs can read every mailbox: mail is as private as the fs, not per user.
+* The log in both plan copies.
+
+### Out of scope (5.5.13b and later)
+* waking handlers without input; IMAP (LOGIN with app passwords, SELECT, FETCH, STORE, SEARCH, EXPUNGE, IDLE); the inbox page and its Playwright spec
+* everything in TD-MAIL-SCOPE
+
+### Verification
+* `npm run check`; `npx vitest run` 3×; `npx playwright test` once (unchanged)
+* `cargo test -p zen-server --test svc` once (the server is unchanged)
+* CI green on the PR
 
 ## Step 5.5.12 in detail: the sealed inbox
 
