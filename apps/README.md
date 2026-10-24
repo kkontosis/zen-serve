@@ -37,7 +37,7 @@ apps/<name>/
 cargo build -p zen-server && scripts/build-wasm.sh   # once
 npm run build:apps                 # apps/dist/<name>/ (bundles, WASM), workers/*.mjs
 node scripts/build-apps.mjs kanban --watch
-npx vitest run apps/<name>         # scenarios (builds the apps and zen-connect first)
+npx vitest run apps/<name>         # scenarios (builds the apps and zen-connect first; ZEN_APPS_BUILT=1 skips that)
 npx playwright test --project=apps # browser specs (builds the apps first)
 ```
 
