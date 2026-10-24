@@ -12,6 +12,7 @@ import { bytes } from '@zen/client';
 import type { Db } from '@zen/db';
 import {
   type Layer,
+  LineReader,
   type RawHandler,
   type ServeHandle,
   type ServeOptions,
@@ -77,18 +78,15 @@ export const echo: RawHandler = async (c, tx) => {
     await tx.table('lines').insert({ conn, n, line: l });
     if (l === 'STARTTLS') c.unseal();
   };
-  let at = 0;
-  for (let nl = input.indexOf(10); nl >= 0; nl = input.indexOf(10, at)) {
-    await line(input.subarray(at, nl));
-    at = nl + 1;
-  }
+  const r = new LineReader(input);
+  for (let l = r.next(); l !== null; l = r.next()) await line(l);
   if (c.eof) {
-    if (at < input.length) await line(input.subarray(at));
+    if (r.rest().length) await line(r.rest());
     c.ack(input.length);
     c.write('bye\n');
     c.end();
   } else {
-    c.ack(at);
+    c.ack(r.consumed);
   }
   c.state = bytes.utf8(String(n));
 };
