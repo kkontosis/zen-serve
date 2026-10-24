@@ -390,9 +390,37 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * **More information for next time** (the user asked whether a recurrence would tell more).
         * Commit `apps: ledger: a failed balance check names the transfer that went wrong`: each committed transfer records its trader and the balances and times it wrote. On a failed sum, each account's transfers are replayed in time order, and one that didn't build on the balance before it is named, with its trader and the transfer before it. Checked by making a recorded transfer stale on purpose.
         * Commit `server: the svc tests show the server's warnings when they fail`: a tracing subscriber (`zen_server=warn`, captured per test). A failing `push_input` shows any `storing relayed input` warning next to its ten push times. Checked by forcing its bound to fail.
+      * **CI on 84c8c02:** both runs red, each in `client`, each in `apps/chat/test/chat.test.ts`. The tests are from milestone 5 and passed on c1e9fb1; this commit changed only the ledger and Rust tests.
+        * Push run: "a dropped connection resumes from the last offset received" timed out after 15 s waiting for the 12 messages, with no detail.
+        * Pull-request run: "who's online" got alice, bob and carol but not dave within `whoIsOnline`'s 1.5 s.
+        * Not reproduced: the chat file 45 times locally, three at once, under the SSH load.
+        * Commit `apps: chat: the resume and presence tests say what went missing`:
+          * the resume test's timeout lists the sends, reconnects and arrivals in order
+          * the presence test asks again with a 10 s wait before failing, and reports who answered then (a slow reply versus a lost ping or reply)
+          * Both messages were checked by forcing the failures.
+        * An observation from the forced run: locally all 12 messages reach Bob after the last reconnect, as history, not live, since the reconnects every four sends keep his stream reconnecting. A failure that names the messages that never came will show whether a resubscribe misses a range.
+        * **Open**, with the diagnostics in place.
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13a: the red on 84c8c02 (chat: a dropped connection resumes)
+
+**Context.** On 84c8c02 the push run's `client` job failed one test; the pull-request run was still in progress when checked. The test: `apps/chat/test/chat.test.ts` › "a dropped connection resumes from the last offset received" (line 205), `timed out waiting for every message` after 15 s.
+* The test subscribes Bob to a room (`readRoom`, a `db.on` from his receipt), and sends 12 messages as Alice. After every 4th it forces Bob's stream to reconnect (`DirectSource.reconnect()` → `Stream.reconnect()`). It expects all 12, in order.
+* It is from milestone 5 (50d077f), has passed every CI run until now, and doesn't involve the typing code this PR changed (`readRoom` and the stream are untouched).
+* The timeout says nothing about which messages were missing: none, the tail, or a gap after a reconnect.
+* Read without finding the fault:
+  * `Stream.reconnect()`: it detaches the socket and starts `reconnectLoop`. After `connect()`, that loop re-sends each `sub` with `after: s.cursor`.
+  * `dropped()`'s re-entry guard.
+
+**Plan:**
+1. **Make the failure name what was lost.** The timeout message prints `seen`, and for each reconnect when it happened relative to the sends (which message indices came before it). A recurrence then shows whether it's a gap right after a reconnect (a resubscribe from a cursor past an undelivered event, or an event delivered on the closing socket after the cursor moved) or a stall.
+2. **Reproduce:** the test alone, in a loop: 100 times, then 3 copies at once (with `ZEN_APPS_BUILT=1`). Also tighten its timing (reconnect after every message, and right after a send) to widen any window.
+3. **Root-cause from what it shows,** in `packages/client/src/stream.ts` (the cursor's update order against the socket swap, frames on a detached socket, the re-subscribe) or `packages/db/src/broker.ts` (`OnSubscription`'s queue and its `after`). Fix with a regression test in `packages/client/test/stream.test.ts` that forces the window. If it doesn't reproduce, keep the diagnostics and log it open, with what was tried.
+4. The pull-request run on 84c8c02: read its result too, and treat any red the same way.
+
+**Verification:** the chat tests 3× alone and in the full `npx vitest run`; the stream tests; `npm run check`; push; CI green on both runs.
 
 ## Step 5.5.13a: the reds on 0319025, pursued to their causes
 
