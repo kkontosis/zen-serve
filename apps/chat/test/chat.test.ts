@@ -197,12 +197,23 @@ describe('messages', () => {
     const [a, b] = [await signIn('alice'), await signIn('bob')];
     const room = newRoom();
     const seen: string[] = [];
-    const sub = await readRoom(b.db, room, (m) => seen.push(m.text));
+    // What happened, in order, for a failure: what arrived, and the reconnects.
+    const events: string[] = [];
+    const sub = await readRoom(b.db, room, (m) => {
+      seen.push(m.text);
+      events.push(`got ${m.text}`);
+    });
     for (let i = 1; i <= 12; i++) {
       await sendMessage(a.db, room, 'alice', `m${i}`);
-      if (i % 4 === 0) await (b.db.source as DirectSource).reconnect();
+      events.push(`sent m${i}`);
+      if (i % 4 === 0) {
+        await (b.db.source as DirectSource).reconnect();
+        events.push('reconnect');
+      }
     }
-    await until(() => seen.length >= 12, 15_000, 'every message');
+    await until(() => seen.length >= 12, 15_000, 'every message').catch((e: Error) => {
+      throw new Error(`${e.message}; in order: ${events.join(', ')}`);
+    });
     await sleep(300);
     expect(seen).toEqual(Array.from({ length: 12 }, (_, i) => `m${i + 1}`));
     expect(b.db.source).toBeInstanceOf(DirectSource);
@@ -281,7 +292,12 @@ describe('typing and presence', () => {
       servePresence(fourth.db, 'dave'),
     ]);
     const names = (ps: Presence[]) => ps.map((p) => p.user).sort();
-    expect(names(await whoIsOnline(ms[1]!.db))).toEqual(['alice', 'bob', 'carol', 'dave']);
+    const all = ['alice', 'bob', 'carol', 'dave'];
+    const first = names(await whoIsOnline(ms[1]!.db));
+    // For a failure: asked again with a longer wait, a late answer is a slow
+    // reply; none is a ping or a reply lost.
+    const again = first.length < all.length ? names(await whoIsOnline(ms[1]!.db, 10_000)) : first;
+    expect(first, `asked again with 10 s: ${again.join(', ')}`).toEqual(all);
     await subs[3]!.close();
     await signOut(fourth);
     await subs[2]!.close();
