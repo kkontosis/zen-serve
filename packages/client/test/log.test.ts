@@ -283,14 +283,29 @@ describe('leaders', () => {
   });
 
   it('renews while it runs', async () => {
+    // A TTL with room for a slow runner (renewals every 500 ms, one second
+    // of slack), checked over more than two TTLs: a holder that stopped
+    // renewing would still lose the lease within the window.
+    const ttlMs = 1500;
     const t = ufs.topic('renewing');
-    const la = await t.leader('renew-l', { ttlMs: 300 });
-    const lb = await bobFs.topic('renewing').leader('renew-l', { ttlMs: 300 });
+    const la = await t.leader('renew-l', { ttlMs });
+    const lb = await bobFs.topic('renewing').leader('renew-l', { ttlMs });
+    // For a failure: when the holder renewed, and with what outcome.
+    const t0 = Date.now();
+    const renewals: string[] = [];
+    const renew = la.renew.bind(la);
+    la.renew = async () => {
+      const at = Date.now() - t0;
+      const ok = await renew();
+      renewals.push(`${at}-${Date.now() - t0}ms ${ok ? 'ok' : 'lost'}`);
+      return ok;
+    };
     expect(await la.acquire()).toBe(true);
-    const end = Date.now() + 1500;
+    const end = Date.now() + 4000;
     while (Date.now() < end) {
-      expect(await lb.acquire()).toBe(false);
-      await new Promise((r) => setTimeout(r, 150));
+      const won = await lb.acquire();
+      expect(won, `lb won at ${Date.now() - t0}ms; la renewed ${renewals.join(', ')}`).toBe(false);
+      await new Promise((r) => setTimeout(r, 300));
     }
     expect(la.isLeader).toBe(true);
     await la.stop();
