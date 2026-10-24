@@ -343,6 +343,11 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
         * waits allow 15 s, not 5 s, for loaded runners
         * the handshake test stops its driver before destroying the client, so the unfinished handshake isn't reported as an error
       * If it recurs, the log names the cause.
+    * **CI on 50f05a9:** green. The pull-request run passed every check (the starttls test included). The push run's `rust` job failed once: `crates/zen-server/tests/svc.rs` `push_input`, worst push latency 1.048 s against its 1 s bound.
+      * The PR doesn't touch `zen-server`; the test passed in the same commit's pull-request run and in every run since step 5.5.4. It ran next to `many_connections` (5,000 connections) in the same test binary.
+      * Per the CI rules: one PR comment saying so, and one re-run of the failed job, which passed (attempt 2: success).
+      * The only 1 s delay on that path is the reader's re-check after a batch fails to store (`RECHECK` in `svc/conn.rs`); nothing showed that happened. If it recurs, it gets root-caused there.
+    * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
 
