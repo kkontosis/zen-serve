@@ -330,8 +330,32 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * `npx vitest run` 3×: 508 passed each time, 7 skipped (the opt-in benches). This includes `packages/svc/test/lines.test.ts` (4), `starttls.test.ts` (6) and `apps/mail/test/smtp.test.ts` (12); the mail suite also passed 3 more times alone.
       * `npx playwright test`: 16 specs, unchanged
       * `cargo test -p zen-server --test svc` (33; the server is unchanged)
+    * **CI fix:** on head 43b3448 the `client` job failed in both runs. Every test passed (508), but Vitest caught 2 unhandled rejections from `packages/svc/test/starttls.test.ts`: `null pointer passed to rust` in `TlsConn.start` and `TlsConn.restore`. Commit `svc: the starttls() test closes its connections before the engine` (plan below).
+      * Cause, a race in the test's teardown: `afterAll` freed the `TlsConfig` (`engine.close()`) while sockets from earlier tests could still deliver bytes to their drivers, whose `void this.run()` then used the freed config with nothing to catch the rejection.
+      * Reproduced locally by forcing the mechanism: a driver that has switched receives bytes after `engine.close()`, which gave the same two errors. Timing alone (a 500 ms wait after closing) didn't reproduce it here.
+      * Fix: drivers are tracked; `stop()` destroys the socket and frees the layer, and `run()` does nothing once stopped. An `afterEach` stops the test's drivers, and `afterAll` stops the rest before `engine.close()`. Failures of `run()` are recorded in the driver's `errors`.
+      * Verified: the forced trigger gives no error with the fix; the test file 10×; `packages/svc` 3× (39); `npm run check`; the whole `npx vitest run` (508 passed, no errors).
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## CI fix in step 5.5.13a: the starttls() layer test's teardown
+
+**The failure.** On PR #50's head 43b3448 the `client` job failed in both runs. Vitest passed every test (508 passed, 7 skipped), but it caught 2 unhandled rejections and failed the run: `Error: null pointer passed to rust`. One came from `TlsConn.start` (`tls.ts` `prepare`), the other from `TlsConn.restore` (`tls.ts` `finish`), both called from `Driver.run` in `packages/svc/test/starttls.test.ts`. The `rust`, `pure-rust` and `fdb` jobs are green.
+
+**Root cause.** It's a race in the test's teardown, not in the layer:
+* `afterAll` calls `engine.close()`, which frees the `TlsConfig`, while sockets of earlier tests' drivers can still deliver data or EOF. The handshake-refusal test, for example, leaves a TLS client mid-handshake and only calls `client.destroy()`.
+* The test's drivers run `void this.run()` on every `data` and `end` event. A late event then calls `TlsConn.start` or `restore` on the freed config, and the rejection has no handler.
+* Locally the late events happened to come before `afterAll`; on the runners they came after.
+
+**Fix** (commit `svc: the starttls() test closes its connections before the engine`, test only):
+* Keep every `Driver` in a set. `Driver.stop()` sets `ended`, destroys its socket, and frees its layer once no step is running.
+* `run()` returns at once when stopped, and the drivers catch `run()` failures and record them in `errors` instead of leaving them unhandled, so a test that expects none fails with the cause.
+* An `afterEach` stops the test's drivers. `afterAll` closes the server, stops whatever is left, then calls `engine.close()`.
+
+**Verify:**
+* `npx vitest run packages/svc/test/starttls.test.ts` 10×, and the svc package 3×. To show the race is gone, also run with a delay in `afterAll` before `engine.close()` reversed (close first, then wait 500 ms for late events), confirming no unhandled rejection.
+* `npm run check`; then the whole `npx vitest run` once.
+* Push, then CI green on both runs of PR #50. Log it in both plan copies.
 
 ## Step 5.5.13a in detail: STARTTLS, the line reader, inbound SMTP
 
