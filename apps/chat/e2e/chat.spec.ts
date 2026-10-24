@@ -14,9 +14,19 @@ const contexts: BrowserContext[] = [];
 const pages: Record<string, Page> = {};
 
 /** What the page exposes on `window.app` (ui/main.ts). */
-type App = { texts(): string[]; offsets(): string[] };
+type App = { texts(): string[]; offsets(): string[]; typingLog(): unknown[] };
 const texts = (p: Page) => p.evaluate(() => (window as unknown as { app: App }).app.texts());
 const offsets = (p: Page) => p.evaluate(() => (window as unknown as { app: App }).app.offsets());
+
+/** Each page's typing indicators, sent and received, as a failure message. */
+async function typingLogs(): Promise<string> {
+  const lines = [`now ${Date.now()}`];
+  for (const [name, p] of Object.entries(pages)) {
+    const log = await p.evaluate(() => (window as unknown as { app: App }).app.typingLog());
+    lines.push(`${name}: ${log.map((e) => JSON.stringify(e)).join('\n  ')}`);
+  }
+  return lines.join('\n');
+}
 
 async function send(p: Page, text: string): Promise<void> {
   await p.fill('#msg-text', text);
@@ -72,8 +82,12 @@ test('offline, then back: every message exactly once, in order', async () => {
 test("typing reaches the others and never the log; who's online counts every page", async () => {
   const { alice, bob, carol } = pages as Record<string, Page>;
   await bob!.locator('#msg-text').pressSequentially('typing something', { delay: 30 });
-  await expect(alice!.locator('#typing')).toHaveText('bob typing…');
-  await expect(carol!.locator('#typing')).toHaveText('bob typing…');
+  try {
+    await expect(alice!.locator('#typing')).toHaveText('bob typing…');
+    await expect(carol!.locator('#typing')).toHaveText('bob typing…');
+  } catch (e) {
+    throw new Error(`${(e as Error).message}\n\ntyping indicators:\n${await typingLogs()}`);
+  }
   await bob!.click('#msg-send');
   await expect.poll(() => texts(alice!)).toContain('typing something');
 

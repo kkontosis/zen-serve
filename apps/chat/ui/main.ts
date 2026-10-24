@@ -188,9 +188,13 @@ addEventListener('online', () => void follow().catch(fail));
 
 // Each member typing, until their newest indicator's time is up.
 const typists = new Map<string, { until: number; timer: ReturnType<typeof setTimeout> }>();
+// The indicators this page sent and received (wall and corrected clock
+// times), for the spec's failure messages.
+const typingLog: Record<string, unknown>[] = [];
 function showTyping(from: string, sentMs: number): void {
   if (from === user) return;
   const left = showFor(db, sentMs);
+  typingLog.push({ from, sentMs, now: db.fs.session.clock.now(), wall: Date.now(), left });
   const until = sentMs + TYPING_SHOW_MS;
   const t = typists.get(from);
   // An older indicator, arriving late, doesn't shorten a newer one.
@@ -209,7 +213,15 @@ function drawTyping(): void {
   const names = [...typists.keys()];
   render(typingLine, names.length ? `${names.join(', ')} typing…` : '');
 }
-input.addEventListener('input', () => void typing.notify().catch(() => {}));
+input.addEventListener('input', () => {
+  const wall = Date.now();
+  void typing
+    .notify(wall)
+    .then((sent) => {
+      if (sent) typingLog.push({ sent: true, wall, now: db.fs.session.clock.now() });
+    })
+    .catch(() => {});
+});
 
 // ------------------------------------------------------------ rooms
 
@@ -344,5 +356,6 @@ ready(ctx, {
   offsets: () => shown.map((m) => bytes.hex(m.offset)),
   room: () => room,
   typists: () => [...typists.keys()],
+  typingLog: () => typingLog,
   whoIsOnline: () => whoIsOnline(db),
 });
