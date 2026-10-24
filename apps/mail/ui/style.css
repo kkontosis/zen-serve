@@ -1,0 +1,54 @@
+body {
+  font:
+    15px / 1.4 system-ui,
+    sans-serif;
+  margin: 0;
+}
+#zen-status {
+  background: #eee;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+#app,
+#zen-signin {
+  padding: 12px;
+  max-width: 820px;
+}
+#zen-signin input,
+#zen-signin button {
+  display: block;
+  margin: 6px 0;
+}
+.zen-error {
+  color: #b00;
+}
+#inbox {
+  list-style: none;
+  padding: 0;
+}
+#inbox .msg {
+  display: grid;
+  grid-template-columns: 1.5em 14em 1fr 11em 5em;
+  gap: 8px;
+  padding: 4px 6px;
+  cursor: pointer;
+  border-bottom: 1px solid #eee;
+}
+#inbox .msg.unread {
+  font-weight: bold;
+}
+#inbox .msg.open {
+  background: #eef4ff;
+}
+#message {
+  white-space: pre-wrap;
+  background: #fafafa;
+  border: 1px solid #ddd;
+  padding: 8px;
+  max-height: 50vh;
+  overflow: auto;
+}
+#new-password {
+  font-family: monospace;
+  font-size: 16px;
+}

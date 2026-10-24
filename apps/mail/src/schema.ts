@@ -134,6 +134,8 @@ export const DB_OPTIONS: DbOptions = {
     2: async (m) => {
       // Whether an expunged message's parts are still shared.
       await m.createIndex('messages', 'by_draft', { fields: [['draft', 'text']] });
+      // A user's addresses, for the page.
+      await m.createIndex('mailboxes', 'by_user', { fields: [['user', 'text']] });
       await m.createTable('app_passwords', { pk: ['user', 'id'] });
       await m.createIndex('app_passwords', 'by_user', { fields: [['user', 'text']] });
     },

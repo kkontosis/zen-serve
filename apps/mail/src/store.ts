@@ -1,5 +1,5 @@
-// What IMAP and the inbox page share: flags and expunges (announced on
-// `mail/changed`), reading a stored message, app passwords, and waking
+// What IMAP and the inbox page share: reading stored messages, flags and
+// expunges (announced on `mail/changed`), app passwords, and waking
 // idling IMAP sessions.
 import type { Db, DbTransaction, OnSubscription } from '@zen/db';
 import type { ServeHandle } from '@zen/svc';
@@ -15,6 +15,38 @@ import {
   type Part,
   receivedTopic,
 } from './schema.js';
+
+// ------------------------------------------------------------ messages
+
+/** A message's bodies' parts, in order. */
+async function body(db: Db, draft: string): Promise<Uint8Array[]> {
+  const parts = await db
+    .table<Part>('parts')
+    .query()
+    .where('draft', '=', draft)
+    .orderBy('seq')
+    .all();
+  return parts.map((p) => p.data);
+}
+
+/** A stored message as received: its `Received:` header, then the body. */
+export async function messageBytes(db: Db, user: string, uid: number): Promise<Uint8Array> {
+  const m = await db.table<Message>('messages').get([user, uid]);
+  if (!m) throw new Error(`no message ${uid} for ${user}`);
+  const pieces = [new TextEncoder().encode(m.head), ...(await body(db, m.draft))];
+  const out = new Uint8Array(pieces.reduce((a, p) => a + p.length, 0));
+  let at = 0;
+  for (const p of pieces) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/** A user's messages, by uid. */
+export function messages(db: Db, user: string): Promise<Message[]> {
+  return db.table<Message>('messages').query().where('user', '=', user).orderBy('uid').all();
+}
 
 // ------------------------------------------------------------ flags and expunge
 
@@ -221,6 +253,12 @@ export function appPasswords(db: Db, user: string): Promise<AppPassword[]> {
 /** Revoke an app password: sessions logged in with it end at their next step. */
 export function revokeAppPassword(db: Db, user: string, id: string): Promise<boolean> {
   return db.table<AppPassword>('app_passwords').delete([user, id]);
+}
+
+/** The addresses that deliver to `user`. */
+export async function addressesOf(db: Db, user: string): Promise<string[]> {
+  const rows = await db.table<Mailbox>('mailboxes').query().where('user', '=', user).all();
+  return rows.map((m) => m.address).sort();
 }
 
 /** The user a login name stands for: a zen user name, or one of its addresses. */
