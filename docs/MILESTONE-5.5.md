@@ -405,6 +405,8 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
         * Commit `client: the leader renewal test has a TTL a slow runner can't outlast`: a 1.5 s TTL over a 4 s window, with `lb` trying every 300 ms. On failure it prints when the holder renewed and when the other won.
         * Checked: 20 of 20 runs pass. A renewal held back 2 s on purpose fails the test, and the message shows the gap (`la` renewed at 1015 ms, `lb` won at 2741 ms).
         * Not proven that CI saw such a stall: nothing recorded the renewals then. A recurrence would now show it.
+      * **CI green on cad1bf6:** both runs passed every check on their first attempt.
+        * Open, with diagnostics that name what went wrong: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test.
     * Next: on merge, plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
