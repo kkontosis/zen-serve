@@ -76,6 +76,7 @@ zen-store = { path = "../zen-store" }
 nix = { version = "0.30", default-features = false, features = ["signal"], optional = true }
 
 [dev-dependencies]
+async-trait = "0.1"
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }

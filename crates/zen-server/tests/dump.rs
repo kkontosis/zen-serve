@@ -6,10 +6,11 @@ mod common;
 
 use common::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zen_proto::*;
 use zen_server::dump;
 use zen_store::embedded::{Embedded, Options};
-use zen_store::{KeyValue, Storage, key_after};
+use zen_store::{KeyValue, Stamp, Storage, Txn, Version, Watch, key_after};
 
 async fn everything(s: &dyn Storage) -> Vec<KeyValue> {
     // Retried: right after a version jump, storage may briefly lag (TooOld).
@@ -17,21 +18,6 @@ async fn everything(s: &dyn Storage) -> Vec<KeyValue> {
         match try_everything(s).await {
             Ok(v) => return v,
             Err(zen_store::Error::TooOld) => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("{e}"),
-        }
-    }
-    panic!("storage kept failing");
-}
-
-/// `dump::is_empty`, retried like `everything` (right after an import's version jump).
-async fn is_empty(s: &dyn Storage) -> bool {
-    let too_old = zen_store::Error::TooOld.to_string();
-    for _ in 0..50 {
-        match dump::is_empty(s).await {
-            Ok(v) => return v,
-            Err(e) if e == too_old => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await
             }
             Err(e) => panic!("{e}"),
@@ -228,7 +214,7 @@ async fn relay_keys_count_as_empty() {
         let mut t = store.begin(None).await.unwrap();
         assert!(t.get(&rk).await.unwrap().is_some(), "the node lease");
     }
-    assert!(is_empty(store.as_ref()).await);
+    assert!(dump::is_empty(store.as_ref()).await.unwrap());
 }
 
 /// A server that was only ever started holds no data: its metadata (the
@@ -258,7 +244,7 @@ async fn a_started_server_counts_as_empty() {
     dump::import(store.as_ref(), std::fs::File::open(&file).unwrap(), false)
         .await
         .unwrap();
-    assert!(!is_empty(store.as_ref()).await);
+    assert!(!dump::is_empty(store.as_ref()).await.unwrap());
     assert_eq!(
         everything(store.as_ref()).await,
         everything(h.server.state.store.as_ref()).await
@@ -277,4 +263,131 @@ async fn a_started_server_counts_as_empty() {
         }
     }
     panic!("storage kept failing");
+}
+
+/// A store whose next `fail` range reads give `TooOld`, as a FoundationDB
+/// cluster's do while it lags (zen-store maps every retryable error to it).
+struct Lagging {
+    inner: Arc<dyn Storage>,
+    fail: Arc<AtomicU32>,
+}
+
+struct LaggingTxn {
+    inner: Box<dyn Txn>,
+    fail: Arc<AtomicU32>,
+}
+
+impl Lagging {
+    fn new(inner: Arc<dyn Storage>, fail: u32) -> Self {
+        Self {
+            inner,
+            fail: Arc::new(AtomicU32::new(fail)),
+        }
+    }
+
+    fn left(&self) -> u32 {
+        self.fail.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Storage for Lagging {
+    async fn begin(&self, rv: Option<Version>) -> zen_store::Result<Box<dyn Txn>> {
+        Ok(Box::new(LaggingTxn {
+            inner: self.inner.begin(rv).await?,
+            fail: self.fail.clone(),
+        }))
+    }
+    async fn watch(&self, key: &[u8]) -> zen_store::Result<Watch> {
+        self.inner.watch(key).await
+    }
+    async fn now_version(&self) -> zen_store::Result<Version> {
+        self.inner.now_version().await
+    }
+    async fn advance_version(&self, at_least: Version) -> zen_store::Result<()> {
+        self.inner.advance_version(at_least).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Txn for LaggingTxn {
+    fn read_version(&self) -> Version {
+        self.inner.read_version()
+    }
+    async fn get(&mut self, key: &[u8]) -> zen_store::Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+    async fn snapshot_get(&mut self, key: &[u8]) -> zen_store::Result<Option<Vec<u8>>> {
+        self.inner.snapshot_get(key).await
+    }
+    async fn get_range(
+        &mut self,
+        begin: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> zen_store::Result<Vec<KeyValue>> {
+        self.inner.get_range(begin, end, limit, reverse).await
+    }
+    async fn snapshot_get_range(
+        &mut self,
+        begin: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> zen_store::Result<Vec<KeyValue>> {
+        // One read at a time in these tests: load, then take one.
+        if self.fail.load(Ordering::Relaxed) > 0 {
+            self.fail.fetch_sub(1, Ordering::Relaxed);
+            return Err(zen_store::Error::TooOld);
+        }
+        self.inner
+            .snapshot_get_range(begin, end, limit, reverse)
+            .await
+    }
+    fn add_read_conflict_range(&mut self, begin: &[u8], end: &[u8]) {
+        self.inner.add_read_conflict_range(begin, end)
+    }
+    fn set(&mut self, key: &[u8], value: &[u8]) {
+        self.inner.set(key, value)
+    }
+    fn clear(&mut self, key: &[u8]) {
+        self.inner.clear(key)
+    }
+    fn clear_range(&mut self, begin: &[u8], end: &[u8]) {
+        self.inner.clear_range(begin, end)
+    }
+    fn set_versionstamped_key(&mut self, prefix: &[u8], suffix: &[u8], value: &[u8]) {
+        self.inner.set_versionstamped_key(prefix, suffix, value)
+    }
+    fn set_versionstamped_value(&mut self, key: &[u8], prefix: &[u8], suffix: &[u8]) {
+        self.inner.set_versionstamped_value(key, prefix, suffix)
+    }
+    fn atomic_add(&mut self, key: &[u8], delta: i64) {
+        self.inner.atomic_add(key, delta)
+    }
+    async fn commit(self: Box<Self>) -> zen_store::Result<Stamp> {
+        self.inner.commit().await
+    }
+}
+
+/// A store that lags for a moment (`TooOld`) doesn't fail the emptiness
+/// check or a copy: both read again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_store_is_read_again() {
+    let (h, _, _) = populated().await;
+    let target = Harness::start().await;
+    let lagging = Lagging::new(target.server.state.store.clone(), 3);
+    assert!(dump::is_empty(&lagging).await.unwrap());
+    assert_eq!(lagging.left(), 0, "the lagging reads happened");
+
+    let src = Lagging::new(h.server.state.store.clone(), 3);
+    dump::copy(&src, target.server.state.store.as_ref(), false)
+        .await
+        .unwrap();
+    assert_eq!(src.left(), 0, "the lagging reads happened");
+    assert_eq!(
+        everything(target.server.state.store.as_ref()).await,
+        everything(h.server.state.store.as_ref()).await
+    );
 }
