@@ -434,10 +434,51 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
           * The spec now has Alice and Bob send just before Bob types. With the old page code it failed 3 of 3 times as in CI; with the fix it passed 5 of 5, and 5 of 5 under full CPU load.
           * Unit tests cover the `Typists` rules, `reset()` and `sentMs`. Also verified: `npm run check`, `apps/chat` vitest (10), and the full Playwright run (16).
       * **CI green on 7497111:** both runs passed every check on their first attempt.
-        * Still open, with their diagnostics: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test.
-    * Next: on merge, plan 5.5.13b.
+        * Still open, with their diagnostics: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test. They are listed in **TD-TEST-OPEN-FAILURES** (spec/TECH_DEBT.md), with where each was seen, what was ruled out and what it prints now.
+    * Merged at 7497111 (merge commit e636e7c). The log commit, c5b90c0, was pushed 33 s after the merge, so it isn't in main. It opens step 5.5.13b's PR, together with the TD entry.
+    * Next: plan 5.5.13b.
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13a: a TD entry for the failures still open, then compaction
+
+**Context.** CI is green on 7497111; c5b90c0 (the log) is in CI. Five failures, each seen once in CI and never locally, are still open. Each now prints a diagnostic meant to name its cause. They are recorded only in this step's log in `docs/MILESTONE-5.5.md`, which nobody rereads once the PR merges and step 13b begins. A tech-debt entry keeps them findable, and tells whoever meets one in CI what is already known.
+
+**The change** (commit `docs: TD-TEST-OPEN-FAILURES, the CI failures seen once`, PR #50, docs only):
+* **`spec/TECH_DEBT.md`:** a new entry, **TD-TEST-OPEN-FAILURES**, in the file's usual form (Status, Context, Why deferred, What it would take). Its Context lists each failure with:
+  * where it was seen (job and commit)
+  * what was ruled out
+  * what its diagnostic prints now
+  1. **The ledger sum** (`apps/ledger/test/ledger.test.ts`): 403, not 400, after `tradeAll(10, 2)`, in the pull-request run on 0319025.
+     * Ruled out: 134 local runs under load, a 2,000-transfer stress test, and a read of the row cache, `expect`, the commit and the store's conflict check.
+     * Diagnostic: each account's balance against its entries, and the transfer that didn't build on the balance before it.
+  2. **`push_input`'s 1 s bound** (`crates/zen-server/tests/svc.rs`): 1.048 s in the `rust` job on 50f05a9.
+     * Ruled out: no failed append was seen in 30 loaded runs.
+     * Diagnostic: all ten push times, and the server's warnings.
+  3. **Chat, a dropped connection resumes** (`apps/chat/test/chat.test.ts`): timed out waiting for 12 messages, in the push run on 84c8c02.
+     * Ruled out: not reproduced in 45 local runs.
+     * Diagnostic: the sends, reconnects and arrivals in order.
+  4. **Chat, who's online**: dave was missing within 1.5 s, in the pull-request run on 84c8c02.
+     * Diagnostic: the test asks again with a 10 s wait and reports who answered, which tells a slow reply from a lost one.
+  5. **The leader renewal** (`packages/client/test/log.test.ts`): the second leader won the lease, in the push run on 8806071.
+     * Likely a runner stall against a 300 ms TTL; the TTL is now 1.5 s.
+     * Diagnostic: the holder's renewal times and when the other won.
+  * **Why deferred:** none reproduced locally. Fixing without a cause would be guessing.
+  * **What it would take:** when one recurs, read its diagnostic, find the cause, and fix it with a regression test; then remove its line. The entry closes when the list is empty.
+* **The log in both plan copies:** a line under step 13a pointing to the entry.
+
+**PR #50 merged** at 7497111 (20:19:04 UTC), 33 s before c5b90c0 (the a6fff93 log) was pushed. So that log commit isn't in main, as happened after step 10. Its push run is green.
+
+**Order:**
+1. Restart from main: `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`. Then `git cherry-pick c5b90c0` (docs only), so the a6fff93 log lands in main.
+2. Write the TD entry and the log line (also: PR #50 merged at 7497111). Commit `docs: TD-TEST-OPEN-FAILURES, the CI failures seen once`.
+3. Push with `--force-with-lease`. The branch has only merged history plus these two commits.
+4. These two commits open step 5.5.13b's PR, as step 10's log went into step 11's plan PR. Open the PR now with them alone, titled for step 13b ("plan to follow").
+5. Confirm CI on both runs.
+6. Stop for compaction.
+7. After compaction, plan 5.5.13b in detail on that PR, as usual.
+
+**Verification:** docs only, so no tests are needed. Check that the entry's links and paths exist (`grep`), and that both plan copies are equal (`cmp`). CI green on both runs.
 
 ## Step 5.5.13a: the red on a6fff93 (svc: the sealed inbox's chunks)
 
