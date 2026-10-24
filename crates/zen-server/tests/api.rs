@@ -341,6 +341,66 @@ async fn kv_commit_and_idempotent_replay() {
     );
 }
 
+/// A short-mode commit (read version, read conflicts on what it writes)
+/// that applied, sent again because its response was lost: the resend
+/// returns the stored result and applies nothing (api.md §6), although the
+/// resend's read version is older than the first attempt's own writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn short_mode_resend_replays() {
+    let h = Harness::start().await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let rv: ReadVersion = h.call("/v1/grv", Some(&tok), &Empty {}).await.unwrap();
+    let c = Commit {
+        commit_id: cid(7),
+        read_version: Some(rv.read_version),
+        read_conflicts: vec![FsRange {
+            fs: 1,
+            begin: b"balance".to_vec(),
+            end: Some(b"balance\0".to_vec()),
+        }],
+        writes: vec![Write {
+            fs: 1,
+            key: b"balance".to_vec(),
+            value: Some(b"97".to_vec()),
+        }],
+        append: vec![append(&topic(1), None, b"moved")],
+        ..Default::default()
+    };
+    let r1: CommitResult = h.call("/v1/commit", Some(&tok), &c).await.unwrap();
+    let r2: R<CommitResult> = h.call("/v1/commit", Some(&tok), &c).await;
+    assert_eq!(r2.map_err(|e| code(Err::<(), _>(e))), Ok(r1.clone()));
+    // Applied once: one event.
+    let log: LogEvents = h
+        .call(
+            "/v1/log/read",
+            Some(&tok),
+            &LogRead {
+                fs: 1,
+                topic: topic(1),
+                after: None,
+                key_token: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(log.events.len(), 1);
+    // A commit with the same read version that conflicts for real still does.
+    let other = Commit {
+        commit_id: cid(8),
+        ..c.clone()
+    };
+    assert_eq!(
+        code(
+            h.call::<_, CommitResult>("/v1/commit", Some(&tok), &other)
+                .await
+        ),
+        (409, "conflict".into())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn short_mode_conflict_exactly_one_wins() {
     let h = Harness::start().await;
