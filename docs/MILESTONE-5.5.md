@@ -462,6 +462,28 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * `cargo test -p zen-server --test svc` (33; the server is unchanged)
     * CI green on PR #51's head 85d3132: both runs (push and pull request) passed every check on their first attempt. Merged at 22:10:36 UTC (merge commit 1af803b). This entry isn't in main: it goes into step 5.5.14's plan commit.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+* **Step 5.5.14** (docs, measurements, the outcome): done, PR #52. Restarted from main after PR #51 merged. Commits: `docs: milestone 5.5 step 14 plan`; `server: svc_sub arms the queue watch again before it sends svc_ready`; `svc: an opt-in bench of relayed services`; `docs: relayed services (docs/SVC.md), measurements, tech debt`; `docs: milestone 5.5 outcome`; this log.
+  * As planned, plus details settled while building:
+    * **The bench found a server bug: a lost wake-up in `svc_sub`.**
+      * The symptom: in 2 of 4 runs that came after the throughput case, 13 of the 1,000 idle connections were never claimed.
+      * The cause: when the ready queue's watch fired, the push loop (`svc/push.rs`) sent `svc_ready` first and armed a new watch only on its next turn. A connection queued after the handler's `/v1/svc/next` read and before that arming fired nothing. The store's watch is armed when it is made (zen-store's contract), so such a connection waited unannounced until `accept_wait_ms` closed it.
+      * The fix: arm the watch, then send `svc_ready`.
+      * The test: `tests/svc_ready.rs`, a binary of its own, with a test-only pause after a fire (`svc::push::testing`, feature `test-utils`). With the old order it fails ("round 0: 1 of 2 connections claimed, and no svc_ready for the rest"); with the fix it passes 5 of 5.
+      * `/v1/svc/next`'s long poll already armed its watch before reading.
+    * **Release builds.** The numbers in STATS §5.5 are from a release server (`ZEN_SERVE_BIN`) and release WASM. The local WASM had been a `--dev` build, about 1.5 to 3 times slower on these paths. The debug figures are noted there too.
+    * **IMAP's part of the bench** is in `apps/mail/test/bench.test.ts`, on the mail world, rather than in the echo bench.
+    * **TD-SVC-ACME** is separate from the existing TD-TLS-ACME, which covers zen-serve's own listener.
+    * **spec/OPS.md** also drops the old advice to run `npm run build:apps` before vitest: the global setup builds the apps since 13a.
+    * **TD-TEST-OPEN-FAILURES:** none recurred in 13b's CI or in this step's local runs. Unchanged.
+  * Verified:
+    * `cargo fmt --all --check`; clippy on zen-server `--all-targets -D warnings`, default, `--no-default-features` and `--all-features`
+    * `tests/svc.rs` 3× on embedded (33)
+    * `tests/svc.rs`, `tests/svc_ready.rs` and `tests/multinode.rs` on FDB. The local cluster had stopped; it was restarted with the binary built `--features fdb`.
+    * `npm run check`
+    * `npx vitest run`: 548 passed, 12 skipped (the benches)
+    * `npx playwright test`: 17 passed
+    * the benches with `ZEN_BENCH=1`, against release builds
+    * a script checking the new and changed docs: every relative link, every anchor, and every `TD-` name as a heading of TECH_DEBT
 
 ## Step 5.5.14 in detail: docs, measurements, the outcome
 
