@@ -314,7 +314,22 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
   * The local FDB cluster had stopped (a container restart); it was restarted with the binary rebuilt `--features fdb`. Stale test executables were pruned (4 GB).
   * CI green on PR #49's head a798c2e: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), `openssh-pq` skipped. Merged at 0185426.
 * **Step 5.5.13** (`apps/mail`) is split in two PRs (the user's decision):
-  * **5.5.13a**: STARTTLS, the line reader and inbound SMTP. Planned below. Next: on "go", implement it.
+  * **5.5.13a**: STARTTLS, the line reader and inbound SMTP: done, PR #50. Commits: `docs: milestone 5.5 step 13a plan`; `spec: STARTTLS (svc.md §7.1)`; `svc: a line reader, and starttls()`; `apps: mail, inbound SMTP`; the docs and this log.
+    * As planned, plus details settled while building:
+      * **Four phases, not three.** The `starttls` engine state's `phase` is 0 plain, 1 switched (the handshake not begun), 2 handshake, 3 TLS. A connection switched but whose handshake hasn't consumed or sent anything is still resumable: a successor begins the handshake. So the window between the `220` and the client's ClientHello survives a takeover.
+      * **Input after the command is read at once.** The switching step sets `again` when input follows what it acked, so pipelined or injected plaintext reaches the TLS engine without waiting for more input, and the handshake fails on it then.
+      * **`TlsConn` carries the phase** for both layers. `tls()` begins at "switched" and seals the bare TLS state, as before; `starttls()` wraps it in `{v, phase, tls?}`. `RawStep.startTls()` comes from the `Step` class (allowed only in `starttls()`'s plain phase).
+      * **`LineReader.next()` gives bytes and `nextText()` UTF-8 text**; `max` counts the terminator, and a line over it, complete or not, sets `tooLong`.
+      * **The DATA decoder** treats only CRLF as a line end: a dot after a bare LF stays, and `\n.\n` never ends a message (no SMTP smuggling). A dot that starts a line is always dropped, as RFC 5321 §4.5.2 says.
+      * **Parts are filled to 64 KiB**: each step appends to the last part (read, concatenate, put) before starting the next, so a 10 MB message is at most 160 rows whatever the step sizes.
+      * **Drafts:** a client's EOF mid-DATA deletes its draft at once; only a connection that dies without one (a reset, a handler that never steps again) leaves one for `sweepDrafts`. A draft swept while its message still arrives makes the end reply `451` (try again), not a truncated message.
+      * **The Python client** sets smtplib's `_host` after `connect()`: `starttls()` checks the certificate against the host given to the constructor, which `connect()` alone leaves unset.
+      * **The layer test** (`packages/svc/test/starttls.test.ts`) drives the layer over real TCP sockets. Over an in-memory Duplex that had been read in plain first, Node's TLS client never finished a 1.3 handshake (1.2 worked); with a `net.Socket`, as real STARTTLS clients use, both do.
+    * Verified:
+      * `npm run check`
+      * `npx vitest run` 3×: 508 passed each time, 7 skipped (the opt-in benches). This includes `packages/svc/test/lines.test.ts` (4), `starttls.test.ts` (6) and `apps/mail/test/smtp.test.ts` (12); the mail suite also passed 3 more times alone.
+      * `npx playwright test`: 16 specs, unchanged
+      * `cargo test -p zen-server --test svc` (33; the server is unchanged)
   * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
 
