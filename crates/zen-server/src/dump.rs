@@ -17,6 +17,7 @@
 use crate::keys;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::time::Duration;
 use zen_store::{Error, KeyValue, Storage, Version, key_after};
 
 const MAGIC: &[u8] = b"zen-serve export\n";
@@ -24,6 +25,8 @@ const END: u32 = u32::MAX;
 const CHUNK: usize = 1000;
 /// Import transactions stay well under FoundationDB's 10 MB limit.
 const TXN_BYTES: usize = 4_000_000;
+/// Reads again after `TooOld` (see `retrying`).
+const RETRIES: u32 = 30;
 
 /// The export header.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,7 +148,11 @@ pub async fn export(store: &dyn Storage, backend: &str, w: impl Write) -> Result
 /// `meta` range and the transient relay keys (keyspace.md §3.9) don't
 /// count, since a started server writes them.
 pub async fn is_empty(store: &dyn Storage) -> Result<bool, String> {
-    let mut t = store.begin(None).await.map_err(|e| e.to_string())?;
+    retrying(|| empty_now(store)).await
+}
+
+async fn empty_now(store: &dyn Storage) -> zen_store::Result<bool> {
+    let mut t = store.begin(None).await?;
     let mut skip = keys::relay_prefixes();
     skip.push(keys::meta_prefix());
     skip.sort();
@@ -158,15 +165,33 @@ pub async fn is_empty(store: &dyn Storage) -> Result<bool, String> {
     }
     gaps.push((from, vec![0xFF]));
     for (b, e) in gaps.iter().filter(|(b, e)| b < e) {
-        let got = t
-            .snapshot_get_range(b, e, 1, false)
-            .await
-            .map_err(|e| e.to_string())?;
-        if !got.is_empty() {
+        if !t.snapshot_get_range(b, e, 1, false).await?.is_empty() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Run `f` again while storage answers `TooOld`, which stands for every
+/// retryable error (a FoundationDB cluster that lags, after an import's
+/// version jump or under load). Backs off to a second, for about half a
+/// minute in all.
+async fn retrying<T, F, Fut>(mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = zen_store::Result<T>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match f().await {
+            Err(Error::TooOld) if attempt < RETRIES => {
+                let ms = (50u64 << attempt.min(5)).min(1000);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                attempt += 1;
+            }
+            r => return r.map_err(|e| e.to_string()),
+        }
+    }
 }
 
 /// Writes pairs in bounded transactions.
@@ -306,12 +331,14 @@ pub async fn copy(from: &dyn Storage, to: &dyn Storage, force: bool) -> Result<S
     };
     let mut from_key = Vec::new();
     loop {
-        let mut t = from.begin(None).await.map_err(|e| e.to_string())?;
-        stats.source_version = stats.source_version.max(t.read_version());
-        let got = t
-            .snapshot_get_range(&from_key, &[0xFF], CHUNK, false)
-            .await
-            .map_err(|e| e.to_string())?;
+        let at = &from_key;
+        let (rv, got) = retrying(|| async move {
+            let mut t = from.begin(None).await?;
+            let got = t.snapshot_get_range(at, &[0xFF], CHUNK, false).await?;
+            Ok((t.read_version(), got))
+        })
+        .await?;
+        stats.source_version = stats.source_version.max(rv);
         let more = got.len() == CHUNK;
         if let Some((k, _)) = got.last() {
             from_key = key_after(k);

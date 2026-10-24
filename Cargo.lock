@@ -3520,6 +3520,7 @@ dependencies = [
 name = "zen-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "blake3",

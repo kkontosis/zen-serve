@@ -1,13 +1,11 @@
 // The echo service (a relayed line service, spec/svc.md) with Node `net`
 // peers: handlers in-process and as Node workers killed with SIGKILL.
-import { execFileSync } from 'node:child_process';
 import { type Socket, connect as tcp } from 'node:net';
 import { bytes } from '@zen/client';
 import type { Db } from '@zen/db';
 import { serve } from '@zen/svc';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
-  ROOT_DIR,
   sleep,
   spawnWorker,
   startWorld,
@@ -25,10 +23,6 @@ let alice: WorkerContext;
 let db: Db;
 
 beforeAll(async () => {
-  execFileSync(process.execPath, ['scripts/build-apps.mjs', 'echo'], {
-    cwd: ROOT_DIR,
-    stdio: 'inherit',
-  });
   w = await startWorld({
     grants: GRANTS,
     services: [

@@ -28,7 +28,10 @@ import {
   sendMessage,
   sendPhoto,
   servePresence,
+  showFor,
+  TYPING_SHOW_MS,
   Typing,
+  Typists,
   whoIsOnline,
 } from '../src/chat.js';
 import { GRANTS } from './grants.js';
@@ -96,6 +99,8 @@ describe('messages', () => {
     expect(seen[0]!.id).toBe(first);
     expect(seen[1]).toMatchObject({ id: photo.id, photo: photo.blob });
     expect(seen[2]!.reply_to).toBe(photo.id);
+    // Each carries when it was sent, on the sender's clock.
+    for (const m of seen) expect(Math.abs(m.sentMs - Date.now())).toBeLessThan(60_000);
     // The room's photos, through the fast index, and the file's bytes.
     const photos = await roomPhotos(b.db, room);
     expect(photos.map((p) => [p.id, p.name, p.size])).toEqual([[photo.blob, 'beach.jpg', 150_000]]);
@@ -195,12 +200,23 @@ describe('messages', () => {
     const [a, b] = [await signIn('alice'), await signIn('bob')];
     const room = newRoom();
     const seen: string[] = [];
-    const sub = await readRoom(b.db, room, (m) => seen.push(m.text));
+    // What happened, in order, for a failure: what arrived, and the reconnects.
+    const events: string[] = [];
+    const sub = await readRoom(b.db, room, (m) => {
+      seen.push(m.text);
+      events.push(`got ${m.text}`);
+    });
     for (let i = 1; i <= 12; i++) {
       await sendMessage(a.db, room, 'alice', `m${i}`);
-      if (i % 4 === 0) await (b.db.source as DirectSource).reconnect();
+      events.push(`sent m${i}`);
+      if (i % 4 === 0) {
+        await (b.db.source as DirectSource).reconnect();
+        events.push('reconnect');
+      }
     }
-    await until(() => seen.length >= 12, 15_000, 'every message');
+    await until(() => seen.length >= 12, 15_000, 'every message').catch((e: Error) => {
+      throw new Error(`${e.message}; in order: ${events.join(', ')}`);
+    });
     await sleep(300);
     expect(seen).toEqual(Array.from({ length: 12 }, (_, i) => `m${i + 1}`));
     expect(b.db.source).toBeInstanceOf(DirectSource);
@@ -226,6 +242,9 @@ describe('typing and presence', () => {
     await until(() => typing.length === 2, 15_000, 'a second one');
     expect(typing).toEqual(['alice', 'alice']);
     await sendMessage(a.db, room, 'alice', 'done typing');
+    // After a message, the next keystroke begins another: announced at once.
+    t.reset();
+    expect(await t.notify()).toBe(true);
     // The log: no event on the typing topic, and only `msg` on the room's.
     const typingLog = [];
     for await (const e of b.ctx.fs.topic('chat', room, 'typing').read()) typingLog.push(e);
@@ -243,9 +262,13 @@ describe('typing and presence', () => {
     const [a, b] = [await signIn('alice'), await signIn('bob')];
     const room = newRoom();
     const fresh: string[] = [];
+    const sent: number[] = [];
     const strict: string[] = [];
     const subs = [
-      await onTyping(b.db, room, (from) => fresh.push(from)),
+      await onTyping(b.db, room, (from, sentMs) => {
+        fresh.push(from);
+        sent.push(sentMs);
+      }),
       // A bound a minute below zero: every indicator counts as too old,
       // whatever the two clocks say.
       await onTyping(b.db, room, (from) => strict.push(from), -60_000),
@@ -255,9 +278,39 @@ describe('typing and presence', () => {
     await sleep(300);
     expect(fresh).toEqual(['alice']);
     expect(strict).toEqual([]);
+    // It shows until its display time after it was sent, not after it arrived.
+    const left = showFor(b.db, sent[0]!);
+    expect(left).toBeLessThanOrEqual(TYPING_SHOW_MS - 300);
+    expect(showFor(b.db, sent[0]! - TYPING_SHOW_MS)).toBeLessThanOrEqual(0);
     for (const s of subs) await s.close();
     await signOut(a);
     await signOut(b);
+  });
+
+  it("a message ends its sender's typing indicator, and one sent before it stays ended", () => {
+    const t = new Typists();
+    const now = 1_000_000;
+    expect(t.typing('alice', now - 100, now)).toBe(now - 100 + TYPING_SHOW_MS);
+    expect(t.typing('bob', now, now)).toBe(now + TYPING_SHOW_MS);
+    expect(t.names).toEqual(['alice', 'bob']);
+    // Alice's message, sent after her indicator, ends it.
+    expect(t.sent('alice', now + 50)).toBe(true);
+    expect(t.names).toEqual(['bob']);
+    // Her indicator from before it, arriving late, doesn't bring it back;
+    // one sent after it is for her next message.
+    expect(t.typing('alice', now + 40, now + 60)).toBeUndefined();
+    expect(t.typing('alice', now + 80, now + 90)).toBe(now + 80 + TYPING_SHOW_MS);
+    // A message sent before Bob's newest indicator leaves it.
+    expect(t.sent('bob', now - 10)).toBe(false);
+    expect(t.names).toEqual(['bob', 'alice']);
+    // An indicator already over, or older than the one shown, changes nothing.
+    expect(t.typing('carol', now - TYPING_SHOW_MS, now)).toBeUndefined();
+    expect(t.typing('bob', now - 5, now)).toBeUndefined();
+    // The timer of a replaced indicator doesn't end the newer one.
+    const later = t.typing('bob', now + 500, now + 500);
+    expect(t.end('bob', now + TYPING_SHOW_MS)).toBe(false);
+    expect(t.end('bob', later!)).toBe(true);
+    expect(t.names).toEqual(['alice']);
   });
 
   it("who's online: every running instance answers, and a closed one no longer", async () => {
@@ -271,7 +324,12 @@ describe('typing and presence', () => {
       servePresence(fourth.db, 'dave'),
     ]);
     const names = (ps: Presence[]) => ps.map((p) => p.user).sort();
-    expect(names(await whoIsOnline(ms[1]!.db))).toEqual(['alice', 'bob', 'carol', 'dave']);
+    const all = ['alice', 'bob', 'carol', 'dave'];
+    const first = names(await whoIsOnline(ms[1]!.db));
+    // For a failure: asked again with a longer wait, a late answer is a slow
+    // reply; none is a ping or a reply lost.
+    const again = first.length < all.length ? names(await whoIsOnline(ms[1]!.db, 10_000)) : first;
+    expect(first, `asked again with 10 s: ${again.join(', ')}`).toEqual(all);
     await subs[3]!.close();
     await signOut(fourth);
     await subs[2]!.close();

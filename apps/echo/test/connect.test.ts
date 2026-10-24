@@ -2,7 +2,7 @@
 // `zen-connect`: OpenSSH with zen-connect as its ProxyCommand, git over
 // it, and `--listen` with Node `net` peers, including a handler worker
 // SIGKILLed mid-stream.
-import { type ChildProcess, execFile, execFileSync, spawn } from 'node:child_process';
+import { type ChildProcess, execFile, spawn } from 'node:child_process';
 import { type Socket, connect as tcp } from 'node:net';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -50,9 +50,6 @@ let keys: TestSshKeys;
 const run = promisify(execFile);
 
 beforeAll(async () => {
-  for (const script of [['scripts/build-apps.mjs', 'echo'], ['scripts/build-zen-connect.mjs']]) {
-    execFileSync(process.execPath, script, { cwd: ROOT_DIR, stdio: 'inherit' });
-  }
   w = await startWorld({
     grants: GRANTS,
     // Bob serves, but may not connect.

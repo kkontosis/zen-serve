@@ -85,6 +85,9 @@ interface Done {
   from: string;
   to: string;
   amount: number;
+  /** What the transfer wrote, for a failed check (`disagreement`): the trader that ran it, and each side's balance and time after it. */
+  trader?: number;
+  after?: { from: number; fromAt: number; to: number; toAt: number };
 }
 interface Refused {
   from: string;
@@ -98,13 +101,21 @@ const pick = <T>(xs: T[]): T => xs[Math.floor(Math.random() * xs.length)]!;
 
 /** `n` random transfers, one after another, on one instance. */
 async function trade(db: Db, n: number, maxAmount: number): Promise<void> {
+  const trader = traders.indexOf(db);
   for (let i = 0; i < n; i++) {
     const from = pick(ACCOUNTS);
     const to = pick(ACCOUNTS.filter((a) => a !== from));
     const amount = 1 + Math.floor(Math.random() * maxAmount);
     try {
       const r = await transfer(db, { from, to, amount, memo: `${from}→${to}` });
-      done.push({ id: r.transfer, from, to, amount });
+      done.push({
+        id: r.transfer,
+        from,
+        to,
+        amount,
+        trader,
+        after: { from: r.from.balance, fromAt: r.from.at, to: r.to.balance, toAt: r.to.at },
+      });
     } catch (e) {
       if (!(e instanceof LedgerError) || e.code !== 'overdraft' || !e.seen) throw e;
       refused.push({ from, amount, seen: e.seen });
@@ -195,12 +206,73 @@ async function checkAudit(): Promise<void> {
   }
 }
 
+/**
+ * What disagrees, for a failed sum: each account's balance against the sum
+ * of its entries, the transfers whose entries don't balance, and the
+ * committed transfers with no entries. Balances off with entries summing
+ * right would be a lost update on an account row (entries are only
+ * inserted); entries off too would be a transfer's entries split.
+ */
+function disagreement(accts: Account[], entries: Map<string, Entry[]>): string {
+  const lines = accts.map((a) => {
+    const es = entries.get(a.id) ?? [];
+    const sum = es.reduce((n, e) => n + e.amount, 0);
+    return `${a.id}: balance ${a.balance} at ${a.at}; entries ${es.length}, sum ${sum}, newest ${es.at(-1)?.at}`;
+  });
+  const byTransfer = new Map<string, Entry[]>();
+  for (const es of entries.values()) {
+    for (const e of es) {
+      if (e.transfer) byTransfer.set(e.transfer, [...(byTransfer.get(e.transfer) ?? []), e]);
+    }
+  }
+  for (const [t, es] of byTransfer) {
+    if (es.length !== 2 || es[0]!.amount + es[1]!.amount !== 0) {
+      lines.push(`transfer ${t}: ${JSON.stringify(es.map((e) => [e.account, e.amount, e.at]))}`);
+    }
+  }
+  for (const d of done) {
+    if (ACCOUNTS.includes(d.from) && !byTransfer.has(d.id)) {
+      lines.push(`no entries for done transfer ${JSON.stringify(d)}`);
+    }
+  }
+  // Each account's committed transfers in its time order: each must have
+  // written the balance before it plus its amount. One that didn't computed
+  // from a stale balance (a lost update): it and the transfer before it.
+  for (const a of accts) {
+    const moves = done
+      .filter((d) => d.after && (d.from === a.id || d.to === a.id))
+      .map((d) =>
+        d.from === a.id
+          ? { d, at: d.after!.fromAt, wrote: d.after!.from, delta: -d.amount }
+          : { d, at: d.after!.toAt, wrote: d.after!.to, delta: d.amount },
+      )
+      .sort((x, y) => x.at - y.at);
+    let bal = DEPOSIT;
+    let prev: (typeof moves)[number] | undefined;
+    for (const m of moves) {
+      if (m.wrote !== bal + m.delta) {
+        const show = (x: typeof m) =>
+          `transfer ${x.d.id} (trader ${x.d.trader}, ${x.d.from}→${x.d.to} ${x.d.amount}) at ${x.at} wrote ${x.wrote}`;
+        lines.push(
+          `${a.id}: ${show(m)}, but after ${bal} it should be ${bal + m.delta}; before it: ${prev ? show(prev) : 'the opening deposit'}`,
+        );
+      }
+      bal = m.wrote;
+      prev = m;
+    }
+  }
+  return lines.join('\n');
+}
+
 /** The invariants of the balances and the entries, after transfers settled. */
 async function checkLedger(): Promise<Map<string, Entry[]>> {
   const accts = await accounts();
   const entries = await allEntries();
   // The sum of balances is constant; no balance is negative.
-  expect(accts.reduce((s, a) => s + a.balance, 0)).toBe(DEPOSIT * ACCOUNTS.length);
+  expect(
+    accts.reduce((s, a) => s + a.balance, 0),
+    `the balances' sum\n${disagreement(accts, entries)}`,
+  ).toBe(DEPOSIT * ACCOUNTS.length);
   for (const a of accts) expect(a.balance).toBeGreaterThanOrEqual(0);
   // Each account's entries, in commit order (`at` strictly increasing),
   // never take it below zero and add up to its balance.

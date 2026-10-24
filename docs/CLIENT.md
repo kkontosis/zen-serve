@@ -293,7 +293,13 @@ await h.stop();                                      // the server requeues its 
 * **State.** `c.state` (bytes, or null) is sealed with the step (kind 9, bound to the connection's cursors) and comes back in the next step, also on another handler. Ack only whole protocol units: what isn't acked comes back as input.
 * **Takeover.** `serve` holds a handler lease (`leaseTtlMs`, default 5 s, renewed every second). When the handler dies, its connections move to another handler once the lease lapses, and that one continues from the last committed step: the output of a committed step is revealed by whichever handler holds the connection (its keys are escrowed under the service key), and the input not acked is pushed again. On a `resume: false` service, output is plain and a connection whose handler dies is closed.
 * **Where it runs.** Like consumers, `serve` runs while the database is the owner, so of a browser's tabs one serves. Keys come from the unlocked fs (`fs.service(...path).keysAt(epoch)`).
-* **Not yet:** a line helper, and STARTTLS in `tls()`: milestone 5.5 step 13.
+* **Lines.** `LineReader` reads the whole lines of a step's input, ended by CRLF or a bare LF, and says how much to ack; a partial line waits for the rest:
+  ```ts
+  const r = new LineReader(c.input, { max: 1000 });   // the longest line, with its terminator
+  for (let l = r.nextText(); l !== null; l = r.nextText()) { … }   // next() gives bytes
+  c.ack(r.consumed);                                   // r.rest(): what follows; r.tooLong
+  ```
+* **Not yet:** waking a handler without new input (IMAP IDLE), and IMAP: milestone 5.5 step 13b.
 
 ### TLS: `tls()`
 
@@ -318,6 +324,37 @@ const h = serve(db, {
 * **The module.** The engine is a second WASM module, `@zen/svc-wasm` (about 1.2 MB, 0.5 MB gzipped, with the SSH engine), loaded the first time a service uses `tls()` or `ssh()`. Node reads it from `node_modules`; a browser fetches `zen_svc_wasm_bg.wasm` next to the glue (`scripts/build-apps.mjs` copies it next to an app's bundle), or from `tls({wasm})`.
 * **When the handler runs.** On the step that finishes the handshake (so a server-first protocol can greet), and then on new plaintext or an EOF it hasn't seen. `c.eof` is set on close_notify, and on an EOF without it, which `c.tls.truncated` tells apart. `c.end()` sends close_notify, then FIN; `c.close()` close_notify, then closes; `c.abort()` resets without close_notify.
 * **What a takeover keeps.** Once the handshake is done, the engine state (keys, sequence numbers, the plaintext not acked) is sealed with every step, and a successor restores it and continues the live connection; the step that finishes the handshake also makes the connection resumable. A handshake can't be serialized: if its handler dies, or a handshake step's commit outcome is unknown, the connection is aborted (TD-SVC-TLS-HANDSHAKE-RESUME), and the client connects again.
+
+### STARTTLS: `starttls()`
+
+Protocols such as SMTP (RFC 3207), IMAP and POP3 begin in plain and switch to TLS on a command. `starttls(…)` takes the same options as `tls(…)`; it begins as `raw()`, and the handler switches with `c.startTls()`:
+
+```ts
+import { LineReader, serve, starttls } from '@zen/svc';
+
+serve(db, {
+  service: ['svc', 'smtp'],
+  layer: starttls({ cert: cert.chain, key: cert.key }),
+  handler: (c, tx) => {
+    const r = new LineReader(c.input);
+    for (let l = r.nextText(); l !== null; l = r.nextText()) {
+      if (l.toUpperCase() === 'STARTTLS' && !c.tls) {
+        c.write('220 2.0.0 Ready to start TLS\r\n');   // sent in plain
+        c.startTls();                                    // the input after this line is TLS
+        break;
+      }
+      …
+    }
+    c.ack(r.consumed);
+  },
+});
+```
+
+* **The switch** happens after the step's writes, which go out in plain. The input after what the step acks is handed to the TLS engine, so plaintext a client sent after the command (pipelined, or injected by an attacker in transit: CVE-2011-0411) is never read as a command: the handshake fails on it and the connection closes. Stop reading at the command and ack only up to it.
+* **After the handshake** the handler runs again with `c.tls` set and empty input (SMTP waits for a new `EHLO`; a protocol whose server speaks first can greet), then as under `tls()`.
+* **Sealing.** The step that switches also stops the inbox's sealing (`unseal`, below): what follows is TLS ciphertext.
+* **Takeover.** The plain phase is resumable from the first step, as `raw()`; so is a connection that has switched but not begun its handshake. A handshake in progress isn't: if its handler dies, the connection is closed. The TLS phase is resumable again, as under `tls()`.
+* `c.startTls()` throws under the other layers, after the switch, and with `end()`, `close()` or `abort()` in the same step.
 
 ### SSH: `ssh()`
 
@@ -406,15 +443,15 @@ serve(db, {
   service: ['svc', 'smtp'],
   inbox: seed,                      // read back from the row
   handler: (c, tx) => {
-    // … on STARTTLS, once the reply is written:
-    c.unseal();                     // what follows is TLS ciphertext: stop sealing it
+    // … a protocol that turns to ciphertext without starttls():
+    c.unseal();                     // what follows needs no sealing
   },
 });
 ```
 
 * **The handler sees plaintext as usual.** The runtime opens each chunk at its offset, so a chunk moved, dropped or altered fails, and the connection is released with `close`. A successor handler decapsulates again from the claim's ciphertext.
 * **Without the seed** a handler can't serve the service: it reports an `inbox` error through `onError` and releases each connection with `close`.
-* **`c.unseal()`** is sticky and sent once, with the step. The server stores plain chunks from the next batch it stores after the step commits; chunks sealed before that still open.
+* **`c.unseal()`** is sticky and sent once, with the step. Under `starttls()`, `c.startTls()` does it. The server stores plain chunks from the next batch it stores after the step commits; chunks sealed before that still open.
 * **What it protects:** input at rest (the keyspace, backups, exports). The server process still sees the bytes in transit, as it reads them from the socket.
 * **Changing the key** needs the old seed until the connections opened under it end: there is no rotation helper yet (TD-SVC-INBOX-ROTATION).
 

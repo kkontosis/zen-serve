@@ -2,6 +2,7 @@
 export { SVC_ABORT, SVC_CLOSE, SVC_FIN } from './flags.js';
 export { Input } from './input.js';
 export { type Layer, type RawStep, raw, type TlsInfo } from './layer.js';
+export { LineReader, type LineReaderOptions } from './lines.js';
 export {
   type Handler,
   type RawHandler,
@@ -19,5 +20,5 @@ export {
   ssh,
 } from './ssh.js';
 export { decodeState, type EngineState, encodeState } from './state.js';
-export { type TlsLayerOptions, tls } from './tls.js';
+export { starttls, type TlsLayerOptions, tls } from './tls.js';
 export { loadSvcWasm, type WasmSource } from './wasm.js';

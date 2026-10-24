@@ -138,13 +138,13 @@ A new holder:
 4. reads input from `in_acked` and continues
 
 * **Ack only at boundaries.** A handler acks input only at the end of a complete protocol unit: a TLS record, an SSH packet, or what the application has fully consumed. So the state holds sequence numbers and bounded application data, never half a record.
-* **When a connection becomes resumable is the engine's call.** TLS sets `resumable` after the handshake: a handshake in progress can't be serialized, so a handler that dies mid-handshake leaves a connection that is aborted. The SSH engine persists its key exchange and sets it from the first step.
+* **When a connection becomes resumable is the engine's call.** TLS sets `resumable` after the handshake (STARTTLS is resumable in its plain phase, and again after the handshake): a handshake in progress can't be serialized, so a handler that dies mid-handshake leaves a connection that is aborted. The SSH engine persists its key exchange and sets it from the first step.
 * **Rollback.** A handler remembers, per connection, the highest `(in_acked, out_head)` it has seen in this process. If a claim returns lower values, it aborts the connection (§12).
 
 ## 7. Engine state
 
 The plaintext of a kind-9 state is a CBOR map `{v: 1, engine: text, engine_state: bytes, app: bytes}`:
-* `engine` is `"raw"`, `"tls"` or `"ssh"`.
+* `engine` is `"raw"`, `"tls"`, `"starttls"` (§7.1, STARTTLS) or `"ssh"`.
 * `engine_state` is the engine's own versioned encoding, defined with the engine.
 * `app` is the application's state.
 
@@ -198,6 +198,15 @@ dir = { seq: uint,            // the next record's sequence number
 * For 1.2 AES-GCM, `iv`'s first 4 bytes are the salt and the rest is ignored; for ChaCha20-Poly1305 it is the 12-byte IV.
 * A state whose `v`, `ver` or `suite` the engine doesn't know, or whose fields have the wrong lengths, is refused; the runtime then releases the connection with `close`.
 * Keys are in the state, so a rotation doesn't protect a live TLS connection (§8).
+
+**STARTTLS** (`engine: "starttls"`). A connection that starts in plain and switches to TLS in mid-stream, as SMTP (RFC 3207), IMAP and POP3 do.
+* **The plain phase** is as `raw`: the handler sees the bytes as they are, and the connection is resumable from its first step.
+* **The switch.** A step of the plain phase may end it. Its records go out in plain (the protocol's go-ahead, such as SMTP's `220`), and the input from its `in_to` on is TLS. The step that switches sets `unseal` (§9), since what follows is TLS ciphertext.
+* **Plaintext sent after the command** (pipelined, or injected by an attacker: CVE-2011-0411) is never read as a command. Input from `in_to` on is handed to the TLS engine as TLS input, so a handshake that begins with it fails and the connection closes.
+* **Between the switch and the handshake** (no TLS input consumed and nothing sent yet) the connection is still resumable: a new holder begins the handshake.
+* **The handshake phase** (from the first step that consumes TLS input or sends handshake bytes) is as `tls`'s handshake: not resumable. A holder that finds a connection in it (a takeover mid-handshake) releases it with `close`.
+* **The TLS phase** is as `tls`, resumable again; the handler is called on the step that finishes the handshake, so a protocol that has the server speak again can.
+* **`engine_state`** is a CBOR map `{v: 1, phase: uint, tls?: bytes}`, where `phase` is 0 (plain), 1 (switched, the handshake not begun), 2 (handshake) or 3 (TLS), and `tls` is the TLS engine's `engine_state` above, present in phase 3 only. A connection that never switched may have an empty `engine_state` instead of phase 0. A state with another `v` or `phase`, or with `tls` missing or present against its phase, is refused.
 
 ### 7.2 The SSH engine
 

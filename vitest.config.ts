@@ -21,5 +21,7 @@ export default defineConfig({
     testTimeout: 60_000,
     hookTimeout: 120_000,
     pool: 'forks',
+    // Builds the apps' bundles and workers once (scripts/vitest-setup.ts).
+    globalSetup: ['scripts/vitest-setup.ts'],
   },
 });

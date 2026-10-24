@@ -79,6 +79,16 @@ fn io<E: std::fmt::Display>(e: E) -> Error {
     Error::Io(e.to_string())
 }
 
+/// A blocking task that didn't finish: cancelled (the runtime is shutting
+/// down before it ran) or panicked.
+fn joined(e: tokio::task::JoinError) -> Error {
+    if e.is_cancelled() {
+        Error::Shutdown
+    } else {
+        io(e)
+    }
+}
+
 fn unix_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -329,7 +339,7 @@ impl Storage for Embedded {
             Ok(())
         })
         .await
-        .map_err(io)?
+        .map_err(joined)?
     }
 }
 
@@ -562,6 +572,6 @@ impl Txn for EmbeddedTxn {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.commit_blocking(*self))
             .await
-            .map_err(io)?
+            .map_err(joined)?
     }
 }

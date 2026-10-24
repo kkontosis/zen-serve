@@ -29,6 +29,7 @@ import {
   servePresence,
   TYPING_SHOW_MS,
   Typing,
+  Typists,
   whoIsOnline,
 } from '../src/chat.js';
 
@@ -140,6 +141,7 @@ function onMsg(g: number, m: ChatMsg): void {
   if (g !== gen) return;
   shown.push(m);
   last = m.offset;
+  messageFrom(m.from, m.sentMs);
   list.append(msgItem(m));
   list.scrollTop = list.scrollHeight;
   toMark = { room: m.room, offset: m.offset };
@@ -170,6 +172,9 @@ async function openRoom(id: string): Promise<void> {
   last = START;
   render(list);
   render(typingLine);
+  typists = new Typists();
+  for (const t of typingTimers.values()) clearTimeout(t);
+  typingTimers.clear();
   typing = new Typing(db, room, user);
   typingSub = await onTyping(db, room, showTyping);
   await follow();
@@ -185,24 +190,48 @@ addEventListener('online', () => void follow().catch(fail));
 
 // ------------------------------------------------------------ typing
 
-const typists = new Map<string, ReturnType<typeof setTimeout>>();
-function showTyping(from: string): void {
+// Each member typing, until their indicator's time is up or their message
+// arrives; a timer per member ends it.
+let typists = new Typists();
+const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// The indicators this page sent and received, and the messages that ended
+// one (wall and corrected clock times), for the spec's failure messages.
+const typingLog: Record<string, unknown>[] = [];
+function showTyping(from: string, sentMs: number): void {
   if (from === user) return;
-  clearTimeout(typists.get(from));
-  typists.set(
+  const now = db.fs.session.clock.now();
+  typingLog.push({ from, sentMs, now, wall: Date.now(), left: sentMs + TYPING_SHOW_MS - now });
+  const until = typists.typing(from, sentMs, now);
+  if (until === undefined) return;
+  clearTimeout(typingTimers.get(from));
+  typingTimers.set(
     from,
     setTimeout(() => {
-      typists.delete(from);
-      drawTyping();
-    }, TYPING_SHOW_MS),
+      if (typists.end(from, until)) drawTyping();
+    }, until - now),
   );
   drawTyping();
 }
+function messageFrom(from: string, sentMs: number): void {
+  if (!typists.sent(from, sentMs)) return;
+  typingLog.push({ message: from, sentMs, now: db.fs.session.clock.now() });
+  clearTimeout(typingTimers.get(from));
+  typingTimers.delete(from);
+  drawTyping();
+}
 function drawTyping(): void {
-  const names = [...typists.keys()];
+  const names = typists.names;
   render(typingLine, names.length ? `${names.join(', ')} typing…` : '');
 }
-input.addEventListener('input', () => void typing.notify().catch(() => {}));
+input.addEventListener('input', () => {
+  const wall = Date.now();
+  void typing
+    .notify(wall)
+    .then((sent) => {
+      if (sent) typingLog.push({ sent: true, wall, now: db.fs.session.clock.now() });
+    })
+    .catch(() => {});
+});
 
 // ------------------------------------------------------------ rooms
 
@@ -310,6 +339,7 @@ render(
               await sendMessage(db, room, user, text);
             }
             input.value = '';
+            typing.reset();
             render(errorLine);
           } catch (err) {
             fail(err);
@@ -336,6 +366,7 @@ ready(ctx, {
   /** The offsets shown (hex), to check for repeats. */
   offsets: () => shown.map((m) => bytes.hex(m.offset)),
   room: () => room,
-  typists: () => [...typists.keys()],
+  typists: () => typists.names,
+  typingLog: () => typingLog,
   whoIsOnline: () => whoIsOnline(db),
 });

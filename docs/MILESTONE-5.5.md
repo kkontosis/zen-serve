@@ -312,7 +312,398 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
     * `npx vitest run` 3×: 486 passed each time, 7 skipped (the opt-in benches). This includes `packages/client/test/svcvectors.test.ts` (7, inbox vectors new) and `apps/echo/test/inbox.test.ts` (4).
     * `npx playwright test`: 16 specs, unchanged
   * The local FDB cluster had stopped (a container restart); it was restarted with the binary rebuilt `--features fdb`. Stale test executables were pruned (4 GB).
-  * CI green on PR #49's head a798c2e: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), `openssh-pq` skipped. Next: once PR #49 merges, plan step 5.5.13 (`apps/mail`: STARTTLS in `tls()`, the line helper, SMTP and IMAP).
+  * CI green on PR #49's head a798c2e: all 8 checks across both runs (`client`, `rust`, `pure-rust`, `fdb`), `openssh-pq` skipped. Merged at 0185426.
+* **Step 5.5.13** (`apps/mail`) is split in two PRs (the user's decision):
+  * **5.5.13a**: STARTTLS, the line reader and inbound SMTP: done, PR #50. Commits: `docs: milestone 5.5 step 13a plan`; `spec: STARTTLS (svc.md §7.1)`; `svc: a line reader, and starttls()`; `apps: mail, inbound SMTP`; the docs and this log.
+    * As planned, plus details settled while building:
+      * **Four phases, not three.** The `starttls` engine state's `phase` is 0 plain, 1 switched (the handshake not begun), 2 handshake, 3 TLS. A connection switched but whose handshake hasn't consumed or sent anything is still resumable: a successor begins the handshake. So the window between the `220` and the client's ClientHello survives a takeover.
+      * **Input after the command is read at once.** The switching step sets `again` when input follows what it acked, so pipelined or injected plaintext reaches the TLS engine without waiting for more input, and the handshake fails on it then.
+      * **`TlsConn` carries the phase** for both layers. `tls()` begins at "switched" and seals the bare TLS state, as before; `starttls()` wraps it in `{v, phase, tls?}`. `RawStep.startTls()` comes from the `Step` class (allowed only in `starttls()`'s plain phase).
+      * **`LineReader.next()` gives bytes and `nextText()` UTF-8 text**; `max` counts the terminator, and a line over it, complete or not, sets `tooLong`.
+      * **The DATA decoder** treats only CRLF as a line end: a dot after a bare LF stays, and `\n.\n` never ends a message (no SMTP smuggling). A dot that starts a line is always dropped, as RFC 5321 §4.5.2 says.
+      * **Parts are filled to 64 KiB**: each step appends to the last part (read, concatenate, put) before starting the next, so a 10 MB message is at most 160 rows whatever the step sizes.
+      * **Drafts:** a client's EOF mid-DATA deletes its draft at once; only a connection that dies without one (a reset, a handler that never steps again) leaves one for `sweepDrafts`. A draft swept while its message still arrives makes the end reply `451` (try again), not a truncated message.
+      * **The Python client** sets smtplib's `_host` after `connect()`: `starttls()` checks the certificate against the host given to the constructor, which `connect()` alone leaves unset.
+      * **The layer test** (`packages/svc/test/starttls.test.ts`) drives the layer over real TCP sockets. Over an in-memory Duplex that had been read in plain first, Node's TLS client never finished a 1.3 handshake (1.2 worked); with a `net.Socket`, as real STARTTLS clients use, both do.
+    * Verified:
+      * `npm run check`
+      * `npx vitest run` 3×: 508 passed each time, 7 skipped (the opt-in benches). This includes `packages/svc/test/lines.test.ts` (4), `starttls.test.ts` (6) and `apps/mail/test/smtp.test.ts` (12); the mail suite also passed 3 more times alone.
+      * `npx playwright test`: 16 specs, unchanged
+      * `cargo test -p zen-server --test svc` (33; the server is unchanged)
+    * **CI fix:** on head 43b3448 the `client` job failed in both runs. Every test passed (508), but Vitest caught 2 unhandled rejections from `packages/svc/test/starttls.test.ts`: `null pointer passed to rust` in `TlsConn.start` and `TlsConn.restore`. Commit `svc: the starttls() test closes its connections before the engine` (plan below).
+      * Cause, a race in the test's teardown: `afterAll` freed the `TlsConfig` (`engine.close()`) while sockets from earlier tests could still deliver bytes to their drivers, whose `void this.run()` then used the freed config with nothing to catch the rejection.
+      * Reproduced locally by forcing the mechanism: a driver that has switched receives bytes after `engine.close()`, which gave the same two errors. Timing alone (a 500 ms wait after closing) didn't reproduce it here.
+      * Fix: drivers are tracked; `stop()` destroys the socket and frees the layer, and `run()` does nothing once stopped. An `afterEach` stops the test's drivers, and `afterAll` stops the rest before `engine.close()`. Failures of `run()` are recorded in the driver's `errors`.
+      * Verified: the forced trigger gives no error with the fix; the test file 10×; `packages/svc` 3× (39); `npm run check`; the whole `npx vitest run` (508 passed, no errors).
+    * **CI on 71f69b5:** the pull-request run is green (all checks). The push run's `client` job failed one test: `starttls.test.ts` "a state in the handshake is refused…" timed out after 5 s waiting for the handshake step's sealed state (phase 2). Every other test passed.
+      * Not reproduced locally: the file 24 times, 6 copies at once, and 10 times alone.
+      * Since the teardown fix, a failure inside a driver's `run()` is recorded in `d.errors` and that test never looked at it, so the cause isn't in the log. Commit `svc: the starttls() test reports its drivers' errors`:
+        * after each test, any error a driver recorded fails the test (the pipelined test, which expects one, clears it)
+        * the handshake wait reports the phase, each step's ack, output, end flag and phase, the pending input and the driver's errors when it times out
+        * waits allow 15 s, not 5 s, for loaded runners
+        * the handshake test stops its driver before destroying the client, so the unfinished handshake isn't reported as an error
+      * If it recurs, the log names the cause.
+    * **CI on 50f05a9:** green. The pull-request run passed every check (the starttls test included). The push run's `rust` job failed once: `crates/zen-server/tests/svc.rs` `push_input`, worst push latency 1.048 s against its 1 s bound.
+      * The PR doesn't touch `zen-server`; the test passed in the same commit's pull-request run and in every run since step 5.5.4. It ran next to `many_connections` (5,000 connections) in the same test binary.
+      * Per the CI rules: one PR comment saying so, and one re-run of the failed job, which passed (attempt 2: success).
+      * The only 1 s delay on that path is the reader's re-check after a batch fails to store (`RECHECK` in `svc/conn.rs`); nothing showed that happened. If it recurs, it gets root-caused there.
+    * **CI on 0319025:** both runs red, each in `client`. Pursued per "the reds on 0319025" below. Commits: `svc: the starttls() test takes the handshake state from its step`; `apps: build the apps once per test run`; `apps: ZEN_APPS_BUILT skips the test run's build`; `server: a test that a resent short-mode commit replays`; `apps: ledger: a failed balance check prints what disagrees`; `store: a cancelled blocking task is a shutdown, not a storage error`; this log.
+      * **The starttls handshake test: cause found and fixed.**
+        * The new diagnostics showed the handshake ran. Its phase-2 state was sealed and then replaced by phase 3 before the 5 ms poll looked. The 71f69b5 failure is the same race.
+        * Waiting for the handshake to finish before the check reproduced the CI message exactly, steps included.
+        * The test now takes the state from the step that sealed it. It passes with the race forced, and 20 of 20 runs.
+      * **The echo worker `MODULE_NOT_FOUND`: cause found and fixed.**
+        * Seven test files rebuilt their app in `beforeAll`, and the build empties `apps/dist/<app>` first. During eight rebuilds, `handler.mjs` was missing in 70 of 130 checks, so a parallel file starting a worker could fail. CI also built all apps before vitest, which hid nothing.
+        * A vitest `globalSetup` (`scripts/vitest-setup.ts`) now builds the apps and zen-connect once, before any file. No test file builds.
+        * A single-file run still builds (checked with `apps/dist/mail` deleted). `ZEN_APPS_BUILT=1` skips the build, for several local runs at once.
+      * **The ledger sum (403, not 400): not reproduced, cause not found.**
+        * The failing check was the one right after `tradeAll(10, 2)` in the third test.
+        * 134 local runs of the ledger test, two and three at once under the 50 MB SSH load, all passed. Five more failed only on concurrent app builds, my harness, not the ledger.
+        * A scratch stress test (four sessions, four loops each, 2,000 transfers over three accounts, 5 runs) kept the sum every time.
+        * Read without finding a flaw:
+          * `transfer`
+          * zen-db's row cache: versions and fields are kept together; a cached row in a write becomes an `expect`; a read-only transaction re-checks cached versions
+          * the client commit
+          * the server's `expect` (a normal read, so a conflict range) and its `txn_loop!` (no retry of a conflict when the client gave a read version)
+          * the embedded store's conflict check
+        * The check now prints each account's balance against its entries, transfers with unbalanced entries, and committed transfers without entries. A recurrence will tell a lost update on an account row from split entries. **Open.**
+      * **The suspected commit-replay bug: not a bug.**
+        * A new test resends a short-mode commit that applied, and gets the stored result. Applying it again would be a lost update.
+        * `commit.rs` looks the `commit_id` record up at the latest version when a commit conflicts, which covers the resend. The test stays, since no test covered that case.
+      * **`push_input`:** still not reproduced. The noise that misled the first look is gone: a blocking store task cancelled at runtime shutdown is now `Error::Shutdown`, logged at debug (0 such ERRORs in 3 runs, about 10 per run before). The test prints all ten push times when its bound fails.
+      * **Found while verifying: the chat typing spec failed again.** It failed in 1 of 5 local runs of `apps/chat`'s Playwright spec, and in a full run.
+        * Carol's line read "alice, bob typing…" until both indicators ended, never "bob typing…": the same as step 10's CI failure.
+        * Step 10's fix drops indicators older than 3 s when they arrive, but one that arrived 1–2 s late still showed for 3 s from its arrival. Alice's indicators, held while Carol was offline, came in like that, and overlapped the next spec.
+        * Fix (commit `apps: chat: a typing indicator shows until its time after it was sent`): `onTyping` passes the send time, and the page shows an indicator until 3 s after it was sent (`showFor`). An older indicator arriving late doesn't shorten a newer one. The unit test checks `showFor`.
+        * After: 15 of 15 chat spec runs, and the full Playwright run (16).
+      * **FDB:** the local cluster had stopped; it was restarted.
+        * Right after the restart, one run of `tests/api.rs` failed `per_key_many_claims_do_not_hide_ready_keys` (an `unwrap` at line 1391; the error was cut from the output).
+        * It passed alone, and `tests/api.rs` and `tests/svc.rs` passed twice in full with `--no-fail-fast`. Not pursued further: an existing milestone-4 test, seen once, on a cluster that had just started.
+      * Verified:
+        * `npm run check`
+        * clippy on zen-store and zen-server `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`)
+        * `tests/svc.rs` 3× (33) and `tests/api.rs` (18) on embedded, and twice each on FDB; zen-store, on embedded and FDB
+        * the app tests (43) with the shared build
+        * `npx vitest run` 3× (508 passed each time, 7 skipped)
+        * `npx playwright test` (16)
+      * CI green on c1e9fb1: both runs (push and pull request) passed every check on their first attempt, with nothing re-run. The ledger failure and `push_input`'s 1 s remain open, with their diagnostics in place.
+      * **More information for next time** (the user asked whether a recurrence would tell more).
+        * Commit `apps: ledger: a failed balance check names the transfer that went wrong`: each committed transfer records its trader and the balances and times it wrote. On a failed sum, each account's transfers are replayed in time order, and one that didn't build on the balance before it is named, with its trader and the transfer before it. Checked by making a recorded transfer stale on purpose.
+        * Commit `server: the svc tests show the server's warnings when they fail`: a tracing subscriber (`zen_server=warn`, captured per test). A failing `push_input` shows any `storing relayed input` warning next to its ten push times. Checked by forcing its bound to fail.
+      * **CI on 84c8c02:** both runs red, each in `client`, each in `apps/chat/test/chat.test.ts`. The tests are from milestone 5 and passed on c1e9fb1; this commit changed only the ledger and Rust tests.
+        * Push run: "a dropped connection resumes from the last offset received" timed out after 15 s waiting for the 12 messages, with no detail.
+        * Pull-request run: "who's online" got alice, bob and carol but not dave within `whoIsOnline`'s 1.5 s.
+        * Not reproduced: the chat file 45 times locally, three at once, under the SSH load.
+        * Commit `apps: chat: the resume and presence tests say what went missing`:
+          * the resume test's timeout lists the sends, reconnects and arrivals in order
+          * the presence test asks again with a 10 s wait before failing, and reports who answered then (a slow reply versus a lost ping or reply)
+          * Both messages were checked by forcing the failures.
+        * An observation from the forced run: locally all 12 messages reach Bob after the last reconnect, as history, not live, since the reconnects every four sends keep his stream reconnecting. A failure that names the messages that never came will show whether a resubscribe misses a range.
+        * **Open**, with the diagnostics in place.
+      * **CI on 8806071:** the pull-request run green; the push run's `client` failed `packages/client/test/log.test.ts` › "leaders › renews while it runs" (milestone 4).
+        * The test gave its leaders a 300 ms TTL. Renewals chain, each sent a third of the TTL after the previous one finished, so one round trip over about 200 ms on a loaded runner lets the lease lapse and the second leader take it. That is the lease working as specified, with a window too small for the runner.
+        * Commit `client: the leader renewal test has a TTL a slow runner can't outlast`: a 1.5 s TTL over a 4 s window, with `lb` trying every 300 ms. On failure it prints when the holder renewed and when the other won.
+        * Checked: 20 of 20 runs pass. A renewal held back 2 s on purpose fails the test, and the message shows the gap (`la` renewed at 1015 ms, `lb` won at 2741 ms).
+        * Not proven that CI saw such a stall: nothing recorded the renewals then. A recurrence would now show it.
+      * **CI green on cad1bf6:** both runs passed every check on their first attempt.
+        * Open, with diagnostics that name what went wrong: the ledger sum, the chat resume and presence tests, `push_input`, and the leader renewal test.
+    * Next: on merge, plan 5.5.13b.
+  * **5.5.13b**: waking handlers without input, the IMAP subset with IDLE, and the inbox page. Planned after 5.5.13a merges.
+  * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.13a: the red on 8806071 (log: a leader renews while it runs)
+
+**Context.** On 8806071 the pull-request run is green and the push run's `client` job failed one test: `packages/client/test/log.test.ts` › "leaders › renews while it runs". `lb.acquire()` returned `true` while `la` should still have held the lease.
+* The test (milestone 4) gives both leaders `ttlMs: 300`. For 1.5 s, `lb` tries to take the lease every 150 ms and must fail.
+* `Leader` (`packages/client/src/log.ts`) renews by chaining: each `renew()` schedules the next `ttlMs / 3` (100 ms) after its own request finishes. So the server sees renewals 100 ms plus one round trip apart.
+* A round trip over about 200 ms lets the lease lapse, and `lb` then takes it, correctly. On a runner running three test files at once, one 200 ms stall in 1.5 s is plausible. Locally it never happens.
+* So the likely cause is a margin too small for the runner, not a defect in leases. The test's intent is that a holder keeps renewing, not that it does so within 200 ms under any load. Not yet proven: nothing recorded the renewal gaps.
+
+**Plan:**
+1. **Record the renewals.** Wrap `la.renew` in the test to timestamp each call and its outcome, and wrap `lb.acquire` to timestamp each attempt. When `lb` gets the lease, the message prints the gaps between `la`'s renewals and when `lb` succeeded. That shows a stall (a gap over the TTL) or a lease lost within its TTL, which would be a real bug.
+2. **Give the margin the test means.** `ttlMs: 1500` (renewals every 500 ms, so 1 s of slack), checked over 4 s (about 2.5 TTLs and 8 renewals) with `lb` trying every 300 ms. A holder that stopped renewing still loses the lease within the window, so the test still tests renewal.
+3. **Verify:** run the test 20 times. Then make a renewal stall on purpose (a delay in the wrapped `renew` over the TTL): `lb` must win, and the message must show the gap. `npm run check`; push; CI.
+
+## Step 5.5.13a: the red on 84c8c02 (chat: a dropped connection resumes)
+
+**Context.** On 84c8c02 the push run's `client` job failed one test; the pull-request run was still in progress when checked. The test: `apps/chat/test/chat.test.ts` › "a dropped connection resumes from the last offset received" (line 205), `timed out waiting for every message` after 15 s.
+* The test subscribes Bob to a room (`readRoom`, a `db.on` from his receipt), and sends 12 messages as Alice. After every 4th it forces Bob's stream to reconnect (`DirectSource.reconnect()` → `Stream.reconnect()`). It expects all 12, in order.
+* It is from milestone 5 (50d077f), has passed every CI run until now, and doesn't involve the typing code this PR changed (`readRoom` and the stream are untouched).
+* The timeout says nothing about which messages were missing: none, the tail, or a gap after a reconnect.
+* Read without finding the fault:
+  * `Stream.reconnect()`: it detaches the socket and starts `reconnectLoop`. After `connect()`, that loop re-sends each `sub` with `after: s.cursor`.
+  * `dropped()`'s re-entry guard.
+
+**Plan:**
+1. **Make the failure name what was lost.** The timeout message prints `seen`, and for each reconnect when it happened relative to the sends (which message indices came before it). A recurrence then shows whether it's a gap right after a reconnect (a resubscribe from a cursor past an undelivered event, or an event delivered on the closing socket after the cursor moved) or a stall.
+2. **Reproduce:** the test alone, in a loop: 100 times, then 3 copies at once (with `ZEN_APPS_BUILT=1`). Also tighten its timing (reconnect after every message, and right after a send) to widen any window.
+3. **Root-cause from what it shows,** in `packages/client/src/stream.ts` (the cursor's update order against the socket swap, frames on a detached socket, the re-subscribe) or `packages/db/src/broker.ts` (`OnSubscription`'s queue and its `after`). Fix with a regression test in `packages/client/test/stream.test.ts` that forces the window. If it doesn't reproduce, keep the diagnostics and log it open, with what was tried.
+4. The pull-request run on 84c8c02: read its result too, and treat any red the same way.
+
+**Verification:** the chat tests 3× alone and in the full `npx vitest run`; the stream tests; `npm run check`; push; CI green on both runs.
+
+## Step 5.5.13a: the reds on 0319025, pursued to their causes
+
+**Context.** Both CI runs on 0319025 (a docs-only commit) are red, each in the `client` job with something different. The diagnostics added in dc37e1a named one cause. These failures, and the earlier ones that were only re-run, are pursued here until each has a cause, a fix, and evidence for both.
+
+**1. starttls: "a state in the handshake is refused…" (push run).** **Cause found.**
+* The new message reads: `phase 3; steps [[0,0,0,null],[10,8,0,1],[1586,2254,0,2],[80,37,0,3]]; errors (none)`.
+  * The handshake did run: the client's hello was consumed and the phase-2 state sealed. Then the client's Finished completed it, and phase 3 replaced phase 2 in `d.sealed`.
+  * The test polls `d.sealed` every 5 ms, so on a busy runner it can miss a state that lasts only one round trip.
+  * The earlier failure (71f69b5, 5 s timeout) is the same race.
+* **Fix (test):** take the state from the step that produced it, not from the latest. Wait until `d.steps.some((f) => phase(f.engineState) === 2)`, and load that step's `engineState`.
+  * That state is exactly what a successor would have claimed mid-handshake, whatever happened after.
+  * The `until` diagnostics stay.
+* **Proof:** make the race happen on purpose (load a handshake state only after the handshake has finished; the old code then times out). Run the test 20×.
+
+**2. Echo worker `Cannot find module …/apps/dist/echo/workers/handler.mjs` (push run).** **Cause found.**
+* Five echo test files (`echo`, `tls`, `ssh`, `connect`, `inbox`), plus `mail` and `checkout`, each run `scripts/build-apps.mjs <app>` in their `beforeAll`. That build starts with `rm -rf apps/dist/<app>`.
+* Vitest runs files in parallel worker processes (`pool: 'forks'`), so one file's rebuild deletes the worker another file is about to start. The step 5.5.8 log already saw this ("two more runs failed only because the copies rebuilt apps/dist/echo at the same moment"), but it wasn't fixed.
+* **Fix:** build the apps once per vitest run, before any file starts.
+  * A `globalSetup` in `vitest.config.ts` (`scripts/vitest-setup.ts`) runs `node scripts/build-apps.mjs` for the apps that have workers.
+  * The seven per-file `execFileSync(… build-apps …)` calls are removed.
+  * `build-zen-connect.mjs` (only `connect.test.ts` uses it) moves into the same setup, so `connect.test.ts`'s build goes too.
+  * Running a single test file still builds first, through the same setup.
+* **Proof:**
+  * Reproduce the race first: two copies of one echo test file at once fail with `MODULE_NOT_FOUND` before the fix.
+  * After the fix, nothing builds during a run: `grep` for `build-apps` in the test files is empty.
+  * The full vitest run 3×.
+
+**3. Ledger: "the projection stopped mid-stream and restarted elsewhere…": the 4 accounts' balances sum to 403, not 400 (pull-request run).**
+* Money appeared, which means a lost update: two transfers each debited a source from the same old balance and both committed. Or a read in the check was stale.
+* Read so far, without finding the flaw:
+  * `transfer` (`apps/ledger/src/ledger.ts`)
+  * zen-db's row cache (`useCached` makes an `expect`; `read` adds a read conflict at the transaction's read version; read-only transactions check cached versions in `finish`)
+  * the client commit (`kv.ts` `build`)
+  * the server's commit (`commit.rs`: `expect` uses `t.get`, which adds a read conflict; `txn_loop!` doesn't retry a conflict when the client gave a read version)
+  * the embedded store's conflict check (`commit_blocking`)
+* **Steps:**
+  1. **Make a recurrence name the cause.** When `checkLedger`'s sum check fails, print for each account its balance, the sum of its entries and its newest entry time. Also print the transfers whose two entries don't balance, and the `done` transfers missing entries.
+     * Balances off but entries summing to 400 means a lost update on an account row: entries are inserts, never lost.
+     * Entries off too means an entry pair split.
+  2. **Reproduce:** loop `apps/ledger/test/ledger.test.ts` locally 50× with load (two copies at once, plus the echo SSH 50 MB test).
+  3. **Root-cause from the dump,** with a regression test in the layer that failed (`packages/db` or `crates/zen-server`). Then fix it.
+  4. If it doesn't reproduce in those runs, say so. The dump stays, and the log records what was ruled out.
+
+**4. A related finding to verify: a resent commit can be answered `conflict` instead of its stored result.**
+* `commit.rs` checks the `commit_id` record (`t.get(&cid_key)`) inside `txn_loop!(st.store, req.read_version, …)`, so at the **client's read version**.
+* `sendCommit` (`packages/client/src/kv.ts`) resends the same body after `network` or `commit_unknown`. If the first attempt did commit (its response was lost), the resend reads the record at a version from before that commit and doesn't see it. It then fails its read conflicts against the first attempt's own writes, and returns `conflict`.
+* The client then re-runs the whole transaction: a second application, against api.md §6 ("If `commit_id` already committed, the stored result is returned and nothing is applied again").
+* **Verify** with a Rust test (`tests/api.rs` or similar): a commit with a `read_version` and writes on keys it read, then the same body again. Expected: the stored result. Suspected today: 409 `conflict`.
+* **Fix if confirmed:** when a commit fails with `Conflict`, read the `commit_id` record at the latest version. If it's there, return its stored result (`Outcome::Replay`). This also covers a resend that races the first attempt. Plus a client test through `sendCommit`, with the first response dropped.
+
+**5. `push_input`'s 1.048 s** (unchanged since the last report, not reproduced).
+* Ruled out: a failed append followed by the 1 s re-check. 30 loaded runs showed no failed append during the test; the only ones were cancellations at runtime shutdown.
+* Fix that noise: a store task cancelled at shutdown (`task … was cancelled`) is logged as an ERROR "storage error" (`error.rs`), which misled this investigation. Log it at debug instead.
+* When the bound fails, the test prints each push's time (all 10, not just the worst), so a recurrence shows whether one push stalled or everything was slow.
+
+### Order and commits
+1. `svc: the starttls() test takes the handshake state from its step` (item 1)
+2. `apps: build the apps once per test run` (item 2)
+3. item 4's test, and the fix if it fails: `server: a resent commit finds its record at the latest version`, with a `spec:` note in api.md §6 if the wording needs it
+4. `apps: ledger: a failed balance check prints what disagrees` (item 3.1), then the fix once found
+5. `server: a cancelled store task isn't an error; push_input prints its pushes` (item 5)
+6. the log in both plan copies
+
+### Verification
+* Each fix shown failing before and passing after, as described per item.
+* `npm run check`; `npx vitest run` 3×; Rust `fmt`, clippy (three variants), `tests/svc.rs` and the commit test file 3× on embedded and once on FDB.
+* Push; CI green on both runs. Any failure that remains: a cause, or a written account of what was tried, not a re-run.
+
+## Step 5.5.13a: root-cause the two CI failures that were only re-run
+
+**Context.** PR #50 is green on 50f05a9, but two of its three CI failures have no root cause yet:
+* **The teardown race** (43b3448): solved. It was reproduced on demand (bytes after `engine.close()`) and fixed (section below).
+* **A. The starttls "handshake step" timeout** (push run on 71f69b5): `packages/svc/test/starttls.test.ts`, "a state in the handshake is refused…", waited 5 s for the first handshake step's sealed state (phase 2) and never saw it.
+  * Not reproduced in 34 local runs (6 copies at once, and alone).
+  * The response was diagnostics (phase, steps, pending input and errors printed on timeout) and 15 s waits. The runs since passed, which proves nothing.
+  * It appeared right after the teardown fix, which began recording `run()` failures in `d.errors` instead of throwing them. So a hidden throw is the leading suspect.
+* **B. `push_input` at 1.048 s** (`crates/zen-server/tests/svc.rs`, `rust` job on 50f05a9's push run): the worst of 10 input pushes took 1.048 s against its 1 s bound; normal is about 10 ms. One re-run passed.
+  * Leading suspect: the input reader in `crates/zen-server/src/svc/conn.rs`. When `append` returns `Err`, the batch is kept (`held`), the reader counts as `blocked`, and it retries only after `RECHECK` (1 s).
+  * `txn_loop!` (`crates/zen-server/src/txn.rs`) retries conflicts up to 20 times with backoff of at most 32 ms (about 0.5 s in total), then returns the error.
+  * So "one failed append, then a 1 s wait" gives exactly 1.0x s. The test ran beside `many_connections` (5,000 connections) in the same binary, which can make storage slow enough for that.
+  * Unconfirmed: nothing logged it, since tests install no tracing subscriber.
+
+The goal is a cause for each, and a fix in code where the cause is in code, not a green that depends on timing.
+
+### A. The starttls handshake timeout
+1. **Make a hidden failure loud.** The test already fails on recorded errors after each test. Add to the timeout message, for both ends:
+   * the client socket's `bytesWritten`
+   * the driver socket's `bytesRead`
+   * whether the TLS client emitted `error` or `close`
+
+   This tells apart three cases: the client never sent its ClientHello; the driver got it but the step consumed nothing; or `run()` threw.
+2. **Reproduce under CI-like load.** Run the file in a loop next to the heavy suites (`apps/echo/test/ssh.test.ts`'s 50 MB transfer, `apps/mail`), e.g. a script that starts both and repeats until a failure or 200 iterations.
+   * Also try the race in the test's own setup: the handshake test is the only one that calls `connect()` without awaiting `secureConnect`. And `nextDriver` is never reset, so a stray connection would be handed to the next `open()`.
+3. **Fix by finding:**
+   * If `run()` threw: fix the cause in the layer (`packages/svc/src/tls.ts`), with a unit test of that path.
+   * If the ClientHello never left the client: fix the test's use of the socket (await the client's `secureConnect` or `error`, or write through it).
+   * If the engine consumed nothing from a complete ClientHello: a bug in `TlsConn.prepare`'s SWITCHED path. Add a test that feeds a ClientHello in one, two and N pieces.
+4. If it doesn't reproduce in 200 loaded runs, say so plainly. Keep the diagnostics, and record it in the log as open with what was tried.
+
+### B. `push_input`'s 1 s
+1. **Instrument, locally only.** Log `append`'s error code and duration in the reader (the `Err(e)` arm already logs through `tracing::warn!`), and the time from the bell rung to the `svc_in` sent in `push.rs`. Run the test binary with a tracing subscriber (`RUST_LOG`, if the test harness installs one; otherwise a temporary `tracing_subscriber::fmt().init()` in `setup`).
+2. **Reproduce.** Run `cargo test -p zen-server --test svc` 30× normally, then 30× with two or three copies at once, recording `push_input`'s worst latency and any `storing relayed input` warning.
+3. **Fix by finding:**
+   * **A failed append, then `RECHECK`:** the 1 s wait is a real latency bug, since a transient storage error stalls a connection's input for a second. Retry a failed append promptly with a short backoff (for example 10 ms doubling to 500 ms), and keep `RECHECK` for the window and the quota, which only an ack or a quota change can clear. Then find which error escaped `txn_loop!` (a conflict on `rm` with a claim or reap, or a storage timeout) and say in svc.md §3 how input storage is retried, if the spec names a delay. Add a test: an append that fails once is stored within 100 ms (by injecting a storage failure, if zen-store's test hooks allow it; otherwise by a conflict forced on `rm`).
+   * **No error, just a slow run:** the bound measures the runner, not the server. Measure the distribution under load. Then either keep 1 s with the measured p99 recorded as why, or assert on the median (well under 100 ms) and keep 1 s only as a hang guard. Not changed without the numbers.
+4. Rust checks: `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); `tests/svc.rs` 3× on embedded and once on FDB.
+
+### Then
+* `npm run check`; the affected vitest files and `packages/svc` 3×; push; CI green on both runs. The log in both plan copies says what each cause was, or what was tried if one wasn't found.
+
+## CI fix in step 5.5.13a: the starttls() layer test's teardown
+
+**The failure.** On PR #50's head 43b3448 the `client` job failed in both runs. Vitest passed every test (508 passed, 7 skipped), but it caught 2 unhandled rejections and failed the run: `Error: null pointer passed to rust`. One came from `TlsConn.start` (`tls.ts` `prepare`), the other from `TlsConn.restore` (`tls.ts` `finish`), both called from `Driver.run` in `packages/svc/test/starttls.test.ts`. The `rust`, `pure-rust` and `fdb` jobs are green.
+
+**Root cause.** It's a race in the test's teardown, not in the layer:
+* `afterAll` calls `engine.close()`, which frees the `TlsConfig`, while sockets of earlier tests' drivers can still deliver data or EOF. The handshake-refusal test, for example, leaves a TLS client mid-handshake and only calls `client.destroy()`.
+* The test's drivers run `void this.run()` on every `data` and `end` event. A late event then calls `TlsConn.start` or `restore` on the freed config, and the rejection has no handler.
+* Locally the late events happened to come before `afterAll`; on the runners they came after.
+
+**Fix** (commit `svc: the starttls() test closes its connections before the engine`, test only):
+* Keep every `Driver` in a set. `Driver.stop()` sets `ended`, destroys its socket, and frees its layer once no step is running.
+* `run()` returns at once when stopped, and the drivers catch `run()` failures and record them in `errors` instead of leaving them unhandled, so a test that expects none fails with the cause.
+* An `afterEach` stops the test's drivers. `afterAll` closes the server, stops whatever is left, then calls `engine.close()`.
+
+**Verify:**
+* `npx vitest run packages/svc/test/starttls.test.ts` 10×, and the svc package 3×. To show the race is gone, also run with a delay in `afterAll` before `engine.close()` reversed (close first, then wait 500 ms for late events), confirming no unhandled rejection.
+* `npm run check`; then the whole `npx vitest run` once.
+* Push, then CI green on both runs of PR #50. Log it in both plan copies.
+
+## Step 5.5.13a in detail: STARTTLS, the line reader, inbound SMTP
+
+An inbound mail server (RFC 5321) as a relayed service. A message is accepted, stored, its event emitted and `250` sent in **one commit**, so a handler killed at any point, even between the end of DATA and the reply, never loses or doubles a message. Sessions may switch to TLS with STARTTLS (RFC 3207), which `@zen/svc` gains as a layer. Before the switch, the sealed inbox (5.5.12) keeps the plaintext sealed at rest. Text protocols get a line reader.
+
+**Commits:**
+1. `docs: milestone 5.5 step 13a plan` (also logs step 5.5.12's CI and merge)
+2. `spec: STARTTLS (svc.md §7.1)`
+3. `svc: a line reader, and starttls()`
+4. `apps: mail, inbound SMTP`
+5. the docs and the log
+
+### Facts from the survey
+* **`tls()`** (`packages/svc/src/tls.ts`) assumes TLS from the first byte.
+  * Its `TlsConn` holds the handshake in memory (`hs`) and the committed state once established.
+  * `load()` refuses a connection taken over mid-handshake.
+  * `prepare()` runs `after()` on an established engine; the handler is called on the step that finishes the handshake, on new plaintext, or on an unseen EOF.
+  * The engine holds at most 16 KiB of unconsumed plaintext and stops decrypting there, so a handler must consume as it reads.
+* **The runtime** (`serve.ts`): a fresh connection gets a first step without input (`due`), so a server-first protocol can greet. The raw layer is resumable from the first step; `Finished.unseal` (5.5.12) sets the inbox's sticky flag.
+* **No line splitting is shared:** echo's raw handler (`apps/echo/src/echo.ts`) and its SSH `lines` command (`ssh.ts`) repeat the same `indexOf(10)` loop.
+* **zen-db:**
+  * A row's large fields are split into parts automatically (`packages/db/src/row.ts` `layoutRow`), but a commit carries at most 8 MB, so a 10 MB message can't be written in one commit.
+  * `tx.emit(topic, type, body, {key, id})` emits an event in the transaction (`txn.ts:166`).
+  * A conflict re-runs the transaction, so a counter row read-modify-write is safe (`db.ts:547`).
+  * Indexes: `createIndex(table, name, {fields, unique})`.
+* **Apps are found by globs** (`scripts/build-apps.mjs` `appNames`, `apps/tsconfig.json`, `vitest.config.ts`, `playwright.config.ts`): `apps/mail` needs no wiring.
+  * The harness: `startWorld({grants, services: [{name, path, mode, resume, more}]})`, `w.servicePort`, `spawnWorker`, `workerEnv`, `waitFor`, `kill`.
+  * `testCerts()` gives a P-256 chain for `localhost` and `127.0.0.1` (needs `openssl`).
+* **Python** 3.11 here, 3.12 on the runners (preinstalled on `ubuntu-latest`), with `smtplib` and `ssl`. Only `packages/fuse/test/mount.test.ts` runs Python today (`python3 -c`).
+
+### spec: svc.md §7.1 (`spec:`)
+* §7's engine list gains `"starttls"`.
+* **A new paragraph, STARTTLS.** A connection that starts plain and switches to TLS in mid-stream.
+  * **The switch.** A step of the plain phase may end it: its records go out in plain (the protocol's go-ahead reply), and the input from its `in_to` on is TLS.
+  * **Plaintext the client sent after the command** (pipelined, or injected, CVE-2011-0411) is handed to the TLS engine as TLS input. So it is never read as a command after the switch: a handshake that begins with it fails, and the connection closes.
+  * **Sealing:** the step that switches sets `unseal` (§9): what follows is TLS ciphertext.
+  * **Resumability:** the plain phase is resumable from the first step, as raw; the handshake isn't (as in `tls`); the TLS phase is again. A successor that finds the handshake phase releases the connection with `close`.
+  * **The state:** `engine_state` is `{v: 1, phase: 0 plain | 1 handshake | 2 tls, tls?: <§7.1's engine_state>}`, absent in the plain phase until the switch.
+
+### `@zen/svc` (`svc:`)
+* **`LineReader`** (`packages/svc/src/lines.ts`):
+  ```ts
+  const r = new LineReader(c.input, { max: 1000 });   // max line, with its terminator
+  for (let l = r.next(); l !== null; l = r.next()) { … }  // a line without its CRLF (or bare LF)
+  r.consumed;     // bytes of whole lines read: what to ack
+  r.rest();       // the bytes after them (e.g. message data after DATA)
+  r.tooLong;      // no terminator within `max` bytes
+  ```
+  * Echo's two loops use it.
+* **`starttls(opts: TlsLayerOptions): Layer<RawStep>`**, engine `starttls`:
+  * Plain phase: as `raw()`, plus `c.startTls()`. The step's writes go out in plain; the switch happens after them.
+  * TLS phase: as `tls()`, with `c.tls` set; the handler is called when the handshake finishes, so a protocol that has the server speak again can.
+  * `RawStep.startTls()` throws under the other layers and after the switch.
+* **Refactor:**
+  * `tls.ts`'s `TlsConn` gains a starting phase.
+  * `tls()` is `TlsConn` started in TLS; `starttls()` starts it plain.
+  * The `Step` class gets the `startTls` hook.
+  * `Finished.unseal` is set on the switching step.
+* **Tests:**
+  * `packages/svc/test/lines.test.ts`: CRLF and bare LF, a partial last line, `max`, `rest()` after a line.
+  * `packages/svc/test/starttls.test.ts`, driving the layer as `serve()` does with no server (the pattern of `sshlayer.test.ts`), against Node's `tls.connect` over an in-memory socket, restoring from the committed state at every step:
+    * a plain exchange, the switch, data both ways, close_notify, on 1.2 and 1.3
+    * pipelined plaintext after the command fails the handshake
+    * a handshake-phase state refused by `load`
+    * `unseal` on the switching step
+
+### `apps/mail`: inbound SMTP (`apps:`)
+* **`src/schema.ts`, namespace `mail`:**
+  * `mailboxes {address → user}`: the local addresses
+  * `drafts {draft, conn, started}` and `parts {draft, seq → data}`: DATA staged as it arrives
+  * `messages {user, uid → draft, size, from, to, received, head, flags}`, with index `by_user_uid`
+  * `counters {user → next}`: UIDs
+  * `certs`: the TLS chain and key, and the inbox seed, as echo keeps them
+  * The topic `mail/received`.
+* **`src/smtp.ts`, the handler (RFC 5321 subset, with RFC 3207 and RFC 1870):**
+  * **The greeting** `220 <host> ESMTP zen` on the first step.
+  * **Commands:**
+    * `EHLO`/`HELO`: `EHLO` lists `PIPELINING`, `SIZE 10485760`, `8BITMIME`, and `STARTTLS` before the switch
+    * `MAIL FROM:<…> [SIZE=n]`: over the limit gives `552`
+    * `RCPT TO:<…>`: an address not in `mailboxes` gives `550`; at most 100 recipients
+    * `DATA`, `RSET`, `NOOP`, `QUIT`, `VRFY` (`252`), `STARTTLS` (`220`, then `c.startTls()`)
+    * anything else: `500`/`502`; out of order: `503`
+  * After the switch the session starts over (RFC 3207 §4.2): the state forgets EHLO and the envelope.
+  * Pipelined commands are answered in order within one step. A line over 1,000 bytes gets `500` and closes.
+  * **DATA:**
+    * At `DATA`, a draft row is created, and `354` is sent.
+    * Each later step decodes what arrived with a streaming decoder (dot-unstuffing, the end `CRLF.CRLF` across steps, no line limit), appends it as `parts` rows of at most 64 KiB, and acks it, in the same commit. The decoder's position and the draft's counters live in the state.
+    * At the end, one commit does the rest, then replies `250 2.0.0 Ok <id>`:
+      * for each recipient, a `messages` row with the next UID of its user and a `Received:` header (peer, HELO, TLS version and suite, time) in `head`; the parts are shared
+      * the draft row is deleted
+      * `tx.emit(received, 'message', {user, uid, size}, {key: user})`
+    * Over 10 MB: the rest is read and dropped, the staged parts are deleted, and the reply is `552`.
+    * `RSET`, or a new `MAIL`, deletes a staged draft's parts.
+  * **Exactly once:** the reply is released only after its commit (svc.md §5). A successor continues from the last committed step: the staged parts, the decoder state and the envelope.
+* **`src/mail.ts`:**
+  * `SMTP_SERVICE = ['svc', 'smtp']`
+  * `putMailbox(db, address, user)`
+  * `messageBytes(db, user, uid)`: head plus parts, for the tests and for 5.5.13b
+  * `sweepDrafts(db, olderThanMs)`: deletes drafts left by connections that died mid-DATA, with their parts
+* **`workers/smtp.ts`:** serves `svc/smtp` with `starttls()` and the inbox seed from `certs`, and sweeps drafts every 10 minutes. `MAIL_STALL=data-end` makes the handler print `stall` and hang inside the transaction at the end of DATA, for the kill tests.
+* **`test/client.py`** (run as `python3 -I`): `smtplib` with options for plain, STARTTLS on 1.2 or 1.3, a CA file, the messages to send (a JSON file) and a timeout. It prints each reply as a JSON line.
+* **Vitest (`apps/mail/test/smtp.test.ts`).** The service has `inbox` set (5.5.12); the certificates are `testCerts()`.
+  1. **In process, with Python:**
+     * one message plain, one over STARTTLS 1.3, one over 1.2
+     * each lands once for each recipient, with its exact bytes (`messageBytes`) and an event on `mail/received`
+     * the `Received:` header names the TLS version
+  2. **Refusals:** an unknown recipient (`550`); `SIZE=` over the limit (`552`); a body over the limit (`552`, and no parts left behind); out of order (`503`); `RSET` mid-transaction.
+  3. **Pipelining and injection:** a Node `net` client.
+     * `MAIL`, `RCPT` and `DATA` in one write get three replies.
+     * `STARTTLS\r\nNOOP\r\n` in one write: `NOOP` is never answered, and the connection closes when the handshake fails.
+  4. **A kill between DATA and the reply:**
+     * a worker with `MAIL_STALL=data-end` prints `stall` and is SIGKILLed
+     * a fresh worker (lease TTL 1 s) takes over, and Python gets `250`
+     * the message is stored exactly once
+     * done plain (sealed inbox) and over STARTTLS 1.3 (the TLS state resumes)
+  5. **A kill mid-DATA:** a 3 MB message over STARTTLS 1.2; the worker is killed after some parts are staged. The successor continues, the stored bytes' SHA-256 equals the sent one, and no draft is left.
+  6. **`sweepDrafts`:** a connection dropped mid-DATA leaves a draft, which the sweep removes.
+
+### Docs
+* `docs/CLIENT.md` §11: `starttls()` and `c.startTls()`, `LineReader`, the injection rule; the "Not yet" line becomes IMAP and waking handlers (5.5.13b).
+* `apps/README.md`: the mail app.
+* TECH_DEBT **TD-MAIL-SCOPE**: inbound only.
+  * No SPF, DKIM or DMARC checks, no outbound delivery, no submission port or SMTP AUTH, no `CHUNKING`/`BDAT` or `SMTPUTF8`.
+  * Members of the fs can read every mailbox: mail is as private as the fs, not per user.
+* The log in both plan copies.
+
+### Out of scope (5.5.13b and later)
+* waking handlers without input; IMAP (LOGIN with app passwords, SELECT, FETCH, STORE, SEARCH, EXPUNGE, IDLE); the inbox page and its Playwright spec
+* everything in TD-MAIL-SCOPE
+
+### Verification
+* `npm run check`; `npx vitest run` 3×; `npx playwright test` once (unchanged)
+* `cargo test -p zen-server --test svc` once (the server is unchanged)
+* CI green on the PR
 
 ## Step 5.5.12 in detail: the sealed inbox
 

@@ -49,6 +49,16 @@ fn service(f: impl FnOnce(&mut ServiceConfig)) -> impl FnOnce(&mut Config) {
 /// A server with the service, claimed by Alice. Returns Alice's token and
 /// the service's address.
 async fn setup(f: impl FnOnce(&mut ServiceConfig)) -> (Harness, Vec<u8>, SocketAddr) {
+    // The server's warnings, captured with each test's output: a failing
+    // test shows them (a relayed input batch that didn't store, a reap
+    // that failed). RUST_LOG overrides the level.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "zen_server=warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let h = Harness::start_with(service(f)).await;
     let alice = User::new(1);
     h.claim(&alice, &[]).await;
@@ -1467,7 +1477,7 @@ async fn push_input() {
     let mut p = Pushed::default();
     assert_eq!(p.until(&mut ws, &c.conn, 0, 5).await, b"hello");
 
-    let mut worst = Duration::ZERO;
+    let mut each = Vec::new();
     for i in 0..10 {
         let t0 = Instant::now();
         let line = format!("line {i}\n");
@@ -1475,12 +1485,14 @@ async fn push_input() {
         let have = p.data[&c.conn].len();
         let got = p.until(&mut ws, &c.conn, 0, have + line.len()).await;
         assert!(got.ends_with(line.as_bytes()));
-        worst = worst.max(t0.elapsed());
+        each.push(t0.elapsed());
     }
+    let worst = each.iter().max().copied().unwrap_or_default();
     println!("push latency, worst of 10: {worst:?}");
+    // All ten on failure: one stalled push, or every one slow (a loaded runner).
     assert!(
         worst < Duration::from_secs(1),
-        "pushed within 1 s: {worst:?}"
+        "pushed within 1 s: {each:?}"
     );
 
     peer.shutdown().await.unwrap();
@@ -2222,19 +2234,21 @@ async fn inbox_seals_input() {
     assert_eq!(info.inbox.as_deref(), Some(&pk[..]));
     lease(&h, &tok, 1, None).await.unwrap();
     let mut peer = TcpStream::connect(addr).await.unwrap();
-    // Written apart, so the input is several chunks.
-    let mut sent = Vec::new();
+    let c = claim(&h, &tok, 1).await;
+    let key = inbox_key(&c);
+    // Each line is stored before the next is written, so each is a chunk of
+    // its own. Lines written apart in time could still share a batch: the
+    // server reads whatever is waiting.
+    let (mut sent, mut chunks) = (Vec::new(), Vec::new());
     for i in 0..8 {
         let line = format!("PLAINMARKER-{i:02}\n");
         peer.write_all(line.as_bytes()).await.unwrap();
+        let (got, ch) = read_open(&h, &tok, &c, &key, sent.len() as u64, line.len()).await;
+        assert_eq!(got, line.as_bytes());
         sent.extend_from_slice(line.as_bytes());
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        chunks.extend(ch);
     }
-    let c = claim(&h, &tok, 1).await;
-    let key = inbox_key(&c);
-    let (got, chunks) = read_open(&h, &tok, &c, &key, 0, sent.len()).await;
-    assert_eq!(got, sent);
-    assert!(chunks.len() > 1, "several chunks: {chunks:?}");
+    assert_eq!(chunks.len(), 8, "a chunk per line: {chunks:?}");
     assert!(chunks.iter().all(|(_, sealed)| *sealed));
     let st = state(&h, &tok, &c).await.unwrap();
     assert_eq!(st.in_head, sent.len() as u64, "in_head counts plaintext");

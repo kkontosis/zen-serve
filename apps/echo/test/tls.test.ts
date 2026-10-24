@@ -1,7 +1,6 @@
 // The echo service over TLS (`tls()`, svc.md §7.1) with Node `tls` peers:
 // handlers in-process and as Node workers killed with SIGKILL, mid-stream
 // (the connection continues) and mid-handshake (the server aborts it).
-import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type Server, type Socket, connect as tcp } from 'node:net';
 import { type ConnectionOptions, connect, type TLSSocket } from 'node:tls';
@@ -10,7 +9,6 @@ import { type RawStep, serve, tls } from '@zen/svc';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { testCerts } from '../../../packages/client/src/testing/index.js';
 import {
-  ROOT_DIR,
   sleep,
   spawnWorker,
   startWorld,
@@ -29,10 +27,6 @@ let db: Db;
 let ca: string;
 
 beforeAll(async () => {
-  execFileSync(process.execPath, ['scripts/build-apps.mjs', 'echo'], {
-    cwd: ROOT_DIR,
-    stdio: 'inherit',
-  });
   w = await startWorld({
     grants: GRANTS,
     services: [
