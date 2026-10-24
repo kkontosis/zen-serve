@@ -58,6 +58,22 @@ export interface RawStep {
    * `end()`, `close()` or `abort()`.
    */
   startTls(): void;
+  /**
+   * Be woken by `ServeHandle.wake(key)` for these keys: the handler is then
+   * called even without new input, for example to tell an idling client
+   * of a change made elsewhere. They replace the keys of earlier steps;
+   * `wakeOn()` clears them. They live in this process only: a successor
+   * calls the handler once when it claims the connection, which registers
+   * them again.
+   */
+  wakeOn(...keys: string[]): void;
+  /**
+   * Step again at once, without new input: for output larger than one
+   * step can hold (`room`).
+   */
+  again(): void;
+  /** The bytes this step may still write. */
+  readonly room: number;
   /** Under `tls()`, and `starttls()` after the switch: the connection's TLS parameters. */
   readonly tls?: TlsInfo;
 }
@@ -98,10 +114,15 @@ export interface Finished {
   engineState: Uint8Array | null;
   /** It differs from the committed one. */
   engineChanged: boolean;
-  /** Step again at once, without new input (the handler made room for held input). */
+  /**
+   * Step again at once, without new input: the layer's (the handler made
+   * room for held input) or the handler's (`again()`).
+   */
   again: boolean;
   /** The handler called `unseal()`. */
   unseal?: boolean;
+  /** The handler's wake keys, if it set them (`wakeOn`). */
+  wakeOn?: string[];
 }
 
 /** @internal One attempt at a step, inside the transaction. */
@@ -124,8 +145,12 @@ export interface LayerConn<S> {
    * connection can't continue here.
    */
   load(engineState: Uint8Array | null, same: boolean): void;
-  /** Process input (`eof`: the peer's FIN follows it). `finSent`: the handler ended its side. */
-  prepare(input: Uint8Array, eof: boolean, finSent: boolean): Prepared;
+  /**
+   * Process input (`eof`: the peer's FIN follows it). `finSent`: the
+   * handler ended its side. `wake`: call the handler even without new
+   * input (a wake, `again()`, or a claim).
+   */
+  prepare(input: Uint8Array, eof: boolean, finSent: boolean, wake: boolean): Prepared;
   /** Open an attempt at the step (may run more than once). */
   open(p: Prepared, ctx: StepContext): Live<S>;
   /** The step committed (or needed no commit). */
@@ -175,6 +200,10 @@ export class Step implements RawStep {
   unsealed = false;
   /** `startTls()` was called. */
   starting = false;
+  /** `again()` was called. */
+  asked = false;
+  /** The keys of `wakeOn()`, if it was called. */
+  keys: string[] | undefined;
 
   constructor(
     readonly conn: Uint8Array,
@@ -183,7 +212,7 @@ export class Step implements RawStep {
     readonly eof: boolean,
     public state: Uint8Array | null,
     private readonly finSent: boolean,
-    private readonly room: number,
+    private readonly limit: number,
     readonly tls: TlsInfo | undefined,
     /** `startTls()` is allowed (`starttls()`'s plain phase). */
     private readonly startable = false,
@@ -204,8 +233,8 @@ export class Step implements RawStep {
   write(data: Uint8Array | string): void {
     this.open('write');
     const d = typeof data === 'string' ? bytes.utf8(data) : data;
-    if (this.outBytes + d.length > this.room) {
-      throw new RangeError(`a step writes at most ${this.room} bytes (out_window)`);
+    if (this.outBytes + d.length > this.limit) {
+      throw new RangeError(`a step writes at most ${this.limit} bytes (out_window)`);
     }
     if (d.length) {
       this.out.push(d);
@@ -233,6 +262,18 @@ export class Step implements RawStep {
 
   unseal(): void {
     this.unsealed = true;
+  }
+
+  get room(): number {
+    return this.limit - this.outBytes;
+  }
+
+  wakeOn(...keys: string[]): void {
+    this.keys = keys;
+  }
+
+  again(): void {
+    this.asked = true;
   }
 
   startTls(): void {
@@ -292,8 +333,9 @@ class RawConn implements LayerConn<RawStep> {
         endFlag: s.endFlag,
         engineState: null,
         engineChanged: false,
-        again: false,
+        again: s.asked,
         unseal: s.unsealed,
+        ...(s.keys ? { wakeOn: s.keys } : {}),
       }),
       dispose: () => {},
     };

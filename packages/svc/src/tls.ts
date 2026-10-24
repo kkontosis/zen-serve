@@ -191,7 +191,7 @@ class TlsConn implements LayerConn<RawStep> {
     this.sealed = st;
   }
 
-  prepare(input: Uint8Array, eof: boolean, finSent: boolean): TlsPrepared {
+  prepare(input: Uint8Array, eof: boolean, finSent: boolean, wake: boolean): TlsPrepared {
     if (this.phase === PLAIN) {
       return {
         phase: PLAIN,
@@ -209,7 +209,7 @@ class TlsConn implements LayerConn<RawStep> {
     if (this.state) {
       const c = this.e.sw.TlsConn.restore(this.e.config, this.state);
       try {
-        return this.after(c, c.input(input, eof), finSent, false);
+        return this.after(c, c.input(input, eof), finSent, wake, false);
       } finally {
         c.free();
       }
@@ -234,13 +234,19 @@ class TlsConn implements LayerConn<RawStep> {
         fragile: begun || p.error !== undefined,
       };
     }
-    const q = this.after(this.hs, p, finSent, true);
+    const q = this.after(this.hs, p, finSent, wake, true);
     this.dropHandshake();
     return q;
   }
 
   /** A step of an established connection, from the engine after its input. */
-  private after(c: SW.TlsConn, p: SW.TlsProgress, finSent: boolean, fragile: boolean): TlsPrepared {
+  private after(
+    c: SW.TlsConn,
+    p: SW.TlsProgress,
+    finSent: boolean,
+    wake: boolean,
+    fragile: boolean,
+  ): TlsPrepared {
     const input = c.plaintext();
     const eof = c.peerClosed || p.truncated;
     const alpn = c.alpn;
@@ -252,10 +258,11 @@ class TlsConn implements LayerConn<RawStep> {
       truncated: p.truncated,
     };
     // The handler runs when the handshake just finished (a server-first
-    // protocol greets then), on new plaintext, and on an EOF it hasn't
-    // seen, unless it has ended its side and there's nothing to read.
+    // protocol greets then), on new plaintext, on an EOF it hasn't seen,
+    // and when woken, unless it has ended its side and there's nothing to
+    // read.
     const fresh =
-      p.established || input.length > this.seenPlain || (eof && !this.seenEof && !finSent);
+      wake || p.established || input.length > this.seenPlain || (eof && !this.seenEof && !finSent);
     return {
       phase: ESTABLISHED,
       consumed: p.consumed,
@@ -320,8 +327,9 @@ class TlsConn implements LayerConn<RawStep> {
         engineChanged: this.changed(engineState),
         // Input after the command is TLS: hand it to the engine at once,
         // so a handshake that begins with plaintext fails now.
-        again: s.starting && s.acked < p.input.length,
+        again: (s.starting && s.acked < p.input.length) || s.asked,
         unseal: s.unsealed || s.starting,
+        ...(s.keys ? { wakeOn: s.keys } : {}),
       },
       next: { phase: s.starting ? SWITCHED : PLAIN, tls: null },
     };
@@ -368,8 +376,9 @@ class TlsConn implements LayerConn<RawStep> {
           engineState,
           engineChanged: this.changed(engineState),
           // Records held back behind the plaintext: the handler made room.
-          again: p.held && s.acked > 0,
+          again: (p.held && s.acked > 0) || s.asked,
           unseal: s.unsealed,
+          ...(s.keys ? { wakeOn: s.keys } : {}),
         },
         next: { phase: ESTABLISHED, tls: tlsState },
       };

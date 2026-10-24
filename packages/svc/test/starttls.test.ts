@@ -160,7 +160,7 @@ class Driver {
     try {
       for (let again = true; again && !this.ended; ) {
         this.more = false;
-        const p = this.lc.prepare(this.pending, this.eof, false);
+        const p = this.lc.prepare(this.pending, this.eof, false, false);
         if (p.error) this.errors.push(p.error);
         const live = this.lc.open(p, {
           conn: new Uint8Array(16),
@@ -336,7 +336,7 @@ describe('starttls()', () => {
     const tryStart = async (e: Engine<RawStep>) => {
       const c = e.conn();
       c.load(null, true);
-      const p = c.prepare(new TextEncoder().encode('x'), false, false);
+      const p = c.prepare(new TextEncoder().encode('x'), false, false, false);
       const live = c.open(p, {
         conn: new Uint8Array(16),
         peer: { addr: '127.0.0.1', port: 0 } as never,
