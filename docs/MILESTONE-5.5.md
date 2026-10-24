@@ -460,7 +460,116 @@ This is a sibling of the broker. It reuses the claim, fencing and commit machine
       * `npx vitest run` 3×: 548 passed each time, 7 skipped (the opt-in benches), no errors
       * `npx playwright test`: smoke and apps, 17 specs (`apps/mail/e2e/mail.spec.ts` new)
       * `cargo test -p zen-server --test svc` (33; the server is unchanged)
+    * CI green on PR #51's head 85d3132: both runs (push and pull request) passed every check on their first attempt. Merged at 22:10:36 UTC (merge commit 1af803b). This entry isn't in main: it goes into step 5.5.14's plan commit.
   * Messages may be up to 10 MB (the user's decision), advertised as `SIZE 10485760`.
+
+## Step 5.5.14 in detail: docs, measurements, the outcome
+
+**Context.** Every piece of milestone 5.5 is built and merged (steps 1–13b). What's left closes the milestone:
+* a guide for whoever runs or writes a relayed service, instead of the spec plus §11 of CLIENT.md
+* measured costs, the way STATS §5.4 has them for zen-db
+* the remaining tech-debt entries
+* the README status and an Outcome section
+
+No new behaviour. A bug the measurements find gets its own commit and a test.
+
+**Restart from main** after PR #51's merge (`git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`). This plan commit carries 13b's CI and merge entry, which isn't in main.
+
+**Commits** (one PR):
+1. `docs: milestone 5.5 step 14 plan`
+2. `svc: an opt-in bench of relayed services`
+3. `docs: relayed services (docs/SVC.md), measurements, tech debt`
+4. `docs: milestone 5.5 outcome`
+
+### Facts from the survey
+* **README** line 46 says milestone 5.5 is in progress with steps 1–10 done. Line 33 lists the apps without `mail`.
+* **`docs/API.md`** is the design-era outline ("draft", "provisional"), with no `/v1/svc/*` rows. spec/api.md §14 is the normative list.
+* **docs/STATS.md** ends at §5.4. The bench pattern is `packages/db/test/bench.test.ts`: `ZEN_BENCH=1`, skipped otherwise, medians of N runs against a local embedded server.
+* **spec/OPS.md** covers building, disk, the FDB pitfalls and advice. It has no section on relayed services. spec/operations.md §4 has the service table rules.
+* **docs/GAPS.md** is the design-gap list (G1–G26), all accepted. G18 (ACME) is the nearest to this milestone.
+* **TECH_DEBT** already has TD-SVC-STATE-ROLLBACK, -TLS-HANDSHAKE-RESUME (from 5.5.7), -SSH-SCOPE, -SSH-PQ-CI, -CONNECT-BACKPRESSURE, -INBOX-ROTATION, TD-MAIL-SCOPE and TD-TEST-OPEN-FAILURES. TD-SVC-ACME and TD-SVC-UDP are named in this plan but don't exist.
+* **The Outcome shape** is `docs/MILESTONE-5.md`'s "## Outcome":
+  * Done, and the differences from the plan
+  * Tests, with counts per package and times
+  * Tech debt, resolved and new
+* **The test harness:** `startWorld` with services and `spawnWorker`; `TestServer` spawns the binary (`packages/client/src/testing/server.ts:144`) but doesn't expose its pid.
+
+### The bench (`apps/echo/test/bench.test.ts`, `ZEN_BENCH=1`, not in CI)
+On the echo world (embedded backend, one machine), it prints a table that goes into STATS §5.5:
+* **Step latency:** a Node peer sends a line and times the reply. Median and p90 of 50, for:
+  * raw `resume: true` and `resume: false`
+  * TLS
+  * SSH (`lines` over one exec channel, timed per line from the client)
+  * a `tcp-auth` connection through `svcConnect`
+  * The handler runs in-process.
+* **Throughput:** `mirror` raw and `mirror-tls`, 20 MB each way; SSH `cat` of 20 MB. In MB/s, in-process.
+* **The takeover pause:** a worker with a 1 s lease TTL is SIGKILLed while a peer sends a line every 5 ms. Measure the longest gap between replies, median of 5. It is about the TTL plus a claim; the bench shows by how much.
+* **An idle connection's cost:**
+  * 1,000 idle raw connections held by one handler: the server's RSS before and after (from `/proc/<pid>/status`; `TestServer` gains `pid`)
+  * the handler's heap delta (`process.memoryUsage().heapUsed`)
+  * the steps run while they sit for 10 s (expected 0)
+* **IMAP:** NOOP latency, and a 10 MB FETCH (MB/s).
+
+### Docs
+* **`docs/SVC.md`** (new): the guide.
+  1. What a relayed service is, and the modes (`tcp`, `tcp-auth`)
+  2. Configuring `[[service]]`:
+     * every setting, with the defaults
+     * `window` for SSH and `idle_secs` for IMAP
+     * the same table on every node
+     * ports
+  3. Writing a handler:
+     * `serve()`, the step, state, layers
+     * `LineReader`, `starttls()`
+     * waking and `again()`
+     * worked from the echo and mail apps, with links to CLIENT.md §11 for the API
+  4. Keys and secrets: certificates, host keys, the inbox seed and app passwords, all as sealed rows; ACME isn't there (TD-SVC-ACME)
+  5. Takeover: what is kept per layer (raw: everything; TLS: after the handshake; SSH: everything); the pause; `resume: false`
+  6. What the server sees, from svc.md §12 in plain words: addresses and timing, and plaintext in transit for non-TLS protocols even with the inbox
+  7. Costs: a pointer to STATS §5.5
+  8. Limits: links to the TD entries
+* **STATS §5.5:** the bench table and how to read it.
+* **spec/OPS.md:**
+  * §2.1: relay bytes in what fills the disk (bounded by `max_conns × window`, counted in the quota)
+  * a new section on the relayed-service tests' tools: `ssh`, `openssl`, `python3`, `ZEN_APPS_BUILT=1`, the OpenSSH-from-source job
+* **docs/API.md:** a "Relayed services" table of the `/v1/svc/*` routes pointing to spec/api.md §14, and a note that spec/api.md is normative.
+* **docs/GAPS.md:** none of G1–G26 changes status. Add a sentence to G18 that relayed services' certificates are brought by the admin (TD-SVC-ACME).
+* **docs/CLIENT.md §11:** a link to SVC.md at its top.
+* **README:**
+  * status: milestone 5.5 done, linking the Outcome
+  * the apps row gains `mail`
+  * the docs list gains SVC.md
+* **DESIGN-3 §6:** 5.5 marked done.
+* **TECH_DEBT:**
+  * **TD-SVC-ACME** (new): certificates are brought by the admin; an ACME client run by a handler, with the challenge served through a relayed `tcp` service on port 80 or TLS-ALPN on 443, would renew them
+  * **TD-SVC-UDP** (new): TCP only; DNS, QUIC and others need datagrams, a different relay model
+  * **TD-TEST-OPEN-FAILURES:** reviewed; any that recurred in steps 13b–14 CI are pursued then
+
+### The Outcome (`docs/MILESTONE-5.5.md`, "## Outcome")
+* **Done,** and what was built, in the M5 shape.
+* **The differences from the plan, condensed from the step logs:**
+  * the step split (13a/13b, plus the CI-fix work in 13a)
+  * the four STARTTLS phases
+  * the SSH bounds and the read-ahead
+  * the windows
+  * waking on claim
+  * 4000 for every WebSocket reset
+  * the sealed inbox's plaintext lengths
+  * app passwords at 160 bits
+* **Tests:**
+  * Rust per crate: zen-svc (tls, ssh, openssh, openssl) and zen-server `svc.rs`
+  * Node per package and app, and Chromium specs, with counts and times from this step's runs
+  * the CI jobs
+* **Measurements:** a pointer to STATS §5.5.
+* **Tech debt:**
+  * new: the TD-SVC-* entries, TD-MAIL-SCOPE, TD-TEST-OPEN-FAILURES
+  * resolved within the milestone: none, or those found
+* **README** links it. The log line for step 14 in both plan copies.
+
+### Verification
+* `npm run check`; the bench run once (`ZEN_BENCH=1`) for the numbers; `npx vitest run` once (the bench is skipped); `npx playwright test` once (unchanged)
+* Links in the new and changed docs checked with a script: each relative path exists, and each `TD-` name is a heading in TECH_DEBT
+* CI green on both runs of the PR
 
 ## Step 5.5.13b in detail: waking handlers, IMAP with IDLE, the inbox page
 
