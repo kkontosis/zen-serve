@@ -221,6 +221,16 @@ Two races in `@zen/db`'s request path (`packages/db/src/txn.ts` `ask`, `packages
   * Fix: `crdtGet` and `crdtRange` observe every `row` and `lww` register's `hlc` (`observeUnchecked`: not when over a minute ahead). zendb.md §19.4 gains a "Causality" bullet.
   * New test "a write after reading one stamped by a clock ahead still wins (§19.4)": a clock persisted 2 s ahead writes, the other installation reads then writes. It failed without the fix ('from ahead' won) and passes with it. The existing test now reads before its second write, which is what "later" means between installations.
 * **The ledger sum** (TD-TEST-OPEN-FAILURES item 1) reproduced locally for the first time, in the same full run, in both ledger tests. The diagnostic: trader 3's transfer acct-3→acct-2 wrote acct-3's balance from the value before trader 3's previous transfer (165, not 136). Each trader `Db` runs 3 trade loops at once, sharing its row cache. Ruled out by reading: the server's `expect` (a `get` inside the commit's transaction at `read_version`, which adds a read-conflict range), the embedded backend's conflict check, and the client's `expectKey`. Not caused by this step: the ledger uses no CRDT tables, requests or integrity. Investigation continues after this push.
+* Pushed 7c1d932 (the inbox and CRDT fixes): **CI green on both runs** (push 397, pull_request 398).
+* **The ledger sum, found:** a lost update through the row cache. `put` reads its row again (`Table.put` → `read`), and each trader `Db` runs three trade loops that share the cache:
+  1. T2's `get` uses the stale cached row (165, version v0) and expects v0.
+  2. T1 commits (the cache drops the row), and another loop's read caches the new row (136, v1).
+  3. T2's `put` reads the row again from the cache: `useCached` called `expectKey(key, v1)`, which replaced v0.
+  4. T2 commits 165 − 39 = 126 expecting v1, the current version, and the commit passes.
+  * Fix: the first version expected of a key in a transaction stands. `Transaction.expectKey` keeps an existing expectation (long-mode server reads already did), and `DbTransaction.useCached` keeps the first record of a key. A transaction that saw two versions of a row now conflicts and re-runs.
+  * Tests that failed without the fix: `txn.test.ts` "a row read twice while the cache changes in between: the commit conflicts, no lost update" (it committed once, on stale data), and `kv.test.ts` "expectKey: the first version expected of a key stands, so two versions conflict" (it committed).
+  * Item 1 of TD-TEST-OPEN-FAILURES is marked resolved, with its cause.
+  * The full vitest run, 3× after the fix: 570 passed, 12 skipped (the opt-in benches).
 
 ## Facts the design rests on (survey)
 
