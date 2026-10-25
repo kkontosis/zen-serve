@@ -204,9 +204,20 @@ fn fs_vectors_open_from_files() {
     );
     let paged = hx(&v["write_paged"]["op"]);
     assert_eq!(paged[0], 4);
+    let paged_chain = fs::chain_next(&chain, &paged, &device);
+    assert_eq!(paged_chain.to_vec(), hx(&v["write_paged"]["chain"]));
+    let nodes: Vec<[u8; 16]> = v["purge"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| hx(n).try_into().unwrap())
+        .collect();
+    let purge = fs::purge_bytes(fsk.fs_id, &tree, &nodes);
+    assert_eq!(purge, hx(&v["purge"]["op"]));
+    assert_eq!(purge.len(), 25 + 16 * nodes.len());
     assert_eq!(
-        fs::chain_next(&chain, &paged, &device).to_vec(),
-        hx(&v["write_paged"]["chain"])
+        fs::chain_next(&paged_chain, &purge, &fs::PURGE_DEVICE).to_vec(),
+        hx(&v["purge"]["chain"])
     );
 }
 
