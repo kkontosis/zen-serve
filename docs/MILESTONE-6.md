@@ -152,6 +152,9 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * The setup helper retries `commit_unknown` as well as `too_old`.
     * `checkpoint_log` tests the resend, which returns the same version, while another checkpoint at the head gets 409.
     * Embedded, and FDB 3×: green.
+  * **CI green on both runs of 43e5455** (push 390, pull_request 391): rust, pure-rust, fdb and client all pass. Step 6.2 is done, waiting on review and merge of PR #55. This line reaches `docs/MILESTONE-6.md` at the restart from main, so CI isn't rerun for a docs-only commit.
+  * PR #55 merged at e3a2c5c.
+* **Step 6.3** (`@zen/client`): planned below ("Step 6.3 in detail"). Restarted from main; the log above is now in the repo copy too.
 
 ## Facts the design rests on (survey)
 
@@ -794,6 +797,237 @@ Detection must be tested against a server that lies, so 6.3–6.5 need one. It s
 * `scripts/build-wasm.sh` and `npm run check` (the proto types still type-check)
 * the vitest client suites that touch commits, streams and the tree, once: `kv`, `stream`, `tree`, `log`
 * CI green on both runs
+
+## Step 6.3 in detail
+
+Step 6.3 makes `@zen/client` use what 6.1 specified and 6.2 serves:
+* device enrollment
+* checkpoints with pins: write, verify, detect forks, compare pins out of band
+* signed fs headers
+* event chains (body v2), with topic heads in checkpoints
+
+Each detection is tested against the 6.2 adversary and against forked servers. The tree, svc and zen-db entries use the same `Integrity` object in 6.4 and 6.5; this step exposes `note(entry)` for them, but only topics call it.
+
+**Survey (what this step builds on):**
+* **Sessions** (`session.ts`, `client.ts`):
+  * A device sign-in (`signInDevice`) takes `DeviceCredentials {identity, device, cert}`, but the session keeps only `info.device_fp`. `vault.signIn` frees the `DeviceSecret` after signing in.
+  * Other methods have no device secret: passkey, OPAQUE, mTLS, API token and resumed sessions. For them `deviceFp` is a credential id, or absent.
+  * **The user identity** (`SigningIdentity`, the ACL member identity) is held only by whoever made the member entry: tests, zen-mount's device-key file, an admin. It's not the password-derived identity of method 6, which is a separate credential (auth.md §3, "Privacy").
+* **The ACL** (`acl.ts`): `Acl.head()` walks the chain from an in-memory pin (`AclVersion`) and refuses a lower or changed version (`acl_chain`). The pin isn't persisted.
+* **The fs header** (`fs.ts`):
+  * `Fs.header()` gets `/v1/fs/header/get` (optionally keeping a copy on a `SealedStore`) and decodes `FsHeader`.
+  * `putHeader`, `init`, `editHeader` and every slot method write the unsigned form.
+  * A signed stored header would fail `FsHeader.decode` today: the first byte is `0x80`.
+* **Topics** (`log.ts`): `Topic.seal` builds a v1 `EventBody`, whose sender is `senderOf(session)`, the device fp or zeros. `append`/`appendIn` seal at call time; a transaction that retries calls its function again, which seals again. `read` pages `/v1/log/read` (no head in the response). `decode` opens events, and so do `Consumer.toDelivery` and the stream's `openEvent`.
+* **Streams** (`stream.ts`): subscription kinds `sub`, `esub` and `svc`, re-sent after a reconnect; `Subscription<T>` is an async iterable or callback.
+* **The local store** (`local/`): `SealedStore` with named stores; `memoryLocalStore`; the vault (`vault/<name>`).
+* **WASM:**
+  * 6.1 added the integrity bindings: `encodeCheckpoint`/`decodeCheckpoint`, `checkpointHash`, `checkpointBodyBytes`, `DeviceSecret.signCheckpoint`, `verifyCheckpoint`, `FsKeys.sealCheckpoint`/`openCheckpoint`, `SigningIdentity.signHeader`, `decodeSignedHeader`, `verifySignedHeader`, `isSignedHeader`, `validateHeaderSuccessor`, `eventChainHash`, and `EventBody.chainId`/`dseq`/`dprev`.
+  * Missing: the wire codecs of the 6.2 types (`wire.rs` lists every zen-proto type; the checkpoint, device and lease types aren't in it), and a random `DeviceSecret` (only `fromSeed`; the client uses `randomBytes(32)`).
+  * The device fp is `fingerprint(devicePublic)`.
+* **Test harness** (`testing/server.ts`): `spawnServer` writes a config (`top`, `limits`, …) and runs `target/debug/zen-serve`. `restart` reuses the data directory. There's no fork, and no adversary option. `testing/cbor.ts` encodes CBOR (for the adversary's request, which isn't a zen-proto type).
+* **CI** (`client` job): `cargo build -p zen-server`, then `scripts/build-wasm.sh`.
+
+### WASM (`crates/zen-wasm/src/wire.rs`)
+
+Add the 6.2 wire types to `wire_fns!`:
+* `CheckpointPut`, `CheckpointVersion`, `CheckpointHeads`, `CheckpointHeadList`, `CheckpointGet`, `CheckpointList`
+* `DeviceRegister`, `DeviceRegistered`, `DevicesGet`, `DeviceList`
+* `NamedLeasePut`, `NamedLease` (for completeness; the TS client doesn't use leases until a later step needs them)
+
+`Frame` already carries `cksub`/`ckh`. Rebuild with `scripts/build-wasm.sh`.
+
+### Devices and enrollment (`session.ts`, new `devices.ts`)
+
+* **`newDevice()`** → `{secret: DeviceSecret, seed, devicePublic, fp}`: a fresh device key (`randomBytes(32)`), for the vault.
+* **`session.approveDevice(identity, devicePublic)`** → `{cert, fp}`:
+  * The user identity issues a cert (`identity.issueDeviceCert(devicePublic, now)`), and it's registered (`/v1/devices/register`).
+  * Any session of the same user can call it: a passkey or OPAQUE session on a laptop that holds the identity approves the phone's device key shown as a code, as in the TECH_DEBT enrolment entry.
+* **`session.enrollDevice(identity, {vault?})`** → `{device: DeviceCredentials, fp}`: `newDevice` and `approveDevice` in one call. With `vault`, `saveDevice` keeps it, so the next `vault.signIn` is a device sign-in.
+* **`session.devices(fps)`** → `/v1/devices/get`, as returned (unverified). Verification is `Integrity`'s job: each cert must verify against the member identity of its `user` in the verified ACL.
+* **`session.useIdentity(identity)`:** the user identity for operations that need it later: signed header puts (below) and `approveDevice` without an argument. It's kept in memory, like `useClock`.
+
+### Signed fs headers (`fs.ts`)
+
+* **Reading** (`Fs.header`):
+  * The stored bytes may be signed (`isSignedHeader`). If so, they're decoded and the signature verified against an admin of `session.acl.head()`; then the inner header is decoded as today.
+  * `StoredHeader` gains `signed?: {version, hash, signer}`.
+  * A signature that doesn't verify, or a signer who isn't an admin, gives `ZenError(0, 'integrity', …)` with a `header` alarm (below).
+  * The offline copy keeps the signed bytes, verified again on use.
+* **Pins:** with an `Integrity` attached to the `Fs`, the header pin `(version, HH)` is checked (formats.md §12.1):
+  * an unsigned header once a pin exists, a lower version, or the pinned version with another hash is a **rollback**
+  * a higher version raises the pin
+* **Writing:**
+  * `fs.init(slots, {signed: true})` writes signed version 1.
+  * `UnlockedFs.signHeader()` converts an unsigned header (admins).
+  * Once the stored header is signed, `editHeader` (and every slot and policy method through it) signs the successor: version + 1, `prev` = HH of the stored one. That needs `session.useIdentity(admin)`; without it, `editHeader` fails before writing, with `ZenError(0, 'signer_needed')`.
+  * The server checks the same rules (6.2). Each successful put raises the pin.
+
+### Integrity (new `integrity.ts`; `Fs.integrity`)
+
+**Attaching:** `fs.integrity(opts)`, where `fs` is the locked `Fs`. Header pins are needed before unlocking; `unlock` hands the keys over. It returns one `Integrity` per `Fs` object. The options:
+* `device?: {device: DeviceSecret, cert}`: the signer. Without it, the client verifies only, and writes no checkpoints.
+* `local?: SealedStore`: where pins are kept (store `integrity/<fs>`); default memory.
+* `sigEvery?` (default 64) and `delayMs?` (default 5,000): the cadence (formats.md §14.3).
+* `onAlarm?(alarm)`.
+
+**Pins** (persisted on `local`, one record per item):
+* `acl`: the signed ACL bytes of the pinned version, so a new process restores `session.acl`'s pin. The `Acl` class gains `pin(bytes)` and `pinned()`.
+* `header`: `(version, HH)`.
+* `dev/<fp>`: each device's verified head `(seq, HC, body)`. The own device's body is kept too, to build the next cumulative body.
+* `obj/<type><id>`: per object, the newest entry verified from each writer, merged into a floor: the highest topic head, the highest `dseq` per chain with its hash, and so on.
+
+**Writing checkpoints:**
+* `note(entry)` records an object entry and counts a change. After `sigEvery` changes, or `delayMs` after the last one, a checkpoint is written in the background; `checkpoint()` writes one now, and `close()` writes a last one and stops the timer.
+* **The body:**
+  * `seq` = own head + 1 and `prev` = its HC; `hlc` from the session clock
+  * `acl` = the pinned ACL head, and `header` = the header pin or `[0, zeros]`
+  * `objects` = the previous body's entries merged with the noted ones
+  * `seen` = every other verified device head
+* **Too big:** when the encoded body exceeds `max_value_bytes` less the seal and signature overhead (from `/v1/info`), the entries unchanged for longest are dropped.
+* **Signed, sealed and put:** `signCheckpoint`, then `sealCheckpoint(fp, seq, signed)` under the current epoch, then `/v1/checkpoint/put`.
+* **Races and retries:**
+  * On 409, the device's head is re-read and verified (another process of the same device), its entries merged, and the put retried with the next seq (formats.md §14.3), up to a bound.
+  * On `commit_unknown` or a network error, the same bytes are resent (idempotent since 6.2).
+* After an alarm, no checkpoint is written: a device doesn't sign a view it knows is false.
+
+**Verifying (`sync()`):**
+1. `heads` for the fs. For each device whose head is past its pin, `get` the head checkpoint, and the pinned seq + 1 when the head is exactly one past, to check `prev`.
+2. For each checkpoint (formats.md §14.4):
+   * Open it (`openCheckpoint(fp, seq)`, the epoch from the sealed header).
+   * Find the device's cert: among the pinned ACL's member devices, or else via `devices/get`, verified against the member identity of its `user`. Then verify the signature, and check `fs`, `device` and `seq`.
+   * Check the pin rules (rule 2): a lower seq, the same seq with another HC, or a broken `prev` is a **fork**.
+3. Check `seen` links (rule 3): equal to the pin at the same seq. Otherwise fetch that seq (to the device's head only), compare HC, and treat a seq the server can't produce as a **fork**.
+4. Raise the object pins (rule 4); an entry below the same writer's previous one is a **fork**.
+5. Freshness of the ACL and the header against the checkpoints' `acl`/`header`:
+   * `session.acl.head()` must reach the version, with the same hash at it (via `acl.entries(v)`).
+   * The header is re-read and checked against the raised pin.
+6. Raise the own device's pins. The own device's server head below its pin is a **rollback** (its checkpoints are withheld or rolled back).
+
+**Watching:** `watch(stream)` subscribes `cksub`, and syncs on each `ckh` and after every (re)subscription, since pushes missed while disconnected are only visible in `heads`. `stream.ts` gains the `ck` kind: it re-sends `cksub` on reconnect and yields `{type: 'heads'}` (resubscribed) or `{type: 'head', device, seq}`.
+
+**Comparing pins out of band:**
+* `exportPins()` → bytes: deterministic CBOR `{fs, acl: [v, H], header: [v, HH], devices: [[fp, seq, HC]]}`, small enough for a QR code or a chat message.
+* `comparePins(bytes)` treats each device entry as a `seen` link (rule 3) and the ACL and header entries as pins (rule 5). It returns the alarms; a split view shows as a fork.
+
+**Alarms:**
+```ts
+type IntegrityAlarm = {
+  kind: 'rollback' | 'fork' | 'gap' | 'rewrite' | 'invalid';
+  object: 'acl' | 'header' | 'checkpoint' | 'topic' | 'tree' | 'db' | 'vol' | 'svc';
+  id?: Uint8Array;       // topic id, device fp, …
+  detail: string;
+}
+```
+* An alarm is recorded (`integrity.alarms`), passed to `onAlarm`, and thrown from the call that found it as `ZenError(0, 'integrity', detail)` with `.alarm`.
+* From then on the fs is **untrusted**: checkpoint writes stop, and `integrity.trusted` is false.
+* What the app does next is policy (docs/CLIENT.md): refuse writes, alert, compare pins.
+* `invalid` is a checkpoint that doesn't open, or whose signature, cert or fields don't verify: the server served bytes no device sealed.
+
+### Event chains (`log.ts`, `stream.ts`)
+
+**Writing** (only when the fs has an `Integrity`; otherwise bodies stay v1 and nothing changes):
+* `sender` is the integrity device's fp. That's the signer of the checkpoints that list the chains; for a device sign-in it's the same as before.
+* **The chain pool.** Each `Topic` object keeps a pool of chains `{chainId (12 random bytes), dseq, dhash}`.
+  * An append takes an idle chain, or starts a new one when every chain has a commit in flight, so a chain never has two commits in flight (formats.md §5.1).
+  * It seals with `dseq + 1` and `dprev = dhash` (consecutive `dseq`s for several appends in one commit).
+  * When the commit applies, the chain advances and goes back to the pool, and the topic entry is noted: chain `(dseq, HE)`, and `head` = the newest appended offset.
+  * When it's refused or conflicts, the chain goes back unadvanced.
+  * When the outcome stays unknown (`commit_unknown` after `sendCommit`'s replays), the chain is dropped.
+  * Sequential appends therefore use one chain, and concurrency adds a few.
+* **In transactions:** `appendIn(tx)` reserves a chain for that attempt of the transaction (`tx.onCommit` advances it; a retry or failure releases it, through a new internal hook on `Transaction` that runs at the end of each attempt).
+
+**Reading** (with an `Integrity` attached):
+* **A `ChainCheck`** per reader: each `Topic.read` call, each stream subscription, and each consumer.
+  * It keeps each chain's last `(dseq, HE)` as it sees them. It starts at whatever `dseq` it first sees, since a read from an offset starts mid-chain.
+  * Unfiltered readers (a `read` without `key`, `sub` without a key) report a skipped `dseq` as a **gap** and a different `dprev` as a **rewrite**.
+  * Filtered readers (`key` reads and groups) check only against the pins: an event at a pinned `dseq` whose HE differs from the pinned `dhash` is a **rewrite** (fork).
+* **Freshness** (formats.md §14.4):
+  * **The end of a read.** When an unfiltered `Topic.read` reaches the end (`more` false, no `limit` cut), its last offset (or `after`) must be at least the pinned `head`. Each pinned chain seen in the read must reach its pinned `dseq`. Otherwise it's a **rollback** (a withheld tail, G26).
+  * **`topic.verifyHead()`:** reads one event after the predecessor of the pinned head offset. It must be that offset, else a **rollback**. It's cheap enough to call after each `sync`.
+* **Reads are noted:** reading through to the end notes the topic entry's `head` (the device "has read through" it). Chains are noted only by their writer.
+
+### Test harness (`testing/`)
+
+* **`spawnServer({adversary: true})`:** writes `adversary = true` (needs a binary built with `test-utils`).
+* **New `testing/adversary.ts`:** `lie(session, lies, {clear?})` CBOR-encodes `{lies, clear}` and posts `/v1/test/adversary`. It's admin only, so an admin session is needed. It has typed helpers for the five lies.
+* **`TestServer.fork()`:** stops the server, copies its data directory, restarts the original on its port, and starts the copy on a free port. It returns the copy as a `TestServer`. Sessions are server-side records, so a session token works on both sides.
+* **CI:** the `client` job builds with `cargo build -p zen-server --features test-utils`. Locally, `--features fdb,test-utils`, so the running FDB cluster's binary keeps working after a restart.
+
+### Tests (new `packages/client/test/integrity.test.ts`; the adversary on)
+
+Every attack test first asserts that the attack works (the server really serves the stale or forked answer), then that it's detected. During development, each one is run once with its check disabled to confirm it then fails, and the log says so.
+
+* **`enrollment`:**
+  * An API-token session (no device) gets `enrollDevice(identity, {vault})`: the device is registered, and `vault.signIn` then signs in by device.
+  * `session.devices` returns its cert.
+  * Its checkpoints verify for another member's device.
+  * `approveDevice` with another user's identity gives 400.
+* **`honest_checkpoints`:**
+  * Two devices (one in the ACL, one enrolled) append and checkpoint, and each syncs the other: bodies are cumulative, `seen` links each other, and there are no alarms.
+  * Pins survive a new `Integrity` on the same local store, and a server restart.
+  * The cadence works: `sigEvery = 3` writes after 3 appends, and `delayMs` after a pause.
+* **`one_device_two_processes`:** two `Integrity`s with the same device checkpoint concurrently. Puts race on seq (409), merge, and both processes' entries end up in the head body, with no alarm.
+* **`watch`:** `cksub` pushes make B sync A's new checkpoint without polling, including after the stream reconnects.
+* **`chains`:**
+  * Appends write v2 bodies, and an unfiltered read checks them.
+  * Concurrent appends use separate chains.
+  * A transaction refused by an `expect` conflict and retried reuses its `dseq` (no gap).
+  * A `key` read and a consumer group see subsets without alarms.
+* **`chain_gap_and_rewrite`:**
+  * Events sealed by hand (`sealEvent` with chain fields), skipping `dseq` 2, give a **gap** on an unfiltered read and a subscription.
+  * Two bodies at one `dseq` give a **rewrite**.
+  * A pinned `dhash` that differs gives a **rewrite** on a filtered read.
+* **`signed_header`:**
+  * `init({signed: true})`; slot edits keep signing (versions 2 and 3); another session verifies and pins them.
+  * Without `useIdentity`, an edit gives `signer_needed`.
+  * A non-admin's signed put is refused by the server (400).
+* **`header_rollback`:** lie `header`; the admin signs v2 (its own pin rises); its next `header()` (still v1 from the server) gives a rollback. B learns v2 from the admin's checkpoint (`header` field) and alarms too.
+* **`topic_tail_withheld`:**
+  * Lie `topic` at e3. A appends e4 and e5 and checkpoints.
+  * B's read stops at e3 (the attack works). After B syncs A's checkpoint, the read's end check and `verifyHead` give a rollback.
+* **`checkpoints_withheld`:**
+  * Lie `checkpoints` for A at seq 2; A writes 3 and 4 (the server accepts them).
+  * A's own `sync` gives a rollback (own head below its pin).
+  * B sees nothing alone (the attack works), but `comparePins(A.exportPins())` gives a fork.
+* **`fork`** (`server.fork()`, two servers on one history):
+  * A writes on S1, and B on S2; each is consistent alone, with no alarms.
+  * `comparePins` across gives a fork.
+  * Device D writes seq k on S1. Moved to S2 with its pins, D sees its head below its pin (a rollback). D then writes a different seq k on S2, as a fresh process with no pins. A client that pinned D@k on S1 and moves to S2 sees a fork (the same seq with another HC).
+* **`whole_store_rollback`:**
+  * Copy the server, then on the original: update the ACL, sign a header version, and checkpoint.
+  * A client with those pins, pointed at the copy, gets alarms for the ACL (`acl_chain` or rollback), the header, and the checkpoints.
+* **`honest_runs_report_nothing`:** a mixed run (two devices, chains, concurrent appends, header edits, an ACL update, a server restart, watch) ends with zero alarms.
+
+**Existing suites:** unchanged (integrity is opt-in). `kv`, `log`, `stream`, `tree`, `local`, `vault`, `unlock`, `keyslots` and `packages/db`/`packages/fs` run once to confirm.
+
+### Docs
+* **docs/CLIENT.md:** a new "Integrity" section covering enrollment, attaching, cadence, pins, alarms and policy, `exportPins`/`comparePins`, signed headers, chains, and what isn't covered (fork consistency, TD-WITNESS).
+* **docs/MILESTONE-6.md:** the log, and the adversary harness.
+
+### Files
+* **WASM:** `crates/zen-wasm/src/wire.rs`
+* **Client source:**
+  * `packages/client/src/{session,fs,acl,log,kv,stream,index}.ts`
+  * new: `{integrity,devices}.ts`
+* **Testing:** `packages/client/src/testing/{server,index}.ts`, new `adversary.ts`
+* **Tests:** `packages/client/test/integrity.test.ts` (new), `helpers.ts`
+* **Other:** `.github/workflows/ci.yml` (the `client` build line), `docs/CLIENT.md`, `docs/MILESTONE-6.md`
+
+### Verification
+* **Rust:** `cargo fmt --check` and clippy on zen-wasm (wasm32 and host).
+* **JS:**
+  * `scripts/build-wasm.sh`, `npm run check`, `npx biome check`
+  * `npx vitest run packages/client/test/integrity.test.ts` 3×, plus the existing client, `packages/db` and `packages/fs` suites once
+  * Playwright smoke unchanged: run it once, since the wasm grows
+* **Attacks:** each attack test fails with its check disabled (logged).
+* **CI:** green on both runs.
+
+**Defaults chosen (overridable):**
+* Integrity is opt-in per `Fs` (`fs.integrity(...)`). Without it, nothing changes, and bodies stay v1.
+* A detected attack throws from the detecting call and stops checkpoint writes; the rest is app policy.
+* Streams check gaps and rewrites only; freshness is checked at the end of reads and by `verifyHead`.
+* A gap in the middle of a topic is tested with hand-sealed events, not a new adversary lie: the server can only withhold tails, which the adversary covers.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.
