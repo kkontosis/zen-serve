@@ -181,6 +181,46 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * all `packages/client` tests (17 files, 162 tests); `packages/db`, `fs`, `svc`, `loro`, `fuse` (only the opt-in benches skip)
     * the Playwright smoke
   * **CI:** the `client` job builds `zen-server --features test-utils`.
+  * Pushed 6ea8fa8. **The push run (395) was green; the pull_request run (396) was red in `client`**, at one test outside this step: `apps/chat` "who's online" (TD-TEST-OPEN-FAILURES item 4, first seen on 84c8c02 in milestone 5.5). Its diagnostic now says more: within 1.5 s, alice, carol and dave answered and bob (the asker) didn't; asked again with 10 s, alice, bob and dave answered and carol didn't. So a reply is **lost, not slow**, and a different one each time. The plan to find and fix the cause is "Step 6.3: the red on run 396" below.
+
+## Step 6.3: the red on run 396 (`apps/chat` "who's online")
+
+**What the code shows** (read-only so far). `whoIsOnline` is `db.requestAll(presence topic, 'ping', {}, {timeoutMs})`; each instance's `servePresence` answers with `db.reply(m, me, {ephemeral: true})`, an `epub` to the asker's inbox topic. The server path was ruled out by reading:
+* the per-device rate limit (64 KB/s, 1 MB burst) is far above a few replies
+* the embedded backend commits under one lock, so the ring's versionstamps become visible in order and the tailer can't skip one
+* the embedded watch future is enabled when armed, so the tailer can't miss a wake-up
+* the client's replay filter is per (topic, sender, stream), and each stream's clock only ticks up
+
+Two races in `@zen/db`'s request path (`packages/db/src/txn.ts` `ask`, `packages/db/src/reply.ts` `Inbox`) can each lose a reply:
+1. **The waiter is registered too late.** `ask` registers the waiter for `corr` only in `raw.onCommit`, after the commit's HTTP response. A responder gets the ping over its stream, so its reply can reach the asker before that response does. `Inbox.deliver` drops a reply with no waiter ("late, repeated or foreign"). The fastest reply is lost, and the asker answering itself is the fastest path: bob in round 1.
+2. **The inbox's ephemeral subscription may not be active yet.** `ask` calls `inbox.start()` but doesn't wait for it before the commit. On a `Db`'s first request, a reply published before the `esub` is active is gone, since ephemeral messages have no history. The inbox's comment ("no reply can come before it") holds only for the log subscription.
+
+**Fix:**
+* `Inbox.expect(corr, type, all, opts)` registers the waiter at ask time and keeps any reply that arrives from then on. Its timer starts at `arm()`, called from `onCommit`, so `timeoutMs` still counts from the commit.
+* A failed or abandoned attempt (`raw.onSettle` with `failed` or `unknown`, from this step) drops the waiter. The promise behaves as today for a transaction that throws (the existing test "a request in a transaction that throws is never sent").
+* `DbTransaction.finish()` awaits `inbox.start()` when the transaction made a request, so both inbox subscriptions are active before the commit is sent.
+
+**Tests that fail without the fix** (`packages/db/test/patterns.test.ts`):
+* **"a reply that arrives before the asker sees its commit is kept"**: the asker's `Db` uses a client whose `fetch` holds back `/v1/commit` responses for 400 ms. A responder on another session replies ephemerally at once, so the reply arrives first. Without the fix `requestAll` returns `[]`; with it, the reply.
+* **"a first request waits for the inbox's ephemeral subscription"**: a fresh asker `Db` over a client whose `WebSocket` delays outgoing `esub` frames by 400 ms. Without the fix the reply is published before the subscription and lost.
+* Run each first against the unfixed code to see it fail, then with the fix. The log says so.
+
+**Then:**
+* Run the chat presence test 30× locally, and the `packages/db` and `apps` suites once.
+* Remove item 4 from TD-TEST-OPEN-FAILURES (`spec/TECH_DEBT.md`), saying what it was.
+* Log it here and in `docs/MILESTONE-6.md`, then commit `db: a request's replies are kept from the ask, and the inbox is live before the commit`.
+* Push, and confirm CI is green on both runs.
+
+**Done:**
+* Both new tests failed on the unfixed code (`[]` instead of `['b']`) and pass with the fix.
+* The chat presence test passed 30× in a row. Item 4 of TD-TEST-OPEN-FAILURES is marked resolved, with its cause.
+* `DbTransaction.abort()` and a manual transaction whose `finish` fails also settle the raw transaction, so a request made in them is forgotten.
+
+**Found while verifying (a full local vitest run):**
+* **A CRDT field write could lose to an earlier one** (`packages/db/test/crdt.test.ts`, "one field, the later write wins", once under the full parallel load). Each installation's clock corrects wall time by its estimate of the server's offset (`/v1/info` round trip), so two installations' clocks differ by up to half a slow round trip. An installation that read a value and then wrote the field could stamp its write earlier than the value it read: reads didn't observe the registers' `hlc`.
+  * Fix: `crdtGet` and `crdtRange` observe every `row` and `lww` register's `hlc` (`observeUnchecked`: not when over a minute ahead). zendb.md §19.4 gains a "Causality" bullet.
+  * New test "a write after reading one stamped by a clock ahead still wins (§19.4)": a clock persisted 2 s ahead writes, the other installation reads then writes. It failed without the fix ('from ahead' won) and passes with it. The existing test now reads before its second write, which is what "later" means between installations.
+* **The ledger sum** (TD-TEST-OPEN-FAILURES item 1) reproduced locally for the first time, in the same full run, in both ledger tests. The diagnostic: trader 3's transfer acct-3→acct-2 wrote acct-3's balance from the value before trader 3's previous transfer (165, not 136). Each trader `Db` runs 3 trade loops at once, sharing its row cache. Ruled out by reading: the server's `expect` (a `get` inside the commit's transaction at `read_version`, which adds a read-conflict range), the embedded backend's conflict check, and the client's `expectKey`. Not caused by this step: the ledger uses no CRDT tables, requests or integrity. Investigation continues after this push.
 
 ## Facts the design rests on (survey)
 
