@@ -26,6 +26,25 @@ async fn everything(s: &dyn Storage) -> Vec<KeyValue> {
     panic!("storage kept failing");
 }
 
+/// One key, retried like [`everything`]: tests in this binary run at once,
+/// and an import or migrate jumps a shared FoundationDB cluster's version.
+async fn get(s: &dyn Storage, key: &[u8]) -> Option<Vec<u8>> {
+    for _ in 0..50 {
+        let got = match s.begin(None).await {
+            Ok(mut t) => t.get(key).await,
+            Err(e) => Err(e),
+        };
+        match got {
+            Ok(v) => return v,
+            Err(zen_store::Error::TooOld) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("storage kept failing");
+}
+
 async fn try_everything(s: &dyn Storage) -> zen_store::Result<Vec<KeyValue>> {
     let mut out = Vec::new();
     let mut from = Vec::new();
@@ -171,9 +190,14 @@ async fn migrate_copies_into_another_store() {
         everything(src.as_ref()).await
     );
     let stamp = loop {
-        let mut t = target.begin(None).await.unwrap();
-        t.set(b"z", b"1");
-        match t.commit().await {
+        let committed = match target.begin(None).await {
+            Ok(mut t) => {
+                t.set(b"z", b"1");
+                t.commit().await
+            }
+            Err(e) => Err(e),
+        };
+        match committed {
             Ok(s) => break s,
             Err(zen_store::Error::TooOld) => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await
@@ -210,10 +234,7 @@ async fn relay_keys_count_as_empty() {
     .await;
     let store = target.server.state.store.clone();
     let rk = zen_server::keys::node_lease(&target.server.state.svc.node);
-    {
-        let mut t = store.begin(None).await.unwrap();
-        assert!(t.get(&rk).await.unwrap().is_some(), "the node lease");
-    }
+    assert!(get(store.as_ref(), &rk).await.is_some(), "the node lease");
     assert!(dump::is_empty(store.as_ref()).await.unwrap());
 }
 
@@ -236,10 +257,7 @@ async fn a_started_server_counts_as_empty() {
     let store = target.server.state.store.clone();
     let key = zen_server::keys::meta("challenge_key");
     let mine = target.server.state.challenge_key;
-    {
-        let mut t = store.begin(None).await.unwrap();
-        assert_eq!(t.get(&key).await.unwrap().as_deref(), Some(&mine[..]));
-    }
+    assert_eq!(get(store.as_ref(), &key).await.as_deref(), Some(&mine[..]));
     assert!(dump::is_empty(store.as_ref()).await.unwrap());
     dump::import(store.as_ref(), std::fs::File::open(&file).unwrap(), false)
         .await
@@ -249,20 +267,11 @@ async fn a_started_server_counts_as_empty() {
         everything(store.as_ref()).await,
         everything(h.server.state.store.as_ref()).await
     );
-    for _ in 0..50 {
-        let mut t = store.begin(None).await.unwrap();
-        match t.get(&key).await {
-            Ok(v) => {
-                assert_eq!(v.as_deref(), Some(&mine[..]), "own challenge key kept");
-                return;
-            }
-            Err(zen_store::Error::TooOld) => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("{e}"),
-        }
-    }
-    panic!("storage kept failing");
+    assert_eq!(
+        get(store.as_ref(), &key).await.as_deref(),
+        Some(&mine[..]),
+        "own challenge key kept"
+    );
 }
 
 /// A store whose next `fail` range reads give `TooOld`, as a FoundationDB

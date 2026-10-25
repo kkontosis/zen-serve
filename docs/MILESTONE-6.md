@@ -100,7 +100,13 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * the TS vectors test 3×
     * `npm run check`
     * the client log, stream and kv tests, and `packages/db` (245 passed; only the opt-in bench skipped)
-  * Next: push, CI green on both runs.
+  * **A red on the plan-only commit (push run 377, `fdb` job), traced to its cause:**
+    * `dump.rs` `relay_keys_count_as_empty` read storage directly, with no retry, and got `TooOld`.
+    * The tests in that binary run at once. `export_import_round_trip` and `migrate_copies_into_another_store` jump the shared FDB cluster's version (`advance_version`), and on a fresh cluster the recovery makes reads fail for about 10 s.
+    * `dump` itself retries since 2322431; the test's own reads didn't.
+    * Fix: a retrying `get` helper for the three direct reads, and the migrate loop now retries `begin` too.
+    * FDB here, 5×: the first run, on a fresh cluster, took 11.5 s and passed.
+  * Next: CI green on both runs.
 
 ## Facts the design rests on (survey)
 
