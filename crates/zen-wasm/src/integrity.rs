@@ -15,7 +15,7 @@ use zen_core::{seal, sig};
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &str = r#"
 /** A `(version, hash)` pair in a checkpoint: the ACL or signed header a device verified. */
-export interface CheckpointHead { version: bigint; hash: Uint8Array }
+export interface ChainHead { version: bigint; hash: Uint8Array }
 /** One of a device's own event chains on a topic (formats.md §5.1). */
 export interface CheckpointChain { chainId: Uint8Array; dseq: bigint; dhash: Uint8Array }
 /** An object entry of a checkpoint (formats.md §14.1). */
@@ -28,7 +28,7 @@ export type CheckpointEntry =
 /** Another device's head a checkpoint names. */
 export interface CheckpointSeen { device: Uint8Array; seq: bigint; hash: Uint8Array }
 /** A device checkpoint body (formats.md §14.1). `objects` and `seen` are sorted on encode. */
-export interface CheckpointBody { fs: number; device: Uint8Array; seq: bigint; prev: Uint8Array; hlc: bigint; acl: CheckpointHead; header: CheckpointHead; objects: CheckpointEntry[]; seen: CheckpointSeen[] }
+export interface CheckpointBody { fs: number; device: Uint8Array; seq: bigint; prev: Uint8Array; hlc: bigint; acl: ChainHead; header: ChainHead; objects: CheckpointEntry[]; seen: CheckpointSeen[] }
 /** A decoded signed fs header (formats.md §12.1) and its hash `HH`. */
 export interface SignedHeaderInfo { fs: number; version: bigint; prev: Uint8Array; signer: Uint8Array; header: Uint8Array; hash: Uint8Array }
 /** A node state as the change feed delivers it, the input of a tree-state leaf (fs.md §9.1). */
