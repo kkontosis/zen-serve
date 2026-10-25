@@ -1,4 +1,5 @@
 // @zen/client/testing: utilities for tests (not for production use).
+export { type Lie, lie, truth } from './adversary.js';
 export { SoftAuthenticator, type SoftAuthenticatorOptions } from './authenticator.js';
 export { type CborItem, CborMap, cbor } from './cbor.js';
 export { type TestCerts, type TestKeyKind, testCerts } from './certs.js';

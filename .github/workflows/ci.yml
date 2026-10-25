@@ -150,7 +150,7 @@ jobs:
           sudo chmod 666 /dev/fuse
       - name: Build zen-serve and the WASM module
         run: |
-          cargo build -p zen-server
+          cargo build -p zen-server --features test-utils
           scripts/build-wasm.sh
       - name: Install and build the packages
         run: |
