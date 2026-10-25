@@ -1,10 +1,19 @@
 // An authenticated session: credentials, the ACL, filesystems, streams.
-import type { Credential, OriginState, Session as WireSession } from '@zen/wasm';
+import type {
+  Credential,
+  DeviceInfo,
+  OriginState,
+  SigningIdentity,
+  Session as WireSession,
+} from '@zen/wasm';
 import { Acl } from './acl.js';
 import { randomBytes, utf8 } from './bytes.js';
-import type { Client } from './client.js';
+import type { Client, DeviceCredentials } from './client.js';
 import { TreeClock } from './clock.js';
+import { newDevice } from './devices.js';
+import { ZenError } from './errors.js';
 import { Fs } from './fs.js';
+import type { CredentialVault } from './local/vault.js';
 import { type Authenticator, passkeyCreate } from './passkey.js';
 import { Stream, type StreamOptions } from './stream.js';
 import { type SvcConnectOptions, SvcSocket } from './svc.js';
@@ -66,6 +75,22 @@ export class Session {
     this.sessionClock = clock;
   }
 
+  private userIdentity: SigningIdentity | undefined;
+
+  /**
+   * The user identity (the ACL member identity) for what needs it later:
+   * signed header writes (formats.md §12.1) and `approveDevice` without an
+   * argument. Kept in memory only; the caller frees it.
+   */
+  useIdentity(identity: SigningIdentity): void {
+    this.userIdentity = identity;
+  }
+
+  /** The identity `useIdentity` set, if any. */
+  get identity(): SigningIdentity | undefined {
+    return this.userIdentity;
+  }
+
   /** The device fingerprint, or the credential id for other methods. */
   get deviceFp(): Uint8Array | undefined {
     return this.info?.device_fp;
@@ -112,6 +137,56 @@ export class Session {
    */
   svcConnect(opts: SvcConnectOptions): Promise<SvcSocket> {
     return SvcSocket.open(this, opts);
+  }
+
+  // ---------------------------------------------------------------- devices
+
+  /**
+   * Certify a device key with the user identity and register it
+   * (api.md §15.2), so its checkpoints verify for every member. Any session
+   * of the same user can do it, e.g. a laptop's passkey session approving a
+   * phone's device key. `identity` defaults to `useIdentity`'s.
+   */
+  async approveDevice(
+    devicePublic: Uint8Array,
+    identity: SigningIdentity | undefined = this.userIdentity,
+  ): Promise<{ cert: Uint8Array; fp: Uint8Array }> {
+    if (!identity)
+      throw new ZenError(0, 'signer_needed', 'approving a device needs the user identity');
+    const cert = identity.issueDeviceCert(devicePublic, BigInt(Math.floor(Date.now() / 1000)));
+    const r = await this.call(
+      '/v1/devices/register',
+      zw.encodeDeviceRegister,
+      zw.decodeDeviceRegistered,
+      { cert },
+    );
+    return { cert, fp: r.device };
+  }
+
+  /**
+   * Enroll a new device key (for sessions without one: passkey, OPAQUE, API
+   * token, mTLS): make it, certify and register it. With `vault`, it is kept
+   * there as the signer (`vault.signer()`). The caller frees `device.device`.
+   */
+  async enrollDevice(
+    identity: SigningIdentity | undefined = this.userIdentity,
+    opts: { vault?: CredentialVault } = {},
+  ): Promise<{ device: DeviceCredentials; fp: Uint8Array }> {
+    const d = newDevice();
+    const { cert, fp } = await this.approveDevice(d.devicePublic, identity);
+    if (opts.vault) {
+      await opts.vault.saveSigner({ identity: identity!, deviceSeed: d.seed, cert });
+    }
+    d.seed.fill(0);
+    return { device: { identity: identity!.publicIdentity, device: d.secret, cert }, fp };
+  }
+
+  /** Registered devices (api.md §15.2), as the server reports them (unverified). */
+  async devices(fps: Uint8Array[]): Promise<DeviceInfo[]> {
+    const r = await this.call('/v1/devices/get', zw.encodeDevicesGet, zw.decodeDeviceList, {
+      devices: fps,
+    });
+    return r.devices;
   }
 
   // ---------------------------------------------------------------- credentials

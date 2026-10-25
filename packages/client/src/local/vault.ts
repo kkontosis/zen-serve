@@ -5,6 +5,8 @@
 //   store vault/<name>
 //   device  = 1 ‖ lp(identity public) ‖ device seed(32) ‖ lp(device cert)
 //   session = 1 ‖ lp(origin) ‖ lp(token) ‖ u64 expires_unix (0: unknown)
+//   signer  = as device: an enrolled device key that signs checkpoints
+//             (formats.md §14) but doesn't sign in
 import type { SigningIdentity } from '@zen/wasm';
 import { concat, fromUtf8, utf8 } from '../bytes.js';
 import type { Client, DeviceCredentials } from '../client.js';
@@ -22,6 +24,7 @@ const SEED = 32;
 const MARGIN_SECS = 60;
 const DEVICE_KEY = utf8('device');
 const SESSION_KEY = utf8('session');
+const SIGNER_KEY = utf8('signer');
 
 /** Options of `credentialVault`. */
 export interface VaultOptions {
@@ -53,6 +56,13 @@ export interface CredentialVault {
   saveDevice(d: StoredDevice): Promise<void>;
   /** The stored device, with a fresh `DeviceSecret` (the caller frees it). */
   device(): Promise<DeviceCredentials | undefined>;
+  /** Keep an enrolled device key (`session.enrollDevice`) that signs checkpoints. */
+  saveSigner(d: StoredDevice): Promise<void>;
+  /**
+   * The device that signs checkpoints (the caller frees it): the enrolled
+   * one, else the sign-in device.
+   */
+  signer(): Promise<DeviceCredentials | undefined>;
   /** Keep a session's token, bound to its client's origin. */
   saveSession(s: Session): Promise<void>;
   /**
@@ -145,27 +155,37 @@ export function credentialVault(sealed: SealedStore, opts: VaultOptions = {}): C
     }));
   }
 
+  async function putDevice(key: Uint8Array, d: StoredDevice): Promise<void> {
+    if (d.deviceSeed.length !== SEED) throw new TypeError('a device seed is 32 bytes');
+    const identity = d.identity instanceof Uint8Array ? d.identity : d.identity.publicIdentity;
+    await sealed.put(
+      store,
+      key,
+      concat(new Uint8Array([VERSION]), lp(identity), d.deviceSeed, lp(d.cert)),
+    );
+  }
+
+  async function getDevice(key: Uint8Array): Promise<DeviceCredentials | undefined> {
+    const d = parse(await sealed.get(store, key), (r) => ({
+      identity: r.lp(),
+      seed: r.take(SEED),
+      cert: r.lp(),
+    }));
+    if (!d) return undefined;
+    return { identity: d.identity, device: zw.DeviceSecret.fromSeed(d.seed), cert: d.cert };
+  }
+
   const vault: CredentialVault = {
     store,
 
-    async saveDevice(d) {
-      if (d.deviceSeed.length !== SEED) throw new TypeError('a device seed is 32 bytes');
-      const identity = d.identity instanceof Uint8Array ? d.identity : d.identity.publicIdentity;
-      await sealed.put(
-        store,
-        DEVICE_KEY,
-        concat(new Uint8Array([VERSION]), lp(identity), d.deviceSeed, lp(d.cert)),
-      );
-    },
+    saveDevice: (d) => putDevice(DEVICE_KEY, d),
 
-    async device() {
-      const d = parse(await sealed.get(store, DEVICE_KEY), (r) => ({
-        identity: r.lp(),
-        seed: r.take(SEED),
-        cert: r.lp(),
-      }));
-      if (!d) return undefined;
-      return { identity: d.identity, device: zw.DeviceSecret.fromSeed(d.seed), cert: d.cert };
+    device: () => getDevice(DEVICE_KEY),
+
+    saveSigner: (d) => putDevice(SIGNER_KEY, d),
+
+    async signer() {
+      return (await getDevice(SIGNER_KEY)) ?? (await getDevice(DEVICE_KEY));
     },
 
     async saveSession(s) {

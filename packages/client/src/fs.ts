@@ -1,8 +1,10 @@
 // A filesystem: its header (keyslots, epoch chain) and unlocking it
 // (spec/formats.md §6, §12; api.md §4.4).
 import type { DeviceSecret, FsHeader, FsKeys, FsPolicy } from '@zen/wasm';
+import type { AclVersion } from './acl.js';
 import { equal, utf8 } from './bytes.js';
 import { isCode, ZenError } from './errors.js';
+import { Integrity, IntegrityError, type IntegrityOptions } from './integrity.js';
 import { Kv, type Transaction, type TxnOptions, transaction } from './kv.js';
 import type { SealedStore } from './local/sealed.js';
 import { Topic } from './log.js';
@@ -34,6 +36,8 @@ export type Unlock =
 export interface StoredHeader {
   header: FsHeader;
   version: Uint8Array;
+  /** The signed form's chain position and signer (formats.md §12.1), when signed. */
+  signed?: { version: bigint; hash: Uint8Array; signer: Uint8Array };
 }
 
 /** Where `unlock({local})` keeps the header of fs `id` (zendb.md §9.3). */
@@ -69,10 +73,31 @@ export interface HeaderOptions {
 
 /** A filesystem, before unlocking. */
 export class Fs {
+  private attached: Promise<Integrity> | undefined;
+  /** @internal The attached integrity, once `integrity` resolved. */
+  integrityRef: Integrity | undefined;
+  /** @internal The fs unlocked last (bound to the integrity). */
+  unlockedRef: UnlockedFs | undefined;
+
   constructor(
     readonly session: Session,
     readonly id: number,
   ) {}
+
+  /**
+   * Attach integrity (formats.md §14; docs/CLIENT.md "Integrity"): pins,
+   * checkpoints of `opts.device`, and the checks of what the server serves.
+   * One per `Fs` object; later calls return the first (their options are
+   * ignored). Attach it before unlocking, so the header is checked too.
+   */
+  integrity(opts: IntegrityOptions = {}): Promise<Integrity> {
+    this.attached ??= Integrity.attach(this, opts).then((i) => {
+      this.integrityRef = i;
+      if (this.unlockedRef) i.bind(this.unlockedRef);
+      return i;
+    });
+    return this.attached;
+  }
 
   /**
    * The stored header, or undefined if the fs has none yet. With `local`,
@@ -97,21 +122,65 @@ export class Fs {
       const kept = await local.get(headerStore(this.id), HEADER_KEY);
       const u = kept && unpackHeader(kept);
       if (!u) throw e;
-      return this.decodeHeader(u.header, u.version);
+      return this.decodeHeader(u.header, u.version, true);
     }
-    if (!r.header || !r.version) return undefined;
-    const stored = this.decodeHeader(r.header, r.version);
+    if (!r.header || !r.version) {
+      // No header at all after a pinned signed one: withheld.
+      await this.integrityRef?.checkHeader(undefined);
+      return undefined;
+    }
+    const stored = await this.decodeHeader(r.header, r.version);
     if (local) await this.keepHeader(local, r.header, r.version);
     return stored;
   }
 
-  private decodeHeader(bytes: Uint8Array, version: Uint8Array): StoredHeader {
-    const header = zw.FsHeader.decode(bytes);
+  /**
+   * Decode a stored header. The signed form's signature must verify with an
+   * admin of the verified ACL (formats.md §12.1); with integrity attached,
+   * its chain position is checked against the pin.
+   */
+  private async decodeHeader(
+    bytes: Uint8Array,
+    version: Uint8Array,
+    offline = false,
+  ): Promise<StoredHeader> {
+    let inner = bytes;
+    let signed: StoredHeader['signed'];
+    if (zw.isSignedHeader(bytes)) {
+      const info = zw.decodeSignedHeader(bytes);
+      const adminIn = (acl: AclVersion | undefined) =>
+        acl?.doc.admins.some((a) => equal(a, info.signer))
+          ? acl.doc.members.find((m) => equal(zw.fingerprint(m.identity), info.signer))
+          : undefined;
+      // The verified ACL; refreshed when it doesn't name the signer (offline: as pinned).
+      let admin = adminIn(this.session.acl.pinned());
+      if (!admin && !offline) admin = adminIn(await this.session.acl.head());
+      let ok = admin !== undefined && info.fs === this.id;
+      if (ok) {
+        try {
+          zw.verifySignedHeader(bytes, admin!.identity);
+        } catch {
+          ok = false;
+        }
+      }
+      if (!ok) {
+        const alarm = {
+          kind: 'invalid' as const,
+          object: 'header' as const,
+          detail: `header version ${info.version} isn't signed by an admin`,
+        };
+        throw this.integrityRef ? this.integrityRef.raise(alarm) : new IntegrityError(alarm);
+      }
+      inner = info.header;
+      signed = { version: info.version, hash: info.hash, signer: info.signer };
+    }
+    await this.integrityRef?.checkHeader(signed && { version: signed.version, hash: signed.hash });
+    const header = zw.FsHeader.decode(inner);
     if (header.fsId !== this.id) {
       header.free();
       throw new ZenError(0, 'format', `header of fs ${header.fsId} served for fs ${this.id}`);
     }
-    return { header, version: version.slice() };
+    return { header, version: version.slice(), ...(signed ? { signed } : {}) };
   }
 
   /** @internal Keep a copy of the header for offline unlocks. */
@@ -124,27 +193,71 @@ export class Fs {
     await local.clear(headerStore(this.id));
   }
 
-  /** Write the header (admins): `expect` is the version read, absent for a new header. */
-  async putHeader(header: FsHeader, expect?: Uint8Array): Promise<Uint8Array> {
+  /**
+   * Write the header (admins): `expect` is the version read, absent for a new
+   * header. With `sign`, the signed form (formats.md §12.1) as the successor
+   * of `sign.after` (absent: version 1), signed by the session's identity
+   * (`useIdentity`).
+   */
+  async putHeader(
+    header: FsHeader,
+    expect?: Uint8Array,
+    sign?: { after?: { version: bigint; hash: Uint8Array } },
+  ): Promise<Uint8Array> {
+    return (await this.writeHeader(header, expect, sign)).version;
+  }
+
+  /** @internal `putHeader`, with the bytes written and the signed position. */
+  async writeHeader(
+    header: FsHeader,
+    expect?: Uint8Array,
+    sign?: { after?: { version: bigint; hash: Uint8Array } },
+  ): Promise<{ version: Uint8Array; bytes: Uint8Array; signed?: StoredHeader['signed'] }> {
+    let bytes = header.encode();
+    let next: { version: bigint; hash: Uint8Array } | undefined;
+    if (sign) {
+      const id = this.session.identity;
+      if (!id) {
+        throw new ZenError(0, 'signer_needed', 'a signed header needs session.useIdentity(admin)');
+      }
+      const v = (sign.after?.version ?? 0n) + 1n;
+      bytes = id.signHeader(this.id, v, sign.after?.hash ?? new Uint8Array(32), bytes);
+      next = { version: v, hash: zw.decodeSignedHeader(bytes).hash };
+    }
     const r = await this.session.call(
       '/v1/fs/header/put',
       zw.encodeHeaderPut,
       zw.decodeHeaderVersion,
-      { fs: this.id, header: header.encode(), ...(expect ? { expect } : {}) },
+      { fs: this.id, header: bytes, ...(expect ? { expect } : {}) },
     );
-    return r.version;
+    if (!next) return { version: r.version, bytes };
+    await this.integrityRef?.checkHeader(next);
+    const signer = this.session.identity!.fingerprint;
+    return { version: r.version, bytes, signed: { ...next, signer } };
   }
 
   /**
    * Create the fs's keys and header (admins), with the slots `slots` makes
    * for the new keys. Fails with 409 `version_mismatch` if a header exists.
+   * With `signed`, the header is signed from version 1 (formats.md §12.1),
+   * by the session's identity (`useIdentity`).
    */
-  async init(slots: (keys: FsKeys) => Uint8Array[] | Promise<Uint8Array[]>): Promise<UnlockedFs> {
+  async init(
+    slots: (keys: FsKeys) => Uint8Array[] | Promise<Uint8Array[]>,
+    opts: { signed?: boolean } = {},
+  ): Promise<UnlockedFs> {
+    if (opts.signed && !this.session.identity) {
+      throw new ZenError(0, 'signer_needed', 'a signed header needs session.useIdentity(admin)');
+    }
     const keys = zw.FsKeys.generate(this.id);
     const header = zw.FsHeader.create(keys);
     for (const s of await slots(keys)) header.addSlot(s);
-    const version = await this.putHeader(header);
-    return new UnlockedFs(this, keys, { header, version });
+    const w = await this.writeHeader(header, undefined, opts.signed ? {} : undefined);
+    return new UnlockedFs(this, keys, {
+      header,
+      version: w.version,
+      ...(w.signed ? { signed: w.signed } : {}),
+    });
   }
 
   /**
@@ -245,6 +358,18 @@ export class UnlockedFs {
     this.epoch = slotKeys.epoch;
     this.epochs.set(this.epoch, slotKeys);
     this.kv = new Kv(this);
+    fs.unlockedRef = this;
+    fs.integrityRef?.bind(this);
+  }
+
+  /** The attached integrity (`fs.integrity`), if any. */
+  get integrity(): Integrity | undefined {
+    return this.fs.integrityRef;
+  }
+
+  /** Whether the stored header (as last read or written here) is signed. */
+  get signed(): boolean {
+    return this.stored.signed !== undefined;
   }
 
   /** The keys the slot opened. After `close` it throws `closed`. */
@@ -369,14 +494,44 @@ export class UnlockedFs {
    * returns whether to write it. Retries on a concurrent change.
    */
   async editHeader(edit: (h: FsHeader) => boolean | Promise<boolean>, attempts = 3): Promise<void> {
+    await this.edit(edit, false, attempts);
+  }
+
+  /**
+   * Sign the header from now on (admins, formats.md §12.1), with the
+   * session's identity (`useIdentity`). Later edits sign each successor.
+   */
+  async signHeader(): Promise<void> {
+    await this.edit(() => true, true, 3);
+  }
+
+  private async edit(
+    edit: (h: FsHeader) => boolean | Promise<boolean>,
+    sign: boolean,
+    attempts: number,
+  ): Promise<void> {
     for (let i = 1; ; i++) {
       const fresh = await this.fs.header();
       if (!fresh) throw new ZenError(404, 'not_found', 'the header is gone');
+      // Once signed, every successor is signed: check for the signer first.
+      const signing = sign || fresh.signed !== undefined;
+      if (signing && !this.session.identity) {
+        fresh.header.free();
+        throw new ZenError(0, 'signer_needed', 'the header is signed: session.useIdentity(admin)');
+      }
       if (!(await edit(fresh.header))) return;
       try {
-        const version = await this.fs.putHeader(fresh.header, fresh.version);
-        this.stored = { header: fresh.header, version };
-        if (this.local) await this.fs.keepHeader(this.local, fresh.header.encode(), version);
+        const w = await this.fs.writeHeader(
+          fresh.header,
+          fresh.version,
+          signing ? { ...(fresh.signed ? { after: fresh.signed } : {}) } : undefined,
+        );
+        this.stored = {
+          header: fresh.header,
+          version: w.version,
+          ...(w.signed ? { signed: w.signed } : {}),
+        };
+        if (this.local) await this.fs.keepHeader(this.local, w.bytes, w.version);
         return;
       } catch (e) {
         if (!(e instanceof ZenError && e.code === 'version_mismatch') || i >= attempts) throw e;

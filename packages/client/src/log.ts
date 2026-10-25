@@ -11,10 +11,11 @@ import type {
   TopicKeys,
   Delivery as WireDelivery,
 } from '@zen/wasm';
-import { equal, randomBytes, utf8 } from './bytes.js';
+import { compare, equal, hex, randomBytes, utf8 } from './bytes.js';
 import { isCode, ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
-import { type Path, sendCommit, type Transaction } from './kv.js';
+import type { Integrity } from './integrity.js';
+import { type Outcome, outcomeOf, type Path, sendCommit, type Transaction } from './kv.js';
 import type { Session } from './session.js';
 import { sleep } from './transport.js';
 import { zw } from './wasm.js';
@@ -64,6 +65,135 @@ export function senderOf(session: Session): Uint8Array {
   return session.deviceFp ?? ZERO32;
 }
 
+/** One of this writer's event chains on a topic (formats.md §5.1). */
+interface Chain {
+  id: Uint8Array;
+  /** The newest committed `dseq` (0: none yet). */
+  dseq: bigint;
+  /** `HE` of its body: the next event's `dprev`. */
+  dhash: Uint8Array;
+}
+
+/** A chain reserved for one commit: the links its events take. */
+interface Reservation {
+  chain: Chain;
+  dseq: bigint;
+  dhash: Uint8Array;
+}
+
+/**
+ * The checks of one reader on one topic (formats.md §5.1, §14.4): each
+ * chain's last link as seen, and the topic's pins. An unfiltered reader
+ * (every event of the topic, in order) reports a skipped `dseq` as a gap
+ * and a changed link as a rewrite; a filtered one (a key, a group) checks
+ * against the pins only.
+ */
+export class ChainCheck {
+  private readonly last = new Map<string, ChainSeen>();
+  /** The newest offset seen. */
+  lastOffset: Uint8Array | undefined;
+
+  constructor(
+    readonly topic: Topic,
+    readonly integrity: Integrity,
+    readonly filtered: boolean,
+  ) {}
+
+  private alarm(kind: 'gap' | 'rewrite' | 'rollback', detail: string): never {
+    throw this.integrity.raise({ kind, object: 'topic', id: this.topic.id, detail });
+  }
+
+  /** Check an opened event. */
+  see(offset: Uint8Array, body: EventBody): void {
+    this.lastOffset = offset;
+    if (!body.chainId || body.dseq === undefined || !body.dprev) return;
+    const k = hex(body.sender) + hex(body.chainId);
+    const name = `chain ${hex(body.chainId).slice(0, 8)}`;
+    const he = zw.eventChainHash(body);
+    const pin = this.integrity.topicPin(this.topic.id)?.chains.get(k);
+    if (pin && pin.dseq === body.dseq && !equal(pin.dhash, he)) {
+      this.alarm('rewrite', `${name} ${body.dseq} differs from its checkpoint`);
+    }
+    let c = this.last.get(k);
+    if (c && body.dseq <= c.dseq) {
+      // An event seen before, again (a dead-letter retry re-appends it): only
+      // the same body is allowed.
+      const had = c.hashes.get(body.dseq);
+      if (had && !equal(had, he)) this.alarm('rewrite', `${name} ${body.dseq} changed`);
+      if (!had && !this.filtered && body.dseq >= c.first) {
+        this.alarm('rewrite', `${name} went back to ${body.dseq}`);
+      }
+      return;
+    }
+    if (!this.filtered) {
+      if (c && body.dseq > c.dseq + 1n) {
+        this.alarm('gap', `${name} skipped from ${c.dseq} to ${body.dseq}`);
+      }
+      if (c && !equal(body.dprev, c.hashes.get(c.dseq)!))
+        this.alarm('rewrite', `${name} link ${body.dseq}`);
+      if (!c && body.dseq === 1n && !equal(body.dprev, ZERO32)) {
+        this.alarm('rewrite', `${name} starts with a link`);
+      }
+    }
+    if (!c) {
+      c = { first: body.dseq, dseq: body.dseq, hashes: new Map() };
+      this.last.set(k, c);
+    }
+    c.dseq = body.dseq;
+    c.hashes.set(body.dseq, he);
+    // Keep a bounded window of links for recognising repeats.
+    if (c.hashes.size > SEEN_WINDOW) {
+      const oldest = c.hashes.keys().next().value!;
+      c.hashes.delete(oldest);
+      c.first = oldest + 1n;
+    }
+  }
+
+  /**
+   * An unfiltered read reached the server's end of the topic (formats.md
+   * §14.4): it must reach the pinned head, and each pinned chain it saw its
+   * pinned `dseq`. `after` is where it started.
+   */
+  end(after: Uint8Array | undefined): void {
+    const pin = this.integrity.topicPin(this.topic.id);
+    const reached = this.lastOffset ?? after;
+    if (pin?.head && (!reached || compare(reached, pin.head) < 0)) {
+      this.alarm('rollback', 'the topic ends before its pinned head');
+    }
+    for (const [k, l] of this.last) {
+      const p = pin?.chains.get(k);
+      if (p && l.dseq < p.dseq)
+        this.alarm('rollback', `a chain ends at ${l.dseq}, pinned ${p.dseq}`);
+    }
+    if (reached) this.integrity.noteRead(this.topic.id, reached);
+  }
+}
+
+/** One chain as a reader saw it. */
+interface ChainSeen {
+  /** The first `dseq` of the window kept. */
+  first: bigint;
+  /** The newest `dseq`. */
+  dseq: bigint;
+  /** `HE` by `dseq`, oldest first. */
+  hashes: Map<bigint, Uint8Array>;
+}
+
+const SEEN_WINDOW = 4096;
+
+/** The offset before `o` (a 96-bit big-endian decrement). */
+function offsetBefore(o: Uint8Array): Uint8Array | undefined {
+  const out = o.slice();
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i]! > 0) {
+      out[i]!--;
+      return out;
+    }
+    out[i] = 0xff;
+  }
+  return undefined;
+}
+
 const bytesOf = (k: Uint8Array | string): Uint8Array => (typeof k === 'string' ? utf8(k) : k);
 
 /**
@@ -75,6 +205,8 @@ export class Topic {
   private readonly byEpoch = new Map<number, TopicKeys>();
   /** The topic id the server sees (16 bytes per path element). */
   readonly id: Uint8Array;
+  /** This writer's idle chains (formats.md §5.1). */
+  private readonly chains: Chain[] = [];
 
   constructor(
     readonly fs: UnlockedFs,
@@ -110,16 +242,65 @@ export class Topic {
     this.byEpoch.clear();
   }
 
-  /** Seal an event body under the current epoch. */
-  seal(keyToken: Uint8Array | undefined, payload: Uint8Array, causation = NO_CAUSE): Uint8Array {
+  /** The fs's integrity, if attached: then appends chain and reads check. */
+  get integrity(): Integrity | undefined {
+    return this.fs.integrity;
+  }
+
+  /** A reader's check (`filtered` for a key or a group); needs integrity attached. */
+  chainCheck(filtered: boolean): ChainCheck {
+    return new ChainCheck(this, this.integrity!, filtered);
+  }
+
+  /** Seal an event body under the current epoch (version 1, or 2 with `link`). */
+  seal(
+    keyToken: Uint8Array | undefined,
+    payload: Uint8Array,
+    causation = NO_CAUSE,
+    link?: Reservation,
+  ): Uint8Array {
     const keys = this.fs.sealKeys();
     const body: EventBody = {
-      sender: senderOf(this.fs.session),
+      sender: (link && this.integrity?.deviceFp) || senderOf(this.fs.session),
       hlc: this.fs.session.clock.tick(),
       causation,
       payload,
     };
+    if (link) {
+      body.chainId = link.chain.id;
+      body.dseq = link.dseq + 1n;
+      body.dprev = link.dhash;
+      link.dseq = body.dseq;
+      link.dhash = zw.eventChainHash(body);
+    }
     return keys.sealEvent(this.keysAt(keys.epoch), keyToken, body);
+  }
+
+  /** Take an idle chain, or start one (formats.md §5.1: one commit in flight per chain). */
+  private reserve(): Reservation {
+    const chain = this.chains.pop() ?? { id: randomBytes(12), dseq: 0n, dhash: ZERO32 };
+    return { chain, dseq: chain.dseq, dhash: chain.dhash };
+  }
+
+  /**
+   * Settle a reservation: `applied` advances the chain and notes the topic
+   * (`last` is the newest appended offset); `failed` returns it as it was;
+   * `unknown` ends it.
+   */
+  private settle(r: Reservation, outcome: Outcome, last?: Uint8Array): void {
+    if (outcome === 'unknown') return;
+    if (outcome === 'applied') {
+      r.chain.dseq = r.dseq;
+      r.chain.dhash = r.dhash;
+      if (last) {
+        this.integrity?.noteAppend(
+          this.id,
+          { chainId: r.chain.id, dseq: r.dseq, dhash: r.dhash },
+          last,
+        );
+      }
+    }
+    this.chains.push(r.chain);
   }
 
   /** Open a sealed event of this topic (with the keys of its epoch). */
@@ -135,12 +316,19 @@ export class Topic {
     return body;
   }
 
-  /** Decrypt a stored event. Throws `decrypt` for one that doesn't open. */
-  decode(e: { offset: Uint8Array; key_token?: Uint8Array; envelope: Uint8Array }): TopicEvent {
+  /**
+   * Decrypt a stored event. Throws `decrypt` for one that doesn't open, and
+   * an `IntegrityError` when `check` finds a gap or rewrite.
+   */
+  decode(
+    e: { offset: Uint8Array; key_token?: Uint8Array; envelope: Uint8Array },
+    check?: ChainCheck,
+  ): TopicEvent {
     if (e.key_token && equal(e.key_token, this.ephemeralToken())) {
       throw new ZenError(0, 'decrypt', 'an ephemeral message in the log');
     }
     const b = this.open(e.key_token, e.envelope);
+    check?.see(e.offset, b);
     return {
       offset: e.offset,
       ...(e.key_token ? { keyToken: e.key_token } : {}),
@@ -156,38 +344,64 @@ export class Topic {
     return this.keyToken(EPHEMERAL_KEY);
   }
 
-  private append1(payload: Uint8Array, opts: AppendOptions) {
+  private append1(payload: Uint8Array, opts: AppendOptions, link?: Reservation) {
     const keyToken = opts.key === undefined ? undefined : this.keyToken(opts.key);
     return {
       fs: this.fs.id,
       topic: this.id,
       ...(keyToken ? { key_token: keyToken } : {}),
-      envelope: this.seal(keyToken, payload, opts.causation),
+      envelope: this.seal(keyToken, payload, opts.causation, link),
     };
   }
 
   /** Append one event; returns its offset. */
   async append(payload: Uint8Array, opts: AppendOptions = {}): Promise<Uint8Array> {
-    const r = await this.fs.session.call(
-      '/v1/log/append',
-      zw.encodeLogAppend,
-      zw.decodeCommitResult,
-      { commit_id: randomBytes(16), append: [this.append1(payload, opts)] },
-    );
+    const link = this.integrity ? this.reserve() : undefined;
+    let r: Awaited<ReturnType<typeof sendCommit>>;
+    try {
+      r = await this.fs.session.call('/v1/log/append', zw.encodeLogAppend, zw.decodeCommitResult, {
+        commit_id: randomBytes(16),
+        append: [this.append1(payload, opts, link)],
+      });
+    } catch (e) {
+      if (link) this.settle(link, outcomeOf(e));
+      throw e;
+    }
+    if (link) this.settle(link, 'applied', r.appended[0]);
     return r.appended[0]!;
   }
 
   /**
    * Append inside a transaction: the event exists only if the transaction
-   * commits. Its offset is in `tx.result.appended` afterwards.
+   * commits. Its offset is in `tx.result.appended` afterwards. With
+   * integrity, each attempt of the transaction holds one chain of this
+   * topic object for its appends.
    */
   appendIn(tx: Transaction, payload: Uint8Array, opts: AppendOptions = {}): void {
-    tx.appends.push(this.append1(payload, opts));
+    if (!this.integrity) {
+      tx.appends.push(this.append1(payload, opts));
+      return;
+    }
+    let link = tx.links.get(this) as (Reservation & { last: number }) | undefined;
+    if (!link) {
+      const r = { ...this.reserve(), last: -1 };
+      link = r;
+      tx.links.set(this, r);
+      tx.onSettle((outcome, result) => this.settle(r, outcome, result?.appended[r.last]));
+    }
+    link.last = tx.appends.length;
+    tx.appends.push(this.append1(payload, opts, link));
   }
 
-  /** The events after `after` (all, or one key's), decrypted, paging as needed. */
+  /**
+   * The events after `after` (all, or one key's), decrypted, paging as
+   * needed. With integrity attached, chains are checked, and a read without
+   * `key` and `limit` that reaches the end must reach the topic's pins
+   * (formats.md §14.4): else it throws an `IntegrityError` (a rollback).
+   */
   async *read(opts: ReadOptions = {}): AsyncGenerator<TopicEvent> {
     const keyToken = opts.key === undefined ? undefined : this.keyToken(opts.key);
+    const check = this.integrity ? this.chainCheck(keyToken !== undefined) : undefined;
     let after = opts.after;
     let left = opts.limit ?? Number.POSITIVE_INFINITY;
     while (left > 0) {
@@ -199,13 +413,45 @@ export class Topic {
         ...(Number.isFinite(left) ? { limit: left } : {}),
       });
       for (const e of r.events) {
-        yield this.decode(e);
+        yield this.decode(e, check);
         left--;
       }
       const last = r.events.at(-1);
-      if (!r.more || !last) return;
+      if (!r.more || !last) {
+        if (check && !check.filtered && opts.limit === undefined) check.end(opts.after);
+        return;
+      }
       after = last.offset;
     }
+  }
+
+  /**
+   * Check that the server still serves the pinned head of this topic
+   * (formats.md §14.4): the event at the pinned offset must come right after
+   * its predecessor. Throws an `IntegrityError` (a rollback) if not. Needs
+   * integrity attached; without a pin it checks nothing.
+   */
+  async verifyHead(): Promise<void> {
+    const integrity = this.integrity;
+    const head = integrity?.topicPin(this.id)?.head;
+    if (!integrity || !head) return;
+    const before = offsetBefore(head);
+    const r = await this.fs.session.call('/v1/log/read', zw.encodeLogRead, zw.decodeLogEvents, {
+      fs: this.fs.id,
+      topic: this.id,
+      ...(before ? { after: before } : {}),
+      limit: 1,
+    });
+    const e = r.events[0];
+    if (!e || !equal(e.offset, head)) {
+      throw integrity.raise({
+        kind: 'rollback',
+        object: 'topic',
+        id: this.id,
+        detail: 'the pinned head is not served',
+      });
+    }
+    this.decode(e, this.chainCheck(true));
   }
 
   /**
@@ -312,6 +558,9 @@ export class Consumer {
   /** Dead-letter queue operations. */
   readonly dlq: Dlq;
 
+  /** With integrity: checks deliveries against the pins (a group sees a subset). */
+  private readonly check: ChainCheck | undefined;
+
   constructor(
     readonly topic: Topic,
     /** The group name. */
@@ -319,6 +568,7 @@ export class Consumer {
     readonly mode: Mode,
   ) {
     this.dlq = new Dlq(this);
+    this.check = topic.integrity ? topic.chainCheck(true) : undefined;
   }
 
   private get session(): Session {
@@ -425,8 +675,9 @@ export class Consumer {
       ...(partition !== undefined ? { partition } : {}),
     };
     try {
-      return { ...this.topic.decode(d), ...meta };
+      return { ...this.topic.decode(d, this.check), ...meta };
     } catch (e) {
+      if (isCode(e, 'integrity')) throw e;
       const error = e instanceof ZenError ? e : new ZenError(0, 'decrypt', String(e));
       return {
         offset: d.offset,

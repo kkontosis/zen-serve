@@ -2,7 +2,7 @@
 import type { AclDoc, Grant, Member, SignedAcl, SigningIdentity } from '@zen/wasm';
 import { equal } from './bytes.js';
 import type { Client } from './client.js';
-import { ZenError } from './errors.js';
+import { isCode, ZenError } from './errors.js';
 import type { Session } from './session.js';
 import { zw } from './wasm.js';
 
@@ -13,6 +13,8 @@ export interface AclVersion {
   /** The signed document bytes, as received (hashing and signing use these). */
   docBytes: Uint8Array;
   signed: SignedAcl;
+  /** The whole signed version, as received. */
+  bytes: Uint8Array;
 }
 
 /** A member: an identity and its device certificates. */
@@ -74,7 +76,7 @@ export async function claim(
 /** The ACL as seen by a session. */
 export class Acl {
   /** The newest version this client verified; later reads must extend it. */
-  private pinned: AclVersion | undefined;
+  private verified: AclVersion | undefined;
 
   constructor(private readonly session: Session) {}
 
@@ -94,9 +96,22 @@ export class Acl {
    * name the previous one's hash and be signed by one of its admins.
    */
   async head(): Promise<AclVersion> {
-    const from = this.pinned ? this.pinned.version : 1n;
-    const { entries } = await this.entries(from);
-    let prev = this.pinned;
+    const from = this.verified ? this.verified.version : 1n;
+    let prev = this.verified;
+    let r: { head: bigint; entries: Uint8Array[] };
+    try {
+      r = await this.entries(from);
+    } catch (e) {
+      // A server without the pinned version serves an older ACL.
+      if (prev && isCode(e, 'not_found')) {
+        throw chainError(`the served ACL is below the pinned version ${prev.version}`);
+      }
+      throw e;
+    }
+    const { head, entries } = r;
+    if (prev && head < prev.version) {
+      throw chainError(`the served head ${head} is below the pinned version ${prev.version}`);
+    }
     for (const bytes of entries) {
       const v = parse(bytes);
       if (prev && v.version === prev.version) {
@@ -107,8 +122,22 @@ export class Acl {
       prev = v;
     }
     if (!prev) throw chainError('no ACL');
-    this.pinned = prev;
+    this.verified = prev;
     return prev;
+  }
+
+  /** The newest verified version, if any (no request). */
+  pinned(): AclVersion | undefined {
+    return this.verified;
+  }
+
+  /**
+   * Pin a version kept from an earlier process (`AclVersion.bytes`), so
+   * `head` must extend it. A version below the current pin is ignored.
+   */
+  pin(bytes: Uint8Array): void {
+    const v = parse(bytes);
+    if (!this.verified || v.version > this.verified.version) this.verified = v;
   }
 
   /**
@@ -146,7 +175,7 @@ function chainError(msg: string): ZenError {
 function parse(bytes: Uint8Array): AclVersion {
   const signed = zw.decodeSignedAcl(bytes);
   const doc = zw.decodeAclDoc(signed.doc);
-  return { version: doc.version, doc, docBytes: signed.doc, signed };
+  return { version: doc.version, doc, docBytes: signed.doc, signed, bytes: bytes.slice() };
 }
 
 /** Check `next` against `prev` (formats.md §9.3 rules 1–2, and the signature). */
