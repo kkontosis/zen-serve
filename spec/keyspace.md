@@ -238,8 +238,8 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 | `pack("dvu", user_fp, dev)` | empty: the devices a user has registered |
 | `pack("ls", fs, name)` | fenced lease: `holder(32) ‖ u64 token ‖ u64 expires_version` (api.md §16) |
 
-* **Checkpoints.** A put reads `dkh` normally, so two puts of one `seq` can't both commit. It writes `dk` and `dkh`, rings `dkd`, and deletes `pack("dk", fs, dev, seq − checkpoint_keep)`, so a device keeps its newest `checkpoint_keep`.
+* **Checkpoints.** A put reads `dkh` normally, so two puts of one `seq` can't both commit. It writes `dk` and `dkh`, rings `dkd`, and deletes `pack("dk", fs, dev, seq − checkpoint_keep)`, so a device keeps its newest `checkpoint_keep`. The checkpoint's bytes and key count toward the fs quota (`pack("q", …)`, §3.1), like KV values.
 * **Devices.** `dv` is keyed by device, so a verifier finds a certificate by fingerprint. `dvu` lists a user's registered devices, for the per-user cap (api.md §15.2).
 * **Leases** follow the consume leases (§3.3, §3.5): never deleted, so tokens only grow. A release sets `expires_version` to 0.
-* `dk`, `dkh`, `dv`, `dvu` and `ls` are data (`export` copies them); `dkd` is a doorbell.
+* `dk`, `dkh`, `dv`, `dvu` and `ls` are data (`export` copies them); `dkd` is a doorbell, never exported (like `meta`, §3.4).
 * The fs header key `pack("hdr", fs)` (§3.1) holds either form of the header (formats.md §12, §12.1).

@@ -633,3 +633,50 @@ pub async fn opaque_sign_in(
     let s = opaque_finish(h, r.state, fin).await?;
     Ok((s, key.expect("a session needs a finished client")))
 }
+
+// ---- device checkpoints (formats.md §14)
+
+/// The fs keys tests seal checkpoints under (fs 1).
+pub fn ckpt_keys() -> zen_core::keys::FsKeys {
+    zen_core::keys::FsKeys::generate(1, &mut zen_core::rng::DetRng::new("ckpt")).unwrap()
+}
+
+/// A device's checkpoint `seq` of `fs`, signed by `device` and sealed.
+pub fn checkpoint_of(device: &DeviceSecret, fs: u32, seq: u64) -> Vec<u8> {
+    use zen_core::integrity::{CheckpointBody, Head, seal_checkpoint, sign_checkpoint};
+    let fp = device.public().fingerprint();
+    let body = CheckpointBody {
+        fs,
+        device: fp,
+        seq,
+        prev: [0; 32],
+        hlc: seq,
+        acl: Head::default(),
+        header: Head::default(),
+        objects: vec![],
+        seen: vec![],
+    };
+    let signed = sign_checkpoint(device, &body).unwrap();
+    let mut rng = zen_core::rng::DetRng::new(&format!("seal {seq}"));
+    seal_checkpoint(&ckpt_keys(), &fp, seq, &signed, &mut rng).unwrap()
+}
+
+/// Put `u`'s checkpoint `seq` of fs 1.
+pub async fn put_checkpoint(
+    h: &Harness,
+    tok: &[u8],
+    device: &DeviceSecret,
+    seq: u64,
+) -> Result<CheckpointVersion, ApiErr> {
+    h.call(
+        "/v1/checkpoint/put",
+        Some(tok),
+        &CheckpointPut {
+            fs: 1,
+            device: device.public().fingerprint().to_vec(),
+            seq,
+            checkpoint: checkpoint_of(device, 1, seq),
+        },
+    )
+    .await
+}

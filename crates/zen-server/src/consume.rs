@@ -60,7 +60,7 @@ impl StoredGroup {
     }
 }
 
-fn ms_to_versions(ms: u32) -> u64 {
+pub(crate) fn ms_to_versions(ms: u32) -> u64 {
     u64::from(ms) * (VERSIONS_PER_SEC / 1000)
 }
 
@@ -143,13 +143,13 @@ pub fn sub_for(g: &StoredGroup, partition: Option<u32>, key: Option<&[u8]>) -> A
     }
 }
 
-struct LeaseRec {
-    holder: [u8; 32],
-    token: u64,
-    expires: u64,
+pub(crate) struct LeaseRec {
+    pub(crate) holder: [u8; 32],
+    pub(crate) token: u64,
+    pub(crate) expires: u64,
 }
 
-fn decode_lease(v: &[u8]) -> Option<LeaseRec> {
+pub(crate) fn decode_lease(v: &[u8]) -> Option<LeaseRec> {
     (v.len() >= 48).then(|| LeaseRec {
         holder: v[..32].try_into().expect("32"),
         token: u64::from_be_bytes(v[32..40].try_into().expect("8")),
@@ -157,7 +157,12 @@ fn decode_lease(v: &[u8]) -> Option<LeaseRec> {
     })
 }
 
-fn encode_lease(holder: &[u8; 32], token: u64, expires: u64, offset: Option<&Offset>) -> Vec<u8> {
+pub(crate) fn encode_lease(
+    holder: &[u8; 32],
+    token: u64,
+    expires: u64,
+    offset: Option<&Offset>,
+) -> Vec<u8> {
     let mut v = holder.to_vec();
     v.extend_from_slice(&token.to_be_bytes());
     v.extend_from_slice(&expires.to_be_bytes());

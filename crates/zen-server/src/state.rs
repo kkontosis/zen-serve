@@ -39,6 +39,12 @@ pub struct AppState {
     pub cfg: Config,
     /// Storage backend.
     pub store: Arc<dyn Storage>,
+    /// What the read endpoints read: the store, or the test adversary
+    /// over it (`adversary = true`).
+    pub view: Arc<dyn Storage>,
+    /// The test adversary, when on.
+    #[cfg(feature = "test-utils")]
+    pub adversary: Option<Arc<crate::adversary::Adversary>>,
     acl: RwLock<Arc<AclState>>,
     /// Session cache by token hash (the sessions live in storage).
     pub sessions: Mutex<HashMap<[u8; 32], CachedSession>>,
@@ -74,7 +80,21 @@ impl AppState {
         claim: Option<String>,
         challenge_key: [u8; 32],
     ) -> Self {
+        #[cfg(feature = "test-utils")]
+        let adversary = cfg
+            .adversary
+            .then(|| Arc::new(crate::adversary::Adversary::new(store.clone())));
+        #[cfg(feature = "test-utils")]
+        let view: Arc<dyn Storage> = match &adversary {
+            Some(a) => a.clone(),
+            None => store.clone(),
+        };
+        #[cfg(not(feature = "test-utils"))]
+        let view = store.clone();
         AppState {
+            view,
+            #[cfg(feature = "test-utils")]
+            adversary,
             pw_limiter: crate::password::Limiter::new(
                 cfg.auth.password_max_failures,
                 std::time::Duration::from_secs(cfg.auth.password_lockout_secs),

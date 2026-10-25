@@ -1,7 +1,7 @@
 //! WebSocket `/v1/stream` (api.md §9): gap-free subscriptions (G9),
 //! ephemeral pub/sub, and pushed relay input (§14.10).
 
-use crate::acl::{R_APPEND, R_READ};
+use crate::acl::{Fp, R_APPEND, R_READ};
 use crate::auth::{Caller, resolve};
 use crate::eph::EphMsg;
 use crate::error::{ApiError, ApiResult, bad_request};
@@ -271,6 +271,34 @@ async fn run(st: Shared, sock: WebSocket) {
                     }
                 }
             }
+            Frame::Cksub { id, fs } => {
+                let started = async {
+                    crate::integrity::require_any_right(&st, &caller, fs)?;
+                    if tasks.len() >= MAX_SUBS || tasks.contains_key(&id) {
+                        return Err(bad_request(
+                            "subscription id in use or too many subscriptions",
+                        ));
+                    }
+                    ckpt_heads(&st, fs).await
+                }
+                .await;
+                match started {
+                    Ok(heads) => {
+                        let _ = out
+                            .send(Frame::Ok {
+                                id: Some(id),
+                                conn: None,
+                            })
+                            .await;
+                        let h =
+                            tokio::spawn(checkpoints(st.clone(), tok, id, fs, heads, out.clone()));
+                        tasks.insert(id, h);
+                    }
+                    Err(e) => {
+                        let _ = out.send(err_frame(Some(id), &e)).await;
+                    }
+                }
+            }
             Frame::SvcReveal {
                 id,
                 fs,
@@ -345,12 +373,64 @@ async fn recheck(st: &Shared, token: &[u8], fs: u32, target: &Target) -> ApiResu
     Ok(caller)
 }
 
+/// Every device's checkpoint head in `fs`.
+async fn ckpt_heads(st: &Shared, fs: u32) -> ApiResult<HashMap<Fp, u64>> {
+    let mut t = st.view.begin(None).await?;
+    let max = st.cfg.limits.max_range_items as usize;
+    Ok(crate::integrity::read_heads(&mut t, fs, max)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+/// `cksub`: push `ckh` whenever a device's checkpoint head moves past the
+/// one last seen (api.md §15.1).
+async fn checkpoints(
+    st: Shared,
+    token: Vec<u8>,
+    id: u32,
+    fs: u32,
+    mut seen: HashMap<Fp, u64>,
+    out: mpsc::Sender<Frame>,
+) {
+    let r: ApiResult<()> = async {
+        loop {
+            let caller = resolve(&st, &token).await?;
+            crate::integrity::require_any_right(&st, &caller, fs)?;
+            // Watch first, then read: a put between the two still wakes us.
+            let w = st.store.watch(&keys::ckpt_bell(fs)).await?;
+            let mut moved: Vec<(Fp, u64)> = ckpt_heads(&st, fs)
+                .await?
+                .into_iter()
+                .filter(|(d, s)| seen.get(d).is_none_or(|old| s > old))
+                .collect();
+            moved.sort();
+            for (device, seq) in moved {
+                seen.insert(device, seq);
+                let f = Frame::Ckh {
+                    id,
+                    device: device.to_vec(),
+                    seq,
+                };
+                if out.send(f).await.is_err() {
+                    return Ok(());
+                }
+            }
+            w.await;
+        }
+    }
+    .await;
+    if let Err(e) = r {
+        let _ = out.send(err_frame(Some(id), &e)).await;
+    }
+}
+
 async fn current_head(st: &Shared, fs: u32, target: &Target) -> ApiResult<Offset> {
     let prefix = match target {
         Target::Topic(t) => keys::log_prefix(fs, t).finish(),
         Target::Prefix(_) => keys::gl_prefix(fs).finish(),
     };
-    let mut t = st.store.begin(None).await?;
+    let mut t = st.view.begin(None).await?;
     Ok(
         match t
             .snapshot_get_range(&prefix, &keys::end_of(&prefix), 1, true)
@@ -389,7 +469,7 @@ async fn subscription(
                 Target::Topic(t) => {
                     let max = st.cfg.limits.max_range_bytes as usize;
                     let (events, more) =
-                        read_topic(st.store.as_ref(), fs, t, None, &cursor, BATCH, max).await?;
+                        read_topic(st.view.as_ref(), fs, t, None, &cursor, BATCH, max).await?;
                     for (o, e) in events {
                         cursor = o;
                         let f = Frame::Ev {
@@ -408,7 +488,7 @@ async fn subscription(
                 Target::Prefix(p) => {
                     let max = st.cfg.limits.max_range_bytes as usize;
                     let (events, last, more) =
-                        read_prefix(st.store.as_ref(), fs, p, &cursor, BATCH, max).await?;
+                        read_prefix(st.view.as_ref(), fs, p, &cursor, BATCH, max).await?;
                     let caller = resolve(&st, &token).await?;
                     for (topic, e) in events {
                         if caller.require_topic(fs, &topic, R_READ).is_err() {

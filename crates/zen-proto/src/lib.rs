@@ -338,6 +338,9 @@ pub struct Limits {
     /// Ephemeral publishes per device and node: burst, in bytes.
     #[serde(default)]
     pub ephemeral_burst_bytes: u64,
+    /// Device checkpoints kept per device and fs (api.md §15.1).
+    #[serde(default)]
+    pub checkpoint_keep: u32,
 }
 
 // ---------------------------------------------------------------- auth
@@ -1439,6 +1442,29 @@ pub struct Commit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub svc: Vec<SvcStep>,
+    /// Fenced leases the commit depends on (api.md §16).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub fence: Vec<Fence>,
+}
+
+/// A fence of a commit: the caller must hold the named lease with this
+/// token (spec/api.md §6, §16).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct Fence {
+    /// fs_id.
+    pub fs: u32,
+    /// Lease name (1–64 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub name: Vec<u8>,
+    /// Fencing token.
+    pub token: u64,
 }
 
 /// `POST /v1/commit` response.
@@ -2688,6 +2714,14 @@ pub struct Changes {
     /// The limit cut the list short.
     #[serde(default)]
     pub more: bool,
+    /// The tree's op count at the read, when `more` is false (api.md §12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub ops: Option<u64>,
+    /// The tree's op chain at the read, when `more` is false.
+    #[serde(default, with = "serde_bytes", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array", optional))]
+    pub chain: Option<Vec<u8>>,
 }
 
 /// `POST /v1/fs/tree/chain` request.
@@ -3328,6 +3362,261 @@ pub struct ClusterStatus {
 
 // ---------------------------------------------------------------- stream
 
+// ---------------------------------------------------------------- integrity
+
+/// `POST /v1/checkpoint/put` request (spec/api.md §15.1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointPut {
+    /// fs_id.
+    pub fs: u32,
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// The device's next sequence number.
+    pub seq: u64,
+    /// Sealed checkpoint (kind 11, formats.md §14.2).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub checkpoint: Vec<u8>,
+}
+
+/// `POST /v1/checkpoint/put` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointVersion {
+    /// Versionstamp of the put.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub version: Vec<u8>,
+}
+
+/// `POST /v1/checkpoint/heads` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointHeads {
+    /// fs_id.
+    pub fs: u32,
+    /// Only these devices (default: every device with checkpoints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub devices: Option<Vec<ByteBuf>>,
+}
+
+/// A device's newest checkpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointHead {
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// Its newest sequence number.
+    pub seq: u64,
+}
+
+/// `POST /v1/checkpoint/heads` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointHeadList {
+    /// In device order.
+    pub heads: Vec<CheckpointHead>,
+}
+
+/// `POST /v1/checkpoint/get` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointGet {
+    /// fs_id.
+    pub fs: u32,
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// First sequence number.
+    pub from: u64,
+    /// Last sequence number (default: the head).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub to: Option<u64>,
+    /// Max items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub limit: Option<u32>,
+}
+
+/// A stored checkpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointItem {
+    /// Sequence number.
+    pub seq: u64,
+    /// Sealed checkpoint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub checkpoint: Vec<u8>,
+}
+
+/// `POST /v1/checkpoint/get` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct CheckpointList {
+    /// In sequence order.
+    pub items: Vec<CheckpointItem>,
+    /// A limit cut the list short.
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// `POST /v1/devices/register` request (spec/api.md §15.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct DeviceRegister {
+    /// Device certificate (formats.md §7.4).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub cert: Vec<u8>,
+}
+
+/// `POST /v1/devices/register` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct DeviceRegistered {
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+}
+
+/// `POST /v1/devices/get` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct DevicesGet {
+    /// Device fingerprints (at most 1,000).
+    pub devices: Vec<ByteBuf>,
+}
+
+/// A registered device.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct DeviceInfo {
+    /// Device fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub device: Vec<u8>,
+    /// Its user's fingerprint.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub user: Vec<u8>,
+    /// Device certificate.
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub cert: Vec<u8>,
+}
+
+/// `POST /v1/devices/get` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct DeviceList {
+    /// Known devices, in request order.
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// `POST /v1/lease` request (spec/api.md §16).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct NamedLeasePut {
+    /// fs_id.
+    pub fs: u32,
+    /// Lease name (1–64 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub name: Vec<u8>,
+    /// The current token, to renew or release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub token: Option<u64>,
+    /// Lifetime (default 10,000, at most 600,000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub ttl_ms: Option<u32>,
+    /// Give the lease up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub release: bool,
+}
+
+/// `POST /v1/lease` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct NamedLease {
+    /// Fencing token.
+    pub token: u64,
+    /// Expiry version; 0 after a release.
+    pub expires_version: u64,
+}
+
 /// A WebSocket frame (spec/api.md §9), tagged by `op`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
@@ -3425,6 +3714,14 @@ pub enum Frame {
         /// Keys to reveal (at most 1,000).
         reveals: Vec<SvcReveal>,
     },
+    /// Client: push `ckh` for every new checkpoint head of the fs
+    /// (api.md §15.1).
+    Cksub {
+        /// Subscription id.
+        id: u32,
+        /// fs_id.
+        fs: u32,
+    },
     /// Server: acknowledgement.
     Ok {
         /// Subscription id, if any.
@@ -3515,6 +3812,17 @@ pub enum Frame {
         id: u32,
         /// One code per reveal, as `SvcRevealResult`.
         results: Vec<u8>,
+    },
+    /// Server: a device's checkpoint head moved (api.md §15.1).
+    Ckh {
+        /// Subscription id.
+        id: u32,
+        /// Device fingerprint.
+        #[serde(with = "serde_bytes")]
+        #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+        device: Vec<u8>,
+        /// Its newest sequence number.
+        seq: u64,
     },
 }
 
@@ -3633,6 +3941,12 @@ mod tests {
             Frame::SvcRevealed {
                 id: 4,
                 results: vec![0, 3],
+            },
+            Frame::Cksub { id: 5, fs: 1 },
+            Frame::Ckh {
+                id: 5,
+                device: vec![6; 32],
+                seq: 9,
             },
         ];
         for f in frames {

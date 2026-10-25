@@ -9,6 +9,7 @@ use crate::state::Shared;
 use crate::txn::txn_loop;
 use axum::extract::State;
 use std::collections::{HashMap, HashSet};
+use zen_core::header::{is_signed, validate_header_successor};
 use zen_core::kdf::acl_hash;
 use zen_core::labels;
 use zen_core::sig::{PublicIdentity, verify_device_cert};
@@ -434,7 +435,7 @@ pub async fn header_get(
     if !caller.is_admin() && caller.acl.fs_rights(&caller.user, req.fs) & R_READ == 0 {
         return Err(forbidden("no read right on this fs"));
     }
-    let mut t = st.store.begin(None).await?;
+    let mut t = st.view.begin(None).await?;
     Ok(Cbor(match t.get(&keys::header(req.fs)).await? {
         Some(v) if v.len() >= 10 => Header {
             version: Some(v[..10].to_vec()),
@@ -462,9 +463,23 @@ pub async fn header_put(
     }
     let mut t = st.store.begin(None).await?;
     let key = keys::header(req.fs);
-    let current = t.get(&key).await?.map(|v| v[..10].to_vec());
+    let stored = t.get(&key).await?;
+    let current = stored.as_ref().map(|v| v[..10].to_vec());
     if current != req.expect {
         return Err(version_mismatch("header version mismatch"));
+    }
+    // The signed form (formats.md §12.1): the server checks the chain, so
+    // a header can't be swapped for an older or forged one.
+    let stored = stored.as_ref().map(|v| &v[10..]);
+    if is_signed(&req.header) || stored.is_some_and(is_signed) {
+        let acl = &caller.acl;
+        validate_header_successor(req.fs, stored, &req.header, |fp| {
+            acl.admins
+                .contains(fp)
+                .then(|| acl.members.get(fp).map(|m| m.identity.clone()))
+                .flatten()
+        })
+        .map_err(|e| bad_request(format!("signed header refused: {e}")))?;
     }
     t.set_versionstamped_value(&key, &[], &req.header);
     let stamp = t.commit().await.map_err(|e| match e {

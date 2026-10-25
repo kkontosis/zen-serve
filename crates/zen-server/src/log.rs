@@ -124,7 +124,7 @@ pub async fn read(
     let max = st.cfg.limits.max_range_items;
     let limit = req.limit.unwrap_or(max).clamp(1, max) as usize;
     let (events, more) = read_topic(
-        st.store.as_ref(),
+        st.view.as_ref(),
         req.fs,
         &req.topic,
         req.key_token.as_deref(),

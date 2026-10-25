@@ -115,7 +115,43 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       1. `flipped[8]! ^= 1;` (the repo's idiom: `local.test.ts:164`, `tree.test.ts:282`, `vault.test.ts:228`), and `let prev: Uint8Array = new Uint8Array(32);`.
       2. Make `npm run check` match CI, so this can't recur: root `package.json` `check` uses `tsc -p packages/client/tsconfig.test.json` (instead of `tsc -p packages/client --noEmit`) and adds `tsc -p packages/fuse/tsconfig.json --noEmit`, the two CI lines it lacks.
     * Done: the new `npm run check` passes. Run on the unfixed test file, it reports exactly CI's 2 errors. The integrity vectors test passes.
-  * Next: CI green on both runs.
+  * **CI green on both runs of b779c7c** (push 383, pull_request 384): rust, pure-rust, fdb and client all pass. Step 6.1 is done, waiting on review and merge of PR #54.
+  * PR #54 merged at 3c8269a.
+* **Step 6.2** (server): planned below ("Step 6.2 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (59d9346), PR #55.
+  * `spec:` commit 5951bc9: checkpoints count toward the fs quota (429 `quota`; pruning gives bytes back); `dkd` isn't exported; `examples/zen-serve.toml` gains `checkpoint_keep`.
+  * **zen-proto:** `Limits.checkpoint_keep`, `Commit.fence` (`Fence`), `Changes.ops`/`chain`, the checkpoint, device and named-lease types, `Frame::Cksub`/`Ckh`.
+  * **zen-server:**
+    * `integrity.rs` (checkpoint `put`/`heads`/`get`, `devices/register`/`get`), `lease.rs` (`/v1/lease`, `check_fence`), `quota.rs` (the quota check, now shared by commits and checkpoint puts)
+    * `commit.rs`: fences are validated (fs `write`, 1–64-byte names, one op each) and checked first in the transaction
+    * `acl.rs` `header_put`: signed headers are checked with `validate_header_successor` against the caller's ACL admins
+    * `tree.rs`: `changes` carries `ops`/`chain` when complete
+    * `stream.rs`: `cksub` (baseline heads, then watch `dkd` and push each moved head)
+    * `dump.rs`: `dkd` is private
+    * config `limits.checkpoint_keep` and `adversary`; `/v1/info` features and limit
+    * `adversary.rs` (`test-utils`): the storage decorator behind `AppState.view`, the five lies, `POST /v1/test/adversary`. Read endpoints switched to `st.view`: kv get/range, log read, stream subs, header get, tree reads (`read_txn`), checkpoint heads/get, devices get, `cksub`.
+  * **Tests:** new `tests/integrity.rs` (15 tests: features, the checkpoint log, ownership, quota, devices, `cksub`, the signed header chain, named leases, fences incl. the read-set conflict, `changes` ops/chain, four adversary tests and its gating). `tests/dump.rs`: the round trip now carries a checkpoint, a registered device and a lease, and checks `dkd` stays behind.
+  * **Found while verifying:**
+    * A POST to a missing route gets 405 from the static fallback, not 404: the gating test checks 405.
+    * The disk filled (971 MB free) while building the fdb tests, and FoundationDB stopped starting transactions, so every FDB test hung. Removed `target/debug/incremental` (2.9 GB, a cache) and stale test binaries (3.8 GB).
+    * The first FDB run after that recovery failed two dump tests at the new setup calls in `populated_on`. These tests run at once, and an import jumps the shared cluster's version (the 6.1 cause), so the extra calls widened the window. `populated_on` now retries its calls on `too_old`. Five plain reruns, then three with the fix, were green.
+  * **Checks (all clean):**
+    * fmt
+    * clippy `-D warnings`: default, `--no-default-features`, `--all-features`
+    * `cargo test -p zen-server -p zen-proto` (embedded)
+    * on local FDB: integrity and dump 3×, then the full `-p zen-store -p zen-server --features fdb`
+    * `build-wasm.sh` and `npm run check`
+    * vitest `kv`, `stream`, `tree`, `log`, `integrityvectors` and `packages/fs`
+  * Pushed 811a74c. **The push run (388) was red in `fdb`; the pull_request run (389) was green.**
+    * `tests/dump.rs` on CI's fresh cluster: `/v1/checkpoint/put` and `/v1/devices/register` returned 409 `commit_unknown`.
+    * Cause: after the version jumps these tests make, FoundationDB can lose track of a commit's outcome. Both endpoints ran the non-idempotent transaction loop, so the unknown outcome reached the client, which per api.md §1 may then only re-read.
+    * Fix in the server: both are now idempotent (`txn_loop!(…, idempotent, …)`).
+      * A put whose `seq` is the head and whose stored checkpoint is byte-for-byte the same returns the stored version.
+      * Registering again was already a no-op.
+      * api.md §1 and §15 say so.
+    * Leases stay non-idempotent: two processes of one device must not share a token. So the dump setup treats `not_leader` after an unknown result as "acquired".
+    * The setup helper retries `commit_unknown` as well as `too_old`.
+    * `checkpoint_log` tests the resend, which returns the same version, while another checkpoint at the head gets 409.
+    * Embedded, and FDB 3×: green.
 
 ## Facts the design rests on (survey)
 
@@ -532,6 +568,231 @@ dprev = HE(previous body of this chain), zeros for dseq 1;   HE(b) = BLAKE3.deri
 * regenerate the vectors, and check the diff is only `integrity.json`
 * `scripts/build-wasm.sh`, `npm run check`, and `npx vitest run packages/client/test/integrityvectors.test.ts` 3×
 * zen-server compiles unchanged (`cargo check -p zen-server`)
+* CI green on both runs
+
+## Step 6.2 in detail
+
+Step 6.2 makes the server implement what 6.1 specified: api.md §15, §16, the `fence` part of §6, `cksub` (§9), §4.4's signed header, and `changes` `ops`/`chain` (§12). It also adds a test-only **adversary** that later steps test detection against. There's no client code in this step. TS types change only through zen-proto, and still have to type-check.
+
+**Survey (what this step builds on):**
+* **The router:** `crates/zen-server/src/lib.rs` `router`, and `info` (features and limits).
+* **Consume leases** (`consume.rs`):
+  * `LeaseRec`, `decode_lease` and `encode_lease` (`holder ‖ token ‖ expires`)
+  * `ms_to_versions`
+  * `lease` (`expires > now`, otherwise token + 1) and `release` (sets `expires` to 0)
+  * `check_token` checks holder and token, but not expiry
+* **The commit** (`commit.rs` `validate` and `execute`):
+  * `validate` checks permissions and sizes per field, and counts ops.
+  * In the transaction come the expects, clears, writes, consumes, `svc` steps, appends, then the tree and rows.
+  * Per-fs `(bytes, keys)` quota deltas are checked against `caller.acl.limits`.
+* **The fs header** (`acl.rs` `header_put`): admin only, CAS on the 10-byte stamp, `set_versionstamped_value(hdr)`. The ACL state is `AclState {admins, members: {identity, devices}}`, with `has_device(user, device)`.
+* **Streams** (`stream.rs`): `run` dispatches frames; `subscription` watches a head key, then range-reads; `recheck` re-validates rights.
+* **The tree** (`tree.rs`):
+  * `read_changes` runs in one read transaction (`read_txn`)
+  * `load_header` gives `ops`, `chain` and `resync_before`
+  * every read endpoint goes through `read_txn` or `st.store.begin`
+* **`dump.rs` `private()`** leaves out `meta` and relay keys; everything else is exported.
+* **Tests:**
+  * `tests/common` `Harness::start_with(|cfg| …)` on the embedded backend, or on FDB when `ZEN_TEST_BACKEND=fdb`
+  * `User` (signing identity and device), `claim`, `sign_in`, `call`, and `connect`/`send`/`recv` for streams
+* **Generated TS types:** zen-proto types derive `tsify` under `ts`, and the wasm glue isn't tracked. The vitest server is the debug binary (`packages/client/src/testing/server.ts`; CI builds it with `cargo build -p zen-server`).
+
+### Spec touch-ups (`spec:` commit, small)
+
+* **api.md §15.1:** checkpoints count toward the fs's `bytes` and `keys` quota (formats.md §9) like KV values; a put over quota gets 403 `quota`, and pruning gives the bytes back.
+  * Why: without it, a member could store `checkpoint_keep × max_value_bytes` (about 92 MB) per device, outside any quota.
+  * keyspace.md §3.10 says the same.
+* **keyspace.md §3.10:** `dkd` isn't exported (it joins `meta` and the relay keys in `dump`'s private set).
+* **`examples/zen-serve.toml`:** `checkpoint_keep` in `[limits]`.
+
+### zen-proto (`crates/zen-proto/src/lib.rs`, all with `ts` derives like their neighbours)
+
+* `Limits.checkpoint_keep: u32`, with `#[serde(default)]` so older servers decode.
+* `Commit.fence: Vec<Fence {fs, name: bytes, token: u64}>`, skipped when empty. `Changes` gains `ops: Option<u64>` and `chain: Option<bytes>`.
+* **Checkpoints:**
+  * `CheckpointPut {fs, device, seq, checkpoint}` → `CheckpointVersion {version}`
+  * `CheckpointHeads {fs, devices?}` → `Heads {heads: [Head {device, seq}]}`
+  * `CheckpointGet {fs, device, from, to?, limit?}` → `Checkpoints {items: [{seq, checkpoint}], more}`
+* **Devices:**
+  * `DeviceRegister {cert}` → `DeviceRegistered {device}`
+  * `DevicesGet {devices}` → `Devices {devices: [{device, user, cert}]}`
+* **Leases:** `LeasePut {fs, name, token?, ttl_ms?, release?}` → `NamedLease {token, expires_version}`. The names avoid the consume `Lease*` types.
+* **Frames:** `Frame::Cksub {id, fs}` and `Frame::Ckh {id, device, seq}`.
+
+### Server
+
+**Config** (`config.rs`):
+* `limits.checkpoint_keep` (default 1,024, at least 1).
+* A top-level `adversary: bool` (default false). If it's true in a build without `test-utils`, the config is refused ("built without test-utils").
+
+**`/v1/info`:**
+* adds the features `checkpoints`, `signed_header`, `lease` and `devices`
+* adds `limits.checkpoint_keep`
+
+**Keys** (`keys.rs`): `ckpt(fs, dev, seq)` (`dk`), `ckpt_head(fs, dev)` (`dkh`), `ckpt_heads(fs)` (prefix), `ckpt_bell(fs)` (`dkd`), `device(dev)` (`dv`), `user_device(user, dev)` (`dvu`), `named_lease(fs, name)` (`ls`).
+
+**New module `integrity.rs`** (checkpoints and devices, api.md §15):
+* **`any_right(caller, fs)`:** an fs right or any topic grant, else 403.
+* **`put`:**
+  * Checks: `check_fs`, `any_right`, `device` is 32 bytes, `checkpoint.len() ≤ max_value_bytes` (413), `seal::peek` gives kind 11 (400), `seq ≥ 1`.
+  * Ownership: `caller.acl.has_device(user, device)`, or `dv(device)` names `caller.user`. Otherwise 403.
+  * In `txn_loop!`:
+    1. Read `dkh` normally. `seq ≠ head + 1` gives 409 `version_mismatch`.
+    2. `set_versionstamped_value(dk, [], checkpoint)`, set `dkh = u64 seq`, ring `dkd`.
+    3. If `seq > keep`, snapshot-read and clear `dk(seq − keep)`.
+    4. Apply the quota delta (bytes: + new length − pruned length; keys: +1, or 0 when one was pruned) through the same check as commits. That check is factored out of `commit.rs` into `quota::apply(t, limits, delta)`.
+  * Returns the stamp.
+* **`heads`:**
+  * With `devices`: one get each, unknown ones left out.
+  * Without: a range over `dkh(fs)`, at most `max_range_items` (the device count per fs is bounded by members × (ACL devices + 64)).
+* **`get`:** a range `[dk(from), dk(to + 1))` (or to the end of the device's prefix), capped by `limit` and `max_range_bytes`. Each value drops its 10-byte stamp.
+* **`register`:**
+  * `verify_device_cert(member identity of caller.user, cert)` must pass, else 400; the identity comes from `caller.acl.members`.
+  * `fp` is the `DevicePublic` fingerprint.
+  * In a transaction:
+    * If `dv(fp)` exists with this user, it's a no-op. If it exists with another user, 409. That can't happen for an honest cert, since certs bind one user.
+    * Otherwise, count the `dvu(user)` range: at 64 already, 429 `quota`.
+    * Set `dv = user ‖ cert` and `dvu`.
+* **`get` devices:** any signed-in caller; at most 1,000 devices per call; a get per device.
+
+**Fenced leases** (`lease.rs`, api.md §16):
+* **`/v1/lease`:**
+  * Checks: `check_fs`, fs `write`, `name` of 1–64 bytes (400), ttl defaults to 10,000 and is clamped to 100..600,000.
+  * Acquire and renew follow `consume::lease`, sharing `LeaseRec`, `decode_lease` and `encode_lease`, which become `pub(crate)`. The key is `ls`, and the holder is `caller.device`.
+  * A release needs the holder and the current token; it sets `expires` to 0 and returns `{token, expires_version: 0}`.
+* **`fence` in `commit.rs`:**
+  * `validate`: each fence needs fs `write`, a name of 1–64 bytes, and counts as one op.
+  * `execute`: fences are checked first in the transaction, before the expects. Each one `get`s `ls` normally (into the read set) and requires `holder == caller.device`, `token == f.token` and `expires > t.read_version()`, else 412 `claim_lost`.
+  * A replay through `commit_id` returns the stored result without re-checking fences, as for every other step (api.md §6 rule 1).
+
+**The signed header** (`acl.rs` `header_put`):
+* Once the `expect` CAS passes, if the new header or the stored one is signed:
+  * call `zen_core::header::validate_header_successor(fs, stored (without its stamp), new, admin)`
+  * `admin(fp)` is the member identity of `fp` when `fp` is an admin of `caller.acl`
+  * an error gives 400 `bad_request` with the reason
+* Unsigned headers over unsigned ones are unchanged.
+
+**`changes` `ops`/`chain`** (`tree.rs` `read_changes`): when `more` is false, set `ops` and `chain` from `load_header` in the same read transaction (the header is already read when `after` is given; reuse it).
+
+**`cksub`** (`stream.rs`):
+* Checks: `check_fs` and `any_right`, rechecked like `sub`.
+* A task:
+  1. reads every head (as `heads`)
+  2. sends `ok`
+  3. loops: watch `dkd(fs)`, re-read the heads, and send `ckh {id, device, seq}` for each device whose seq grew (or that is new)
+* `unsub` stops it, like other subscriptions.
+
+**`dump.rs`:** `private()` also covers the `dkd` prefix. `dk`, `dkh`, `dv`, `dvu` and `ls` export as data.
+
+### The adversary (`adversary.rs`, `#[cfg(feature = "test-utils")]`)
+
+Detection must be tested against a server that lies, so 6.3–6.5 need one. It sits at the storage boundary:
+* **The decorator:** `Adversary` wraps `Arc<dyn Storage>` and its transactions, and filters reads by rules.
+* **`AppState.view`:** an `Arc<dyn Storage>`, the decorated store when `adversary = true`, otherwise `store` itself.
+* **What reads through it:** only the read endpoints:
+  * kv `get`/`range`
+  * `log/read` and stream `sub` reads
+  * `fs/header/get`
+  * the tree read endpoints (via `read_txn` and `tree_list`)
+  * checkpoint `heads`/`get` and `cksub`
+* **What doesn't:** commits, puts and the server's own bookkeeping use `store`. The server's internal state stays honest, and lifting a lie restores honest answers.
+
+**Rules** are generic (built from typed lies):
+* `Freeze {key, value: Option<bytes>}`: reads of `key` return `value`, including inside ranges, where the current entry is replaced, removed or inserted in order.
+* `Hide {prefix, pred(key, value)}`: hides matching keys under `prefix`. A range read keeps reading past hidden items until it has `limit` visible ones or reaches the end, so `more` stays truthful about what's visible.
+
+**Typed lies** (each "freezes X as it is now"; a test writes, lies, writes again, and the server serves the first state):
+
+| Lie | Rules |
+|---|---|
+| `{kind: "kv", fs, key}` | freeze `kv(fs, key)` at its current raw value (or absent) |
+| `{kind: "header", fs}` | freeze `hdr(fs)` |
+| `{kind: "topic", fs, topic}` | record the head offset `h`; freeze `lh(fs, topic)`; hide log entries of the topic with offset > `h`, plus its `lk` index entries and `gl` entries (value = topic) above `h` |
+| `{kind: "tree", fs, tree}` | freeze the tree header (ops, chain); hide change entries above the current tree head |
+| `{kind: "checkpoints", fs, device}` | record the head `s`; freeze `dkh` at `s`; hide `dk(fs, device, seq > s)` |
+
+**The control endpoint:** `POST /v1/test/adversary {lies: [Lie], clear?: bool}` → `{}`.
+* It's routed only when `adversary = true`, and it's admin-only.
+* `clear` drops every rule first.
+* It's documented in the module and in `docs/MILESTONE-6.md`, not in spec/api.md (test-only).
+
+**Forks** need no server code: in 6.3 the TS harness starts two servers on copies of one data directory (`TestServer.fork()`), and each client talks to one. That's a real split view, and it's what pins and `seen` must catch. A whole-store rollback is the same (restart on an older copy).
+
+**CI:** the vitest binary needs the adversary from 6.3 on. In 6.3 the client job's build becomes `cargo build -p zen-server --features test-utils` (likewise locally), and `spawnServer` gains an `adversary` option. Nothing changes in CI in 6.2.
+
+### Tests (new `crates/zen-server/tests/integrity.rs`; both backends via `Harness`)
+
+* **`info_lists_integrity_features`:** the four features, and `checkpoint_keep` (default, and set by config).
+* **`checkpoint_log`:** real checkpoints built with `zen_core::integrity` (`sign_checkpoint` and `seal_checkpoint` under a fixture `FsKeys`):
+  * `put` 1, 2, 3; then a replay of 3, or 5, gives 409
+  * `heads` (all and filtered, an unknown device left out)
+  * `get` ranges, `limit`/`more`, and `to`
+  * open and verify what comes back
+  * pruning with `checkpoint_keep = 3`: after 5 puts, `get` from 1 returns 3–5
+  * kind 1 sealed → 400; over `max_value_bytes` → 413; `seq` 0 → 400
+* **`checkpoint_ownership`:**
+  * a device of another member → 403; an unknown device → 403
+  * after that user's `devices/register`, puts work
+  * a user with no right on the fs → 403 for put, heads and get; a topic-only grant can put
+* **`checkpoint_quota`:** with an fs `max_bytes`, puts past it → 403 `quota`; pruning frees bytes (puts under `checkpoint_keep` continue).
+* **`devices_register_and_get`:**
+  * register returns the fingerprint; again it's a no-op
+  * a cert by another identity → 400
+  * the 65th device → 429
+  * `get` returns `{device, user, cert}`, and leaves out unknown ones
+* **`cksub_pushes_heads`:**
+  * `ok`, then `ckh` for each put of two devices, in order per device
+  * no push for a 409'd put
+  * a caller without rights → `err`
+* **`signed_header_chain`:**
+  * unsigned v0, then signed v1 (admin), then signed v2 by another admin, all accepted; `get` returns the bytes
+  * refused with 400, storing nothing:
+    * an unsigned put over a signed one
+    * a version skip
+    * a wrong `prev`
+    * a wrong `fs`
+    * a non-admin member's signature
+    * a flipped signature byte
+* **`named_lease`:**
+  * acquire gives token 1; another device gets 412 `not_leader`; renew keeps the token
+  * release gives `expires_version` 0; the other device then gets token 2
+  * with a 100 ms ttl, after expiry, another device gets token + 1
+  * a read-only user → 403; names of 0 or 65 bytes → 400
+* **`fence`:**
+  * a commit with a held fence applies; after another device takes the lease, the old holder's fenced commit gets 412 `claim_lost` and writes nothing
+  * a released lease gets `claim_lost`
+  * a short-mode commit at a read version taken before another device acquired the lease gets 409 `conflict`, since the lease is in the read set
+  * a fence on an fs without `write` → 403
+  * a replayed `commit_id` returns the stored result
+* **`changes_carry_ops_and_chain`:**
+  * after moves, `changes` (whole and after a cursor) with `more` false carries `ops`/`chain` equal to `tree/chain`
+  * with `limit` cutting the list (`more` true), they're absent
+* **`adversary_*`** (embedded and FDB, `adversary = true`):
+  * kv: `get` and `range` serve the frozen value and version, and an absent key stays absent; `clear` restores the truth
+  * topic: `log/read` and a `sub` stream stop at the frozen head; a new event is withheld until `clear`, then delivered with no gap
+  * checkpoints: `heads` stays at the frozen seq, `get` hides newer ones, and `cksub` stays silent; meanwhile the device's real puts keep succeeding (the server's own state is honest)
+  * header: `get` serves the frozen header
+  * tree: `changes` hides new ops, and `chain` serves the old `ops`/`chain`
+  * the endpoint returns 404 without `adversary = true`, and 403 for a non-admin
+* **`dump`:** an existing export/import test also round-trips a checkpoint, a registered device and a lease, and `dkd` isn't exported.
+* **Existing tests stay green:** the consume lease tests run unchanged (they share `decode_lease`).
+
+### Files
+* **spec:** `spec/{api,keyspace}.md`, `examples/zen-serve.toml`
+* **zen-proto:** `crates/zen-proto/src/lib.rs`
+* **zen-server, `src`:**
+  * `{lib,config,keys,commit,consume,acl,tree,stream,dump,state,kv,log}.rs`
+  * new: `{integrity,lease,quota,adversary}.rs`
+* **zen-server, `tests`:** `crates/zen-server/tests/{integrity.rs (new), dump.rs}`
+* **docs:** `docs/MILESTONE-6.md` (the log)
+
+### Verification
+* `cargo fmt --check`
+* clippy `--all-targets -D warnings`: default, `--no-default-features`, `--all-features`
+* `cargo test -p zen-server` (embedded) and `cargo test -p zen-proto`
+* the integrity and dump tests on local FDB (`ZEN_TEST_BACKEND=fdb`), 3×
+* `scripts/build-wasm.sh` and `npm run check` (the proto types still type-check)
+* the vitest client suites that touch commits, streams and the tree, once: `kv`, `stream`, `tree`, `log`
 * CI green on both runs
 
 ## Verification (each sub-step)

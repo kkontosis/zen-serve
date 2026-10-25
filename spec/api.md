@@ -17,7 +17,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 403 | `method_disabled` (the sign-in method is turned off on this server, auth.md §2) | no |
   | 404 | `not_found` (unknown fs, group, …) | no |
   | 409 | `conflict`, `too_old` (read version left the ~5 s window, or a transient storage error) | **yes**, the whole transaction |
-  | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is; otherwise re-read first |
+  | 409 | `commit_unknown` (the storage could not tell whether the write applied) | only if idempotent: `/v1/commit` with the same `commit_id` is, and so are `/v1/checkpoint/put` and `/v1/devices/register` (§15); otherwise re-read first |
   | 409 | `clock_skew` (an `hlc` is too far ahead, fs.md §3.4) | after fixing the clock |
   | 409 | `stale_op` (an `hlc` is past the horizon or needs too deep an undo, or the operation names a purged node, fs.md §3.4; or a CRDT-row timestamp collision, §13.2) | with a fresh `hlc` (rebase); not for a purged node |
   | 409 | `resync` (a change-feed cursor is older than the kept tombstones, fs.md §5) | with a full sync |
@@ -25,7 +25,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 412 | `conn_closed` (a relayed connection is closing, closed or reaped, §14) | no |
   | 413 | `too_large` | no |
-  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, §3.16, credentials per user §3.7, §3.8, §3.11, §3.13, §3.15) | later |
+  | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, §3.16, credentials per user §3.7, §3.8, §3.11, §3.13, §3.15, devices per user §15.2, fs quotas §6, §15.1) | later |
   | 429 | `window` (a relayed connection's unwritten output is at `out_window`, §14.5) | once the node writes; the lease doorbell rings |
 
 * **Ids.** `fs` is the `u32` fs_id. `topic` is a topic id (16·n bytes, 1 ≤ n ≤ 16). `key_token` is 16 bytes. `version` (a value version) is a 10-byte versionstamp. `offset` is a 12-byte event offset (keyspace.md §2). `read_version` is a `u64`.
@@ -854,8 +854,10 @@ POST /v1/checkpoint/get   {fs, device, from: u64, to?: u64, limit?}             
 * **`put`** stores a sealed checkpoint (formats.md §14.2), which the server can't read:
   * `device` must belong to the caller's user: a device certificate of the caller's member entry in the current ACL, or a device the user registered (§15.2). Otherwise 403 `forbidden`.
   * `seq` must be the device's head + 1 (1 for its first): otherwise 409 `version_mismatch`, and the client re-reads the head (formats.md §14.3).
+  * A put is safe to resend after `commit_unknown` (§1): when `seq` is the head and the stored checkpoint is byte-for-byte this one, it returns the stored version.
   * `checkpoint` is at most `max_value_bytes` (413) and must be a kind-11 sealed object (400).
   * The server keeps each device's newest `checkpoint_keep` checkpoints; a put deletes the one `checkpoint_keep` below it.
+  * Checkpoints count toward the fs's `bytes` and `keys` quota (formats.md §9) like KV values: a put past it returns 429 `quota`, and a pruned checkpoint gives its bytes back.
 * **`heads`** returns the head of each device with checkpoints in the fs, in device order, or of the `devices` given (unknown ones left out).
 * **`get`** returns a device's kept checkpoints with `from ≤ seq ≤ to` (`to` absent: up to the head), in order, at most `limit` (default and cap `max_range_items`), and `more` when cut. Checkpoints that were pruned are absent; a client that needs one gets an empty list.
 * **`cksub`** on the stream (§9) pushes `ckh {id, device, seq}` whenever a device's head moves, so clients verify new checkpoints as they appear. After a reconnect, a client calls `heads`.
@@ -867,7 +869,7 @@ POST /v1/devices/register {cert: bytes}              → {device: bytes(32)}
 POST /v1/devices/get      {devices: [bytes(32)]}      → {devices: [{device, user: bytes(32), cert: bytes}]}
 ```
 
-* **`register`** adds a device enrolled by its user, without an admin: `cert` is a device certificate (formats.md §7.4) that verifies against the caller's member identity in the current ACL (400 otherwise). It returns the device's fingerprint. Registering a device again is a no-op. A user holds at most 64 registered devices (429 `quota`).
+* **`register`** adds a device enrolled by its user, without an admin: `cert` is a device certificate (formats.md §7.4) that verifies against the caller's member identity in the current ACL (400 otherwise). It returns the device's fingerprint. Registering a device again is a no-op, so a registration is safe to resend. A user holds at most 64 registered devices (429 `quota`).
 * **`get`** returns the certificate of each known device, from the registry. Unknown devices are left out. Verifiers check every certificate against the member identity of `user` in the ACL they have verified, so the server can't introduce a device.
 * Devices whose certificates are in the ACL need no registration.
 
