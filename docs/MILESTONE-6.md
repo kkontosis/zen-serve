@@ -154,7 +154,33 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * Embedded, and FDB 3×: green.
   * **CI green on both runs of 43e5455** (push 390, pull_request 391): rust, pure-rust, fdb and client all pass. Step 6.2 is done, waiting on review and merge of PR #55. This line reaches `docs/MILESTONE-6.md` at the restart from main, so CI isn't rerun for a docs-only commit.
   * PR #55 merged at e3a2c5c.
-* **Step 6.3** (`@zen/client`): planned below ("Step 6.3 in detail"). Restarted from main; the log above is now in the repo copy too.
+* **Step 6.3** (`@zen/client`): planned below ("Step 6.3 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (854bcea), PR #56.
+  * **wasm:** the 6.2 wire codecs (checkpoints, devices, named leases). The 6.1 TS type `CheckpointHead {version, hash}` is renamed `ChainHead`: exported next to zen-proto's `CheckpointHead {device, seq}`, the two interfaces merged.
+  * **`@zen/client`:**
+    * new `integrity.ts`: `Fs.integrity(opts)`, pins, checkpoint writing (cadence, cumulative bodies, the 409 merge, idempotent resends), `sync` (rules 1–4, the ACL and header claims), `watch`, `exportPins`/`comparePins`, alarms (`IntegrityError`)
+    * new `devices.ts` (`newDevice`); `session.useIdentity`, `approveDevice`, `enrollDevice`, `devices`
+    * `fs.ts`: signed headers read (verified against an admin of the verified ACL, pinned with integrity) and written (`init({signed})`, `signHeader()`, signed successors; `signer_needed`)
+    * `log.ts`: chain pools, version-2 bodies, `ChainCheck` (gaps, rewrites, pins; repeats of the same body allowed, as a dead-letter retry re-appends one), the end-of-read freshness check, `verifyHead`
+    * `kv.ts`: `Transaction.onSettle` (applied, failed or unknown), so a retried transaction reuses its chain position
+    * `stream.ts`: the `ck` subscription (`subscribeCheckpoints`), chain checks on subscriptions
+    * `acl.ts`: `pin`/`pinned`, `AclVersion.bytes`
+    * the vault: `saveSigner`/`signer()`
+    * testing: `spawnServer({adversary})`, `TestServer.fork()`, `testing/adversary.ts` (`lie`, `truth`); booleans in the test CBOR encoder
+  * **Changes from the plan:**
+    * An enrolled device signs checkpoints but doesn't sign in: method 1 still needs the cert in the ACL (auth.md §3), so the vault keeps it as `signer`, not as `device`.
+    * Only device heads, the ACL and the header pins are persisted. Object floors are rebuilt from the device bodies on load (each body is cumulative), so no `obj/` records.
+    * `exportPins` is a fixed binary record, not CBOR: `1 ‖ u32 fs ‖ acl ‖ header ‖ u32 n ‖ n × (fp ‖ u64 seq ‖ HC)`.
+    * A non-admin's header put is refused with 403 before any signature check (the plan said 400).
+  * **Found while testing:**
+    * `Stream.connect` had no timeout: an attempt that met the server restarting stayed in CONNECTING forever, so the stream never came back. It now gives up after `connectTimeoutMs` (default 10 s) and the backoff loop retries.
+    * `Acl.head()` didn't notice a server below the pin: an empty answer returned the pin, and a missing version gave `not_found`. Both are now `acl_chain` ("below the pinned version"), which integrity reports as an ACL rollback.
+  * **Tests:** new `packages/client/test/integrity.test.ts`, 13 tests (enrollment, honest checkpoints, two processes of one device, watch, chains, gap and rewrite, signed header, header rollback, topic tail withheld, checkpoints withheld, fork, whole-store rollback, an honest mixed run). 3× green. Each attack test was run with its check disabled and failed: tail, header, gap, rewrite, fork, ACL; for checkpoints withheld, the per-device head check, the own head check and both `seen` checks had to be disabled together, since each catches it alone.
+  * **Checks (all clean):**
+    * `cargo fmt --check`; clippy on zen-wasm (host `--all-targets`, wasm32)
+    * `scripts/build-wasm.sh`, `npm run check`
+    * all `packages/client` tests (17 files, 162 tests); `packages/db`, `fs`, `svc`, `loro`, `fuse` (only the opt-in benches skip)
+    * the Playwright smoke
+  * **CI:** the `client` job builds `zen-server --features test-utils`.
 
 ## Facts the design rests on (survey)
 

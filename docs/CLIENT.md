@@ -15,10 +15,10 @@ npm ci
 npm run build -w @zen/client   # packages/client/dist
 ```
 
-Tests run against a real server, the debug build on the embedded backend:
+Tests run against a real server, the debug build on the embedded backend, with the test adversary (`test-utils`) that the integrity tests make lie:
 
 ```sh
-cargo build -p zen-server
+cargo build -p zen-server --features test-utils
 npx vitest run                 # Node: packages/*/test
 npx playwright test            # Chromium: packages/client/browser
 ```
@@ -266,6 +266,7 @@ await session.logout(); await vault.forget();             // sign-out
 * **What it holds:** the device (its 32-byte seed, its cert and the identity's public bytes; the `DeviceSecret` is rebuilt from the seed) and the last session's token with its origin and expiry. `{name}` keeps several identities in one store.
 * **`signIn(client)`** resumes the stored session while it hasn't expired (60 s margin), checked with one `/v1/grv` call (`{probe: false}` skips it). A session the server refuses (401) falls back to a device sign-in, and the new session is stored. When the server can't be reached, the stored session is returned: the kept header and local caches work, and calls fail with `network` until it is back. A token is only ever sent to the origin it was issued for.
 * **The store** needs the device layer (G15: the seed and token sit at rest under a non-extractable key), or `plaintext: true` and `allowPlaintext`. It can't have the fs layer, which needs the keys it unlocks. `Db.wipe` leaves the vault; `forget()` (or `forgetSession()`) clears it.
+* **A checkpoint signer** (§12): `saveSigner` keeps an enrolled device key in the same format, and `signer()` returns it, or the sign-in device when none was enrolled.
 
 ## 11. Relayed services (`@zen/svc`)
 
@@ -466,9 +467,36 @@ serve(db, {
 * **What it protects:** input at rest (the keyspace, backups, exports). The server process still sees the bytes in transit, as it reads them from the socket.
 * **Changing the key** needs the old seed until the connections opened under it end: there is no rotation helper yet (TD-SVC-INBOX-ROTATION).
 
-## 12. Security notes
+## 12. Integrity
+
+The server can't read or forge data, but it can serve an **older** valid answer, **withhold** the newest events, or show two groups of clients two histories (a **fork**). Integrity detects these up to fork consistency (spec/formats.md §14, DESIGN.md §2.6). It is opt-in per `Fs` object:
+
+```ts
+const fs = session.fs(1);
+const integrity = await fs.integrity({
+  device: { device, cert },   // the signer; omit to verify only
+  local,                      // where pins are kept (store integrity/<fs>); default memory
+  sigEvery: 64, delayMs: 5000,
+  onAlarm: (a) => report(a),
+});
+const ufs = await fs.unlock();          // attach before unlocking, so the header is checked too
+await integrity.sync();                 // verify every device's newest checkpoint
+const sub = await integrity.watch(await session.stream());   // or sync on every pushed head
+```
+
+* **Checkpoints.** A device with a signer writes a hash-chained, signed, sealed **checkpoint** (§14.1) after `sigEvery` changes, `delayMs` after the last one, on `checkpoint()` and on `close()`. Each names the newest state of every object the device wrote or read through (topic heads and its event chains; trees, connections, namespaces and volumes in later steps), the ACL and signed header it verified, and every other device's head it verified (`seen`). Processes of one device share one sequence: a put that loses the race merges the winner's entries and retries.
+* **Pins.** `sync()` verifies each device's head: its signature (the cert from the ACL, or the device registry checked against the ACL's member), its chain from the pinned one, its `seen` links, and that no object went back. It raises the **pins**: per device `(seq, hash, body)`, and per object the newest state any device vouched for. Pins persist on `local`, with the ACL version, so a new process continues where the last stopped.
+* **What is checked against the pins:** a topic read without `key` or `limit` that reaches the end must reach the pinned head and each pinned chain position; `topic.verifyHead()` checks the pinned head is still served; the ACL can't go below its pin; the header can't go below its pinned version (or change at it); this device's head can't go below what it wrote.
+* **Event chains** (§5.1). With integrity attached, appends write version-2 bodies: each writer's events on a topic form chains `(chain id, dseq, dprev)`, advanced only when a commit is known to have applied. Unfiltered readers (`read` without `key`, subscriptions) report a skipped `dseq` as a **gap** and another body at a seen position as a **rewrite**; filtered readers (keys, consumer groups) check against the pins only. `sender` is the signer's device.
+* **Alarms.** `{kind: rollback | fork | gap | rewrite | invalid, object, id?, detail}`: recorded in `integrity.alarms`, passed to `onAlarm`, and thrown from the call that found it as an `IntegrityError` (code `integrity`). After one, `integrity.trusted` is false and no more checkpoints are written: the device won't sign a view it knows is false. What to do next is the app's policy: stop writing, alert the user, compare pins.
+* **Comparing out of band.** `exportPins()` gives a few hundred bytes (the ACL and header pins and each device's head) to pass over another channel (a QR code, a chat); `comparePins(bytes)` on the other client returns the alarms. Two clients the server keeps on separate histories find a fork this way, or as soon as either sees a checkpoint of the other side.
+* **Signed headers** (§12.1). `fs.init(slots, {signed: true})` or `ufs.signHeader()` signs the header with the admin's identity (`session.useIdentity(identity)`); every later edit (slots, policy, rotation) signs its successor and fails with `signer_needed` without the identity. Readers verify the signature against an admin of the verified ACL, and with integrity attached pin `(version, HH)`.
+* **Enrollment.** A session without a device key (passkey, OPAQUE, API token, mTLS) enrolls one: `session.enrollDevice(identity, {vault})` makes a device key, certifies it with the user identity and registers it (api.md §15.2); `session.approveDevice(devicePublic, identity)` certifies a key made elsewhere (a phone showing its key as a code to a laptop that holds the identity). An enrolled device signs checkpoints; signing in by device key still needs its cert in the ACL.
+* **Not covered:** a server that keeps two groups apart forever (fork consistency; an independent witness is TD-WITNESS), and rollbacks within the cadence window of a device that hasn't checkpointed yet (`sigEvery: 1` closes it).
+
+## 13. Security notes
 
 * **Secrets stay in WASM memory** behind handles (`FsKeys`, `SigningIdentity`, `DeviceSecret`, `PasswordKey`, OPAQUE state); `free()` and `UnlockedFs.close()` zeroize them. Values passed in from JS (passwords, recovery keys) are copied; JS strings can't be wiped.
 * **Argon2id parameters.** The floor is 64 MiB, t=1. Browsers should register with 256 MiB, t=3 (the default of `addPassphrase`); 1 GiB takes ~8 s in WASM (docs/STATS.md §5.2). The parameters the server returns are bounded on use (formats.md §6), so a hostile server can't make a client hang.
 * **Origins.** Every sign-in signs the origin the client believes it talks to. A browser page served by the server uses its own origin; elsewhere, pass the public origin (auth.md §5).
-* **What the server can still do** to a client: refuse service, drop or roll back headers (formats.md §12), withhold events or tree changes. The ACL chain is pinned by the client; signed headers and the authenticated tier come in milestone 6.
+* **What the server can still do** to a client: refuse service, withhold or roll back what it serves. With integrity (§12) and signed headers, a rollback, a withheld tail or a fork is detected once a checkpoint covers it, or when pins are compared; without them, only the ACL chain is pinned. Tree checkpoints and the authenticated zen-db tier come in later milestone 6 steps.
