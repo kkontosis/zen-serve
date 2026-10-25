@@ -11,6 +11,8 @@ import {
   connect,
   credentialVault,
   type DeviceCredentials,
+  type Integrity,
+  type IntegrityOptions,
   type Session,
   sealedStore,
   type UnlockedFs,
@@ -40,6 +42,14 @@ export interface WorkerSignIn {
   fs?: number;
   /** A directory for a credential vault (the session survives restarts). */
   vaultDir?: string;
+  /**
+   * Attach integrity to the fs (docs/CLIENT.md "Integrity"), signed by the
+   * device of the file; `true` for the defaults. Pins are kept in the vault
+   * directory when there is one.
+   */
+  integrity?: Omit<IntegrityOptions, 'device'> | true;
+  /** A `fetch` for the client (tests that tamper with one worker's transport). */
+  fetch?: typeof fetch;
 }
 
 /** A signed-in worker. */
@@ -47,6 +57,8 @@ export interface WorkerContext {
   client: Client;
   session: Session;
   fs: UnlockedFs;
+  /** The fs's integrity, when attached (`integrity`). */
+  integrity?: Integrity;
   /** Open a database (no Web Locks or tab channel in Node: each instance owns). */
   open(ns: string, opts?: DbOptions): Promise<Db>;
   /** Close every database opened here, then the fs. */
@@ -65,14 +77,18 @@ async function deviceOf(d: string | DeviceFile): Promise<DeviceFile> {
 
 /** Sign in with a device key, unlock the fs with the passphrase. */
 export async function signInWorker(o: WorkerSignIn): Promise<WorkerContext> {
-  const client = await connect(o.url, { origin: o.origin ?? localOrigin(o.url) });
+  const client = await connect(o.url, {
+    origin: o.origin ?? localOrigin(o.url),
+    ...(o.fetch ? { fetch: o.fetch } : {}),
+  });
   const file = await deviceOf(o.device);
   const identity = zw.SigningIdentity.fromSeed(bytes.fromHex(file.identity_seed));
   const deviceSeed = bytes.fromHex(file.device_seed);
   const cert = bytes.fromHex(file.cert);
   let session: Session;
-  if (o.vaultDir) {
-    const vault = credentialVault(sealedStore(nodeDiskLocalStore(o.vaultDir)));
+  const store = o.vaultDir ? sealedStore(nodeDiskLocalStore(o.vaultDir)) : undefined;
+  if (store) {
+    const vault = credentialVault(store);
     if (!(await vault.device())) await vault.saveDevice({ identity, deviceSeed, cert });
     session = await vault.signIn(client);
   } else {
@@ -83,12 +99,22 @@ export async function signInWorker(o: WorkerSignIn): Promise<WorkerContext> {
     };
     session = await client.signInDevice(device);
   }
-  const fs = await session.fs(o.fs ?? 1).unlock({ passphrase: o.passphrase });
+  const locked = session.fs(o.fs ?? 1);
+  let integrity: Integrity | undefined;
+  if (o.integrity) {
+    integrity = await locked.integrity({
+      ...(o.integrity === true ? {} : o.integrity),
+      ...(store && !(o.integrity !== true && o.integrity.local) ? { local: store } : {}),
+      device: { device: zw.DeviceSecret.fromSeed(deviceSeed), cert },
+    });
+  }
+  const fs = await locked.unlock({ passphrase: o.passphrase });
   const dbs: Db[] = [];
   return {
     client,
     session,
     fs,
+    ...(integrity ? { integrity } : {}),
     async open(ns, opts = {}) {
       const db = await Db.open(fs, ns, { locks: null, channel: null, ...opts });
       dbs.push(db);
@@ -96,6 +122,7 @@ export async function signInWorker(o: WorkerSignIn): Promise<WorkerContext> {
     },
     async close() {
       await Promise.all(dbs.map((d) => d.close()));
+      await integrity?.close().catch(() => {});
       fs.close();
     },
   };
@@ -104,7 +131,7 @@ export async function signInWorker(o: WorkerSignIn): Promise<WorkerContext> {
 /**
  * Sign in from the environment `harness.workerEnv` sets: `ZEN_URL`,
  * `ZEN_ORIGIN`, `ZEN_DEVICE_FILE`, `ZEN_PASSPHRASE`, and optionally
- * `ZEN_VAULT_DIR`. For worker scripts.
+ * `ZEN_VAULT_DIR` and `ZEN_INTEGRITY=1` (attach integrity). For worker scripts.
  */
 export function workerFromEnv(env: Record<string, string | undefined> = process.env) {
   const need = (k: string): string => {
@@ -118,5 +145,6 @@ export function workerFromEnv(env: Record<string, string | undefined> = process.
     device: need('ZEN_DEVICE_FILE'),
     passphrase: need('ZEN_PASSPHRASE'),
     ...(env.ZEN_VAULT_DIR ? { vaultDir: env.ZEN_VAULT_DIR } : {}),
+    ...(env.ZEN_INTEGRITY === '1' ? { integrity: true as const } : {}),
   });
 }

@@ -13,6 +13,7 @@ import type {
   NodeState,
   PagePut,
   PageRef,
+  StateNode,
   Versions,
 } from '@zen/wasm';
 import { compare, equal, hex, randomBytes } from './bytes.js';
@@ -268,6 +269,27 @@ export interface ChangeBatch {
   cursor?: Uint8Array;
   /** More changes are ready (no wait). */
   more: boolean;
+  /**
+   * The tree's op count and chain at this point (api.md §12), when the
+   * response was caught up (`more` false). A replica that has applied
+   * this batch and nothing newer holds the state they name (fs.md §9).
+   */
+  head?: { ops: bigint; chain: Uint8Array };
+}
+
+/** A node state in the form `TreeState` and `stateLeaf` take (fs.md §9.1). */
+export function stateNodeOf(s: NodeState): StateNode {
+  return {
+    node: s.node,
+    ...(s.parent ? { parent: s.parent } : {}),
+    moveHlc: s.move_hlc,
+    moveDevice: s.move_device,
+    ...(s.meta ? { meta: s.meta } : {}),
+    ...(s.meta_hlc !== undefined ? { metaHlc: s.meta_hlc } : {}),
+    ...(s.meta_device ? { metaDevice: s.meta_device } : {}),
+    versions: s.versions,
+    changed: s.changed,
+  };
 }
 
 /** An operation as sent, for the op chain (formats.md §11.5). */
@@ -452,13 +474,14 @@ export class Tree {
   /**
    * The change feed (fs.md §5) from `cursor` (absent: a full sync). Without
    * `waitMs` it ends once caught up; with it, it long-polls for new changes
-   * until the caller stops iterating. Batches with no changes aren't yielded.
-   * A cursor older than the kept tombstones yields `{resync: true}` and goes
-   * on with a full sync.
+   * until the caller stops iterating. Batches with no changes aren't yielded,
+   * unless `heads` is set and they carry a `head` (so a follower sees every
+   * caught-up point). A cursor older than the kept tombstones yields
+   * `{resync: true}` and goes on with a full sync.
    */
   async *changes(
     cursor?: Uint8Array,
-    opts: { waitMs?: number; limit?: number } = {},
+    opts: { waitMs?: number; limit?: number; heads?: boolean } = {},
   ): AsyncGenerator<ChangeBatch> {
     let after = cursor;
     for (;;) {
@@ -479,7 +502,11 @@ export class Tree {
       }
       after = r.cursor ?? after;
       const more = r.more ?? false;
-      if (r.changes.length) {
+      const head =
+        !more && r.ops !== undefined && r.chain
+          ? { ops: BigInt(r.ops), chain: r.chain }
+          : undefined;
+      if (r.changes.length || (opts.heads && head)) {
         yield {
           changes: r.changes.map((c) => ({
             offset: c.offset,
@@ -488,6 +515,7 @@ export class Tree {
           })),
           ...(after ? { cursor: after } : {}),
           more,
+          ...(head ? { head } : {}),
         };
       }
       if (!more && opts.waitMs === undefined) return;
