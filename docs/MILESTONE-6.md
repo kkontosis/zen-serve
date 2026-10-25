@@ -183,7 +183,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **CI:** the `client` job builds `zen-server --features test-utils`.
   * Pushed 6ea8fa8. **The push run (395) was green; the pull_request run (396) was red in `client`**, at one test outside this step: `apps/chat` "who's online" (TD-TEST-OPEN-FAILURES item 4, first seen on 84c8c02 in milestone 5.5). Its diagnostic now says more: within 1.5 s, alice, carol and dave answered and bob (the asker) didn't; asked again with 10 s, alice, bob and dave answered and carol didn't. So a reply is **lost, not slow**, and a different one each time. The plan to find and fix the cause is "Step 6.3: the red on run 396" below.
   * Fixed and logged in "Step 6.3: the red on run 396" below. PR #56 merged at 883c9ba.
-* **Step 6.4** (fs and svc): planned below ("Step 6.4 in detail"). Restarted from main; the log above is now in the repo copy too.
+* **Step 6.4** (fs and svc): planned below ("Step 6.4 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (08750c1), PR #57.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
