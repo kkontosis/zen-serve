@@ -546,3 +546,50 @@ pub fn node_work(node: &[u8]) -> Key {
 pub fn node_conns(node: &[u8]) -> Key {
     Key::new().str("rnc").bytes(node)
 }
+
+// ---- integrity: checkpoints, devices, leases (keyspace.md §3.10)
+
+/// `("dk", fs, dev)`: a device's checkpoints, then `.int(seq)`.
+pub fn ckpts(fs: u32, dev: &[u8]) -> Key {
+    Key::new().str("dk").int(fs.into()).bytes(dev)
+}
+
+/// A device checkpoint.
+pub fn ckpt(fs: u32, dev: &[u8], seq: u64) -> Vec<u8> {
+    ckpts(fs, dev).int(seq as i64).finish()
+}
+
+/// `("dkh", fs)`: the devices' heads, then `.bytes(dev)`.
+pub fn ckpt_heads(fs: u32) -> Key {
+    Key::new().str("dkh").int(fs.into())
+}
+
+/// A device's newest checkpoint seq.
+pub fn ckpt_head(fs: u32, dev: &[u8]) -> Vec<u8> {
+    ckpt_heads(fs).bytes(dev).finish()
+}
+
+/// `("dkd", fs)`: the checkpoint doorbell.
+pub fn ckpt_bell(fs: u32) -> Vec<u8> {
+    Key::new().str("dkd").int(fs.into()).finish()
+}
+
+/// Prefix of every checkpoint doorbell (not exported).
+pub fn ckpt_bells() -> Vec<u8> {
+    Key::new().str("dkd").finish()
+}
+
+/// A registered device: `user ‖ cert`.
+pub fn device(dev: &[u8]) -> Vec<u8> {
+    Key::new().str("dv").bytes(dev).finish()
+}
+
+/// `("dvu", user)`: the devices a user registered, then `.bytes(dev)`.
+pub fn user_devices(user: &[u8]) -> Key {
+    Key::new().str("dvu").bytes(user)
+}
+
+/// A fenced lease (api.md §16).
+pub fn named_lease(fs: u32, name: &[u8]) -> Vec<u8> {
+    Key::new().str("ls").int(fs.into()).bytes(name).finish()
+}

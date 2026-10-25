@@ -117,7 +117,30 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * Done: the new `npm run check` passes. Run on the unfixed test file, it reports exactly CI's 2 errors. The integrity vectors test passes.
   * **CI green on both runs of b779c7c** (push 383, pull_request 384): rust, pure-rust, fdb and client all pass. Step 6.1 is done, waiting on review and merge of PR #54.
   * PR #54 merged at 3c8269a.
-* **Step 6.2** (server): planned below ("Step 6.2 in detail"). Restarted from main; the log above is now in the repo copy too.
+* **Step 6.2** (server): planned below ("Step 6.2 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (59d9346), PR #55.
+  * `spec:` commit 5951bc9: checkpoints count toward the fs quota (429 `quota`; pruning gives bytes back); `dkd` isn't exported; `examples/zen-serve.toml` gains `checkpoint_keep`.
+  * **zen-proto:** `Limits.checkpoint_keep`, `Commit.fence` (`Fence`), `Changes.ops`/`chain`, the checkpoint, device and named-lease types, `Frame::Cksub`/`Ckh`.
+  * **zen-server:**
+    * `integrity.rs` (checkpoint `put`/`heads`/`get`, `devices/register`/`get`), `lease.rs` (`/v1/lease`, `check_fence`), `quota.rs` (the quota check, now shared by commits and checkpoint puts)
+    * `commit.rs`: fences are validated (fs `write`, 1–64-byte names, one op each) and checked first in the transaction
+    * `acl.rs` `header_put`: signed headers are checked with `validate_header_successor` against the caller's ACL admins
+    * `tree.rs`: `changes` carries `ops`/`chain` when complete
+    * `stream.rs`: `cksub` (baseline heads, then watch `dkd` and push each moved head)
+    * `dump.rs`: `dkd` is private
+    * config `limits.checkpoint_keep` and `adversary`; `/v1/info` features and limit
+    * `adversary.rs` (`test-utils`): the storage decorator behind `AppState.view`, the five lies, `POST /v1/test/adversary`. Read endpoints switched to `st.view`: kv get/range, log read, stream subs, header get, tree reads (`read_txn`), checkpoint heads/get, devices get, `cksub`.
+  * **Tests:** new `tests/integrity.rs` (15 tests: features, the checkpoint log, ownership, quota, devices, `cksub`, the signed header chain, named leases, fences incl. the read-set conflict, `changes` ops/chain, four adversary tests and its gating). `tests/dump.rs`: the round trip now carries a checkpoint, a registered device and a lease, and checks `dkd` stays behind.
+  * **Found while verifying:**
+    * A POST to a missing route gets 405 from the static fallback, not 404: the gating test checks 405.
+    * The disk filled (971 MB free) while building the fdb tests, and FoundationDB stopped starting transactions, so every FDB test hung. Removed `target/debug/incremental` (2.9 GB, a cache) and stale test binaries (3.8 GB).
+    * The first FDB run after that recovery failed two dump tests at the new setup calls in `populated_on`. These tests run at once, and an import jumps the shared cluster's version (the 6.1 cause), so the extra calls widened the window. `populated_on` now retries its calls on `too_old`. Five plain reruns, then three with the fix, were green.
+  * **Checks (all clean):**
+    * fmt
+    * clippy `-D warnings`: default, `--no-default-features`, `--all-features`
+    * `cargo test -p zen-server -p zen-proto` (embedded)
+    * on local FDB: integrity and dump 3×, then the full `-p zen-store -p zen-server --features fdb`
+    * `build-wasm.sh` and `npm run check`
+    * vitest `kv`, `stream`, `tree`, `log`, `integrityvectors` and `packages/fs`
 
 ## Facts the design rests on (survey)
 

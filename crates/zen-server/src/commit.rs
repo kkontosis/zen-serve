@@ -76,6 +76,7 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
         + req.clear_ranges.len()
         + req.append.len()
         + req.consume.len()
+        + req.fence.len()
         + req.svc.iter().map(|s| 1 + s.out.len()).sum::<usize>();
     if ops > l.max_commit_ops as usize {
         return Err(too_large("too many operations"));
@@ -94,6 +95,10 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
     };
     for r in &req.read_conflicts {
         fs_ok(r.fs, R_READ)?;
+    }
+    for f in &req.fence {
+        fs_ok(f.fs, R_WRITE)?;
+        crate::lease::check_name(&f.name)?;
     }
     for e in &req.expect {
         fs_ok(e.fs, R_READ)?;
@@ -278,6 +283,9 @@ pub async fn execute(
             }
             t.clear(k);
         }
+        for f in &req.fence {
+            crate::lease::check_fence(&mut t, caller, f).await?;
+        }
         for r in &req.read_conflicts {
             let (b, e) = keys::kv_range(r.fs, &r.begin, r.end.as_deref());
             t.add_read_conflict_range(&b, &e);
@@ -420,29 +428,7 @@ pub async fn execute(
         }
         let writes = eng.writes;
         let adds = rows.adds;
-        for (fs, (bytes, nkeys)) in &delta {
-            if let Some(l) = limits.get(fs) {
-                for (what, d, max) in [("bytes", *bytes, l.max_bytes), ("keys", *nkeys, l.max_keys)]
-                {
-                    if let (true, Some(max)) = (d > 0, max) {
-                        let cur = t
-                            .snapshot_get(&keys::quota(*fs, what))
-                            .await?
-                            .map(|v| i64::from_le_bytes(v.try_into().unwrap_or_default()))
-                            .unwrap_or(0);
-                        if cur.saturating_add(d) > max as i64 {
-                            return Err(quota(format!("fs {fs} {what} quota exceeded")));
-                        }
-                    }
-                }
-            }
-            if *bytes != 0 {
-                t.atomic_add(&keys::quota(*fs, "bytes"), *bytes);
-            }
-            if *nkeys != 0 {
-                t.atomic_add(&keys::quota(*fs, "keys"), *nkeys);
-            }
-        }
+        crate::quota::apply(&mut t, &limits, &delta).await?;
         let n = req.append.len() as u16;
         let mut rec = n.to_be_bytes().to_vec();
         rec.extend_from_slice(&caller.device);

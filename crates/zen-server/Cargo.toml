@@ -26,9 +26,12 @@ fdb = ["zen-store/fdb", "dep:nix"]
 pure = ["blake3/pure"]
 # A software WebAuthn authenticator (`webauthn::soft`) and the RSA test
 # helpers (`rsakey::testing`), for tests.
-test-utils = ["zen-tls-rustcrypto/test-utils"]
+# Also the test adversary (`adversary`): a config switch that makes the
+# server lie to readers, for testing detection (docs/MILESTONE-6.md).
+test-utils = ["zen-tls-rustcrypto/test-utils", "dep:async-trait"]
 
 [dependencies]
+async-trait = { version = "0.1", optional = true }
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }

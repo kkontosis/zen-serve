@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 pub mod acl;
+#[cfg(feature = "test-utils")]
+pub mod adversary;
 pub mod auth;
 pub mod cbor;
 pub mod commit;
@@ -17,14 +19,17 @@ pub mod dump;
 pub mod eph;
 pub mod error;
 pub mod ids;
+pub mod integrity;
 pub mod keys;
 pub mod kv;
+pub mod lease;
 pub mod log;
 pub mod mtls;
 pub mod opaque;
 pub mod origin;
 pub mod passkey;
 pub mod password;
+pub mod quota;
 pub mod state;
 pub mod statics;
 pub mod stream;
@@ -78,6 +83,10 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             "crdt_rows",
             "fs_pages",
             "svc",
+            "checkpoints",
+            "signed_header",
+            "lease",
+            "devices",
         ]
         .map(String::from)
         .to_vec(),
@@ -107,6 +116,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             max_groups_per_topic: l.max_groups_per_topic,
             ephemeral_bytes_per_sec: l.ephemeral_bytes_per_sec,
             ephemeral_burst_bytes: l.ephemeral_burst_bytes,
+            checkpoint_keep: l.checkpoint_keep,
         },
         auth: Some(auth::info(&st).await),
     })
@@ -299,8 +309,19 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/admin/status", post(admin_status))
         .route("/v1/admin/origins/get", post(origin::admin_get))
         .route("/v1/admin/origins/set", post(origin::admin_set))
+        .route("/v1/checkpoint/put", post(integrity::put))
+        .route("/v1/checkpoint/heads", post(integrity::heads))
+        .route("/v1/checkpoint/get", post(integrity::get))
+        .route("/v1/devices/register", post(integrity::register))
+        .route("/v1/devices/get", post(integrity::devices_get))
+        .route("/v1/lease", post(lease::lease))
         .route("/v1/stream", get(stream::ws))
-        .fallback(statics::fallback)
+        .fallback(statics::fallback);
+    #[cfg(feature = "test-utils")]
+    if st.adversary.is_some() {
+        r = r.route("/v1/test/adversary", post(adversary::tell));
+    }
+    r = r
         .layer(DefaultBodyLimit::max(limit))
         .layer(middleware::from_fn_with_state(
             st.clone(),

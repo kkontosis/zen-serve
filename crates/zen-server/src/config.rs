@@ -39,6 +39,10 @@ pub struct Config {
     /// CORS allowlist (G17). Empty: same-origin only.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Serve the test adversary (`adversary.rs`): lies to readers on
+    /// request, for testing detection. Only builds with `test-utils`.
+    #[serde(default)]
+    pub adversary: bool,
     /// Native TLS on `listen` (operations.md §8). Absent: plain HTTP.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -460,6 +464,8 @@ pub struct LimitsConfig {
     pub max_groups_per_topic: u32,
     /// Max depth of a move's new parent (ancestors walked per move).
     pub crdt_max_depth: u32,
+    /// Device checkpoints kept per device and fs (api.md §15.1).
+    pub checkpoint_keep: u32,
 }
 
 impl Default for LimitsConfig {
@@ -485,6 +491,7 @@ impl Default for LimitsConfig {
             chunk_grace_secs: 86_400,
             max_groups_per_topic: 64,
             crdt_max_depth: 1000,
+            checkpoint_keep: 1024,
         }
     }
 }
@@ -531,6 +538,7 @@ impl Config {
             csp: default_csp(),
             cross_origin_isolation: false,
             cors_origins: Vec::new(),
+            adversary: false,
             tls: None,
             auth: AuthConfig::default(),
             limits: LimitsConfig::default(),
@@ -574,8 +582,17 @@ impl Config {
         if self.limits.max_commit_ops > u16::MAX as u32 {
             return Err("limits.max_commit_ops must be at most 65535".into());
         }
-        if self.limits.crdt_max_depth == 0 || self.limits.max_range_items == 0 {
-            return Err("limits.crdt_max_depth and max_range_items must be at least 1".into());
+        if self.limits.crdt_max_depth == 0
+            || self.limits.max_range_items == 0
+            || self.limits.checkpoint_keep == 0
+        {
+            return Err(
+                "limits.crdt_max_depth, max_range_items and checkpoint_keep must be at least 1"
+                    .into(),
+            );
+        }
+        if self.adversary && !cfg!(feature = "test-utils") {
+            return Err("adversary: this zen-serve is built without test-utils".into());
         }
         let l = &self.limits;
         if l.ephemeral_bytes_per_sec > 0

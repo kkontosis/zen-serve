@@ -91,7 +91,7 @@ pub async fn get(
     if req.keys.len() > st.cfg.limits.max_range_items as usize {
         return Err(too_large("too many keys"));
     }
-    let mut t = st.store.begin(req.read_version).await?;
+    let mut t = st.view.begin(req.read_version).await?;
     let mut items = Vec::with_capacity(req.keys.len());
     for k in req.keys {
         let k = k.into_vec();
@@ -130,7 +130,7 @@ pub async fn range(
     let max = st.cfg.limits.max_range_items;
     let limit = req.limit.unwrap_or(max).clamp(1, max) as usize;
     let (b, e) = keys::kv_range(req.fs, &req.begin, req.end.as_deref());
-    let mut t = st.store.begin(req.read_version).await?;
+    let mut t = st.view.begin(req.read_version).await?;
     let (mut got, capped) = read_capped(
         &mut t,
         &b,

@@ -62,11 +62,14 @@ fn io(e: std::io::Error) -> String {
 /// challenge key. It is never exported or imported, and doesn't make a
 /// target count as holding data, so a server that was only ever started can
 /// be imported into without `--force`. Relay keys (§3.9) are transient: a
-/// socket can't move with the data.
+/// socket can't move with the data. Checkpoint doorbells (§3.10) only wake
+/// streams.
 fn private(k: &[u8]) -> bool {
     static RELAY: std::sync::LazyLock<Vec<Vec<u8>>> =
         std::sync::LazyLock::new(keys::relay_prefixes);
-    k.starts_with(&keys::meta_prefix()) || RELAY.iter().any(|p| k.starts_with(p))
+    k.starts_with(&keys::meta_prefix())
+        || k.starts_with(&keys::ckpt_bells())
+        || RELAY.iter().any(|p| k.starts_with(p))
 }
 
 /// Stream every pair in key order to `f`, reading in chunks. One
@@ -155,6 +158,7 @@ async fn empty_now(store: &dyn Storage) -> zen_store::Result<bool> {
     let mut t = store.begin(None).await?;
     let mut skip = keys::relay_prefixes();
     skip.push(keys::meta_prefix());
+    skip.push(keys::ckpt_bells());
     skip.sort();
     // The gaps between the skipped ranges, then the rest of the keyspace.
     let mut from = Vec::new();

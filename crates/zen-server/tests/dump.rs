@@ -60,15 +60,40 @@ async fn try_everything(s: &dyn Storage) -> zen_store::Result<Vec<KeyValue>> {
             break;
         }
     }
-    // Server metadata is private to each store (keyspace.md §3.4).
-    let private = zen_server::keys::meta_prefix();
-    out.retain(|(k, _)| !k.starts_with(&private));
+    // Server metadata is private to each store (keyspace.md §3.4), and
+    // checkpoint doorbells only wake streams (§3.10): neither is exported.
+    let private = [
+        zen_server::keys::meta_prefix(),
+        zen_server::keys::ckpt_bells(),
+    ];
+    out.retain(|(k, _)| !private.iter().any(|p| k.starts_with(p)));
     Ok(out)
 }
 
 /// A server with some KV data and events; returns it with a session token.
 async fn populated() -> (Harness, Vec<u8>, CommitResult) {
     populated_on(Harness::start().await).await
+}
+
+/// `h.call`, retried on `too_old`: tests in this binary run at once, and an
+/// import or migrate jumps a shared FoundationDB cluster's version, after
+/// which it refuses transactions for a few seconds.
+async fn call<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+    h: &Harness,
+    path: &str,
+    tok: &[u8],
+    req: &Q,
+) -> R {
+    for _ in 0..50 {
+        match h.call(path, Some(tok), req).await {
+            Ok(r) => return r,
+            Err((409, e)) if e.code == "too_old" => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("{path}: {e:?}"),
+        }
+    }
+    panic!("{path}: storage kept failing");
 }
 
 async fn populated_on(h: Harness) -> (Harness, Vec<u8>, CommitResult) {
@@ -89,8 +114,43 @@ async fn populated_on(h: Harness) -> (Harness, Vec<u8>, CommitResult) {
             .collect(),
         ..Default::default()
     };
-    let r: CommitResult = h.call("/v1/commit", Some(&tok), &c).await.unwrap();
+    let r: CommitResult = call(&h, "/v1/commit", &tok, &c).await;
+    // Integrity data (keyspace.md §3.10): a checkpoint, a registered
+    // device and a fenced lease.
+    let _: CheckpointVersion = call(
+        &h,
+        "/v1/checkpoint/put",
+        &tok,
+        &CheckpointPut {
+            fs: 1,
+            device: admin_device(),
+            seq: 1,
+            checkpoint: checkpoint_of(&admin.device, 1, 1),
+        },
+    )
+    .await;
+    let extra = zen_core::sig::DeviceSecret::from_seed(&[0x33; 32]);
+    let cert = zen_core::sig::issue_device_cert(&admin.id, &extra.public(), 1).unwrap();
+    let _: DeviceRegistered =
+        call(&h, "/v1/devices/register", &tok, &DeviceRegister { cert }).await;
+    let _: NamedLease = call(
+        &h,
+        "/v1/lease",
+        &tok,
+        &NamedLeasePut {
+            fs: 1,
+            name: b"vol".to_vec(),
+            token: None,
+            ttl_ms: None,
+            release: false,
+        },
+    )
+    .await;
     (h, tok, r)
+}
+
+fn admin_device() -> Vec<u8> {
+    User::new(1).device.public().fingerprint().to_vec()
 }
 
 fn fresh_embedded(dir: &std::path::Path) -> Embedded {
@@ -117,6 +177,14 @@ async fn export_import_round_trip() {
             .unwrap();
         assert_eq!((hdr.backend.as_str(), st2.keys), ("test", st.keys));
         assert_eq!(everything(&dst).await, everything(src.as_ref()).await);
+        // Checkpoints and their heads are data; the doorbell isn't.
+        let copied = everything(&dst).await;
+        let has = |p: Vec<u8>| copied.iter().any(|(k, _)| k.starts_with(&p));
+        assert!(has(zen_server::keys::ckpts(1, &admin_device()).finish()));
+        assert!(has(zen_server::keys::ckpt_head(1, &admin_device())));
+        let bell = zen_server::keys::ckpt_bell(1);
+        assert!(get(src.as_ref(), &bell).await.is_some());
+        assert!(get(&dst, &bell).await.is_none());
         // The pinned sign-in origin is data, not server metadata.
         let pins = zen_server::keys::origin_pins();
         assert!(everything(&dst).await.iter().any(|(k, _)| *k == pins));

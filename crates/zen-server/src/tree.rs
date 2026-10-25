@@ -933,7 +933,7 @@ impl<'a> Engine<'a> {
 // ------------------------------------------------------------------ reads
 
 async fn read_txn(st: &Shared, rv: Option<u64>) -> ApiResult<Box<dyn Txn>> {
-    Ok(st.store.begin(rv).await?)
+    Ok(st.view.begin(rv).await?)
 }
 
 async fn load_node(
@@ -1068,12 +1068,14 @@ async fn read_changes(st: &Shared, req: &TreeChanges, tree: &Id) -> ApiResult<Ch
     let mut t = read_txn(st, None).await?;
     let prefix = keys::changes(req.fs, tree);
     let pfx = prefix.clone().finish();
+    let mut header = None;
     let begin = match &req.after {
         Some(a) => {
             let a: [u8; 12] = a[..]
                 .try_into()
                 .map_err(|_| bad_request("after must be 12 bytes"))?;
-            if a < load_header(&mut t, req.fs, tree).await?.resync_before {
+            let h = header.insert(load_header(&mut t, req.fs, tree).await?);
+            if a < h.resync_before {
                 return Err(resync("the cursor is older than the kept tombstones"));
             }
             strinc(&prefix.vs(&a).finish()).ok_or_else(|| internal("bad cursor key"))?
@@ -1119,10 +1121,23 @@ async fn read_changes(st: &Shared, req: &TreeChanges, tree: &Id) -> ApiResult<Ch
         .last()
         .map(|c| c.offset.clone())
         .or_else(|| req.after.clone());
+    // The complete feed carries the header of the same read, so a replica
+    // knows which `ops` its tree state stands for (api.md §12, fs.md §9.1).
+    let (ops, chain) = if more {
+        (None, None)
+    } else {
+        let h = match header {
+            Some(h) => h,
+            None => load_header(&mut t, req.fs, tree).await?,
+        };
+        (Some(h.ops), Some(h.chain.to_vec()))
+    };
     Ok(Changes {
         changes,
         cursor,
         more,
+        ops,
+        chain,
     })
 }
 
