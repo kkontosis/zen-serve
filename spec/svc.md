@@ -368,4 +368,8 @@ With `inbox`:
     * a handler aborts on a cursor regression it can see (§6)
     * TLS 1.2 AES-GCM explicit nonces carry a 32-bit prefix drawn at random for each batch of records (§7.1), so a rolled-back sequence number repeats a nonce only with probability 2^-32 per batch
   * **Handler checkpoints** (milestone 6) bound this. A handler names each connection it serves in its device checkpoints (formats.md §14, entry type 5: `svc, conn, in_acked, out_head`), at least every `sig_every` steps and when it releases the connection or its lease. A successor verifies the checkpoints of the fs before resuming a claim (formats.md §14.4), and aborts a connection whose claimed `(in_acked, out_head)` is below the newest verified entry. So a rollback that reuses nonces is possible only past the predecessor's last checkpoint; `sig_every = 1` checkpoints every step and closes it.
+    * A successor syncs the fs's device checkpoints before it resumes the connections a claim returned. The claimed cursors are checked against the floor, then noted (they ride in the successor's next checkpoint).
+    * A handler writes a checkpoint before it hands back a live connection or releases its lease. Connections it closes need none: no one resumes them.
+    * The cadence is the device's (`sig_every`): every committed step counts as a change. A crash leaves the window since the last checkpoint.
+    * The handler's database (zendb.md §14) isn't covered until authenticated namespaces (milestone 6, step 5).
   * Honest failures never cause reuse: an uncommitted record is never revealed.

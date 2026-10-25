@@ -606,7 +606,7 @@ NodeState = { node: bytes(16),
 | `POST /v1/fs/tree/get {fs, tree, nodes: [bytes(16)], read_version?}` | `{read_version, nodes: [NodeState]}`. Unknown nodes are left out. |
 | `POST /v1/fs/tree/children {fs, tree, parent, after?: bytes(16), limit?, read_version?}` | `{read_version, nodes: [NodeState], more}`, in node-id order after `after` |
 | `POST /v1/fs/tree/changes {fs, tree, after?: bytes(12), limit?, wait_ms?}` | `{changes: [{offset: bytes(12), node, state?: NodeState}], cursor?: bytes(12), more, ops?: u64, chain?: bytes(32)}` |
-| `POST /v1/fs/tree/chain {fs, tree}` | `{ops: u64, chain: bytes(32)}` (formats.md §11.5) |
+| `POST /v1/fs/tree/chain {fs, tree}` | `{ops: u64, chain: bytes(32)}` (formats.md §11.5); `ops` counts operations and purge rounds |
 | `POST /v1/fs/file/get {fs, tree, node, read_version?}` | `{read_version, versions: [{dot, device, chunks: [bytes(16)], pages?: [bytes(16)], manifest}]}`. A paged version has `pages` and empty `chunks`. |
 | `POST /v1/fs/chunks/get {fs, ids: [bytes(16)]}` | `{chunks: [{id, data?}]}`. `data` is absent for unknown ids. |
 | `POST /v1/fs/pages/get {fs, ids: [bytes(16)]}` | `{pages: [{id, data?}]}`, at most 64 ids. `data` is absent for unknown ids. |

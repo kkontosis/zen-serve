@@ -166,6 +166,8 @@ The sweeper (every node runs it) keeps the tree bounded. It visits only trees wi
 
   Purging removes the whole subtree: node records, versions, children entries. Chunk references are released, and each purged node leaves a tombstone in the change feed, plus a by-id entry (keyspace.md §3.6, `tp`) that refuses later operations on the node (§3.4) until the tombstone is dropped.
 
+  Each round that removes nodes adds a purge record to the tree's op chain (formats.md §11.5), so `(ops, chain)` names every change of the node set (§9).
+
   The sweeper works through the trash in bounded rounds, each resuming where the last one stopped (keyspace.md §3.6, `tq`) and starting over after the last child of `TRASH`. So a subtree that can't be purged yet doesn't hold up the others. A subtree too large for one round is removed over several, leaves first: a node is removed only in a round that also removes all of its children, so an interrupted purge never leaves an orphan.
 
   The rule above holds for the whole subtree, including the part a round doesn't reach. Before removing part of a subtree, the round reads the tree's move log from the horizon on (it keeps every recent move), and walks up from each node whose current move is that recent. If one is inside the subtree, nothing of the subtree is removed. This check is bounded at 5,000 log entries and 2,000 node reads per round. While a tree has more recent moves than that, subtrees too large for one round wait. Smaller ones are still purged, because their round sees every node.
@@ -193,9 +195,13 @@ The sweeper (every node runs it) keeps the tree bounded. It visits only trees wi
 * **Op chain.**
   * The server records the sending device with every operation.
   * It extends a per-tree hash chain over operations in **arrival order**: `chain_n = H("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op_bytes) ‖ device)`, formats.md §11.5.
+  * Each trash-purge round that removes nodes extends it with a purge record (formats.md §11.5).
   * `/v1/fs/tree/chain` returns `(count, chain)`.
 * **What the server could still do.** It could serve an old version as the current one, drop operations, or merge wrongly. That would deny service or show stale data, but it can't forge content. A client that replays the operations it holds detects a wrong merge.
 * **Tree state.** A replica computes a hash of the node states it holds, defined below. A device names `(ops, chain, state)` of a tree in its device checkpoints (formats.md §14), taken where its replica had applied every change up to a `changes` response with `more: false`, which carries the `ops` and `chain` of that point (api.md §12). Another device at the same `ops` must hold the same `chain` and `state`; a different one, or a lower `ops` than a verified checkpoint names, means the server showed it another or an older history (formats.md §14.4).
+  * **Same `ops`, same state.** Operations and purge rounds (§6) are all in the chain, and nothing else changes a node record, so honest replicas at the same `ops` hold the same nodes.
+  * **When a replica checks.** Only where its node table is exactly the server's at a `changes` response with `more: false`: it has applied that response and nothing newer, and after a full sync it has also dropped the nodes the full sync didn't return.
+  * **What it checks**, against the floor of verified checkpoints and its own pins: an `ops` below the floor is a **rollback**; the same `ops` with another `chain` or `state` is a **fork**.
 
 ### 9.1 Tree state
 
