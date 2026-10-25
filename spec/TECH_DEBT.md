@@ -294,6 +294,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** Detecting a consistent rollback needs state outside the server: signed, gossiped checkpoints. That is milestone 6's authenticated tier. Honest failures can't cause reuse, because uncommitted output is never revealed (svc.md §5).
 * **Mitigations until then:** A handler aborts a connection when a claim shows cursors lower than it has seen (svc.md §6). TLS 1.2 AES-GCM explicit nonces carry a 32-bit prefix drawn at random for each batch of records (svc.md §7.1), so a rolled-back sequence number repeats a nonce only with probability 2^-32 per batch.
 * **What it would take:** Put `(conn, out_head)` in the handler-signed checkpoint of milestone 6 (zendb.md §14), and have a successor refuse a state older than the newest checkpoint it can verify.
+* **Narrowed (milestone 6, step 4):** handlers name each connection's `(in_acked, out_head)` in their device checkpoints, checkpoint before a release, and a successor syncs and refuses a claim below the newest verified entry (svc.md §12, docs/SVC.md §6). Left: the handler's database, which can still be rolled back together with a connection whose cursors are within the window, until authenticated namespaces (milestone 6, step 5); and the window itself (steps since a crashed handler's last checkpoint; `sigEvery: 1` closes it).
 
 ## TD-SVC-TLS-HANDSHAKE-RESUME
 
