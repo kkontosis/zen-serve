@@ -67,6 +67,14 @@ pub const OPAQUE_KEYSLOT: &str = "zen/v1/opaque-keyslot";
 pub const DB_PARTS_DIGEST: &str = "zen/v1/db-parts-digest";
 /// Hash: `key_hash` of an output record's key (spec/formats.md §13.1).
 pub const SVC_REVEAL: &str = "zen/v1/svc-reveal";
+/// Hash: `HC(body)` of a device checkpoint (spec/formats.md §14.1).
+pub const CHECKPOINT_HASH: &str = "zen/v1/checkpoint-hash";
+/// Hash: `HH` of a signed fs header (spec/formats.md §12.1).
+pub const FS_HEADER_CHAIN: &str = "zen/v1/fs-header-chain";
+/// Hash: `HE(body)` of a version-2 event body (spec/formats.md §5.1).
+pub const EVENT_CHAIN: &str = "zen/v1/event-chain";
+/// Hash: leaves and inner nodes of a filesystem tree state (spec/fs.md §9).
+pub const TREE_STATE: &str = "zen/v1/tree-state";
 
 /// OPAQUE: prefix of the AKE context, `label ‖ 0x00 ‖ origin` (sign-in
 /// method 3).
@@ -98,29 +106,33 @@ pub const AAD_SVC_KEY: &str = "zen/v1/aad/svc-key";
 pub const AAD_SVC_OUT: &str = "zen/v1/aad/svc-out";
 /// AAD domain: sealed input chunk (no header).
 pub const AAD_SVC_IN: &str = "zen/v1/aad/svc-in";
+/// AAD domain: device checkpoint (kind 11).
+pub const AAD_CHECKPOINT: &str = "zen/v1/aad/checkpoint";
 
 /// Signature domain prefix, prepended to every signed message.
 pub const SIG_DOMAIN: &str = "zen/v1/sig";
 /// Signature purpose: device certificate issued by a user identity.
 pub const SIG_DEVICE_CERT: &str = "zen/v1/sig/device-cert";
-/// Signature purpose: commit record / signed root.
+/// Signature purpose: reserved (roots ride in device checkpoints).
 pub const SIG_COMMIT: &str = "zen/v1/sig/commit";
-/// Signature purpose: per-device event checkpoint.
+/// Signature purpose: device checkpoint (spec/formats.md §14.2).
 pub const SIG_CHECKPOINT: &str = "zen/v1/sig/checkpoint";
 /// Signature purpose: signed ACL document.
 pub const SIG_ACL: &str = "zen/v1/sig/acl";
 /// Signature purpose: membership-log entry.
 pub const SIG_MEMBERSHIP: &str = "zen/v1/sig/membership";
-/// Signature purpose: individual event (when `sig_every = 1` uses Ed25519 only).
+/// Signature purpose: reserved (events are chained, spec/formats.md §5.1).
 pub const SIG_EVENT: &str = "zen/v1/sig/event";
 /// Signature purpose: device sign-in challenge.
 pub const SIG_SESSION: &str = "zen/v1/sig/session";
-/// Signature purpose: filesystem tree checkpoint.
+/// Signature purpose: reserved (tree states ride in device checkpoints).
 pub const SIG_TREE_CHECKPOINT: &str = "zen/v1/sig/tree-checkpoint";
 /// Signature purpose: sign-in challenge signed by a password-derived key.
 pub const SIG_PASSWORD_SESSION: &str = "zen/v1/sig/password-session";
-/// Signature purpose: zen-db signed root (authenticated tier, milestone 6).
+/// Signature purpose: reserved (zen-db roots ride in device checkpoints).
 pub const SIG_DB_ROOT: &str = "zen/v1/sig/db-root";
+/// Signature purpose: signed fs header (spec/formats.md §12.1).
+pub const SIG_FS_HEADER: &str = "zen/v1/sig/fs-header";
 /// Signature purpose: a signed app bundle (reserved, milestone 11).
 pub const SIG_APP_BUNDLE: &str = "zen/v1/sig/app-bundle";
 
@@ -159,6 +171,10 @@ pub const ALL: &[&str] = &[
     OPAQUE_KEYSLOT,
     DB_PARTS_DIGEST,
     SVC_REVEAL,
+    CHECKPOINT_HASH,
+    FS_HEADER_CHAIN,
+    EVENT_CHAIN,
+    TREE_STATE,
     OPAQUE_CONTEXT,
     AAD_KV,
     AAD_EVENT,
@@ -173,6 +189,7 @@ pub const ALL: &[&str] = &[
     AAD_SVC_KEY,
     AAD_SVC_OUT,
     AAD_SVC_IN,
+    AAD_CHECKPOINT,
     SIG_DOMAIN,
     SIG_DEVICE_CERT,
     SIG_COMMIT,
@@ -184,6 +201,7 @@ pub const ALL: &[&str] = &[
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
     SIG_DB_ROOT,
+    SIG_FS_HEADER,
     SIG_APP_BUNDLE,
 ];
 
@@ -199,5 +217,6 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_TREE_CHECKPOINT,
     SIG_PASSWORD_SESSION,
     SIG_DB_ROOT,
+    SIG_FS_HEADER,
     SIG_APP_BUNDLE,
 ];

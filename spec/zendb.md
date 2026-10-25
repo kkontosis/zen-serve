@@ -976,11 +976,11 @@ The cases of DESIGN-3 §3.2, plus the ones a client library adds:
   * Every value is AEAD-sealed and bound to its key: no forgery, no swapping between keys.
   * The server **can** serve an older valid version of a value, or an older RootRecord together with the nodes of that older tree. It can also withhold events (G26).
   * A member can forge another member's `sender_fp`, since all members hold the topic keys (DESIGN-2 §2.6).
-* **Reserved for milestone 6 (the authenticated tier):**
+* **Reserved for milestone 6 (the authenticated tier, specified with its code in a later step of milestone 6):**
   * the DbRecord value `integrity: "authenticated"`
-  * the signature purpose `zen/v1/sig/db-root` (spec/labels.md), for a signed root over each index root, a row tree and the catalog
-  * Private-index node ids are already keyed hashes of their content, so a signed root id commits to a whole index. Milestone 6 reuses this.
-* **Event signatures** stay as DESIGN-2 §2.6 and DESIGN-3 §0 describe them, for a later milestone.
+  * a namespace root over each index root, a row tree and the catalog, chained by `seq` inside its sealed value, and named by device checkpoints (formats.md §14, entry type 3) instead of a signature per commit. The purpose `zen/v1/sig/db-root` stays reserved.
+  * Private-index node ids are already keyed hashes of their content, so a root id commits to a whole index. Milestone 6 reuses this.
+* **Events** are chained per writer (formats.md §5.1), and device checkpoints carry topic heads, so withheld events are detected (G26). A member can still forge another member's `sender_fp` inside an event; the chain of a forged sender doesn't extend the real sender's checkpointed chain.
 
 ## 15. Leakage
 

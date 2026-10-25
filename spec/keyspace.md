@@ -224,3 +224,22 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
   * deletes `rli` entries older than `limits.ephemeral_ttl_secs`
 * **Ending a lease** deletes its `rl`, `rld` and every `rli` entry, after requeueing its connections.
 * **Relay keys are transient:** `export` skips the prefixes above and `import` ignores them (operations.md §6); a socket can't move with the data.
+
+### 3.10 Integrity: checkpoints, devices, leases (formats.md §14, api.md §15, §16)
+
+`dev` is a 32-byte device fingerprint and `seq` an integer element. `name` is a lease name (1–64 bytes, client-chosen and preferably a token), a byte-string element.
+
+| Key | Value |
+|---|---|
+| `pack("dk", fs, dev, seq)` | `versionstamp ‖ checkpoint`: a sealed device checkpoint (formats.md §14.2), as put |
+| `pack("dkh", fs, dev)` | `u64 seq`: the device's newest checkpoint |
+| `pack("dkd", fs)` | `versionstamp` of the last checkpoint put in the fs; watched to wake `cksub` streams |
+| `pack("dv", dev)` | `user_fp(32) ‖ cert`: a device registered by its user (api.md §15.2) |
+| `pack("dvu", user_fp, dev)` | empty: the devices a user has registered |
+| `pack("ls", fs, name)` | fenced lease: `holder(32) ‖ u64 token ‖ u64 expires_version` (api.md §16) |
+
+* **Checkpoints.** A put reads `dkh` normally, so two puts of one `seq` can't both commit. It writes `dk` and `dkh`, rings `dkd`, and deletes `pack("dk", fs, dev, seq − checkpoint_keep)`, so a device keeps its newest `checkpoint_keep`.
+* **Devices.** `dv` is keyed by device, so a verifier finds a certificate by fingerprint. `dvu` lists a user's registered devices, for the per-user cap (api.md §15.2).
+* **Leases** follow the consume leases (§3.3, §3.5): never deleted, so tokens only grow. A release sets `expires_version` to 0.
+* `dk`, `dkh`, `dv`, `dvu` and `ls` are data (`export` copies them); `dkd` is a doorbell.
+* The fs header key `pack("hdr", fs)` (§3.1) holds either form of the header (formats.md §12, §12.1).

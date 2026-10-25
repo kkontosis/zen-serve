@@ -195,7 +195,34 @@ The sweeper (every node runs it) keeps the tree bounded. It visits only trees wi
   * It extends a per-tree hash chain over operations in **arrival order**: `chain_n = H("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op_bytes) ‖ device)`, formats.md §11.5.
   * `/v1/fs/tree/chain` returns `(count, chain)`.
 * **What the server could still do.** It could serve an old version as the current one, drop operations, or merge wrongly. That would deny service or show stale data, but it can't forge content. A client that replays the operations it holds detects a wrong merge.
-* **Signed checkpoints** (a later milestone): devices sign `(state hash, count, chain)` with the purpose `zen/v1/sig/tree-checkpoint`, so other devices can check the server's history.
+* **Tree state.** A replica computes a hash of the node states it holds, defined below. A device names `(ops, chain, state)` of a tree in its device checkpoints (formats.md §14), taken where its replica had applied every change up to a `changes` response with `more: false`, which carries the `ops` and `chain` of that point (api.md §12). Another device at the same `ops` must hold the same `chain` and `state`; a different one, or a lower `ops` than a verified checkpoint names, means the server showed it another or an older history (formats.md §14.4).
+
+### 9.1 Tree state
+
+**Leaf.** Each node the change feed delivers with a state (api.md §12, `NodeState`) has a leaf; tombstones have none:
+
+```
+leaf = H(0x00 ‖ node(16) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_device(32)
+            ‖ u64 meta_hlc ‖ meta_device(32) ‖ lp(meta) ‖ u32 versions ‖ changed(12))
+H(x) = BLAKE3.derive_key("zen/v1/tree-state", x)
+```
+
+* `flags`: bit 0 = has `parent`, bit 1 = has `meta`. A field that is absent is zero bytes (`meta`: empty), as in the node record (keyspace.md §3.6).
+* `meta` is the sealed meta (kind 4), byte for byte, so the leaf commits to the node's name and attributes without opening them. `changed` is the node's change offset, which moves whenever its content does.
+
+**Fold.** A radix tree of fixed shape over node ids, 256-ary, three levels:
+
+```
+N(p), p of 2 bytes  = H(0x01 ‖ for each node whose id starts with p, in id order: node(16) ‖ leaf)
+N(p), p of 0 or 1 byte = H(0x02 ‖ for each byte b in 0…255 with a node whose id starts with p ‖ b: u8 b ‖ N(p ‖ b))
+state = N(empty)
+```
+
+* Empty subtrees are left out, so the empty tree's state is `H(0x02)`.
+* The shape depends only on the set of nodes, so two replicas with the same nodes compute the same state, whatever order they learned them in. A change recomputes one bucket and two inner nodes of at most 256 entries each.
+* The tree is a Merkle tree of a collision-resistant hash, so it needs no key, unlike a sum or XOR of leaves, which generalized-birthday attacks break.
+
+Vectors: `test-vectors/integrity.json`.
 
 ## 10. Leakage
 

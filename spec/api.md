@@ -38,7 +38,8 @@ No authentication. Returns:
 { server: text, api: 1,
   suites: [1],                       // supported suite ids (spec/suites.md)
   formats: [1],
-  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows", "fs_pages", "svc"
+  features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows", "fs_pages", "svc",
+                                     //   "checkpoints", "signed_header", "lease", "devices" (§15, §16, §4.4)
   cross_origin_isolation: bool,      // DESIGN-3 §4.2
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
@@ -48,7 +49,7 @@ No authentication. Returns:
             ephemeral_bytes_per_sec, ephemeral_burst_bytes,
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
-            chunk_grace_secs },
+            chunk_grace_secs, checkpoint_keep },
   auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2); a dormant mtls is left out (auth.md §10)
            origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
            passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
@@ -57,7 +58,7 @@ No authentication. Returns:
            password_params?: { m_cost_kib: u32, t_cost: u32, p_cost: u32 } } }   // auth.md §11.2
 ```
 
-Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400.
+Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400; `checkpoint_keep` 1,024 (§15.1).
 
 * **Range reads** (`/v1/kv/range`, `/v1/log/read`, `tree/children`, `tree/changes`, `dlq/list`, stream subscriptions) return at most `max_range_items` items **and** stop once the items returned hold about `max_range_bytes` of keys and values; either cut sets `more`. A range the server must read whole (`expect_ranges`, `clear_ranges`, a file's versions) returns 413 `too_large` past either cap.
 
@@ -349,7 +350,7 @@ put: {fs, header: bytes, expect: bytes(10)?} → {version: bytes(10)}
 
 * `get` needs fs `read`, or admin.
 * `put` needs admin. `expect` absent means "must not exist yet". A mismatch returns 409 `version_mismatch`.
-* The header (keyslots and epoch chain, formats.md §12) is opaque to the server.
+* The header (keyslots and epoch chain, formats.md §12) is opaque to the server, except in its signed form (formats.md §12.1, feature `"signed_header"`): a `header` starting with `0x80` is checked by the acceptance rules of formats.md §12.1 against the stored header and the current ACL. A malformed one, a wrong `version` or `prev`, a signer who isn't an admin, a signature that doesn't verify, or an unsigned header replacing a signed one returns 400 `bad_request`, and nothing is stored.
 
 ## 5. KV
 
@@ -386,7 +387,8 @@ POST /v1/commit
   chunks?: [{fs, id: bytes(16), data: bytes}],              // filesystem chunks (fs.md §4.1)
   pages?: [{fs, id: bytes(16), data: bytes}],               // chunk-list pages (fs.md §4.1, formats.md §11.6)
   crdt_ops?: [CrdtOp],                                      // filesystem operations (fs.md §3, §4), CRDT rows (§13)
-  svc?: [SvcStep] }                                         // relayed-service steps (§14.5)
+  svc?: [SvcStep],                                          // relayed-service steps (§14.5)
+  fence?: [{fs, name: bytes, token: u64}] }                 // fenced leases the commit depends on (§16)
 → { commit_version: u64, versionstamp: bytes(10), appended: [bytes(12)], dots: [bytes(12)],
     set_dots: [bytes(12)] }                                  // one per `add`, in order (§13)
 
@@ -404,7 +406,7 @@ CrdtOp = {fs, tree: bytes(16), op: "move",  node: bytes(16), parent: bytes(16), 
 The whole commit is **one storage transaction**: all of it applies, or none of it.
 
 1. **Idempotency.** If `commit_id` already committed, the stored result is returned and nothing is applied again. The record is kept for `idempotency_ttl_secs` (default 24 h, G13). A `commit_id` reused by a different device returns 409 `commit_id_reused`.
-2. **Permissions and limits.** Writes and clears need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`; consumes and `svc` steps need topic `consume`. Then sizes and quotas are checked: at most `max_commit_ops` operations, and at most `max_commit_bytes` counting every payload plus 512 bytes per operation for its keys and index entries.
+2. **Permissions and limits.** Writes, clears and fences need fs `write`. `expect` and `expect_ranges` need fs `read`. Appends need topic `append`; consumes and `svc` steps need topic `consume`. Then sizes and quotas are checked: at most `max_commit_ops` operations, and at most `max_commit_bytes` counting every payload plus 512 bytes per operation for its keys and index entries.
 3. **Short mode.** With `read_version`, the transaction runs at that version, and every `read_conflicts` range conflicts with any write committed after it. That gives full serializability, including phantoms. Anything else the server reads (cursors, leases, idempotency) is checked the same way. A conflict returns 409 `conflict`.
 4. **Long mode.**
    * Each `expect` key is re-read: its version must equal `version`, or the key must be absent when `version` is null.
@@ -413,7 +415,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
    * A range with more than `max_range_items` items, or more than `max_range_bytes` of keys and values, returns 413.
    * Any mismatch returns 409 `conflict`.
 5. **Clears**, then **writes**. `clear_ranges` apply first (each range at most `max_range_items` keys and `max_range_bytes`, else 413), then `writes`, where the last write to a key wins.
-6. **Consumes** (§8.3) are processed before appends, in order. Then the **`svc` steps** (§14.5), in order; each step and each of its output records count as one operation, and the records and state toward `max_commit_bytes`.
+6. **Fences** (§16) are checked first, in order: each named lease is read normally, and must hold `token`, name the caller's device as holder, and not have expired or been released at the commit's read; otherwise 412 `claim_lost`, and nothing applies. A server without the feature `"lease"` refuses `fence` (400). **Consumes** (§8.3) are processed next, in order. Then the **`svc` steps** (§14.5), in order; each step and each of its output records count as one operation, and the records and state toward `max_commit_bytes`.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
 9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` or `pages` (the stored version holds both, keyspace.md §3.6). That bounds an inline file at about `max_value_bytes / 32` chunks, and a paged one at about `max_value_bytes / 64` pages (fs.md §4). A `write` carries `chunks` or `pages`, never both (400). Chunks apply before pages, and pages before the operations, so a commit can upload a file's last chunks, its last page and its `write` together. Each page counts as one operation toward `max_commit_ops`, and its data plus 48 bytes per chunk it lists (the reference counts it adds) toward `max_commit_bytes`. A server without the feature `"fs_pages"` refuses `pages` (400). Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
@@ -535,6 +537,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `esub` | `id, fs, topic?, prefix?` | ephemeral subscribe: messages published after the `ok`. Needs topic `read`. |
 | `svc_sub` | `id, fs, svc, lease: bytes(16)` | push the input of the connections the caller holds under `lease`, and wake-ups of the service's ready queue (§14.10). Needs topic `consume`. |
 | `svc_reveal` | `id, fs, svc, reveals` | `/v1/svc/reveal` over the stream (§14.7); answered by `svc_revealed`. |
+| `cksub` | `id, fs` | push `ckh` for every new checkpoint head of the fs (§15.1). Needs any right on the fs. |
 
 **Server → client:**
 
@@ -547,6 +550,7 @@ POST /v1/consume/dlq/drop  {fs, group, id} → {}
 | `svc_in` | `id, conn: bytes(16), off: u64, data, sealed: bool, flags: u8` (an input chunk, §14.6) |
 | `svc_ready` | `id` (the service's ready queue changed: call `/v1/svc/next`) |
 | `svc_revealed` | `id, results: [u8]` (§14.7) |
+| `ckh` | `id, device: bytes(32), seq: u64` (a device's checkpoint head moved, §15.1) |
 
 * Consumer delivery is not pushed over the stream: `/v1/consume/next` with `wait_ms` long-polls instead (§8.3).
 * Watches only wake a subscription. The data always comes from a range read after the subscription's cursor, so reconnecting with the last received `offset` loses nothing.
@@ -601,7 +605,7 @@ NodeState = { node: bytes(16),
 | `POST /v1/fs/tree/list {fs}` | `{trees: [{tree, ops: u64}]}` |
 | `POST /v1/fs/tree/get {fs, tree, nodes: [bytes(16)], read_version?}` | `{read_version, nodes: [NodeState]}`. Unknown nodes are left out. |
 | `POST /v1/fs/tree/children {fs, tree, parent, after?: bytes(16), limit?, read_version?}` | `{read_version, nodes: [NodeState], more}`, in node-id order after `after` |
-| `POST /v1/fs/tree/changes {fs, tree, after?: bytes(12), limit?, wait_ms?}` | `{changes: [{offset: bytes(12), node, state?: NodeState}], cursor?: bytes(12), more}` |
+| `POST /v1/fs/tree/changes {fs, tree, after?: bytes(12), limit?, wait_ms?}` | `{changes: [{offset: bytes(12), node, state?: NodeState}], cursor?: bytes(12), more, ops?: u64, chain?: bytes(32)}` |
 | `POST /v1/fs/tree/chain {fs, tree}` | `{ops: u64, chain: bytes(32)}` (formats.md §11.5) |
 | `POST /v1/fs/file/get {fs, tree, node, read_version?}` | `{read_version, versions: [{dot, device, chunks: [bytes(16)], pages?: [bytes(16)], manifest}]}`. A paged version has `pages` and empty `chunks`. |
 | `POST /v1/fs/chunks/get {fs, ids: [bytes(16)]}` | `{chunks: [{id, data?}]}`. `data` is absent for unknown ids. |
@@ -612,6 +616,7 @@ NodeState = { node: bytes(16),
   * A change without `state` is a purged node (tombstone).
   * `cursor` is the offset of the last change returned. Pass it as `after` next time; it is absent when nothing was returned and no `after` was given.
   * With `wait_ms` (at most 30,000), an empty result waits for the next change of the tree.
+  * When `more` is false, `ops` and `chain` are the tree's op count and op chain (formats.md §11.5) read in the same transaction, so a replica that has applied every change up to `cursor` holds the tree state (fs.md §9) of exactly that `ops`. A server without the feature `"checkpoints"` leaves them out.
   * 409 `resync`: start again without `after`.
 * **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`; `max_range_bytes` of node records also sets `more` (§2). `nodes` and `ids` take at most 1,000 and 64 entries. `file/get` returns 413 when a node's versions exceed either cap.
 * **`read_version`** works as in KV reads (§5): several reads at one version see one snapshot.
@@ -832,3 +837,50 @@ A member reaches a `tcp-auth` service through the server's own listener. `fs` is
 * **`svc_ready`** is sent once right after the `ok` if the service's ready queue isn't empty, then whenever the queue changes.
 * A lost claim simply stops the pushes for that connection; the next step on it gets `claim_lost`.
 * **`svc_reveal`** is `/v1/svc/reveal` over the stream, with the same checks. It is answered by `svc_revealed` with its `id`, or by `err` with its `id` (for example `too_large` over 1,000 entries). It is not a subscription.
+
+## 15. Checkpoints and devices (formats.md §14)
+
+A server with the feature `"checkpoints"` keeps each device's checkpoints per fs; with `"devices"`, a registry of device certificates outside the ACL.
+
+### 15.1 Checkpoints
+
+```
+POST /v1/checkpoint/put   {fs, device: bytes(32), seq: u64, checkpoint: bytes}   → {version: bytes(10)}
+POST /v1/checkpoint/heads {fs, devices?: [bytes(32)]}                             → {heads: [{device, seq}]}
+POST /v1/checkpoint/get   {fs, device, from: u64, to?: u64, limit?}               → {items: [{seq, checkpoint}], more: bool}
+```
+
+* Every request needs a right on the fs (fs or topic).
+* **`put`** stores a sealed checkpoint (formats.md §14.2), which the server can't read:
+  * `device` must belong to the caller's user: a device certificate of the caller's member entry in the current ACL, or a device the user registered (§15.2). Otherwise 403 `forbidden`.
+  * `seq` must be the device's head + 1 (1 for its first): otherwise 409 `version_mismatch`, and the client re-reads the head (formats.md §14.3).
+  * `checkpoint` is at most `max_value_bytes` (413) and must be a kind-11 sealed object (400).
+  * The server keeps each device's newest `checkpoint_keep` checkpoints; a put deletes the one `checkpoint_keep` below it.
+* **`heads`** returns the head of each device with checkpoints in the fs, in device order, or of the `devices` given (unknown ones left out).
+* **`get`** returns a device's kept checkpoints with `from ≤ seq ≤ to` (`to` absent: up to the head), in order, at most `limit` (default and cap `max_range_items`), and `more` when cut. Checkpoints that were pruned are absent; a client that needs one gets an empty list.
+* **`cksub`** on the stream (§9) pushes `ckh {id, device, seq}` whenever a device's head moves, so clients verify new checkpoints as they appear. After a reconnect, a client calls `heads`.
+
+### 15.2 Devices
+
+```
+POST /v1/devices/register {cert: bytes}              → {device: bytes(32)}
+POST /v1/devices/get      {devices: [bytes(32)]}      → {devices: [{device, user: bytes(32), cert: bytes}]}
+```
+
+* **`register`** adds a device enrolled by its user, without an admin: `cert` is a device certificate (formats.md §7.4) that verifies against the caller's member identity in the current ACL (400 otherwise). It returns the device's fingerprint. Registering a device again is a no-op. A user holds at most 64 registered devices (429 `quota`).
+* **`get`** returns the certificate of each known device, from the registry. Unknown devices are left out. Verifiers check every certificate against the member identity of `user` in the ACL they have verified, so the server can't introduce a device.
+* Devices whose certificates are in the ACL need no registration.
+
+## 16. Fenced leases
+
+```
+POST /v1/lease {fs, name: bytes(1..64), token?: u64, ttl_ms?: u32, release?: bool} → {token: u64, expires_version: u64}
+```
+
+A named single-holder lease with a fencing token, for writers that need to exclude each other: a block volume's writer (milestone 6), or any app.
+
+* Needs fs `write`. A server without the feature `"lease"` returns 404.
+* **Acquire or renew**, as consume leases (§8.2): if the lease is empty, expired or released, the caller gets it with `token = previous token + 1`. If the caller passes the current `token` and holds the lease, it is renewed with the same token. Otherwise 412 `not_leader`.
+* **Release.** With `release` and the current `token`, the holder gives it up at once (412 `not_leader` if it doesn't hold it); the response repeats the token, with `expires_version` 0.
+* `ttl_ms` defaults to 10,000 and is at most 600,000. Expiry is measured in versions, as for consume leases.
+* **Fencing.** A commit that lists `{fs, name, token}` in `fence` (§6) applies only while the caller holds that lease with that token. The lease is in the commit's read set, so a commit and a new holder's acquire can't both commit, and a writer that lost its lease can't write afterwards, even with a delayed request.

@@ -69,7 +69,8 @@ off  len  field
                          4 = fs node meta, 5 = fs manifest, 6 = fs chunk,
                          7 = CRDT value (zendb.md §19),
                          8 = local record (zendb.md §9.3),
-                         9 = svc state, 10 = svc output key (§13)
+                         9 = svc state, 10 = svc output key (§13),
+                         11 = device checkpoint (§14)
   3    1  reserved       = 0
   4    4  key_epoch      u32
   8   24  nonce          random per seal
@@ -92,9 +93,11 @@ Total = 48 + plaintext length.
 | 8 local record | `zen/v1/aad/local` | `u32(fs) ‖ lp(store) ‖ lp(record_key)` (zendb.md §9.3) | KV AEAD key of `key_epoch` |
 | 9 svc state | `zen/v1/aad/svc-state` | `u32(fs) ‖ lp(svc) ‖ conn(16) ‖ u64(in_acked) ‖ u64(out_head)`, the cursors after the step that wrote it (svc.md §4) | service key `K_svc` of `key_epoch` (§13) |
 | 10 svc output key | `zen/v1/aad/svc-key` | `u32(fs) ‖ lp(svc) ‖ conn(16) ‖ u64(off)`, the record's output offset | service key `K_svc` of `key_epoch` (§13) |
+| 11 device checkpoint | `zen/v1/aad/checkpoint` | `u32(fs) ‖ device(32) ‖ u64(seq)` (§14) | KV AEAD key of `key_epoch` |
 
 * A value moved to another key or fs, or an event moved to another topic or event key, fails authentication. So does a local record moved to another store, record key or fs.
 * A state (kind 9) paired with other cursors, or an output key (kind 10) moved to another record, connection or service, fails authentication.
+* A checkpoint (kind 11) moved to another device or sequence number fails authentication.
 * Local records (kind 8) never reach the server: they are the fs layer of a device's local store (zendb.md §9.3).
 * Clients read `key_epoch` from the header to pick the right epoch keys before decrypting.
 * **Native block-device blocks** are KV values (DESIGN-3 §1). There's no separate block format, and the layout in DESIGN.md §2.4 is superseded.
@@ -102,13 +105,32 @@ Total = 48 + plaintext length.
 ## 5. Event body (plaintext of a kind-2 object)
 
 ```
-u8 body_version = 1 ‖ sender_fp[32] ‖ u64(hlc) ‖ lp(causation_id) ‖ payload
+version 1:  u8 body_version = 1 ‖ sender_fp[32] ‖ u64(hlc) ‖ lp(causation_id) ‖ payload
+version 2:  u8 body_version = 2 ‖ sender_fp[32] ‖ u64(hlc) ‖ lp(causation_id)
+                                 ‖ chain_id[12] ‖ u64(dseq) ‖ dprev[32] ‖ payload
 ```
 
 * `sender_fp` is the sending device's id.
 * `hlc` is a hybrid logical clock.
 * `causation_id` is empty when there's no causing event. Otherwise the transaction layer fills it with the consumed event's id, `topic_id ‖ offset` (zendb.md §10.2).
 * In an ephemeral message (api.md §9), which no event causes, `causation_id` holds the publishing stream's id instead: 12 random bytes chosen once per stream (a connection, kept across reconnects). Receivers use it to tell apart two sessions of one device (api.md §9.2). An empty one is valid (older clients).
+
+### 5.1 Event chains (version 2)
+
+A version-2 body is a link of a **chain**: the events one writer appends to one topic, `(sender_fp, chain_id, topic)`.
+
+```
+dprev = HE(body of the chain's previous event), 32 zero bytes when dseq = 1
+HE(b) = BLAKE3.derive_key("zen/v1/event-chain", b)          b: the whole plaintext body
+```
+
+* **`chain_id`** is 12 random bytes a writer picks when it starts (a process, a tab). A restart starts a new chain at `dseq = 1`, so a writer stores no counter.
+* **`dseq`** counts the chain's events from 1, in offset order. Several appends to one topic in one commit take consecutive values in `append` order.
+* **Advancing.** A writer advances its chain only once the commit that carries an event is known to have applied. A refused or conflicting commit leaves it where it was, so the rebuilt commit reuses the same `dseq`. A commit whose outcome stays unknown (`commit_unknown`, never resolved) ends the chain: the writer starts a new one. A chain has at most one commit in flight.
+* **Readers of a whole topic** (log reads and subscriptions without a key filter) keep each chain's last `(dseq, HE(body))`. The next event of a chain must have `dseq + 1` and that `dprev`. A skipped `dseq` is a **gap** (an event withheld), and a different body at a `dseq` already seen is a **rewrite**.
+* **Filtered readers** (`key_token` reads, `partitioned`, `per_key` and `single_key` groups) see a subset of each chain, so they check only for rewrites.
+* The body is sealed (kind 2), so the server can't read `dseq` or compute `dprev`; it can only withhold events, which gaps and checkpoints (§14) reveal.
+* Ephemeral messages stay version 1, and so may events of writers that don't chain. Version 1 still decodes.
 
 ## 6. Keyslots
 
@@ -216,12 +238,10 @@ Vectors: `test-vectors/pwkey.json`.
 ## 8. Not yet specified
 
 These later-milestone formats are out of scope here:
-* commit records and signed roots
-* event checkpoints and filesystem tree checkpoints
-* the authenticated (Merkle) integrity tier
+* the authenticated (Merkle) integrity tier of zen-db (zendb.md §14) and block volumes (milestone 6)
 * CRDT objects other than the filesystem (§11)
 
-They'll reuse §4 and §7 and the labels already registered. zen-db's catalog, row, index and message encodings are in [zendb.md](zendb.md).
+They'll reuse §4, §7 and §14 and the labels already registered. Device checkpoints, which carry event, tree and connection heads, are §14. zen-db's catalog, row, index and message encodings are in [zendb.md](zendb.md).
 
 ## 9. Signed ACL and membership log (G1)
 
@@ -423,15 +443,36 @@ lp(policy)                         version 2 only
 * **Checks on decode.** Exact length (no trailing bytes), known header version and suite, a policy that decodes (version 2), `n_chain = current_epoch`, every chain record of kind 3 with the right `key_epoch`, every slot with a valid prefix. A client also checks that a bundle it unwraps names the header's `fs`.
 * **Writing a slot for oneself.** Header writes need admin. A member who wants a slot for a new passkey or password prepares the slot (the bundle never leaves the client unwrapped) and hands it to an admin, who adds it (`TD-FS-HEADER-SELF-SLOT`).
 
-**Leakage and rollback.** The server sees the number of slots, their types and ids, the credential ids and device fingerprints in their parameters, the Argon2id parameters, the number of epochs, and the policy. It can't open a slot or forge one that opens to real keys. It can:
+**Leakage and rollback.** The server sees the number of slots, their types and ids, the credential ids and device fingerprints in their parameters, the Argon2id parameters, the number of epochs, and the policy. It can't open a slot or forge one that opens to real keys. Of an **unsigned** header it can:
 * drop slots or the whole header (denial of service; detectable only out of band),
 * serve an older header: a client then sees an older `current_epoch`, and notices when it meets data sealed under a newer `key_epoch` than its keys can reach. It refuses to write under an epoch older than one it has seen (clients remember the highest epoch per fs),
 * serve another policy. That changes only how new files are keyed: both key modes are end-to-end encrypted, and only sharing a single file depends on file keys,
 * nothing else: a slot or chain record that was tampered with fails to open.
 
-A signed header (by an admin, chained like the ACL) is planned with the authenticated tier (milestone 6).
+A **signed** header (§12.1) leaves it only the first point and serving an older version, which a client that pinned a newer one, or that verified a device checkpoint naming one (§14), detects.
 
-Vectors: `test-vectors/header.json`. The ACL encoding (§9) has vectors too: `test-vectors/acl.json`.
+### 12.1 Signed header
+
+An admin signs each header version, chained like the ACL (§9):
+
+```
+signed header = u8 0x80 ‖ u8 suite = 1 ‖ u32 fs ‖ u64 version ‖ prev(32) ‖ signer(32) ‖ lp(header) ‖ sig
+msg           = every byte before sig
+sig           = hybrid signature (§7.3), purpose "zen/v1/sig/fs-header", of msg
+HH            = BLAKE3.derive_key("zen/v1/fs-header-chain", msg)
+```
+
+* `header` is the header of §12, byte for byte. The first byte `0x80` can't be a header version, so a reader tells the two forms apart by it.
+* `version` counts signed versions from 1. `prev` is `HH` of the previous signed version, or 32 zero bytes for version 1. `signer` is the admin's `user_fp`.
+* **Acceptance** (the server on `/v1/fs/header/put`, api.md §4.4, and clients):
+  1. `fs` is the header's fs, and `header` decodes far enough to name the same `fs`.
+  2. `version` is the stored signed version + 1, or 1 when the stored header is unsigned or absent; `prev` is `HH` of the stored one, or zeros for version 1.
+  3. `signer` is an admin of the current ACL, and `sig` verifies with its identity from the ACL's `members`.
+  4. Once a header is signed, an unsigned one is refused.
+* **Clients** pin `(version, HH)` per fs. They accept an unsigned header only while they hold no pin, and refuse a lower version than the pin, or the pinned version with another `HH`. A higher version needs only a valid signature from an admin of the ACL they have verified; past versions are not kept.
+* A device checkpoint (§14) names the `(version, HH)` its device verified, so a server that keeps serving one client an older version is caught by the clients that see that checkpoint.
+
+Vectors: `test-vectors/header.json`; the signed form is in `test-vectors/integrity.json`. The ACL encoding (§9) has vectors too: `test-vectors/acl.json`.
 
 ## 13. Relayed services (svc.md)
 
@@ -491,3 +532,82 @@ The first check makes the key commit to the record (Poly1305 alone doesn't bind 
 * **Opening.** A handler decapsulates `ct` with its seed, derives `K_in`, and opens each chunk at its offset. It checks that consecutive chunks are contiguous, so a dropped or reordered chunk fails.
 
 Vectors: `test-vectors/svc.json`.
+
+## 14. Device checkpoints
+
+A **device checkpoint** is a signed statement by one device of the newest state it has written or verified, per object: topic heads and its own event chains (§5.1), filesystem trees (fs.md §9), zen-db namespaces, block volumes and relayed connections. Each device keeps one hash-chained sequence of them per fs, stored by the server (api.md §15). Checkpoints are how clients detect a server that **rolls back** an object or **withholds** its newest changes, and, through the cross-links in `seen`, a server that shows two groups of clients two different histories (a **fork**). Up to fork consistency (DESIGN.md §2.6), nothing else is needed.
+
+### 14.1 Body
+
+Deterministic CBOR (zendb.md §1), map keys unsigned integers:
+
+```
+CheckpointBody = { 1: v: 1,
+                   2: fs: u32,
+                   3: device: bytes(32),              // device_fp of the signer
+                   4: seq: u64,                       // 1, 2, 3, … per (fs, device)
+                   5: prev: bytes(32),                // HC(body of seq − 1), 32 zero bytes for seq 1
+                   6: hlc: u64,                       // the device's clock (§11.1), informative
+                   7: acl: [version: u64, hash: bytes(32)],     // the ACL head the device has verified (§9.2 H)
+                   8: header: [version: u64, hash: bytes(32)],  // the signed fs header it has verified (§12.1 HH);
+                                                                //   [0, 32 zero bytes] when none
+                   9: objects: [Entry],
+                   10: seen: [[device: bytes(32), seq: u64, hash: bytes(32)]] }
+
+Entry = [1, topic: bytes, head: bytes(12), chains: [[chain_id: bytes(12), dseq: u64, dhash: bytes(32)]]]
+      | [2, tree: bytes(16), ops: u64, chain: bytes(32), state: bytes(32)]
+      | [3, ns: bytes, seq: u64, hash: bytes(32)]
+      | [4, vol: bytes, seq: u64, hash: bytes(32)]
+      | [5, svc: bytes, conn: bytes(16), in_acked: u64, out_head: u64]
+
+HC(body) = BLAKE3.derive_key("zen/v1/checkpoint-hash", body)
+```
+
+* **Topic** (type 1): `head` is the offset of the newest event of the topic the device has read through or appended (the zero offset if none). `chains` lists the device's own chains on the topic (§5.1), sorted by `chain_id`, with the newest `dseq` that committed and `dhash = HE(its body)`: the `dprev` its next event will carry.
+* **Tree** (type 2): the op count and op chain of the tree (§11.5) at a point where the device's replica was caught up, and the tree state there (fs.md §9).
+* **Namespace** (type 3) and **volume** (type 4): a zen-db authenticated namespace (by its stored-key prefix, zendb.md §14) or a block volume, with the `seq` of its newest root and the hash of that root. Their roots are defined with them (milestone 6, later steps).
+* **Connection** (type 5): a relayed connection (svc.md §12), with the cursors after the newest step the device committed or verified.
+* **Order.** `objects` is sorted by type, then by its id bytes (`topic`, `tree`, `ns`, `vol`, then `svc` followed by `conn`), and holds at most one entry per object. `seen` is sorted by device, holds at most one entry per device, and never the signer.
+* A decoder refuses another `v`, unknown entry types, entries out of order or repeated, ids of the wrong size and trailing bytes.
+
+### 14.2 Signing and sealing
+
+```
+signed     = u32(len(body)) ‖ body ‖ sig          sig: the device's hybrid signature (§7.3),
+                                                       purpose "zen/v1/sig/checkpoint", of body
+checkpoint = kind-11 sealed object (§4) of signed, under the KV AEAD key of the current epoch,
+             context u32(fs) ‖ device(32) ‖ u64(seq)
+```
+
+* The device signs with the identity of its device secret (§7.1). Its certificate (§7.4) comes from the verified ACL's `members`, or, for a device enrolled outside the ACL, from the server's device registry (api.md §15.2), verified against the member identity in the ACL.
+* The server stores the checkpoint as is. It sees which devices checkpoint, how often and how large, but not which objects they name.
+* A checkpoint must fit `max_value_bytes`.
+
+### 14.3 Writing
+
+* **Cumulative.** A body carries the device's newest entry for every object it has written or verified, carried forward from its previous body, not only those that changed. When the body would no longer fit, the entries unchanged for longest are left out (they stay in the older checkpoints). So a verifier needs one body per device: the head.
+* **Cadence** (informative): a device checkpoints after `sig_every` changes it made (default 64), a few seconds after its last write (default 5 s), and on close. A smaller `sig_every` narrows the window in which a rollback of its own writes goes unnoticed by other devices; `sig_every = 1` closes it.
+* **One sequence per device.** All processes of a device share it. A put that loses the race for `seq` (409, api.md §15.1) re-reads the head, merges its entries into that body's, and retries with the next `seq`.
+* `seen` names the head of every other device the writer has verified, with `hash = HC(that body)`.
+
+### 14.4 Verifying
+
+A client keeps **pins** per fs: the head `(seq, HC)` of each device it has verified, its own included, and per object the newest entry it has verified from any device or written itself. On each checkpoint `c` of device `d`:
+
+1. It opens `c`, and verifies `sig` with `d`'s certificate, which must verify against a member of the pinned ACL. `fs` and `device` must match, and `seq` the sealed context.
+2. `seq` must be at least the pinned seq of `d`. At the pinned seq, `HC` must equal the pin. At the pinned seq + 1, `prev` must equal it. Two different bodies of `d` with one `seq` are a **fork**.
+3. Each `seen` entry `(e, s, h)` must agree with what the client knows of `e`: if it has pinned `e` at `s`, `h` must equal that pin; otherwise it fetches `e`'s checkpoint `s` (api.md §15.1). A different body, or a seq the server can't produce (one beyond `e`'s head or the kept window), is a **fork**.
+4. Each entry in `objects` raises the client's per-object pin. It is **refused** when it is lower than the pin of the same writer, which is a fork too.
+
+Then, for every server answer about an object, the **freshness rule**: an answer older than the object's pin is a **rollback**:
+* a topic whose newest offset is below the pinned `head`, or a chain whose events end before the pinned `dseq` (a withheld tail, GAPS G26)
+* a tree whose `ops` is below the pinned `ops`, or at the same `ops` with another `chain` or `state`
+* a namespace or volume root with a lower `seq`, or the same `seq` and another hash
+* a relayed connection whose `in_acked` or `out_head` is below the pinned one
+* an ACL or signed header with a lower version than the pinned one
+
+The client reports a rollback or fork to the application and stops trusting the server for that fs. What it does then (refuse to write, alert, compare pins out of band) is the client's policy (docs/CLIENT.md).
+
+**What it does not catch.** A server can split clients into groups that never see each other's checkpoints, and show each group a consistent history: fork consistency. The groups detect it as soon as any checkpoint crosses over, or when they compare pins out of band. An independent witness that cross-checks heads is later work (TD-WITNESS).
+
+Vectors: `test-vectors/integrity.json`.
