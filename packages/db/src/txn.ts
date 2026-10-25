@@ -145,10 +145,17 @@ export class DbTransaction implements IndexTx {
     if (this.deadline !== undefined && Date.now() > this.deadline) throw new SwitchToLong();
   }
 
-  /** @internal Use a cached record: its version joins the read set (§7.7). */
+  /**
+   * @internal Use a cached record: its version joins the read set (§7.7).
+   * Read again here after the cache changed (another transaction of this
+   * database committed or read it), the first version stays expected: the
+   * commit then conflicts rather than building on two versions of one row.
+   */
   useCached(key: Uint8Array, version: Uint8Array | undefined, drop: () => void): void {
+    const h = bytes.hex(key);
+    if (this.cached.has(h)) return;
     this.raw.expectKey(key, version);
-    this.cached.set(bytes.hex(key), { key, version, drop });
+    this.cached.set(h, { key, version, drop });
   }
 
   /** @internal Keep a row read in this transaction in the row cache. */

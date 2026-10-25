@@ -471,10 +471,13 @@ export class Transaction {
    * Make the commit depend on a key's version (by path or stored key): it
    * fails with `conflict` unless the key is still at `version`, or still
    * absent for `undefined`. Puts a record read earlier (a cache) into the
-   * read set, in either mode.
+   * read set, in either mode. The first version expected of a key stands:
+   * expecting another one later means the transaction saw two versions of
+   * it, and the commit then conflicts rather than building on both.
    */
   expectKey(key: Path | Uint8Array, version: Uint8Array | undefined): void {
     const k = this.key(key);
+    if (this.expects.has(hex(k))) return;
     this.expects.set(hex(k), { fs: this.fs.id, key: k, ...(version ? { version } : {}) });
   }
 
