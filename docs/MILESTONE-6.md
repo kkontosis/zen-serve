@@ -141,6 +141,17 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * on local FDB: integrity and dump 3×, then the full `-p zen-store -p zen-server --features fdb`
     * `build-wasm.sh` and `npm run check`
     * vitest `kv`, `stream`, `tree`, `log`, `integrityvectors` and `packages/fs`
+  * Pushed 811a74c. **The push run (388) was red in `fdb`; the pull_request run (389) was green.**
+    * `tests/dump.rs` on CI's fresh cluster: `/v1/checkpoint/put` and `/v1/devices/register` returned 409 `commit_unknown`.
+    * Cause: after the version jumps these tests make, FoundationDB can lose track of a commit's outcome. Both endpoints ran the non-idempotent transaction loop, so the unknown outcome reached the client, which per api.md §1 may then only re-read.
+    * Fix in the server: both are now idempotent (`txn_loop!(…, idempotent, …)`).
+      * A put whose `seq` is the head and whose stored checkpoint is byte-for-byte the same returns the stored version.
+      * Registering again was already a no-op.
+      * api.md §1 and §15 say so.
+    * Leases stay non-idempotent: two processes of one device must not share a token. So the dump setup treats `not_leader` after an unknown result as "acquired".
+    * The setup helper retries `commit_unknown` as well as `too_old`.
+    * `checkpoint_log` tests the resend, which returns the same version, while another checkpoint at the head gets 409.
+    * Embedded, and FDB 3×: green.
 
 ## Facts the design rests on (survey)
 

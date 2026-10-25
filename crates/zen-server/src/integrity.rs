@@ -100,7 +100,9 @@ pub async fn put(
     }
     let keep = u64::from(st.cfg.limits.checkpoint_keep);
     let limits = caller.acl.limits.clone();
-    let ((), stamp) = txn_loop!(st.store, None, |t| {
+    // Idempotent: a put resent after an unknown result finds its own
+    // checkpoint at the head and answers with the stored version.
+    let (stored, stamp) = txn_loop!(st.store, None, idempotent, |t| {
         if !caller.acl.has_device(&caller.user, &dev) {
             match registered(&mut t, &dev).await? {
                 Some((user, _)) if user == caller.user => {}
@@ -111,6 +113,13 @@ pub async fn put(
             Some(v) => decode_seq(&v)?,
             None => 0,
         };
+        if req.seq == head
+            && let Some(v) = t.get(&keys::ckpt(req.fs, &dev, req.seq)).await?
+            && v.len() >= 10
+            && v[10..] == req.checkpoint[..]
+        {
+            return Ok(Some(v[..10].to_vec()));
+        }
         if req.seq != head + 1 {
             return Err(version_mismatch(format!(
                 "the device's head is {head}: the next checkpoint is {}",
@@ -130,10 +139,10 @@ pub async fn put(
         t.set_versionstamped_value(&keys::ckpt(req.fs, &dev, req.seq), &[], &req.checkpoint);
         t.set(&keys::ckpt_head(req.fs, &dev), &req.seq.to_be_bytes());
         t.set_versionstamped_value(&keys::ckpt_bell(req.fs), &[], &[]);
-        Ok(())
+        Ok(None)
     })?;
     Ok(Cbor(CheckpointVersion {
-        version: stamp.to_vec(),
+        version: stored.unwrap_or_else(|| stamp.to_vec()),
     }))
 }
 
@@ -247,7 +256,9 @@ pub async fn register(
     let dev = device.fingerprint();
     let mut record = caller.user.to_vec();
     record.extend_from_slice(&req.cert);
-    txn_loop!(st.store, None, |t| {
+    // Idempotent: registering again is a no-op, so a resend after an
+    // unknown result finds the device registered.
+    txn_loop!(st.store, None, idempotent, |t| {
         match registered(&mut t, &dev).await? {
             Some((user, _)) if user == caller.user => return Ok(()),
             Some(_) => return Err(conflict("the device belongs to another user")),

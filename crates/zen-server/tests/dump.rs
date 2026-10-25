@@ -75,9 +75,10 @@ async fn populated() -> (Harness, Vec<u8>, CommitResult) {
     populated_on(Harness::start().await).await
 }
 
-/// `h.call`, retried on `too_old`: tests in this binary run at once, and an
-/// import or migrate jumps a shared FoundationDB cluster's version, after
-/// which it refuses transactions for a few seconds.
+/// `h.call` of an idempotent request, retried on `too_old` and
+/// `commit_unknown`: tests in this binary run at once, and an import or
+/// migrate jumps a shared FoundationDB cluster's version, after which it
+/// refuses or loses track of transactions for a few seconds.
 async fn call<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
     h: &Harness,
     path: &str,
@@ -87,7 +88,7 @@ async fn call<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
     for _ in 0..50 {
         match h.call(path, Some(tok), req).await {
             Ok(r) => return r,
-            Err((409, e)) if e.code == "too_old" => {
+            Err((409, e)) if e.code == "too_old" || e.code == "commit_unknown" => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await
             }
             Err(e) => panic!("{path}: {e:?}"),
@@ -133,19 +134,27 @@ async fn populated_on(h: Harness) -> (Harness, Vec<u8>, CommitResult) {
     let cert = zen_core::sig::issue_device_cert(&admin.id, &extra.public(), 1).unwrap();
     let _: DeviceRegistered =
         call(&h, "/v1/devices/register", &tok, &DeviceRegister { cert }).await;
-    let _: NamedLease = call(
-        &h,
-        "/v1/lease",
-        &tok,
-        &NamedLeasePut {
+    // An acquire isn't idempotent: after an unknown result, `not_leader`
+    // means the earlier attempt took the lease.
+    let mut unknown = false;
+    for _ in 0..50 {
+        let req = NamedLeasePut {
             fs: 1,
             name: b"vol".to_vec(),
             token: None,
             ttl_ms: None,
             release: false,
-        },
-    )
-    .await;
+        };
+        match h.call::<_, NamedLease>("/v1/lease", Some(&tok), &req).await {
+            Ok(_) => break,
+            Err((409, e)) if e.code == "too_old" || e.code == "commit_unknown" => {
+                unknown |= e.code == "commit_unknown";
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err((412, _)) if unknown => break,
+            Err(e) => panic!("/v1/lease: {e:?}"),
+        }
+    }
     (h, tok, r)
 }
 

@@ -137,11 +137,24 @@ async fn info_lists_integrity_features() {
 async fn checkpoint_log() {
     let w = world_with(vec![], |c| c.limits.checkpoint_keep = 3).await;
     let (h, dev) = (&w.h, &w.a.device);
+    let mut v3 = Vec::new();
     for seq in 1..=3 {
-        put_checkpoint(h, &w.ta, dev, seq).await.unwrap();
+        v3 = put_checkpoint(h, &w.ta, dev, seq).await.unwrap().version;
     }
+    // Resending the head (after an unknown result) returns its version;
+    // another checkpoint at the head doesn't go in.
+    let again = put_checkpoint(h, &w.ta, dev, 3).await.unwrap();
+    assert_eq!(again.version, v3);
+    let other = CheckpointPut {
+        fs: 1,
+        device: fp(dev),
+        seq: 3,
+        checkpoint: checkpoint_of(dev, 1, 4),
+    };
+    let r: Result<CheckpointVersion, _> = h.call("/v1/checkpoint/put", Some(&w.ta), &other).await;
+    assert_eq!(code(r), (409, "version_mismatch".into()));
     // Only head + 1 goes in.
-    for seq in [3, 5] {
+    for seq in [2, 5] {
         assert_eq!(
             code(put_checkpoint(h, &w.ta, dev, seq).await),
             (409, "version_mismatch".into())
