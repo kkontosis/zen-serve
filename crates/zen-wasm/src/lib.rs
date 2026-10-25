@@ -9,6 +9,8 @@
 //! * [`crypto`]: fs keys, keyslots, the fs header, identities, sealing,
 //!   password keys, OPAQUE, the filesystem op encodings.
 //! * [`db`]: zen-db keys, CRDT-row tokens and values, group ids.
+//! * [`integrity`]: device checkpoints, signed fs headers, event chains, tree
+//!   states (milestone 6).
 //!
 //! Errors are JS `Error`s named `ZenCryptoError` whose message is a stable
 //! code: `decrypt`, `format`, `param`, `signature`, `rng`, or `wire: …`.
@@ -17,6 +19,7 @@ use wasm_bindgen::prelude::*;
 
 pub mod crypto;
 pub mod db;
+pub mod integrity;
 pub mod wire;
 
 #[wasm_bindgen(typescript_custom_section)]

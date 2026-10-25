@@ -46,6 +46,10 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/opaque-keyslot` | the secret of an OPAQUE export-key keyslot from the 64-byte export key (formats.md §6, type 5) |
 | `zen/v1/db-parts-digest` | digest of a zen-db value split into parts: a large row or message body (zendb.md §4.2, §10.3) |
 | `zen/v1/svc-reveal` | `key_hash` of an output record's key, which a reveal must match (formats.md §13.1) |
+| `zen/v1/checkpoint-hash` | `HC(body)` of a device checkpoint, chaining a device's checkpoints and naming them in `seen` (formats.md §14.1) |
+| `zen/v1/fs-header-chain` | `HH` of a signed fs header, chaining header versions (formats.md §12.1) |
+| `zen/v1/event-chain` | `HE(body)` of a version-2 event body, chaining a writer's events on a topic (formats.md §5.1) |
+| `zen/v1/tree-state` | leaves and inner nodes of a filesystem tree's state hash (fs.md §9) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 
@@ -64,6 +68,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/aad/svc-key` | svc output key escrow (kind 10; formats.md §13.1) |
 | `zen/v1/aad/svc-out` | body of an output record: `label ‖ 0x00 ‖ context`, no header (formats.md §13.1) |
 | `zen/v1/aad/svc-in` | sealed input chunk: `label ‖ 0x00`, no header or context (formats.md §13.3) |
+| `zen/v1/aad/checkpoint` | device checkpoint (kind 11; formats.md §14.2) |
 
 ## OPAQUE (auth.md §8)
 
@@ -78,15 +83,16 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | Purpose | Signed by | Message |
 |---|---|---|
 | `zen/v1/sig/device-cert` | user identity | device certificate body (formats.md §7.4) |
-| `zen/v1/sig/commit` | device | commit record / signed root (later milestone) |
-| `zen/v1/sig/checkpoint` | device | per-device event checkpoint, every `sig_every` events (later milestone) |
+| `zen/v1/sig/commit` | device | reserved: roots are chained inside sealed values and named by device checkpoints (formats.md §14) instead |
+| `zen/v1/sig/checkpoint` | device | device checkpoint body (formats.md §14.2) |
 | `zen/v1/sig/acl` | admin identity | signed ACL document (formats.md §9) |
 | `zen/v1/sig/membership` | admin identity | reserved; the membership log is the ACL chain (formats.md §9) |
 | `zen/v1/sig/session` | device | sign-in challenge (formats.md §10) |
-| `zen/v1/sig/event` | device | a single event (later milestone) |
-| `zen/v1/sig/tree-checkpoint` | device | filesystem tree checkpoint over (state hash, count, chain) (fs.md §9, later milestone) |
+| `zen/v1/sig/event` | device | reserved: events are chained (formats.md §5.1) and their chains named by device checkpoints |
+| `zen/v1/sig/tree-checkpoint` | device | reserved: tree states ride in device checkpoints (fs.md §9, formats.md §14) |
 | `zen/v1/sig/password-session` | password-derived key | sign-in challenge (formats.md §7.5, §10) |
-| `zen/v1/sig/db-root` | device | zen-db signed root of the authenticated integrity tier (zendb.md §14, milestone 6) |
+| `zen/v1/sig/db-root` | device | reserved: authenticated zen-db roots ride in device checkpoints (zendb.md §14, formats.md §14) |
+| `zen/v1/sig/fs-header` | admin identity | signed fs header (formats.md §12.1) |
 | `zen/v1/sig/app-bundle` | release key | reserved: a signed app bundle checked by a bootstrap service worker (milestone 11) |
 
 Signing with a purpose not in this table is an error.

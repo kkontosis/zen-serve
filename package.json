@@ -18,7 +18,7 @@
   "scripts": {
     "build:wasm": "scripts/build-wasm.sh",
     "build": "npm run build --workspaces --if-present",
-    "check": "biome check packages apps scripts && tsc -p packages/client --noEmit && tsc -p packages/db/tsconfig.test.json && tsc -p packages/fs/tsconfig.test.json && tsc -p packages/loro/tsconfig.test.json && tsc -p packages/svc/tsconfig.test.json && tsc -p apps/tsconfig.json",
+    "check": "biome check packages apps scripts && tsc -p packages/client/tsconfig.test.json && tsc -p packages/fuse/tsconfig.json --noEmit && tsc -p packages/db/tsconfig.test.json && tsc -p packages/fs/tsconfig.test.json && tsc -p packages/loro/tsconfig.test.json && tsc -p packages/svc/tsconfig.test.json && tsc -p apps/tsconfig.json",
     "test": "vitest run",
     "build:apps": "node scripts/build-apps.mjs",
     "test:apps": "vitest run apps && playwright test --project=apps"

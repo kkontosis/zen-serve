@@ -72,7 +72,50 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * Write `docs/MILESTONE-6.md` (this plan).
   * Update DESIGN-3 §6 item 6 (scope and link) and the README status ("Milestone 6: in progress").
   * Commit `docs: milestone 6 plan (integrity, zen-ublk)`, then open the PR.
-  * Next: plan step 6.1 (spec) in detail, on "go".
+  * PR #53 merged.
+* **Step 6.1** (spec, zen-core, vectors, wasm): planned below ("Step 6.1 in detail"). Plan committed (95ec6a8), PR #54.
+  * `spec:` commit 330c7fa:
+    * formats.md §4 (kind 11), §5.1 (event chains), §8, §12.1 (signed header), §14 (device checkpoints)
+    * fs.md §9.1 (tree state)
+    * api.md §2 (features, `checkpoint_keep`), §4.4, §6 (`fence`), §9 (`cksub`/`ckh`), §12 (`changes` ops/chain), §15, §16
+    * keyspace.md §3.10 (`dk`, `dkh`, `dkd`, `dv`, `dvu`, `ls`)
+    * svc.md §6 and §12, zendb.md §14
+    * labels.md and `labels.rs`
+  * **zen-core:**
+    * new `integrity.rs`: `CheckpointBody`/`Entry`, canonical encode/decode, sign/verify, seal/open as kind 11
+    * `header.rs`: `SignedHeader`, `validate_header_successor`
+    * `seal.rs`: `EventBody.chain` (v2) and `event_chain_hash`
+    * `fs.rs`: `StateNode`, `state_leaf`, `tree_state`, incremental `TreeState`
+    * vectors in `integrity.json`; unit tests plus a test that reads the vectors back from the file
+  * **zen-wasm:**
+    * new `integrity.rs`: checkpoint codec, verify, seal/open, signed header, event chain, `TreeState`
+    * `DeviceSecret.sign`/`signCheckpoint`, `SigningIdentity.signHeader`
+    * `EventBody` v2 fields, `label()` names
+  * **TS:** `packages/client/test/integrityvectors.test.ts`.
+  * **Found and fixed:** a JS `JSON.parse` loses u64 hlc values above 2^53, so `integrity.json` writes hlc as decimal strings.
+  * **Checks (all clean):**
+    * fmt
+    * clippy on the workspace, and on zen-core/zen-wasm with `--all-features`, `--no-default-features` and wasm32
+    * zen-core tests
+    * the TS vectors test 3×
+    * `npm run check`
+    * the client log, stream and kv tests, and `packages/db` (245 passed; only the opt-in bench skipped)
+  * **A red on the plan-only commit (push run 377, `fdb` job), traced to its cause:**
+    * `dump.rs` `relay_keys_count_as_empty` read storage directly, with no retry, and got `TooOld`.
+    * The tests in that binary run at once. `export_import_round_trip` and `migrate_copies_into_another_store` jump the shared FDB cluster's version (`advance_version`), and on a fresh cluster the recovery makes reads fail for about 10 s.
+    * `dump` itself retries since 2322431; the test's own reads didn't.
+    * Fix: a retrying `get` helper for the three direct reads, and the migrate loop now retries `begin` too.
+    * FDB here, 5×: the first run, on a fresh cluster, took 11.5 s and passed.
+  * **CI on 297245b and 51e629f (runs 379–382): `client` "Lint and typecheck" red.** `rust`, `pure-rust` and `fdb` are green, so the dump fix holds on CI.
+    * Cause: CI type-checks the client tests (`tsc -p packages/client/tsconfig.test.json`, `include: [src, test]`). The local `npm run check` runs `tsc -p packages/client --noEmit`, which leaves `test/` out, so the new test's type errors passed locally.
+    * Errors in `packages/client/test/integrityvectors.test.ts`:
+      * line 44: `flipped[8] ^= 1` gives TS2532 (index access may be undefined)
+      * line 95: assigning `eventChainHash`'s `Uint8Array<ArrayBufferLike>` to `prev`, inferred as `Uint8Array<ArrayBuffer>`, gives TS2322
+    * **Fix:**
+      1. `flipped[8]! ^= 1;` (the repo's idiom: `local.test.ts:164`, `tree.test.ts:282`, `vault.test.ts:228`), and `let prev: Uint8Array = new Uint8Array(32);`.
+      2. Make `npm run check` match CI, so this can't recur: root `package.json` `check` uses `tsc -p packages/client/tsconfig.test.json` (instead of `tsc -p packages/client --noEmit`) and adds `tsc -p packages/fuse/tsconfig.json --noEmit`, the two CI lines it lacks.
+    * Done: the new `npm run check` passes. Run on the unfixed test file, it reports exactly CI's 2 errors. The integrity vectors test passes.
+  * Next: CI green on both runs.
 
 ## Facts the design rests on (survey)
 
@@ -133,7 +176,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
 * **Signing and sealing:**
   * A device signs `SM(zen/v1/sig/checkpoint, body)`.
   * The body and signature are sealed under the fs key of the epoch (a new seal kind 11). The server stores ciphertext, so it learns which devices checkpoint and when, not which objects.
-* **The server** stores `pack("ck", fs, device_fp, seq)`. It accepts only `seq = last + 1` from the caller's own device (its `Caller.device` is a real device fingerprint), and keeps `pack("ckh", fs, device_fp)` as that device's head.
+* **The server** stores `pack("dk", fs, device_fp, seq)` (`ck` is taken by chunks). It accepts only `seq = last + 1` for a device of the caller's user (in the ACL, or registered with a cert), and keeps `pack("dkh", fs, device_fp)` as that device's head. Step 6.1 below has the exact formats.
 * **API:**
   * `POST /v1/checkpoint/put`
   * `POST /v1/checkpoint/heads`: every device's head seq
@@ -207,7 +250,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
 
 **6.0, plan:** above.
 
-**6.1, spec (`spec:` commits) and zen-core:**
+**6.1, spec (`spec:` commits) and zen-core** (detailed below; zendb.md §14 and spec/blk.md move to 6.5 and 6.7):
 * **Spec text:**
   * formats.md §5 (event body v2), §12 (the signed header), §14 (checkpoints, kind 11)
   * labels (`sig/fs-header`, `db-ns-root`, `blk-root`, `ckpt-hash`, `event-chain`, `tree-state`)
@@ -275,6 +318,221 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
 * STATS §6 (checkpoint cost, authenticated read and write overhead, block throughput and latency)
 * TECH_DEBT: TD-WITNESS and TD-BLK-SNAPSHOTS; TD-SVC-STATE-ROLLBACK closed
 * README, DESIGN-3 §6, and the Outcome
+
+## Step 6.1 in detail
+
+**Scope change from the step list:** 6.1 specifies everything that steps 6.2–6.4 build on:
+* checkpoints, with all five entry types laid out
+* the signed header
+* event body v2
+* tree state
+* device registration
+* fenced leases and `Commit.fence`
+* the svc rule
+
+The full texts of zendb.md §14 (the `NsRoot`, the row tree, PRF32) and spec/blk.md are written in 6.5 and 6.7, with their code. That way, three PRs of experience can change them first. For now, their checkpoint entries only name `(id, seq, hash)`.
+
+**Simplification found while specifying:** the `NsRoot`, the volume root and the event chain need no MAC. They're inside AEAD-sealed values, so the server can't forge them anyway. `prev` is a plain labelled hash of the previous plaintext. A rollback (an older valid value) is what checkpoints and pins catch.
+
+### Spec text (`spec:` commit)
+
+**formats.md §14, device checkpoints (new)**
+
+* **Body.** Deterministic CBOR (zendb.md §1) with integer keys:
+  ```
+  CheckpointBody = { 1: v = 1, 2: fs: u32, 3: device: bytes(32), 4: seq: u64 (1, 2, …),
+                     5: prev: bytes(32)            // HC(previous body), zeros for seq 1
+                     6: hlc: u64,
+                     7: acl: [version: u64, hash: bytes(32)],        // the ACL head the device verified
+                     8: header: [version: u64, hash: bytes(32)],     // signed header head; [0, zeros] if none
+                     9: objects: [Entry],                            // sorted by (type, id), one per object
+                     10: seen: [[device: bytes(32), seq: u64, hash: bytes(32)]] }   // sorted by device, never itself
+  Entry = [1, topic: bytes, head: bytes(12), chains: [[chain_id: bytes(12), dseq: u64, dhash: bytes(32)]]]
+        | [2, tree: bytes(16), ops: u64, chain: bytes(32), state: bytes(32)]
+        | [3, ns: bytes, seq: u64, hash: bytes(32)]           // zen-db authenticated namespace (6.5)
+        | [4, vol: bytes, seq: u64, hash: bytes(32)]          // block volume root (6.7)
+        | [5, svc: bytes, conn: bytes(16), in_acked: u64, out_head: u64]
+  HC(body) = BLAKE3.derive_key("zen/v1/checkpoint-hash", body)
+  ```
+* **Signed and sealed.**
+  * `signed = u32(len body) ‖ body ‖ sig`, where `sig` is the device's hybrid signature with purpose `zen/v1/sig/checkpoint`.
+  * `signed` is sealed as **kind 11** under the KV AEAD key, with AAD `zen/v1/aad/checkpoint` and context `u32(fs) ‖ device(32) ‖ u64(seq)`. So the server can't move a checkpoint to another device or seq.
+  * The body must fit `max_value_bytes`.
+* **Cumulative bodies.** Each body carries forward the device's newest entry for every object it wrote or verified. When the body would no longer fit, the entries unchanged the longest are dropped. A verifier therefore reads one head per device.
+* **Verifying a checkpoint:**
+  * The signature verifies against the device's cert (from the pinned ACL, or the device registry, §15), checked against the member identity in the pinned ACL.
+  * `seq` is greater than the pinned seq of that device, and `prev` links when the seq is adjacent.
+  * Two different bodies of one device at the same seq are a **fork**.
+  * Each `seen` entry must match what the verifier knows of that device, or what it can fetch. A mismatch, or a seq the server can't produce, is a fork.
+* **Freshness rule (per object):** a server answer older than the newest verified entry for the object, or than the client's own pin, is a **rollback**:
+  * a topic head below `head`
+  * a chain behind `dseq`
+  * a tree `ops` below a checkpointed `ops` (or the same `ops` with another `chain`/`state`)
+  * an `in_acked`/`out_head` below a checkpointed one
+  * a namespace or volume `seq` below a checkpointed one
+* **Cadence (informative):** every `sig_every` changes (default 64), 5 s after the last write, and on close.
+* **Shared by a device's processes:** a put that loses the seq race re-reads the head, merges its entries in, and retries.
+
+**formats.md §12, signed header (replaces the "planned" sentence)**
+
+```
+signed header = u8 0x80 ‖ u8 suite = 1 ‖ u32 fs ‖ u64 version ‖ prev(32) ‖ signer(32) ‖ lp(header) ‖ sig
+msg  = every byte before sig;   sig = hybrid signature, purpose "zen/v1/sig/fs-header", msg
+HH   = BLAKE3.derive_key("zen/v1/fs-header-chain", msg)
+```
+
+* The first byte `0x80` can't be a header version (1 or 2).
+* **Acceptance (server and clients):**
+  * `version` is the head's version + 1. It's 1 when the stored header is unsigned or absent.
+  * `prev` is HH(head), or zeros for version 1.
+  * `fs` matches.
+  * `signer` is an admin of the current ACL, and its member identity verifies `sig`.
+  * Once a header is signed, an unsigned put is refused.
+* **Clients:**
+  * pin `(version, HH)`
+  * accept an unsigned header only while they hold no pin
+  * refuse a version below the pin, or the same version with another hash
+* History isn't kept; the signature and version suffice.
+* The leakage and rollback paragraph is updated to match.
+
+**formats.md §5, event body v2**
+
+```
+u8 2 ‖ sender_fp[32] ‖ u64 hlc ‖ lp(causation) ‖ chain_id(12) ‖ u64 dseq ‖ dprev(32) ‖ payload
+dprev = HE(previous body of this chain), zeros for dseq 1;   HE(b) = BLAKE3.derive_key("zen/v1/event-chain", b)
+```
+
+* **A chain** is `(sender, chain_id, topic)`. A writer instance picks `chain_id` at random, so a restart starts a new chain and needs no stored counter.
+* **Advancing:** the chain advances only once a commit is known to have applied. A failed commit reuses the `dseq`. A commit whose outcome stays unknown ends the chain.
+* **In flight:** one commit at a time per chain. Several appends in one commit take consecutive `dseq`s in append order.
+* **Readers:**
+  * Readers of a whole topic check consecutive `dseq`s and `dprev`, and report a gap.
+  * Filtered readers (`key_token`, partitioned and per-key groups) see subsets, so they check only for rewrites: the same `(chain, dseq)` with a different body.
+* **Unchanged on v1:** v1 bodies still decode, and ephemeral messages stay v1.
+
+**fs.md §9, tree state (replaces "signed checkpoints, a later milestone")**
+
+* **Leaf.** For each node the change feed delivers with a state:
+  ```
+  leaf = BLAKE3.derive_key("zen/v1/tree-state", 0x00 ‖ node ‖ u8 flags ‖ parent ‖ u64 move_hlc ‖ move_dev ‖ u64 meta_hlc ‖ meta_dev ‖ lp(meta) ‖ u32 versions ‖ changed(12))
+  ```
+  Absent fields are zero, and `flags` marks `parent` and `meta`. Tombstones leave the set.
+* **Fold.** A fixed 3-level, 256-ary radix tree over node ids:
+  * bucket `N(p)`, for a 2-byte prefix `p`, is `H(0x01 ‖ ∥ over sorted ids (id ‖ leaf))`
+  * `N(p)` above that is `H(0x02 ‖ ∥ over non-empty b (u8 b ‖ N(p‖b)))`
+  * `state = N(empty)`, where `H` is the same derive_key
+* **Why this fold:** it's canonical and costs about one bucket plus 2 × 256 child hashes per change. That makes it incremental, and keyless, because the tree is collision-resistant (a sum or XOR would be weak to generalized-birthday attacks).
+* **Checkpoints:** a device checkpoints `(ops, chain, state)` at a cursor where the replica is caught up.
+* **api.md §12:** `changes` gains `ops?` and `chain?`, the tree header at the read version, when `more` is false. That ties `state` to `(ops, chain)` (implemented in 6.2).
+
+**api.md §15, checkpoints and devices (new)**
+
+* `POST /v1/checkpoint/put {fs, device, seq, checkpoint: bytes}` → `{version: bytes(10)}`
+  * Needs any right on the fs, and `device` must belong to the caller's user: a cert in the ACL, or registered.
+  * A `seq` other than head + 1 → 409 `version_mismatch`. Over `max_value_bytes` → 413.
+  * The server keeps the newest `limits.checkpoint_keep` (default 1,024) per device; each put deletes `seq − keep`.
+* `POST /v1/checkpoint/heads {fs, devices?}` → `{heads: [{device, seq}]}`
+* `POST /v1/checkpoint/get {fs, device, from, to?, limit?}` → `{items: [{seq, checkpoint}], more}`
+* stream op `cksub {id, fs}` → `ckh {id, device, seq}` on every new head
+* `POST /v1/devices/register {cert}` → `{}`
+  * The cert must verify against the caller's member identity in the current ACL.
+  * At most 64 per user (429 `quota`).
+* `POST /v1/devices/get {devices}` → `{devices: [{device, user, cert?}]}`, so verifiers can find enrolled devices that aren't in the ACL.
+
+**api.md §16, fenced leases (new), and §6 `Commit.fence`**
+
+* `POST /v1/lease {fs, name: bytes(1..64), token?, ttl_ms?, release?}` → `{token, expires_version}`. It needs fs `write`, and works like consume leases (§8.2): empty, expired or released gives the previous token + 1; the holder renews with its token; otherwise 412 `not_leader`.
+* `fence?: [{fs, name, token}]` on a commit: each lease is read normally. It must hold `token`, name the caller's device, and be unexpired, else 412 `claim_lost`.
+* `/v1/info` features: `"checkpoints"`, `"signed_header"`, `"lease"`, `"devices"`.
+
+**keyspace.md §3.10 (new)**
+
+* `pack("dk", fs, device, seq)` → `versionstamp ‖ sealed checkpoint`
+* `pack("dkh", fs, device)` → `u64 seq`
+* `pack("dkd", fs)` → doorbell versionstamp
+* `pack("dv", device)` → `user_fp(32) ‖ cert`
+* `pack("ls", fs, name)` → `holder(32) ‖ u64 token ‖ u64 expires_version`
+* `dk`/`dkh`/`dv` are data (`export` copies them); `dkd` is a doorbell. `hdr` is unchanged: it may hold the signed form.
+
+**svc.md §12:** the handler's device checkpoints carry `[5, svc, conn, in_acked, out_head]` every `sig_every` steps and on release. A successor refuses a claim below the newest verified entry. This replaces the "fix is milestone 6" bullet.
+
+**labels.md (and `labels.rs`)**
+
+* **New:**
+  * the purpose `zen/v1/sig/fs-header`
+  * the hash labels `zen/v1/checkpoint-hash`, `zen/v1/fs-header-chain`, `zen/v1/event-chain` and `zen/v1/tree-state`
+  * the AAD `zen/v1/aad/checkpoint`
+* **Rewritten:**
+  * `sig/checkpoint` becomes "device checkpoint (formats.md §14)"
+  * `sig/tree-checkpoint`, `sig/event`, `sig/commit` and `sig/db-root` are marked reserved, since tree, event and root states ride in device checkpoints
+* formats.md §4 gets the kind 11 row; §8 ("not yet specified") shrinks to the authenticated tier and other CRDT objects.
+
+### zen-core (new module `crates/zen-core/src/integrity.rs`, plus edits)
+
+* **`integrity.rs`:**
+  * `CheckpointBody`, `Entry`, `TopicChain`, `Seen`
+  * `encode`/`decode` through `db::cbor`. Decode is strict: canonical order, no duplicate objects, `v = 1`.
+  * `checkpoint_hash`
+  * `sign_checkpoint(&DeviceSecret, &body) -> Vec<u8>` and `verify_checkpoint(&PublicIdentity, &signed) -> CheckpointBody`
+  * `seal_checkpoint` and `open_checkpoint` (kind 11, via `seal.rs`)
+* **`header.rs`:**
+  * `SignedHeader {fs, version, prev, signer, header}`, with `encode`/`decode`, `sign(&SigningIdentity)`, `verify(&PublicIdentity)` and `hash()`
+  * `is_signed(bytes)`
+  * `validate_header_successor(current: Option<&[u8]>, next: &[u8], admin: impl Fn(&[u8; 32]) -> Option<PublicIdentity>)`, which the server reuses in 6.2
+* **`seal.rs`:**
+  * `EventBody` gains `chain: Option<EventChain {chain_id, dseq, dprev}>`. `encode` writes v2 when it's `Some`, and `decode` accepts v1 and v2.
+  * `event_chain_hash(body)`
+  * kind 11 added to the kind table.
+* **`fs.rs`:**
+  * `state_leaf(&NodeStateFields)`
+  * `TreeState` (a `BTreeMap` of leaves plus cached bucket and mid hashes; `set`, `remove`, `root`)
+* **`labels.rs`:** the new constants, `ALL`, and `SIG_PURPOSES` gets `fs-header`.
+* **Vectors:** a new `spec/test-vectors/integrity.json` from `vectors.rs`:
+  * a checkpoint with one entry of each type and two `seen` entries: its body hex, hash, signature from a fixture device, and the sealed form under `fixture_fs`
+  * a signed header v1 → v2: msg, hash and signature
+  * an event v2 chain of three bodies, with their hashes
+  * tree states: empty, one node, three nodes (two in one bucket), then one removed
+
+### zen-wasm (`crates/zen-wasm/src/crypto.rs`)
+
+* `DeviceSecret.sign(purpose, msg)` and `SigningIdentity`'s existing `sign`. `label()` learns the new names.
+* `encodeCheckpoint`, `decodeCheckpoint`, `checkpointHash`, `FsKeys.sealCheckpoint` and `FsKeys.openCheckpoint`. The TS types `CheckpointBody` and `CheckpointEntry` go in `TS_TYPES`.
+* `signHeader(identity, fs, version, prev, header)`, `decodeSignedHeader`, `verifySignedHeader` and `headerHash`.
+* `EventBody` gets optional `chainId`, `dseq` and `dprev` (through the existing `sealEvent`/`openEvent`), plus `eventChainHash`.
+* a `TreeState` class with `set(node, fields)`, `remove(node)` and `root()`, plus `stateLeaf`.
+* `scripts/build-wasm.sh` is rebuilt, and `packages/zen-wasm` is regenerated.
+
+### Tests
+
+* **Rust (zen-core):**
+  * `tests/vectors.rs` covers the new file, and `tests/labels.rs` passes.
+  * Unit tests for:
+    * checkpoint round trip
+    * decode refuses unsorted or duplicate entries, `v ≠ 1` and trailing bytes
+    * a flipped body bit or a wrong device key fails verification
+    * an open with the wrong device or seq fails
+    * header successor rules: wrong version, wrong `prev`, non-admin signer, unsigned after signed, wrong fs
+    * event v1 and v2 round trips
+    * `TreeState`: incremental equals from scratch over 2,000 random set/remove steps (`DetRng`), and the empty-tree value
+* **TS:** `packages/client/test/integrityvectors.test.ts` checks the wasm bindings against `integrity.json`, like `fsvectors.test.ts`.
+
+### Files
+
+* `spec/{formats,api,keyspace,fs,svc,labels}.md`
+* `crates/zen-core/src/{integrity.rs (new), lib.rs, header.rs, seal.rs, fs.rs, labels.rs, vectors.rs}`
+* `crates/zen-wasm/src/crypto.rs`, `packages/zen-wasm/*` (generated)
+* `spec/test-vectors/integrity.json`, `packages/client/test/integrityvectors.test.ts`
+* `docs/MILESTONE-6.md` (the log)
+
+### Verification
+
+* `cargo fmt --check`
+* clippy `-D warnings` on zen-core and zen-wasm (default and `--all-features`)
+* `cargo test -p zen-core --features test-utils`
+* regenerate the vectors, and check the diff is only `integrity.json`
+* `scripts/build-wasm.sh`, `npm run check`, and `npx vitest run packages/client/test/integrityvectors.test.ts` 3×
+* zen-server compiles unchanged (`cargo check -p zen-server`)
+* CI green on both runs
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.

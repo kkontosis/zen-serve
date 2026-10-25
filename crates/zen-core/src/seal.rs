@@ -8,7 +8,8 @@
 //!   2    1  kind           (1 = kv value, 2 = event, 3 = epoch-chain record,
 //!                           4–6 = filesystem meta, manifest, chunk,
 //!                           7 = CRDT value, 8 = local record,
-//!                           9 = svc state, 10 = svc output key)
+//!                           9 = svc state, 10 = svc output key,
+//!                           11 = device checkpoint)
 //!   3    1  reserved       (= 0)
 //!   4    4  key_epoch      (u32 BE)
 //!   8   24  nonce          (random per seal)
@@ -58,6 +59,8 @@ pub enum Kind {
     SvcState = 9,
     /// An output record's key escrow (spec/formats.md §13.1), sealed in [`crate::svc`].
     SvcKey = 10,
+    /// A device checkpoint (spec/formats.md §14), sealed in [`crate::integrity`].
+    Checkpoint = 11,
 }
 
 fn header(kind: Kind, epoch: u32, nonce: &[u8; 24]) -> [u8; HEADER_LEN] {
@@ -156,6 +159,7 @@ pub fn peek(sealed: &[u8]) -> Result<(Kind, u32)> {
         8 => Kind::Local,
         9 => Kind::SvcState,
         10 => Kind::SvcKey,
+        11 => Kind::Checkpoint,
         _ => return Err(Error::Format),
     };
     Ok((
@@ -222,39 +226,81 @@ pub struct EventBody {
     pub hlc: u64,
     /// Id of the event that caused this one (empty if none).
     pub causation: Vec<u8>,
+    /// The event's link in its writer's chain (body version 2, §5.1); `None`
+    /// for a version-1 body.
+    pub chain: Option<EventChain>,
     /// Application payload.
     pub payload: Vec<u8>,
 }
 
+/// A version-2 event's link in its chain (spec/formats.md §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventChain {
+    /// Random id of the writer's chain.
+    pub chain_id: [u8; 12],
+    /// 1, 2, 3, … in the chain.
+    pub dseq: u64,
+    /// `HE(previous body)`, zeros for `dseq = 1`.
+    pub dprev: [u8; 32],
+}
+
 impl EventBody {
-    /// `0x01 || sender[32] || u64(hlc) || lp(causation) || payload`.
+    /// Version 1: `0x01 || sender[32] || u64(hlc) || lp(causation) || payload`.
+    /// Version 2 (with `chain`) adds `chain_id[12] || u64(dseq) || dprev[32]`
+    /// before the payload.
     pub fn encode(&self) -> Vec<u8> {
         let mut out =
-            Vec::with_capacity(1 + 32 + 8 + 4 + self.causation.len() + self.payload.len());
-        out.push(1);
+            Vec::with_capacity(1 + 32 + 8 + 4 + 52 + self.causation.len() + self.payload.len());
+        out.push(if self.chain.is_some() { 2 } else { 1 });
         out.extend_from_slice(&self.sender);
         out.extend_from_slice(&self.hlc.to_be_bytes());
         lp(&mut out, &self.causation);
+        if let Some(c) = &self.chain {
+            out.extend_from_slice(&c.chain_id);
+            out.extend_from_slice(&c.dseq.to_be_bytes());
+            out.extend_from_slice(&c.dprev);
+        }
         out.extend_from_slice(&self.payload);
         out
     }
 
-    /// Decode an event body.
+    /// Decode an event body of version 1 or 2.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != 1 {
+        let version = r.u8()?;
+        if version != 1 && version != 2 {
             return Err(Error::Format);
         }
         let sender = r.array()?;
         let hlc = r.u64()?;
         let causation = r.lp()?.to_vec();
+        let chain = if version == 2 {
+            let c = EventChain {
+                chain_id: r.array()?,
+                dseq: r.u64()?,
+                dprev: r.array()?,
+            };
+            if c.dseq == 0 || (c.dseq == 1 && c.dprev != [0; 32]) {
+                return Err(Error::Format);
+            }
+            Some(c)
+        } else {
+            None
+        };
         Ok(EventBody {
             sender,
             hlc,
             causation,
+            chain,
             payload: r.rest().to_vec(),
         })
     }
+}
+
+/// `HE(body) = BLAKE3.derive_key("zen/v1/event-chain", body)`: the `dprev`
+/// of the chain's next event (spec/formats.md §5.1).
+pub fn event_chain_hash(body: &[u8]) -> [u8; 32] {
+    blake3::derive_key(labels::EVENT_CHAIN, body)
 }
 
 /// Seal an event for `topic`, optionally bound to an event key token.

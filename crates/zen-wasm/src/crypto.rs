@@ -13,18 +13,18 @@ use zen_core::sig;
 use zen_core::{kdf, labels, opaque, pwkey, svc, token};
 use zeroize::Zeroizing;
 
-type R<T> = Result<T, JsValue>;
+pub(crate) type R<T> = Result<T, JsValue>;
 
-fn arr<const N: usize>(b: &[u8]) -> R<[u8; N]> {
+pub(crate) fn arr<const N: usize>(b: &[u8]) -> R<[u8; N]> {
     b.try_into().map_err(|_| js_err("param"))
 }
 
-fn to_js<T: Serialize>(v: &T) -> R<JsValue> {
+pub(crate) fn to_js<T: Serialize>(v: &T) -> R<JsValue> {
     v.serialize(&serializer())
         .map_err(|e| js_err(&format!("wire: {e}")))
 }
 
-fn from_js<T: for<'de> Deserialize<'de>>(v: JsValue) -> R<T> {
+pub(crate) fn from_js<T: for<'de> Deserialize<'de>>(v: JsValue) -> R<T> {
     serde_wasm_bindgen::from_value(v).map_err(|e| js_err(&format!("wire: {e}")))
 }
 
@@ -58,8 +58,8 @@ export interface ManifestV2 { version: 2; size: number; chunkSize: number; n: nu
 export interface FsPolicy { fileKeys: boolean; rekeyAfterRotate: "rewrite" | "eager" | "keep" }
 /** A manifest of either version, as `openAnyManifest` returns it. */
 export type AnyManifest = (Manifest & { version: 1 }) | ManifestV2;
-/** Plaintext event body (spec/formats.md §5). */
-export interface EventBody { sender: Uint8Array; hlc: bigint; causation: Uint8Array; payload: Uint8Array }
+/** Plaintext event body (spec/formats.md §5). With `chainId`, `dseq` and `dprev` (all three) it is a version-2 body, a link of its writer's chain (§5.1). */
+export interface EventBody { sender: Uint8Array; hlc: bigint; causation: Uint8Array; payload: Uint8Array; chainId?: Uint8Array; dseq?: bigint; dprev?: Uint8Array }
 /** The kind and key epoch in a sealed object's header. */
 export interface Peek { kind: number; epoch: number }
 /** A keyslot's type and id. */
@@ -97,6 +97,8 @@ pub fn label(name: &str) -> R<String> {
         "SIG_EVENT" => labels::SIG_EVENT,
         "SIG_SESSION" => labels::SIG_SESSION,
         "SIG_PASSWORD_SESSION" => labels::SIG_PASSWORD_SESSION,
+        "SIG_CHECKPOINT" => labels::SIG_CHECKPOINT,
+        "SIG_FS_HEADER" => labels::SIG_FS_HEADER,
         _ => return Err(js_err("param")),
     }
     .to_string())
@@ -186,7 +188,7 @@ pub struct FsKeys(pub(crate) CoreKeys);
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct JsEvent {
+pub(crate) struct JsEvent {
     #[serde(with = "serde_bytes")]
     sender: Vec<u8>,
     hlc: u64,
@@ -194,6 +196,49 @@ struct JsEvent {
     causation: Vec<u8>,
     #[serde(with = "serde_bytes")]
     payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_id: Option<serde_bytes::ByteBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dseq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dprev: Option<serde_bytes::ByteBuf>,
+}
+
+impl JsEvent {
+    pub(crate) fn to_core(&self) -> R<seal::EventBody> {
+        let chain = match (&self.chain_id, self.dseq, &self.dprev) {
+            (None, None, None) => None,
+            (Some(id), Some(dseq), Some(dprev)) => Some(seal::EventChain {
+                chain_id: arr(id)?,
+                dseq,
+                dprev: arr(dprev)?,
+            }),
+            _ => return Err(js_err("param")),
+        };
+        Ok(seal::EventBody {
+            sender: arr(&self.sender)?,
+            hlc: self.hlc,
+            causation: self.causation.clone(),
+            chain,
+            payload: self.payload.clone(),
+        })
+    }
+
+    pub(crate) fn from_core(b: seal::EventBody) -> Self {
+        JsEvent {
+            sender: b.sender.to_vec(),
+            hlc: b.hlc,
+            causation: b.causation,
+            payload: b.payload,
+            chain_id: b
+                .chain
+                .map(|c| serde_bytes::ByteBuf::from(c.chain_id.to_vec())),
+            dseq: b.chain.map(|c| c.dseq),
+            dprev: b
+                .chain
+                .map(|c| serde_bytes::ByteBuf::from(c.dprev.to_vec())),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -435,13 +480,7 @@ impl FsKeys {
         key_token: Option<Vec<u8>>,
         #[wasm_bindgen(unchecked_param_type = "EventBody")] body: JsValue,
     ) -> R<Vec<u8>> {
-        let b: JsEvent = from_js(body)?;
-        let body = seal::EventBody {
-            sender: arr(&b.sender)?,
-            hlc: b.hlc,
-            causation: b.causation,
-            payload: b.payload,
-        };
+        let body = from_js::<JsEvent>(body)?.to_core()?;
         let token = self::key_token(key_token)?;
         seal::seal_event(&self.0, &topic.0, token.as_ref(), &body, &mut OsRng).map_err(core_err)
     }
@@ -456,12 +495,7 @@ impl FsKeys {
     ) -> R<JsValue> {
         let token = self::key_token(key_token)?;
         let b = seal::open_event(&self.0, &topic.0, token.as_ref(), sealed).map_err(core_err)?;
-        to_js(&JsEvent {
-            sender: b.sender.to_vec(),
-            hlc: b.hlc,
-            causation: b.causation,
-            payload: b.payload,
-        })
+        to_js(&JsEvent::from_core(b))
     }
 
     /// Seal a node's meta.
@@ -1037,6 +1071,16 @@ impl SigningIdentity {
         let dev = sig::DevicePublic::decode(device_public).map_err(core_err)?;
         sig::issue_device_cert(&self.0, &dev, created_unix).map_err(core_err)
     }
+
+    /// Sign `header` as signed `version` of `fs`'s header chain (formats.md
+    /// §12.1); `prev` is `HH` of the previous signed version, zeros for 1.
+    /// Returns the signed form, as stored.
+    #[wasm_bindgen(js_name = signHeader)]
+    pub fn sign_header(&self, fs: u32, version: u64, prev: &[u8], header: &[u8]) -> R<Vec<u8>> {
+        zen_core::header::SignedHeader::sign(&self.0, fs, version, arr(prev)?, header.to_vec())
+            .map(|h| h.encode())
+            .map_err(core_err)
+    }
 }
 
 /// Verify a hybrid signature by an encoded public identity.
@@ -1103,6 +1147,23 @@ impl DeviceSecret {
                 &zen_proto::session_message(challenge, origin),
             )
             .map_err(core_err)
+    }
+
+    /// A hybrid signature by the device's identity with a purpose label (see
+    /// [`label`]).
+    pub fn sign(&self, purpose: &str, msg: &[u8]) -> R<Vec<u8>> {
+        self.0.signing().sign(purpose, msg).map_err(core_err)
+    }
+
+    /// Sign a checkpoint body (formats.md §14.2): `u32(len) ‖ body ‖ sig`.
+    /// The body must name this device.
+    #[wasm_bindgen(js_name = signCheckpoint)]
+    pub fn sign_checkpoint(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "CheckpointBody")] body: JsValue,
+    ) -> R<Vec<u8>> {
+        let body = crate::integrity::body_from_js(body)?;
+        zen_core::integrity::sign_checkpoint(&self.0, &body).map_err(core_err)
     }
 }
 

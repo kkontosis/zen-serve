@@ -653,3 +653,234 @@ pub fn chain_next(prev: &[u8; 32], op_bytes: &[u8], device: &[u8; 32]) -> [u8; 3
     h.update(device);
     *h.finalize().as_bytes()
 }
+
+// --------------------------------------------------------------- tree state
+
+/// A node state as the change feed delivers it (api.md §12 `NodeState`), the
+/// input of a tree-state leaf (spec/fs.md §9.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateNode {
+    /// Node id.
+    pub node: Id,
+    /// Parent; `None` when the node is invisible.
+    pub parent: Option<Id>,
+    /// Timestamp of the node's winning move.
+    pub move_hlc: u64,
+    /// Device of the node's winning move.
+    pub move_device: [u8; 32],
+    /// The sealed meta (kind 4) with its timestamp and device, if any.
+    pub meta: Option<(Vec<u8>, u64, [u8; 32])>,
+    /// Number of content versions.
+    pub versions: u32,
+    /// Change offset.
+    pub changed: [u8; 12],
+}
+
+fn state_hash(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(labels::TREE_STATE);
+    for p in parts {
+        h.update(p);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// A node's leaf in the tree state (spec/fs.md §9.1).
+pub fn state_leaf(n: &StateNode) -> [u8; 32] {
+    let flags = u8::from(n.parent.is_some()) | (u8::from(n.meta.is_some()) << 1);
+    let (meta, meta_hlc, meta_device) = match &n.meta {
+        Some((m, hlc, dev)) => (&m[..], *hlc, *dev),
+        None => (&[][..], 0, [0; 32]),
+    };
+    let mut b = Vec::with_capacity(1 + 16 + 1 + 16 + 8 + 32 + 8 + 32 + 4 + meta.len() + 4 + 12);
+    b.push(0x00);
+    b.extend_from_slice(&n.node);
+    b.push(flags);
+    b.extend_from_slice(&n.parent.unwrap_or([0; ID_LEN]));
+    b.extend_from_slice(&n.move_hlc.to_be_bytes());
+    b.extend_from_slice(&n.move_device);
+    b.extend_from_slice(&meta_hlc.to_be_bytes());
+    b.extend_from_slice(&meta_device);
+    lp(&mut b, meta);
+    b.extend_from_slice(&n.versions.to_be_bytes());
+    b.extend_from_slice(&n.changed);
+    state_hash(&[&b])
+}
+
+fn bucket_hash<'a>(entries: impl Iterator<Item = (&'a Id, &'a [u8; 32])>) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(labels::TREE_STATE);
+    h.update(&[0x01]);
+    for (id, leaf) in entries {
+        h.update(id);
+        h.update(leaf);
+    }
+    *h.finalize().as_bytes()
+}
+
+fn inner_hash<'a>(children: impl Iterator<Item = (u8, &'a [u8; 32])>) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(labels::TREE_STATE);
+    h.update(&[0x02]);
+    for (b, child) in children {
+        h.update(&[b]);
+        h.update(child);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// The state of a tree from its leaves, computed from scratch (spec/fs.md
+/// §9.1). [`TreeState`] keeps the same value incrementally.
+pub fn tree_state(leaves: &std::collections::BTreeMap<Id, [u8; 32]>) -> [u8; 32] {
+    let mut mids =
+        std::collections::BTreeMap::<u8, std::collections::BTreeMap<u8, [u8; 32]>>::new();
+    let mut it = leaves.iter().peekable();
+    while let Some((id, _)) = it.peek() {
+        let (a, b) = (id[0], id[1]);
+        let mut bucket = Vec::new();
+        while let Some((id, leaf)) = it.peek() {
+            if id[0] != a || id[1] != b {
+                break;
+            }
+            bucket.push((*id, *leaf));
+            it.next();
+        }
+        mids.entry(a)
+            .or_default()
+            .insert(b, bucket_hash(bucket.into_iter()));
+    }
+    let mids: Vec<(u8, [u8; 32])> = mids
+        .into_iter()
+        .map(|(a, bs)| (a, inner_hash(bs.iter().map(|(b, h)| (*b, h)))))
+        .collect();
+    inner_hash(mids.iter().map(|(a, h)| (*a, h)))
+}
+
+/// The state of a tree, kept incrementally as nodes change (spec/fs.md §9.1).
+#[derive(Debug, Clone, Default)]
+pub struct TreeState {
+    leaves: std::collections::BTreeMap<Id, [u8; 32]>,
+    buckets: std::collections::BTreeMap<[u8; 2], [u8; 32]>,
+    mids: std::collections::BTreeMap<u8, [u8; 32]>,
+    dirty: std::collections::BTreeSet<[u8; 2]>,
+    root: Option<[u8; 32]>,
+}
+
+impl TreeState {
+    /// An empty tree.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of nodes.
+    pub fn len(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Whether the tree has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+
+    /// Set a node's leaf ([`state_leaf`]).
+    pub fn set(&mut self, node: Id, leaf: [u8; 32]) {
+        if self.leaves.insert(node, leaf) != Some(leaf) {
+            self.dirty.insert([node[0], node[1]]);
+            self.root = None;
+        }
+    }
+
+    /// Remove a node (a tombstone).
+    pub fn remove(&mut self, node: &Id) {
+        if self.leaves.remove(node).is_some() {
+            self.dirty.insert([node[0], node[1]]);
+            self.root = None;
+        }
+    }
+
+    /// The tree state.
+    pub fn root(&mut self) -> [u8; 32] {
+        if let Some(r) = self.root {
+            return r;
+        }
+        let mut mids = std::collections::BTreeSet::new();
+        for p in std::mem::take(&mut self.dirty) {
+            let mut lo = [0u8; ID_LEN];
+            lo[..2].copy_from_slice(&p);
+            let mut hi = [0xFFu8; ID_LEN];
+            hi[..2].copy_from_slice(&p);
+            let mut range = self.leaves.range(lo..=hi).peekable();
+            if range.peek().is_some() {
+                self.buckets.insert(p, bucket_hash(range));
+            } else {
+                self.buckets.remove(&p);
+            }
+            mids.insert(p[0]);
+        }
+        for a in mids {
+            let children = self
+                .buckets
+                .range([a, 0]..=[a, 0xFF])
+                .map(|(k, h)| (k[1], h));
+            let mut children = children.peekable();
+            if children.peek().is_some() {
+                self.mids.insert(a, inner_hash(children));
+            } else {
+                self.mids.remove(&a);
+            }
+        }
+        let r = inner_hash(self.mids.iter().map(|(a, h)| (*a, h)));
+        self.root = Some(r);
+        r
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::rng::{DetRng, Rng};
+
+    #[test]
+    fn empty_and_incremental() {
+        let mut t = TreeState::new();
+        let empty = state_hash(&[&[0x02]]);
+        assert_eq!(t.root(), empty);
+        assert_eq!(tree_state(&Default::default()), empty);
+
+        let mut rng = DetRng::new("tree-state");
+        let mut ids = Vec::new();
+        for i in 0..2000u32 {
+            let mut b = [0u8; 20];
+            rng.fill(&mut b).unwrap();
+            // Few distinct prefixes, so buckets hold several nodes.
+            let mut id = [0u8; ID_LEN];
+            id[0] = b[0] % 3;
+            id[1] = b[1] % 4;
+            id[2..].copy_from_slice(&b[2..16]);
+            if b[16] % 4 == 0 && !ids.is_empty() {
+                let gone: Id = ids.swap_remove(b[17] as usize % ids.len());
+                t.remove(&gone);
+            } else {
+                let leaf = state_leaf(&StateNode {
+                    node: id,
+                    parent: (b[18] % 2 == 0).then_some(ROOT),
+                    move_hlc: u64::from(i),
+                    move_device: [b[19]; 32],
+                    meta: (b[19] % 2 == 0).then(|| (vec![b[3]; 5], 7, [1; 32])),
+                    versions: i % 3,
+                    changed: [b[4]; 12],
+                });
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                t.set(id, leaf);
+            }
+            if i % 97 == 0 {
+                assert_eq!(t.root(), tree_state(&t.leaves));
+            }
+        }
+        assert_eq!(t.root(), tree_state(&t.leaves));
+        assert_eq!(t.len(), ids.len());
+        for id in ids {
+            t.remove(&id);
+        }
+        assert_eq!(t.root(), empty);
+    }
+}

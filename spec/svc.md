@@ -139,7 +139,7 @@ A new holder:
 
 * **Ack only at boundaries.** A handler acks input only at the end of a complete protocol unit: a TLS record, an SSH packet, or what the application has fully consumed. So the state holds sequence numbers and bounded application data, never half a record.
 * **When a connection becomes resumable is the engine's call.** TLS sets `resumable` after the handshake (STARTTLS is resumable in its plain phase, and again after the handshake): a handshake in progress can't be serialized, so a handler that dies mid-handshake leaves a connection that is aborted. The SSH engine persists its key exchange and sets it from the first step.
-* **Rollback.** A handler remembers, per connection, the highest `(in_acked, out_head)` it has seen in this process. If a claim returns lower values, it aborts the connection (§12).
+* **Rollback.** A handler remembers, per connection, the highest `(in_acked, out_head)` it has seen in this process, and the newest it has verified in device checkpoints (§12). If a claim returns lower values, it aborts the connection.
 
 ## 7. Engine state
 
@@ -367,5 +367,5 @@ With `inbox`:
   * **Mitigations:**
     * a handler aborts on a cursor regression it can see (§6)
     * TLS 1.2 AES-GCM explicit nonces carry a 32-bit prefix drawn at random for each batch of records (§7.1), so a rolled-back sequence number repeats a nonce only with probability 2^-32 per batch
-  * The fix is milestone 6's handler-signed checkpoint, carrying `(conn, out_head)`.
+  * **Handler checkpoints** (milestone 6) bound this. A handler names each connection it serves in its device checkpoints (formats.md §14, entry type 5: `svc, conn, in_acked, out_head`), at least every `sig_every` steps and when it releases the connection or its lease. A successor verifies the checkpoints of the fs before resuming a claim (formats.md §14.4), and aborts a connection whose claimed `(in_acked, out_head)` is below the newest verified entry. So a rollback that reuses nonces is possible only past the predecessor's last checkpoint; `sig_every = 1` checkpoints every step and closes it.
   * Honest failures never cause reuse: an uncommitted record is never revealed.
