@@ -271,6 +271,157 @@ impl FsHeader {
     }
 }
 
+/// First byte of a signed header (spec/formats.md §12.1); never a header version.
+pub const SIGNED_HEADER_TAG: u8 = 0x80;
+
+/// Whether stored header bytes are the signed form.
+pub fn is_signed(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&SIGNED_HEADER_TAG)
+}
+
+/// A header signed by an admin, chained like the ACL (spec/formats.md §12.1):
+///
+/// ```text
+/// 0x80 || u8 suite || u32 fs || u64 version || prev(32) || signer(32) || lp(header) || sig
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedHeader {
+    /// The fs.
+    pub fs: u32,
+    /// Signed version, from 1.
+    pub version: u64,
+    /// `HH` of the previous signed version; zeros for version 1.
+    pub prev: [u8; 32],
+    /// The signing admin's `user_fp`.
+    pub signer: [u8; 32],
+    /// The header (§12), byte for byte.
+    pub header: Vec<u8>,
+    /// Hybrid signature, purpose `zen/v1/sig/fs-header`, of [`SignedHeader::msg`].
+    pub sig: Vec<u8>,
+}
+
+impl SignedHeader {
+    /// Sign `header` as `version` of `fs`'s chain. The signer is `identity`.
+    pub fn sign(
+        identity: &crate::sig::SigningIdentity,
+        fs: u32,
+        version: u64,
+        prev: [u8; 32],
+        header: Vec<u8>,
+    ) -> Result<Self> {
+        let mut h = SignedHeader {
+            fs,
+            version,
+            prev,
+            signer: identity.public().fingerprint(),
+            header,
+            sig: Vec::new(),
+        };
+        h.check()?;
+        h.sig = identity.sign(crate::labels::SIG_FS_HEADER, &h.msg())?;
+        Ok(h)
+    }
+
+    fn check(&self) -> Result<()> {
+        // The header must name the same fs: `u8 version || u8 suite || u32 fs`.
+        if self.version == 0
+            || (self.version == 1 && self.prev != [0; 32])
+            || self.header.len() < 6
+            || self.header[2..6] != self.fs.to_be_bytes()
+        {
+            return Err(Error::Format);
+        }
+        Ok(())
+    }
+
+    /// The signed bytes: everything before `sig`.
+    pub fn msg(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(82 + 4 + self.header.len());
+        out.push(SIGNED_HEADER_TAG);
+        out.push(Suite::Modern as u8);
+        out.extend_from_slice(&self.fs.to_be_bytes());
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.extend_from_slice(&self.prev);
+        out.extend_from_slice(&self.signer);
+        lp(&mut out, &self.header);
+        out
+    }
+
+    /// `msg || sig`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.msg();
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Decode the signed form (no signature check).
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != SIGNED_HEADER_TAG || r.u8()? != Suite::Modern as u8 {
+            return Err(Error::Format);
+        }
+        let h = SignedHeader {
+            fs: r.u32()?,
+            version: r.u64()?,
+            prev: r.array()?,
+            signer: r.array()?,
+            header: r.lp()?.to_vec(),
+            sig: r.rest().to_vec(),
+        };
+        if h.sig.len() != crate::sig::SIGNATURE_LEN {
+            return Err(Error::Format);
+        }
+        h.check()?;
+        Ok(h)
+    }
+
+    /// `HH = BLAKE3.derive_key("zen/v1/fs-header-chain", msg)`.
+    pub fn hash(&self) -> [u8; 32] {
+        blake3::derive_key(crate::labels::FS_HEADER_CHAIN, &self.msg())
+    }
+
+    /// Verify the signature with the signer's identity, which must be the
+    /// identity `signer` names.
+    pub fn verify(&self, signer: &crate::sig::PublicIdentity) -> Result<()> {
+        if signer.fingerprint() != self.signer {
+            return Err(Error::Signature);
+        }
+        signer.verify(crate::labels::SIG_FS_HEADER, &self.msg(), &self.sig)
+    }
+}
+
+/// The acceptance rules of spec/formats.md §12.1 for storing `next` over
+/// `current` (the stored header bytes, either form) of `fs`. `admin` returns
+/// the identity of an admin of the current ACL by `user_fp`, or `None`.
+pub fn validate_header_successor(
+    fs: u32,
+    current: Option<&[u8]>,
+    next: &[u8],
+    admin: impl Fn(&[u8; 32]) -> Option<crate::sig::PublicIdentity>,
+) -> Result<()> {
+    let current_signed = match current {
+        Some(c) if is_signed(c) => Some(SignedHeader::decode(c)?),
+        _ => None,
+    };
+    if !is_signed(next) {
+        // Unsigned headers stay accepted until the first signed one.
+        return match current_signed {
+            None => Ok(()),
+            Some(_) => Err(Error::Param),
+        };
+    }
+    let h = SignedHeader::decode(next)?;
+    let (version, prev) = match &current_signed {
+        Some(c) => (c.version.checked_add(1).ok_or(Error::Param)?, c.hash()),
+        None => (1, [0; 32]),
+    };
+    if h.fs != fs || h.version != version || h.prev != prev {
+        return Err(Error::Param);
+    }
+    let identity = admin(&h.signer).ok_or(Error::Signature)?;
+    h.verify(&identity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +509,66 @@ mod tests {
         let (_, h) = header();
         let other = FsKeys::generate(4, &mut OsRng).unwrap();
         assert!(h.keys_at(&other, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod signed_tests {
+    use super::*;
+    use crate::rng::DetRng;
+    use crate::sig::SigningIdentity;
+
+    fn header_bytes(fs: u32) -> Vec<u8> {
+        FsHeader::new(&FsKeys::generate(fs, &mut DetRng::new("sh-fs")).unwrap())
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    #[test]
+    fn successor_rules() {
+        let admin = SigningIdentity::from_seed(&[1; 32]);
+        let other = SigningIdentity::from_seed(&[2; 32]);
+        let lookup = |fp: &[u8; 32]| (*fp == admin.public().fingerprint()).then(|| admin.public());
+        let plain = header_bytes(7);
+
+        let v1 = SignedHeader::sign(&admin, 7, 1, [0; 32], plain.clone()).unwrap();
+        let v1b = v1.encode();
+        assert_eq!(SignedHeader::decode(&v1b).unwrap(), v1);
+        assert!(is_signed(&v1b) && !is_signed(&plain));
+        // Unsigned → unsigned, unsigned → v1, absent → v1.
+        validate_header_successor(7, Some(&plain), &plain, lookup).unwrap();
+        validate_header_successor(7, Some(&plain), &v1b, lookup).unwrap();
+        validate_header_successor(7, None, &v1b, lookup).unwrap();
+        // v1 → v2 with the right prev.
+        let v2 = SignedHeader::sign(&admin, 7, 2, v1.hash(), plain.clone()).unwrap();
+        validate_header_successor(7, Some(&v1b), &v2.encode(), lookup).unwrap();
+
+        // Unsigned after signed, a skipped or repeated version, a wrong prev.
+        assert!(validate_header_successor(7, Some(&v1b), &plain, lookup).is_err());
+        assert!(validate_header_successor(7, Some(&v1b), &v1b, lookup).is_err());
+        let v3 = SignedHeader::sign(&admin, 7, 3, v1.hash(), plain.clone()).unwrap();
+        assert!(validate_header_successor(7, Some(&v1b), &v3.encode(), lookup).is_err());
+        let bad_prev = SignedHeader::sign(&admin, 7, 2, [9; 32], plain.clone()).unwrap();
+        assert!(validate_header_successor(7, Some(&v1b), &bad_prev.encode(), lookup).is_err());
+        // A signer who isn't an admin, a forged signer field, another fs.
+        let not_admin = SignedHeader::sign(&other, 7, 1, [0; 32], plain.clone()).unwrap();
+        assert_eq!(
+            validate_header_successor(7, None, &not_admin.encode(), lookup),
+            Err(Error::Signature)
+        );
+        let mut forged = not_admin.clone();
+        forged.signer = admin.public().fingerprint();
+        assert_eq!(
+            validate_header_successor(7, None, &forged.encode(), lookup),
+            Err(Error::Signature)
+        );
+        assert!(validate_header_successor(8, None, &v1b, lookup).is_err());
+        assert!(SignedHeader::sign(&admin, 8, 1, [0; 32], plain.clone()).is_err());
+        // A flipped byte of the header breaks the signature.
+        let mut flipped = v1b.clone();
+        let at = flipped.len() - crate::sig::SIGNATURE_LEN - 1;
+        flipped[at] ^= 1;
+        assert!(validate_header_successor(7, None, &flipped, lookup).is_err());
     }
 }

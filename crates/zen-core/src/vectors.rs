@@ -40,6 +40,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("acl.json", acl_vectors()?),
         ("zendb.json", crate::db_vectors::zendb_vectors()?),
         ("svc.json", svc_vectors()?),
+        ("integrity.json", integrity_vectors()?),
     ])
 }
 
@@ -106,6 +107,7 @@ pub fn fixture_event() -> EventBody {
         sender: [0xAB; 32],
         hlc: 0x0001_0203_0405_0607,
         causation: b"evt-1".to_vec(),
+        chain: None,
         payload: b"hello family".to_vec(),
     }
 }
@@ -593,5 +595,225 @@ fn svc_vectors() -> Result<Value> {
         "fin_record": {"off": 580, "flags": svc::FIN, "raw": "", "rng_seed": "svc-fin", "k_r": h(fin_key.as_ref()), "record": h(&fin)},
         "plain_record": {"flags": svc::CLOSE, "raw": h(b"221 bye\r\n"), "record": h(&plain)},
         "inbox": {"seed": h(&seed), "public": h(&public), "rng_seed": "svc-inbox", "ct": h(&ct), "chunks": chunks},
+    }))
+}
+
+/// The fixture checkpoint body of `integrity.json`: one entry of each type,
+/// two `seen` heads.
+pub fn fixture_checkpoint(device: [u8; 32]) -> crate::integrity::CheckpointBody {
+    use crate::integrity::{CheckpointBody, Entry, Head, Seen, TopicChain};
+    CheckpointBody {
+        fs: 7,
+        device,
+        seq: 2,
+        prev: [0x9A; 32],
+        hlc: fs::hlc(1_790_000_000_000, 3),
+        acl: Head {
+            version: 4,
+            hash: [0xAC; 32],
+        },
+        header: Head {
+            version: 1,
+            hash: [0x4D; 32],
+        },
+        objects: vec![
+            Entry::Topic {
+                topic: vec![0x70; 32],
+                head: [0x01; 12],
+                chains: vec![
+                    TopicChain {
+                        chain_id: [0x0A; 12],
+                        dseq: 3,
+                        dhash: [0xA3; 32],
+                    },
+                    TopicChain {
+                        chain_id: [0x0B; 12],
+                        dseq: 1,
+                        dhash: [0xB1; 32],
+                    },
+                ],
+            },
+            Entry::Tree {
+                tree: [0x11; 16],
+                ops: 42,
+                chain: [0x42; 32],
+                state: [0x43; 32],
+            },
+            Entry::Db {
+                ns: vec![0xD0; 16],
+                seq: 17,
+                hash: [0xD1; 32],
+            },
+            Entry::Vol {
+                vol: vec![0xB0; 16],
+                seq: 5,
+                hash: [0xB5; 32],
+            },
+            Entry::Svc {
+                svc: vec![0x5C; 16],
+                conn: [0x51; 16],
+                in_acked: 1_000,
+                out_head: 2_000,
+            },
+        ],
+        seen: vec![
+            Seen {
+                device: [0x01; 32],
+                seq: 9,
+                hash: [0x19; 32],
+            },
+            Seen {
+                device: [0xEE; 32],
+                seq: 1,
+                hash: [0xE1; 32],
+            },
+        ],
+    }
+}
+
+/// The fixture node states of `integrity.json`: `a` and `b` share a bucket
+/// (the first two id bytes), `c` doesn't.
+pub fn fixture_state_nodes() -> Vec<fs::StateNode> {
+    let (_, _, _, device) = fixture_fs_ids();
+    let node = |first: [u8; 2], fill: u8| {
+        let mut id = [fill; fs::ID_LEN];
+        id[..2].copy_from_slice(&first);
+        id
+    };
+    vec![
+        fs::StateNode {
+            node: node([0x12, 0x34], 0xA0),
+            parent: Some(fs::ROOT),
+            move_hlc: fs::hlc(1_790_000_000_000, 0),
+            move_device: device,
+            meta: Some((
+                b"sealed meta a".to_vec(),
+                fs::hlc(1_790_000_000_000, 0),
+                device,
+            )),
+            versions: 0,
+            changed: [0x01; 12],
+        },
+        fs::StateNode {
+            node: node([0x12, 0x34], 0xB0),
+            parent: Some(node([0x12, 0x34], 0xA0)),
+            move_hlc: fs::hlc(1_790_000_000_001, 0),
+            move_device: device,
+            meta: Some((
+                b"sealed meta b".to_vec(),
+                fs::hlc(1_790_000_000_002, 1),
+                [0xDF; 32],
+            )),
+            versions: 2,
+            changed: [0x02; 12],
+        },
+        fs::StateNode {
+            node: node([0x9F, 0x00], 0xC0),
+            parent: None,
+            move_hlc: fs::hlc(1_790_000_000_003, 0),
+            move_device: device,
+            meta: None,
+            versions: 1,
+            changed: [0x03; 12],
+        },
+    ]
+}
+
+fn integrity_vectors() -> Result<Value> {
+    use crate::header::{FsHeader, SignedHeader};
+    use crate::integrity::{checkpoint_hash, seal_checkpoint, sign_checkpoint};
+    let fsk = fixture_fs();
+
+    // A device checkpoint, signed by the fixture device and sealed.
+    let dev = fixture_device();
+    let fp = dev.public().fingerprint();
+    let body = fixture_checkpoint(fp);
+    let body_bytes = body.encode()?;
+    let signed = sign_checkpoint(&dev, &body)?;
+    let sealed = seal_checkpoint(&fsk, &fp, body.seq, &signed, &mut DetRng::new("ck-seal"))?;
+
+    // A signed header, versions 1 and 2, by the fixture user.
+    let (admin, _) = SigningIdentity::generate(&mut DetRng::new("user"))?;
+    let plain = FsHeader::new(&fsk)?.encode()?;
+    let v1 = SignedHeader::sign(&admin, fsk.fs_id, 1, [0; 32], plain.clone())?;
+    let v2 = SignedHeader::sign(&admin, fsk.fs_id, 2, v1.hash(), plain.clone())?;
+
+    // An event chain of three bodies.
+    let mut prev = [0u8; 32];
+    let mut events = Vec::new();
+    for dseq in 1..=3u64 {
+        let b = EventBody {
+            sender: fp,
+            hlc: fs::hlc(1_790_000_000_000 + dseq, 0),
+            causation: Vec::new(),
+            chain: Some(seal::EventChain {
+                chain_id: [0x0C; 12],
+                dseq,
+                dprev: prev,
+            }),
+            payload: format!("event {dseq}").into_bytes(),
+        };
+        let bytes = b.encode();
+        prev = seal::event_chain_hash(&bytes);
+        events.push(json!({"dseq": dseq, "body": h(&bytes), "hash": h(&prev)}));
+    }
+
+    // Tree states: empty, one node, all three, then the second removed.
+    let nodes = fixture_state_nodes();
+    let mut t = fs::TreeState::new();
+    let empty = t.root();
+    let leaves: Vec<Value> = nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "node": h(&n.node),
+                "parent": n.parent.map(|p| h(&p)),
+                "move_hlc": n.move_hlc.to_string(),
+                "move_device": h(&n.move_device),
+                "meta": n.meta.as_ref().map(|(m, _, _)| h(m)),
+                "meta_hlc": n.meta.as_ref().map(|(_, hlc, _)| hlc.to_string()),
+                "meta_device": n.meta.as_ref().map(|(_, _, d)| h(d)),
+                "versions": n.versions,
+                "changed": h(&n.changed),
+                "leaf": h(&fs::state_leaf(n)),
+            })
+        })
+        .collect();
+    t.set(nodes[0].node, fs::state_leaf(&nodes[0]));
+    let one = t.root();
+    for n in &nodes[1..] {
+        t.set(n.node, fs::state_leaf(n));
+    }
+    let three = t.root();
+    t.remove(&nodes[1].node);
+    let removed = t.root();
+
+    Ok(json!({
+        "description": "Device checkpoints (formats.md §14), signed fs headers (§12.1), event chains (§5.1), tree states (fs.md §9.1). fs from keys.json fs_epoch0; device and user as in signatures.json. hlc values are decimal strings (they exceed 2^53).",
+        "checkpoint": {
+            "device_rng_seed": "device",
+            "device_public": h(&dev.public().encode()),
+            "device_fingerprint": h(&fp),
+            "body": h(&body_bytes),
+            "hash": h(&checkpoint_hash(&body_bytes)),
+            "signed": h(&signed),
+            "seal_rng_seed": "ck-seal",
+            "sealed": h(&sealed),
+        },
+        "signed_header": {
+            "user_rng_seed": "user",
+            "user_public": h(&admin.public().encode()),
+            "header": h(&plain),
+            "v1": {"msg": h(&v1.msg()), "hash": h(&v1.hash()), "signed": h(&v1.encode())},
+            "v2": {"msg": h(&v2.msg()), "hash": h(&v2.hash()), "signed": h(&v2.encode())},
+        },
+        "event_chain": {"chain_id": h(&[0x0C; 12]), "events": events},
+        "tree_state": {
+            "nodes": leaves,
+            "empty": h(&empty),
+            "first": h(&one),
+            "all": h(&three),
+            "without_second": h(&removed),
+        },
     }))
 }

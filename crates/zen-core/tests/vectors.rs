@@ -470,3 +470,100 @@ fn svc_vectors_open_from_files() {
         next = off + data.len() as u64;
     }
 }
+
+#[test]
+fn integrity_vectors_verify_from_files() {
+    use zen_core::fs::{StateNode, TreeState, state_leaf};
+    use zen_core::header::{SignedHeader, validate_header_successor};
+    use zen_core::integrity::{
+        CheckpointBody, checkpoint_hash, open_checkpoint, verify_checkpoint,
+    };
+    use zen_core::sig::DevicePublic;
+
+    let v = load("integrity.json");
+    let fs = fs_from_file();
+
+    // Checkpoint: open, verify with the device's public keys, hash.
+    let c = &v["checkpoint"];
+    let dev = DevicePublic::decode(&hx(&c["device_public"])).unwrap();
+    let fp: [u8; 32] = hx(&c["device_fingerprint"]).try_into().unwrap();
+    assert_eq!(dev.fingerprint(), fp);
+    let body = CheckpointBody::decode(&hx(&c["body"])).unwrap();
+    let signed = open_checkpoint(&fs, &fp, body.seq, &hx(&c["sealed"])).unwrap();
+    assert_eq!(signed, hx(&c["signed"]));
+    assert_eq!(verify_checkpoint(&dev, &signed).unwrap(), body);
+    assert_eq!(checkpoint_hash(&hx(&c["body"])).to_vec(), hx(&c["hash"]));
+    assert!(open_checkpoint(&fs, &fp, body.seq + 1, &hx(&c["sealed"])).is_err());
+
+    // Signed header: v1 over the unsigned header, then v2.
+    let sh = &v["signed_header"];
+    let user = PublicIdentity::decode(&hx(&sh["user_public"])).unwrap();
+    let admin = |f: &[u8; 32]| (*f == user.fingerprint()).then(|| user.clone());
+    let (plain, v1, v2) = (
+        hx(&sh["header"]),
+        hx(&sh["v1"]["signed"]),
+        hx(&sh["v2"]["signed"]),
+    );
+    validate_header_successor(fs.fs_id, Some(&plain), &v1, admin).unwrap();
+    validate_header_successor(fs.fs_id, Some(&v1), &v2, admin).unwrap();
+    let d1 = SignedHeader::decode(&v1).unwrap();
+    assert_eq!(d1.msg(), hx(&sh["v1"]["msg"]));
+    assert_eq!(d1.hash().to_vec(), hx(&sh["v1"]["hash"]));
+    assert_eq!(d1.header, plain);
+
+    // Event chain: each body links to the previous one's hash.
+    let mut prev = [0u8; 32];
+    for (i, e) in v["event_chain"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let bytes = hx(&e["body"]);
+        let b = seal::EventBody::decode(&bytes).unwrap();
+        let chain = b.chain.unwrap();
+        assert_eq!((chain.dseq, chain.dprev), (i as u64 + 1, prev));
+        prev = seal::event_chain_hash(&bytes);
+        assert_eq!(prev.to_vec(), hx(&e["hash"]));
+    }
+
+    // Tree states from the listed node states.
+    let ts = &v["tree_state"];
+    let arr = |x: &Value| -> [u8; 32] { hx(x).try_into().unwrap() };
+    let nodes: Vec<StateNode> = ts["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            let s = StateNode {
+                node: hx(&n["node"]).try_into().unwrap(),
+                parent: n["parent"]
+                    .as_str()
+                    .map(|_| hx(&n["parent"]).try_into().unwrap()),
+                move_hlc: n["move_hlc"].as_str().unwrap().parse().unwrap(),
+                move_device: arr(&n["move_device"]),
+                meta: n["meta"].as_str().map(|_| {
+                    (
+                        hx(&n["meta"]),
+                        n["meta_hlc"].as_str().unwrap().parse().unwrap(),
+                        arr(&n["meta_device"]),
+                    )
+                }),
+                versions: n["versions"].as_u64().unwrap() as u32,
+                changed: hx(&n["changed"]).try_into().unwrap(),
+            };
+            assert_eq!(state_leaf(&s), arr(&n["leaf"]));
+            s
+        })
+        .collect();
+    let mut t = TreeState::new();
+    assert_eq!(t.root(), arr(&ts["empty"]));
+    t.set(nodes[0].node, state_leaf(&nodes[0]));
+    assert_eq!(t.root(), arr(&ts["first"]));
+    for n in &nodes[1..] {
+        t.set(n.node, state_leaf(n));
+    }
+    assert_eq!(t.root(), arr(&ts["all"]));
+    t.remove(&nodes[1].node);
+    assert_eq!(t.root(), arr(&ts["without_second"]));
+}

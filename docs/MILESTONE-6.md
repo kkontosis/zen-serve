@@ -73,8 +73,34 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * Update DESIGN-3 §6 item 6 (scope and link) and the README status ("Milestone 6: in progress").
   * Commit `docs: milestone 6 plan (integrity, zen-ublk)`, then open the PR.
   * PR #53 merged.
-* **Step 6.1** (spec, zen-core, vectors, wasm): planned below ("Step 6.1 in detail").
-  * Next: restart from main, commit the plan (`docs: milestone 6 step 1 plan`), and open the PR. Implement on "go".
+* **Step 6.1** (spec, zen-core, vectors, wasm): planned below ("Step 6.1 in detail"). Plan committed (95ec6a8), PR #54.
+  * `spec:` commit 330c7fa:
+    * formats.md §4 (kind 11), §5.1 (event chains), §8, §12.1 (signed header), §14 (device checkpoints)
+    * fs.md §9.1 (tree state)
+    * api.md §2 (features, `checkpoint_keep`), §4.4, §6 (`fence`), §9 (`cksub`/`ckh`), §12 (`changes` ops/chain), §15, §16
+    * keyspace.md §3.10 (`dk`, `dkh`, `dkd`, `dv`, `dvu`, `ls`)
+    * svc.md §6 and §12, zendb.md §14
+    * labels.md and `labels.rs`
+  * **zen-core:**
+    * new `integrity.rs`: `CheckpointBody`/`Entry`, canonical encode/decode, sign/verify, seal/open as kind 11
+    * `header.rs`: `SignedHeader`, `validate_header_successor`
+    * `seal.rs`: `EventBody.chain` (v2) and `event_chain_hash`
+    * `fs.rs`: `StateNode`, `state_leaf`, `tree_state`, incremental `TreeState`
+    * vectors in `integrity.json`; unit tests plus a test that reads the vectors back from the file
+  * **zen-wasm:**
+    * new `integrity.rs`: checkpoint codec, verify, seal/open, signed header, event chain, `TreeState`
+    * `DeviceSecret.sign`/`signCheckpoint`, `SigningIdentity.signHeader`
+    * `EventBody` v2 fields, `label()` names
+  * **TS:** `packages/client/test/integrityvectors.test.ts`.
+  * **Found and fixed:** a JS `JSON.parse` loses u64 hlc values above 2^53, so `integrity.json` writes hlc as decimal strings.
+  * **Checks (all clean):**
+    * fmt
+    * clippy on the workspace, and on zen-core/zen-wasm with `--all-features`, `--no-default-features` and wasm32
+    * zen-core tests
+    * the TS vectors test 3×
+    * `npm run check`
+    * the client log, stream and kv tests, and `packages/db` (245 passed; only the opt-in bench skipped)
+  * Next: push, CI green on both runs.
 
 ## Facts the design rests on (survey)
 

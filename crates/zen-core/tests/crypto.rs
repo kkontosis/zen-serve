@@ -89,6 +89,7 @@ fn event_is_bound_to_topic_and_key_token() {
         sender: [1; 32],
         hlc: 9,
         causation: vec![],
+        chain: None,
         payload: b"hi".to_vec(),
     };
     let sealed = seal::seal_event(&fs, &topic, Some(&tok), &body, &mut DetRng::new("e")).unwrap();
@@ -430,4 +431,36 @@ fn password_key_parameter_bounds() {
             Err(Error::Param)
         ));
     }
+}
+
+#[test]
+fn event_body_versions_round_trip() {
+    let v1 = EventBody {
+        sender: [1; 32],
+        hlc: 9,
+        causation: b"c".to_vec(),
+        chain: None,
+        payload: b"p".to_vec(),
+    };
+    let b1 = v1.encode();
+    assert_eq!(b1[0], 1);
+    assert_eq!(EventBody::decode(&b1).unwrap(), v1);
+    let mut v2 = v1.clone();
+    v2.chain = Some(seal::EventChain {
+        chain_id: [2; 12],
+        dseq: 2,
+        dprev: seal::event_chain_hash(&b1),
+    });
+    let b2 = v2.encode();
+    assert_eq!((b2[0], b2.len()), (2, b1.len() + 52));
+    assert_eq!(EventBody::decode(&b2).unwrap(), v2);
+    // dseq 0, or dseq 1 with a non-zero dprev, is refused; so is version 3.
+    let mut bad = v2.clone();
+    bad.chain.as_mut().unwrap().dseq = 0;
+    assert!(EventBody::decode(&bad.encode()).is_err());
+    bad.chain.as_mut().unwrap().dseq = 1;
+    assert!(EventBody::decode(&bad.encode()).is_err());
+    let mut b3 = b2.clone();
+    b3[0] = 3;
+    assert!(EventBody::decode(&b3).is_err());
 }
