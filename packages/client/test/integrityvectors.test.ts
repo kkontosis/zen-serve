@@ -41,7 +41,7 @@ describe('integrity.json', () => {
     expect(zw.verifyCheckpoint(devicePublic, signed)).toEqual(body);
     expect(hex(zw.checkpointBodyBytes(signed))).toBe(c.body);
     const flipped = signed.slice();
-    flipped[8] ^= 1;
+    flipped[8]! ^= 1;
     expect(() => zw.verifyCheckpoint(devicePublic, flipped)).toThrow();
 
     // A device signs and seals its own checkpoint; it round-trips.
@@ -85,7 +85,7 @@ describe('integrity.json', () => {
   });
 
   it('event chain bodies link by HE', () => {
-    let prev = new Uint8Array(32);
+    let prev: Uint8Array = new Uint8Array(32);
     for (const e of V.event_chain.events) {
       const body = zw.decodeEventBody(fromHex(e.body));
       expect(hex(body.chainId!)).toBe(V.event_chain.chain_id);

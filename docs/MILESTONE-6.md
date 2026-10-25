@@ -106,6 +106,15 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * `dump` itself retries since 2322431; the test's own reads didn't.
     * Fix: a retrying `get` helper for the three direct reads, and the migrate loop now retries `begin` too.
     * FDB here, 5×: the first run, on a fresh cluster, took 11.5 s and passed.
+  * **CI on 297245b and 51e629f (runs 379–382): `client` "Lint and typecheck" red.** `rust`, `pure-rust` and `fdb` are green, so the dump fix holds on CI.
+    * Cause: CI type-checks the client tests (`tsc -p packages/client/tsconfig.test.json`, `include: [src, test]`). The local `npm run check` runs `tsc -p packages/client --noEmit`, which leaves `test/` out, so the new test's type errors passed locally.
+    * Errors in `packages/client/test/integrityvectors.test.ts`:
+      * line 44: `flipped[8] ^= 1` gives TS2532 (index access may be undefined)
+      * line 95: assigning `eventChainHash`'s `Uint8Array<ArrayBufferLike>` to `prev`, inferred as `Uint8Array<ArrayBuffer>`, gives TS2322
+    * **Fix:**
+      1. `flipped[8]! ^= 1;` (the repo's idiom: `local.test.ts:164`, `tree.test.ts:282`, `vault.test.ts:228`), and `let prev: Uint8Array = new Uint8Array(32);`.
+      2. Make `npm run check` match CI, so this can't recur: root `package.json` `check` uses `tsc -p packages/client/tsconfig.test.json` (instead of `tsc -p packages/client --noEmit`) and adds `tsc -p packages/fuse/tsconfig.json --noEmit`, the two CI lines it lacks.
+    * Done: the new `npm run check` passes. Run on the unfixed test file, it reports exactly CI's 2 errors. The integrity vectors test passes.
   * Next: CI green on both runs.
 
 ## Facts the design rests on (survey)
