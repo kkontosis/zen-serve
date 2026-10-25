@@ -201,6 +201,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Docs:** CLIENT.md §12 (trees, relayed connections), SVC.md §6 (handler checkpoints, the window), TECH_DEBT TD-SVC-STATE-ROLLBACK narrowed to the handler's database and the window, STATS §5.2 (tree state: 100,000 nodes from scratch ~0.5–0.6 s plus 60–130 ms for the first root; a change then `root()` ~55–95 µs; measured while the full vitest run was going, so upper bounds).
   * Local: the full vitest run green (578 passed, 12 skipped: the opt-in benches); `cargo test -p zen-server --test fs --test crdt` on local FDB green.
   * Pushed ae68e8e. **The push run (406) was green; the pull_request run (407) was red in `client`**, at one test outside this step: `packages/db/test/patterns.test.ts` "retry 'delay'", `decrypt` reading the topic's events. Not reproduced in 21 local runs; reading found no cause. Recorded as TD-TEST-OPEN-FAILURES item 6, and `Topic.decode` now names the event that didn't open (offset, topic, kind, epoch, key token, size), so a recurrence says what was stored.
+  * **CI green on both runs of c756b0c** (push 408, pull_request 409). Step 6.4 is done, waiting on review and merge of PR #57.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
