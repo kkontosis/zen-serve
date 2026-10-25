@@ -113,6 +113,8 @@ export class DbTransaction implements IndexTx {
   /** @internal The queue entry this transaction became. */
   queued: QueueEntry | undefined;
   private readonly afters: (() => void)[] = [];
+  /** Set by a request: the inbox's subscriptions starting. */
+  private inboxReady: Promise<void> | undefined;
 
   constructor(
     readonly db: Db,
@@ -249,19 +251,21 @@ export class DbTransaction implements IndexTx {
     this.live();
     checkType(type);
     const inbox = this.db.inbox;
-    const ready = inbox.start();
+    // The inbox's subscriptions must be live before the request is sent
+    // (`finish` waits for them): an ephemeral reply has no history.
+    this.inboxReady = inbox.start();
     const corr = opts.corr ?? bytes.randomBytes(16);
+    // Replies are kept from now: one can arrive before this commit's answer.
+    const w = inbox.expect(corr, type, all, opts);
     appendMsg(
       this,
       topic,
       { type, id: bytes.randomBytes(16), corr, replyTo: inbox.path, body },
       opts.key,
     );
-    return new Promise((resolve, reject) => {
-      this.raw.onCommit(() => {
-        ready.then(() => inbox.wait(corr, type, all, opts).then(resolve, reject), reject);
-      });
-    });
+    // Sent (or maybe sent): the timeout counts from now. Never sent: forgotten.
+    this.raw.onSettle((outcome) => (outcome === 'failed' ? w.drop() : w.arm()));
+    return w.promise;
   }
 
   /** Reply to a request in this transaction (an `on` responder, a manual consumer). */
@@ -462,6 +466,7 @@ export class DbTransaction implements IndexTx {
    */
   async finish(): Promise<void> {
     this.live();
+    if (this.inboxReady) await this.inboxReady;
     if (this.queueAs && this.crdtW?.size && this.crdtOnly()) {
       this.queued = this.queueEntry(this.queueAs.single);
       return;
@@ -1057,6 +1062,8 @@ export class ManualTransaction extends DbTransaction {
       return await commitTransaction(this.raw);
     } catch (e) {
       for (const h of this.raw.errorHooks) await h(e, 1);
+      // Never sent (a failed `finish`): requests made in it are forgotten.
+      this.raw.settle('failed');
       throw e;
     } finally {
       this.closed = true;
@@ -1066,5 +1073,6 @@ export class ManualTransaction extends DbTransaction {
   /** Drop the transaction: nothing is sent. */
   abort(): void {
     this.closed = true;
+    this.raw.settle('failed');
   }
 }
