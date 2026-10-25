@@ -99,22 +99,41 @@ export class Inbox {
   }
 
   /**
-   * Wait for the replies to `corr`: the first (`all` false), or every one
-   * until the timeout or `max`. The timer starts now.
+   * Expect the replies to `corr`: the first (`all` false), or every one
+   * until the timeout or `max`. Replies are kept from now on, since a
+   * responder can answer before the asker sees its own commit; the timer
+   * starts at `arm` (the commit). `drop` forgets a request that was never
+   * sent: its promise never settles.
    */
-  wait(corr: Uint8Array, type: string, all: boolean, opts: RequestAllOptions): Promise<never> {
-    return new Promise((resolve, reject) => {
+  expect(
+    corr: Uint8Array,
+    type: string,
+    all: boolean,
+    opts: RequestAllOptions,
+  ): { promise: Promise<never>; arm: () => void; drop: () => void } {
+    const k = bytes.hex(corr);
+    let w: Waiter | undefined;
+    const promise = new Promise<never>((resolve, reject) => {
       if (this.closed) return reject(new DbError('closed', 'the database was closed'));
-      const k = bytes.hex(corr);
-      const w: Waiter = { type, all, max: opts.max ?? Infinity, got: [], resolve, reject };
-      w.timer = setTimeout(() => {
-        this.waiting.delete(k);
-        if (all) resolve(w.got as never);
-        else
-          reject(new DbError('timeout', `no reply to ${type} in ${opts.timeoutMs ?? 10_000} ms`));
-      }, opts.timeoutMs ?? 10_000);
+      w = { type, all, max: opts.max ?? Infinity, got: [], resolve, reject };
       this.waiting.set(k, w);
     });
+    const arm = () => {
+      if (!w || this.waiting.get(k) !== w) return;
+      const ww = w;
+      ww.timer = setTimeout(() => {
+        this.waiting.delete(k);
+        if (all) ww.resolve(ww.got as never);
+        else
+          ww.reject(
+            new DbError('timeout', `no reply to ${type} in ${opts.timeoutMs ?? 10_000} ms`),
+          );
+      }, opts.timeoutMs ?? 10_000);
+    };
+    const drop = () => {
+      if (w && this.waiting.get(k) === w) this.settle(k, w);
+    };
+    return { promise, arm, drop };
   }
 
   private deliver(m: Reply): void {

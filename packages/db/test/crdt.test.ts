@@ -198,9 +198,25 @@ describe('CRDT tables (§19)', () => {
       status: 'from b',
     });
     await a.table<Card>('cards').patch('c', { title: 'a again' });
+    // Later in causal order: b has read a's write (two installations' clocks
+    // agree only to within their offset estimates, so wall time alone isn't).
+    expect((await b.table<Card>('cards').get('c'))!.title).toBe('a again');
     await b.table<Card>('cards').patch('c', { title: 'b last' });
     expect((await a.table<Card>('cards').get('c'))!.title).toBe('b last');
     close();
+  });
+
+  it('a write after reading one stamped by a clock ahead still wins (§19.4)', async () => {
+    const name = ns();
+    const ahead = new TreeClock({ store: memoryClockStore(zw.hlc(Date.now() + 2000, 0)) });
+    const a = await open(await installation(ahead), name);
+    const b = await open(fs2, name);
+    await a.table<Card>('cards').insert({ id: 'c', title: 'from ahead' });
+    expect((await b.table<Card>('cards').get('c'))!.title).toBe('from ahead');
+    await b.table<Card>('cards').patch('c', { title: 'after reading it' });
+    expect((await a.table<Card>('cards').get('c'))!.title).toBe('after reading it');
+    a.close();
+    b.close();
   });
 
   it('counters: installations sum, parallel increments of one all count', async () => {

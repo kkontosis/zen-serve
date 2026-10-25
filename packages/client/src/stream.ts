@@ -3,7 +3,8 @@ import type { Frame } from '@zen/wasm';
 import { concat, fromB64url, hex, randomBytes, utf8 } from './bytes.js';
 import { ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
-import type { Topic, TopicEvent } from './log.js';
+import { IntegrityError } from './integrity.js';
+import type { ChainCheck, Topic, TopicEvent } from './log.js';
 import type { Session } from './session.js';
 import { sleep } from './transport.js';
 import { zw } from './wasm.js';
@@ -14,6 +15,11 @@ export interface StreamOptions {
   onError?: (e: ZenError) => void;
   /** Reconnect backoff: the first delay and the cap, in ms (default 100 and 5 000). */
   backoffMs?: [number, number];
+  /**
+   * Give up on a connection attempt not authenticated within this long (default
+   * 10 000 ms): an attempt that meets a server going down can hang unanswered.
+   */
+  connectTimeoutMs?: number;
 }
 
 /** What to subscribe to: a topic, or every topic under a prefix of an fs. */
@@ -75,6 +81,13 @@ export type SvcPush =
       flags: number;
     }
   | { type: 'ready' };
+
+/**
+ * What a checkpoint subscription pushes (api.md §9, `cksub`): a device's
+ * new head, or `heads` after each (re)subscription, when heads may have
+ * moved unseen.
+ */
+export type CheckpointPush = { type: 'heads' } | { type: 'head'; device: Uint8Array; seq: bigint };
 
 /** Options of `subscribe`. */
 export interface SubscribeOptions<T> {
@@ -163,9 +176,13 @@ export class Subscription<T> implements AsyncIterable<T> {
 }
 
 interface SubState {
-  kind: 'sub' | 'esub' | 'svc';
+  kind: 'sub' | 'esub' | 'svc' | 'ck';
   fs: number;
-  target: { topic: Uint8Array } | { prefix: Uint8Array } | { svc: Uint8Array; lease: Uint8Array };
+  target:
+    | { topic: Uint8Array }
+    | { prefix: Uint8Array }
+    | { svc: Uint8Array; lease: Uint8Array }
+    | Record<string, never>;
   /** Topics that can open what arrives, by hex id. */
   topics: Map<string, Topic>;
   /** `sub`: the last offset received (or the start). */
@@ -176,6 +193,8 @@ interface SubState {
   started?: { ok: () => void; fail: (e: ZenError) => void };
   /** `esub`: the newest hlc per topic, sender and stream (replay protection, api.md §9.2). */
   seen?: Map<string, bigint>;
+  /** `sub`: event chain checks per topic, with integrity attached (formats.md §5.1). */
+  checks?: Map<string, ChainCheck>;
 }
 
 /** u64be(v) ‖ 0xFFFF ‖ 0xFFFF: an offset after every event committed at or before version v. */
@@ -238,6 +257,13 @@ export class Stream {
       ws.binaryType = 'arraybuffer';
       this.ws = ws;
       let authed = false;
+      const timer = setTimeout(() => {
+        if (authed) return;
+        reject(new ZenError(0, 'network', 'the stream did not connect in time'));
+        if (ws === this.ws) this.ws = undefined;
+        ws.close();
+      }, this.opts.connectTimeoutMs ?? 10_000);
+      (timer as { unref?: () => void }).unref?.();
       ws.onopen = () => ws.send(zw.encodeFrame({ op: 'auth', token: this.authToken() }));
       ws.onmessage = (m: MessageEvent) => {
         if (ws !== this.ws) return;
@@ -252,13 +278,16 @@ export class Stream {
           this.dispatch(f);
         } else if (f.op === 'ok') {
           authed = true;
+          clearTimeout(timer);
           resolve();
         } else if (f.op === 'err') {
+          clearTimeout(timer);
           reject(new ZenError(f.code === 'unauthorized' ? 401 : 0, f.code, f.message));
           ws.close();
         }
       };
       ws.onclose = () => {
+        clearTimeout(timer);
         if (!authed) reject(new ZenError(0, 'network', 'the stream closed'));
         else if (ws === this.ws) this.dropped();
       };
@@ -345,8 +374,10 @@ export class Stream {
   }
 
   private sendSub(id: number, s: SubState): void {
-    if ('svc' in s.target) {
-      this.send({ op: 'svc_sub', id, fs: s.fs, ...s.target });
+    if (s.kind === 'ck') {
+      this.send({ op: 'cksub', id, fs: s.fs });
+    } else if ('svc' in s.target && 'lease' in s.target) {
+      this.send({ op: 'svc_sub', id, fs: s.fs, svc: s.target.svc, lease: s.target.lease });
     } else if (s.kind === 'sub') {
       this.send({ op: 'sub', id, fs: s.fs, ...s.target, ...(s.cursor ? { after: s.cursor } : {}) });
     } else {
@@ -367,6 +398,7 @@ export class Stream {
         const s = f.id !== undefined ? this.subs.get(f.id) : undefined;
         s?.started?.ok();
         if (s) s.started = undefined;
+        if (s?.kind === 'ck') s.sub.push({ type: 'heads' } satisfies CheckpointPush);
         return;
       }
       case 'err': {
@@ -385,7 +417,17 @@ export class Stream {
         const s = this.subs.get(f.id);
         if (s?.kind !== 'sub') return;
         s.cursor = f.offset;
-        s.sub.push(openEvent(s, f));
+        let ev: StreamEvent;
+        try {
+          ev = openEvent(s, f);
+        } catch (e) {
+          // An integrity alarm (a gap or rewrite) ends the subscription.
+          this.subs.delete(f.id);
+          s.sub.fail(e as IntegrityError);
+          this.send({ op: 'unsub', id: f.id });
+          return;
+        }
+        s.sub.push(ev);
         return;
       }
       case 'eph': {
@@ -406,6 +448,12 @@ export class Stream {
           sealed: f.sealed,
           flags: f.flags,
         } satisfies SvcPush);
+        return;
+      }
+      case 'ckh': {
+        const s = this.subs.get(f.id);
+        if (s?.kind !== 'ck') return;
+        s.sub.push({ type: 'head', device: f.device, seq: f.seq } satisfies CheckpointPush);
         return;
       }
       case 'svc_ready': {
@@ -464,7 +512,7 @@ export class Stream {
   }
 
   private async start<T>(
-    kind: 'sub' | 'esub' | 'svc',
+    kind: 'sub' | 'esub' | 'svc' | 'ck',
     target: StreamTarget | Pick<SubState, 'fs' | 'target' | 'topics'>,
     opts: SubscribeOptions<T>,
   ): Promise<Subscription<T>> {
@@ -478,6 +526,7 @@ export class Stream {
       // the server pick its head: the cursor is then known from the start,
       // and a reconnection before the first event still misses nothing.
       s.cursor = opts.after ?? offsetAfterVersion(await this.session.readVersion());
+      s.checks = new Map();
     } else if (kind === 'esub') {
       s.seen = new Map();
     }
@@ -527,6 +576,19 @@ export class Stream {
     return this.start('svc', { fs: fsId, target: { svc, lease }, topics: new Map() }, opts);
   }
 
+  /**
+   * Have each device's new checkpoint head of fs `fs` pushed (api.md §9,
+   * `cksub`), and `heads` after each (re)subscription. `Integrity.watch`
+   * uses it.
+   */
+  subscribeCheckpoints(
+    fs: UnlockedFs | number,
+    opts: Omit<SubscribeOptions<CheckpointPush>, 'after'> = {},
+  ): Promise<Subscription<CheckpointPush>> {
+    const fsId = typeof fs === 'number' ? fs : fs.id;
+    return this.start('ck', { fs: fsId, target: {}, topics: new Map() }, opts);
+  }
+
   /** Stop a subscription. */
   async unsubscribe(id: number): Promise<void> {
     const s = this.subs.get(id);
@@ -562,9 +624,17 @@ function openEvent(s: SubState, f: Extract<Frame, { op: 'ev' }>): StreamEvent {
   };
   const t = s.topics.get(hex(f.topic));
   if (!t) return { ...raw, opened: false };
+  const k = hex(f.topic);
+  let check = s.checks?.get(k);
+  if (!check && t.integrity) {
+    // A subscription sees every event of each topic: unfiltered.
+    check = t.chainCheck(false);
+    s.checks?.set(k, check);
+  }
   try {
-    return { ...t.decode(f), topic: f.topic, opened: true };
+    return { ...t.decode(f, check), topic: f.topic, opened: true };
   } catch (e) {
+    if (e instanceof IntegrityError) throw e;
     const error = e instanceof ZenError ? e : new ZenError(0, 'decrypt', String(e));
     return { ...raw, opened: false, error };
   }

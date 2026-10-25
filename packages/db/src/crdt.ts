@@ -161,6 +161,19 @@ export function viewOf(t: TableRecord, m: Merged): Fields | undefined {
 
 // ------------------------------------------------------------ reads
 
+/**
+ * Observe the registers' `hlc`s of states read from the server (§19.4,
+ * causality): a write made after this read is stamped after what it read.
+ */
+function observed(db: Db, states: ObjState[]): ObjState[] {
+  const clock = db.fs.session.clock;
+  for (const s of states) {
+    if (s.row) clock.observeUnchecked(s.row.hlc);
+    for (const r of s.lww ?? []) clock.observeUnchecked(r.hlc);
+  }
+  return states;
+}
+
 /** `/v1/crdt/get`, in batches of 1,000 objects: their states, absent ones left out. */
 export async function crdtGet(
   db: Db,
@@ -174,7 +187,7 @@ export async function crdtGet(
       objects: objects.slice(i, i + GET_MAX),
       ...(readVersion !== undefined ? { read_version: readVersion } : {}),
     });
-    out.push(...r.objects);
+    out.push(...observed(db, r.objects));
   }
   return out;
 }
@@ -195,7 +208,7 @@ export async function crdtRange(
     limit,
     ...(readVersion !== undefined ? { read_version: readVersion } : {}),
   });
-  return { objects: r.objects, more: !!r.more };
+  return { objects: observed(db, r.objects), more: !!r.more };
 }
 
 // ------------------------------------------------------------ writes

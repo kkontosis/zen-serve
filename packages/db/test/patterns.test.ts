@@ -1,6 +1,6 @@
 // The broker's patterns against a spawned zen-serve (zendb.md §12.2–12.4,
 // §12.6): the scheduler, work queues and request/reply.
-import { bytes, type Topic, type UnlockedFs, ZenError, zw } from '@zen/client';
+import { bytes, connect, type Topic, type UnlockedFs, ZenError, zw } from '@zen/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type World, world } from '../../client/test/helpers.js';
 import { openMessage } from '../src/broker.js';
@@ -386,6 +386,67 @@ describe('request/reply (§12.3)', () => {
     const first = await a.requestAll(t, 'ping', null, { timeoutMs: 5000, max: 1 });
     expect(first).toHaveLength(1);
     for (const d of [a, b, c]) d.close();
+  });
+
+  /**
+   * The fs over a session of its own, whose client holds back `/v1/commit`
+   * responses (`hold`) and outgoing `esub` frames (`holdEsub`) for 400 ms.
+   */
+  async function slowFs(): Promise<{ fs: UnlockedFs; hold: { commit: boolean; esub: boolean } }> {
+    const hold = { commit: false, esub: false };
+    const slowFetch: typeof fetch = async (url, init) => {
+      const r = await fetch(url, init);
+      if (hold.commit && String(url).endsWith('/v1/commit')) await sleep(400);
+      return r;
+    };
+    class SlowSocket extends WebSocket {
+      override send(data: ArrayBufferLike | ArrayBufferView | Blob | string): void {
+        const op = data instanceof Uint8Array ? zw.decodeFrame(data).op : undefined;
+        if (hold.esub && op === 'esub') setTimeout(() => super.send(data), 400);
+        else super.send(data);
+      }
+    }
+    const client = await connect(w.server.url, {
+      origin: w.client.origin,
+      fetch: slowFetch,
+      WebSocket: SlowSocket as typeof WebSocket,
+    });
+    const session = await client.signInDevice(w.admin);
+    return { fs: await session.fs(1).unlock({ device: w.admin.device }), hold };
+  }
+
+  it('scatter-gather: a reply that arrives before the asker sees its commit is kept', async () => {
+    const name = ns();
+    const slow = await slowFs();
+    const a = await Db.open(slow.fs, name, { ...quiet, locks: null, scheduler: false });
+    const b = await open(name, { scheduler: false });
+    const t = b.topic('who', ns());
+    await b.on(t, (m) => b.reply(m, 'b', { ephemeral: true }));
+    expect((await a.requestAll(t, 'ping', null, { timeoutMs: 800 })).map((r) => r.body)).toEqual([
+      'b',
+    ]);
+    // The reply now arrives while the asker still waits for its commit's answer.
+    slow.hold.commit = true;
+    expect((await a.requestAll(t, 'ping', null, { timeoutMs: 800 })).map((r) => r.body)).toEqual([
+      'b',
+    ]);
+    for (const d of [a, b]) d.close();
+  });
+
+  it("a request in a transaction waits for the inbox's ephemeral subscription", async () => {
+    const name = ns();
+    const slow = await slowFs();
+    slow.hold.esub = true;
+    const a = await Db.open(slow.fs, name, { ...quiet, locks: null, scheduler: false });
+    const b = await open(name, { scheduler: false });
+    const t = b.topic('who', ns());
+    await b.on(t, (m) => b.reply(m, 'b', { ephemeral: true }));
+    // The inbox's first use, inside a transaction: its `esub` is slow to start.
+    const { p } = await a.transaction(async (tx) => ({
+      p: tx.requestAll(t, 'ping', null, { timeoutMs: 1500 }),
+    }));
+    expect((await p).map((r) => r.body)).toEqual(['b']);
+    for (const d of [a, b]) d.close();
   });
 
   it('a request in a transaction that throws is never sent', async () => {

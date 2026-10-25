@@ -1,8 +1,8 @@
 // A minimal CBOR encoder for test fixtures (WebAuthn attestation objects
 // and COSE keys): unsigned and negative integers, byte and text strings,
-// arrays and maps, in the order given.
+// arrays and maps, in the order given, and booleans.
 
-export type CborItem = number | bigint | string | Uint8Array | CborItem[] | CborMap;
+export type CborItem = number | bigint | boolean | string | Uint8Array | CborItem[] | CborMap;
 /** A map with its entries in encoding order. */
 export class CborMap {
   constructor(readonly entries: [CborItem, CborItem][]) {}
@@ -24,7 +24,9 @@ function head(major: number, n: number | bigint, out: number[]): void {
 }
 
 function item(x: CborItem, out: number[]): void {
-  if (typeof x === 'number' || typeof x === 'bigint') {
+  if (typeof x === 'boolean') {
+    out.push(x ? 0xf5 : 0xf4);
+  } else if (typeof x === 'number' || typeof x === 'bigint') {
     const v = BigInt(x);
     if (v >= 0n) head(0, v, out);
     else head(1, -1n - v, out);

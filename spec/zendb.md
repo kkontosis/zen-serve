@@ -1250,6 +1250,7 @@ ObjState = { object: bytes,
   * counters summed over their `(device, actor)` entries
   * sets as the elements with at least one dot
   * the row visible if its register is `alive`
+* **Causality.** The client's clock observes the `hlc` of every `row` and `lww` register it reads, unless it is more than a minute ahead of its server-corrected clock (as for events; the server refuses `hlc`s further ahead than `crdt_max_skew_ms`, fs.md §3.4). So a write made after reading a value is stamped after it, and "last writer wins" follows causal order, not only the two installations' wall clocks, which agree only to within their offset estimates.
 * **Inside a transaction,** reads of CRDT rows are **not** part of its read set: there is no conflict range for them. A transaction that reads a CRDT row and writes a transactional row is not serializable with respect to the CRDT row. That's by design: the CRDT row accepts every concurrent write.
 * **The cache.** The class keeps the ObjStates it reads (`get`, `range`) in a cache per database: in memory, least recently used out (default 1,024 objects), and on the local store with their `checked` times (§9.3), so `cache` and `auto` reads (and offline ones) work after a restart. A commit of this instance with CRDT operations marks their objects stale. A state fetched while a commit marked its object stale stays stale.
 * **Read modes.** A read takes one of three modes (default `auto`; per database, transaction, `get` or query):

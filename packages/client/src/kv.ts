@@ -11,7 +11,7 @@ import type {
   Write,
 } from '@zen/wasm';
 import { compare, equal, hex, keyAfter, prefixEnd, randomBytes, utf8 } from './bytes.js';
-import { ZenError } from './errors.js';
+import { isCode, ZenError } from './errors.js';
 import type { UnlockedFs } from './fs.js';
 import type { Session } from './session.js';
 import { sleep } from './transport.js';
@@ -184,6 +184,11 @@ export class Transaction {
   readonly commitHooks: ((r: CommitResult) => void)[] = [];
   /** @internal */
   readonly errorHooks: ((e: unknown, attempt: number) => Promise<boolean>)[] = [];
+  /** @internal Run once at the end of this attempt, with its outcome. */
+  readonly settleHooks: ((outcome: Outcome, r?: CommitResult) => void)[] = [];
+  /** @internal Per-attempt state of objects taking part (event chains). */
+  readonly links = new Map<unknown, unknown>();
+  private settled = false;
 
   constructor(
     readonly fs: UnlockedFs,
@@ -466,10 +471,13 @@ export class Transaction {
    * Make the commit depend on a key's version (by path or stored key): it
    * fails with `conflict` unless the key is still at `version`, or still
    * absent for `undefined`. Puts a record read earlier (a cache) into the
-   * read set, in either mode.
+   * read set, in either mode. The first version expected of a key stands:
+   * expecting another one later means the transaction saw two versions of
+   * it, and the commit then conflicts rather than building on both.
    */
   expectKey(key: Path | Uint8Array, version: Uint8Array | undefined): void {
     const k = this.key(key);
+    if (this.expects.has(hex(k))) return;
     this.expects.set(hex(k), { fs: this.fs.id, key: k, ...(version ? { version } : {}) });
   }
 
@@ -481,6 +489,22 @@ export class Transaction {
   /** Add chunk uploads to the commit. */
   addChunks(chunks: ChunkPut[]): void {
     this.chunks.push(...chunks);
+  }
+
+  /**
+   * @internal Run `fn` once this attempt ends: `applied` (with the result),
+   * `failed` (refused, conflicting, or never sent) or `unknown` (the
+   * commit's outcome stayed unknown).
+   */
+  onSettle(fn: (outcome: Outcome, r?: CommitResult) => void): void {
+    this.settleHooks.push(fn);
+  }
+
+  /** @internal End the attempt: run the settle hooks once. */
+  settle(outcome: Outcome, r?: CommitResult): void {
+    if (this.settled) return;
+    this.settled = true;
+    for (const h of this.settleHooks) h(outcome, r);
   }
 
   /** Run `fn` with the result once this attempt commits. */
@@ -560,6 +584,14 @@ export class Transaction {
   }
 }
 
+/** How an attempt ended. */
+export type Outcome = 'applied' | 'failed' | 'unknown';
+
+/** The outcome a commit error implies. */
+export function outcomeOf(e: unknown): Outcome {
+  return isCode(e, 'network') || isCode(e, 'commit_unknown') ? 'unknown' : 'failed';
+}
+
 const backoff = (i: number) => sleep(Math.min(10 * 2 ** i, 1000) * (0.5 + Math.random()));
 
 const retryable = (e: unknown) => e instanceof ZenError && e.retryable;
@@ -575,8 +607,17 @@ export async function commitTransaction(
   tx: Transaction,
   opts: { attempts?: number } = {},
 ): Promise<CommitResult | undefined> {
-  if (tx.empty) return undefined;
-  tx.result = await sendCommit(tx.fs.session, tx.build(), opts.attempts);
+  if (tx.empty) {
+    tx.settle('failed');
+    return undefined;
+  }
+  try {
+    tx.result = await sendCommit(tx.fs.session, tx.build(), opts.attempts);
+  } catch (e) {
+    tx.settle(outcomeOf(e));
+    throw e;
+  }
+  tx.settle('applied', tx.result);
   for (const h of tx.commitHooks) h(tx.result);
   return tx.result;
 }
@@ -599,16 +640,21 @@ export async function transaction<T>(
     try {
       out = await fn(tx);
     } catch (e) {
+      tx.settle('failed');
       // A read that hit `too_old`, or a check of `fn`'s own that found a
       // concurrent change, re-runs it like a failed commit.
       if (i >= attempts || !retry(e)) throw e;
       await backoff(i);
       continue;
     }
-    if (tx.empty) return out;
+    if (tx.empty) {
+      tx.settle('failed');
+      return out;
+    }
     try {
       tx.result = await sendCommit(fs.session, tx.build());
     } catch (e) {
+      tx.settle(outcomeOf(e));
       // The hooks always run, so caches are dropped even on the last attempt.
       const again0 = retry(e);
       let again = again0;
@@ -617,6 +663,7 @@ export async function transaction<T>(
       if (again0) await backoff(i);
       continue;
     }
+    tx.settle('applied', tx.result);
     for (const h of tx.commitHooks) h(tx.result);
     return out;
   }

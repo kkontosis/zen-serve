@@ -218,6 +218,28 @@ describe('row cache (§7.7)', () => {
     expect(await other.table('items').get('a')).toEqual({ id: 'a', v: 11 });
   });
 
+  it('a row read twice while the cache changes in between: the commit conflicts, no lost update', async () => {
+    const name = ns();
+    const db = await itemsDb(name);
+    const other = await itemsDb(name);
+    await db.table('items').put({ id: 'a', v: 1 });
+    await db.table('items').get('a'); // cached at v 1
+    let runs = 0;
+    await db.transaction(async (tx) => {
+      runs++;
+      const r = await tx.table<Item>('items').get('a'); // the cached copy: v 1, stale below
+      if (runs === 1) {
+        // Another installation commits, and another transaction of this
+        // database caches the new row, before `put` reads it again.
+        await other.table<Item>('items').update('a', (x) => ({ ...x, v: 10 }));
+        expect(await db.table('items').get('a')).toEqual({ id: 'a', v: 10 });
+      }
+      await tx.table<Item>('items').put({ ...r!, v: (r!.v ?? 0) + 1 });
+    });
+    expect(runs).toBe(2);
+    expect(await other.table('items').get('a')).toEqual({ id: 'a', v: 11 });
+  });
+
   it('insert checks a cached row on the server: a stale copy is no `exists`', async () => {
     const name = ns();
     const db = await itemsDb(name);

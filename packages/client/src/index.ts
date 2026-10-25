@@ -3,6 +3,7 @@ export { type AclVersion, claim, fullGrants, member, verifyNext } from './acl.js
 export * as bytes from './bytes.js';
 export { Client, type ConnectOptions, connect, type DeviceCredentials } from './client.js';
 export { type ClockStore, memoryClockStore, SessionClock, TreeClock } from './clock.js';
+export { type NewDevice, newDevice } from './devices.js';
 export { isCode, ZenError } from './errors.js';
 export {
   Fs,
@@ -15,9 +16,21 @@ export {
   UnlockedFs,
 } from './fs.js';
 export {
+  type AlarmObject,
+  type DevicePin,
+  entryKey,
+  Integrity,
+  type IntegrityAlarm,
+  IntegrityError,
+  type IntegrityOptions,
+  type Signer,
+  type TopicPin,
+} from './integrity.js';
+export {
   commitTransaction,
   Kv,
   type KvEntry,
+  type Outcome,
   type Path,
   type RangeOptions,
   sendCommit,
@@ -50,6 +63,7 @@ export {
 } from './local/vault.js';
 export {
   type AppendOptions,
+  ChainCheck,
   Consumer,
   type Delivery,
   Dlq,
@@ -73,6 +87,7 @@ export {
 } from './passkey.js';
 export { type Argon2, Session, type UnlockMaterial } from './session.js';
 export {
+  type CheckpointPush,
   type EphemeralMessage,
   offsetAfterVersion,
   Stream,

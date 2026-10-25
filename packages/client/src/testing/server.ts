@@ -1,7 +1,7 @@
 // A throwaway zen-serve for tests: the debug binary on the embedded backend,
 // in a temporary data directory, on a free localhost port.
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -25,6 +25,11 @@ export interface ServerOptions {
   probeInit?: Record<string, unknown>;
   /** A fixed port (default: a free one). */
   port?: number;
+  /**
+   * Turn on the test adversary (`/v1/test/adversary`, `testing/adversary.ts`):
+   * needs a binary built with `--features test-utils`.
+   */
+  adversary?: boolean;
 }
 
 /** A running test server. */
@@ -44,6 +49,13 @@ export interface TestServer {
   kill(): Promise<void>;
   /** Stop the process and start it again on the same data and port, with `opts` merged in. */
   restart(opts?: ServerOptions): Promise<TestServer>;
+  /**
+   * Split the history: stop, copy the data directory, start this server
+   * again on its port (the returned object is the restarted one's twin
+   * `self`), and start the copy on a free port. Sessions are server
+   * records, so a token works on both.
+   */
+  fork(): Promise<{ self: TestServer; copy: TestServer }>;
   /** The server's log so far. */
   log(): Promise<string>;
 }
@@ -127,7 +139,7 @@ export async function startIn(dataDir: string, opts: ServerOptions = {}): Promis
   const config = [
     `data_dir = ${JSON.stringify(join(dataDir, 'data'))}`,
     `listen = "127.0.0.1:${port}"`,
-    table(undefined, opts.top),
+    table(undefined, { ...opts.top, ...(opts.adversary ? { adversary: true } : {}) }),
     fsTables,
     table('auth', {
       password_m_cost_kib: 65536,
@@ -192,6 +204,14 @@ export async function startIn(dataDir: string, opts: ServerOptions = {}): Promis
     async restart(more: ServerOptions = {}) {
       await kill();
       return startIn(dataDir, { ...opts, ...more, port });
+    },
+    async fork() {
+      await kill();
+      const copyDir = await mkdtemp(join(tmpdir(), 'zen-test-'));
+      await cp(join(dataDir, 'data'), join(copyDir, 'data'), { recursive: true });
+      const self = await startIn(dataDir, { ...opts, port });
+      const copy = await startIn(copyDir, { ...opts, port: undefined });
+      return { self, copy };
     },
     async stop() {
       await kill();

@@ -311,6 +311,25 @@ describe('snapshot reads, expectKey and commit hooks', () => {
     expect(s(await fs.kv.get(['derived']))).toBe('from c2');
   });
 
+  it('expectKey: the first version expected of a key stands, so two versions conflict', async () => {
+    await fs.kv.set(['twice'], u('t1'));
+    const [old] = await fs.kv.getEntries([['twice']]);
+    await fs.kv.set(['twice'], u('t2'));
+    const [cur] = await fs.kv.getEntries([['twice']]);
+    await expect(
+      fs.transaction(
+        async (tx) => {
+          // Built on t1, then shown t2 (a cache refreshed in between): not serializable.
+          tx.expectKey(['twice'], old!.version);
+          tx.expectKey(['twice'], cur!.version);
+          tx.set(['from-twice'], u('from t1'));
+        },
+        { attempts: 1 },
+      ),
+    ).rejects.toSatisfy((e) => isCode(e, 'conflict'));
+    expect(await fs.kv.get(['from-twice'])).toBeUndefined();
+  });
+
   it('expectKey: an absent key conflicts once written', async () => {
     await expect(
       fs.transaction(
