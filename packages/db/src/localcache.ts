@@ -126,26 +126,39 @@ const bin = (v: Value | undefined): Uint8Array => {
   return v;
 };
 
-export function encodeCachedRow(r: { version: Uint8Array; fields: Fields; parts: number }) {
-  return encode(
-    new Map<Value, Value>([
-      [1, r.version],
-      [2, r.fields],
-      [3, r.parts],
-    ]),
-  );
+/** A kept row; `vh` (authenticated databases, §14.6) is absent in older records. */
+export function encodeCachedRow(r: {
+  version: Uint8Array;
+  fields: Fields;
+  parts: number;
+  vh?: Uint8Array;
+}) {
+  const m = new Map<Value, Value>([
+    [1, r.version],
+    [2, r.fields],
+    [3, r.parts],
+  ]);
+  if (r.vh) m.set(4, r.vh);
+  return encode(m);
 }
 
 export function decodeCachedRow(b: Uint8Array): {
   version: Uint8Array;
   fields: Fields;
   parts: number;
+  vh?: Uint8Array;
 } {
   const m = asMap(b);
   const fields = m.get(2);
   const parts = m.get(3);
   if (!isPlainObject(fields) || typeof parts !== 'number') throw new Error('a row');
-  return { version: bin(m.get(1)), fields: fields as Fields, parts };
+  const vh = m.get(4);
+  return {
+    version: bin(m.get(1)),
+    fields: fields as Fields,
+    parts,
+    ...(vh !== undefined ? { vh: bin(vh) } : {}),
+  };
 }
 
 export function encodeEntry(e: Entry): Uint8Array {

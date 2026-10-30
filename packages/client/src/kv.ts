@@ -155,6 +155,16 @@ export interface TxnOptions {
 }
 
 /** An entry read in a transaction: its version is undefined for the transaction's own write. */
+/**
+ * A server answer a transaction read, as `onRead` hooks see it: point reads
+ * (the keys asked, each opened value or undefined), or one page of a range
+ * read (`[begin, end)` is the stored-key range the page covers: up to its
+ * last item when a limit or `more` stopped it; `end` undefined: no bound).
+ */
+export type ReadAnswer =
+  | { keys: Uint8Array[]; values: (Uint8Array | undefined)[] }
+  | { begin: Uint8Array; end: Uint8Array | undefined; items: KvEntry[] };
+
 export interface TxEntry {
   key: Uint8Array;
   value: Uint8Array;
@@ -188,6 +198,7 @@ export class Transaction {
   readonly settleHooks: ((outcome: Outcome, r?: CommitResult) => void)[] = [];
   /** @internal Per-attempt state of objects taking part (event chains). */
   readonly links = new Map<unknown, unknown>();
+  private readonly readHooks: ((a: ReadAnswer) => Promise<void>)[] = [];
   private settled = false;
 
   constructor(
@@ -213,6 +224,19 @@ export class Transaction {
 
   private noteRv(v: bigint): void {
     if (this.mode === 'short') this.rv0 ??= v;
+  }
+
+  /**
+   * Check every server answer with `fn` before the read returns it (and
+   * before this transaction's own writes are overlaid). A hook that throws
+   * fails the read. Used by zen-db's authenticated tier (zendb.md §14.6).
+   */
+  onRead(fn: (a: ReadAnswer) => Promise<void>): void {
+    this.readHooks.push(fn);
+  }
+
+  private async answered(a: ReadAnswer): Promise<void> {
+    for (const h of this.readHooks) await h(a);
   }
 
   /** This transaction's own value for a stored key: a write, a clear, or nothing. */
@@ -256,6 +280,12 @@ export class Transaction {
       ...this.rv(),
     });
     this.noteRv(r.read_version);
+    const opened = r.items.map((it, j) =>
+      it.value && it.version ? this.fs.kv.open(keys[need[j]!]!, it.value) : undefined,
+    );
+    if (this.readHooks.length) {
+      await this.answered({ keys: need.map((i) => keys[i]!), values: opened });
+    }
     need.forEach((i, j) => {
       const key = keys[i]!;
       const it = r.items[j]!;
@@ -268,9 +298,7 @@ export class Transaction {
           ...(it.version ? { version: it.version } : {}),
         });
       }
-      if (it.value && it.version) {
-        out[i] = { key, value: this.fs.kv.open(key, it.value), version: it.version };
-      }
+      if (opened[j] && it.version) out[i] = { key, value: opened[j], version: it.version };
     });
     return out;
   }
@@ -315,12 +343,21 @@ export class Transaction {
         ...this.rv(),
       });
       this.noteRv(r.read_version);
-      for (const it of r.items) {
-        hasher?.update(it.key, it.version!);
-        out.push({ key: it.key, value: this.fs.kv.open(it.key, it.value!), version: it.version! });
-      }
+      const page: KvEntry[] = r.items.map((it) => ({
+        key: it.key,
+        value: this.fs.kv.open(it.key, it.value!),
+        version: it.version!,
+      }));
       left -= r.items.length;
       const last = r.items.at(-1);
+      if (this.readHooks.length) {
+        const cut = last && (r.more || left <= 0);
+        await this.answered({ begin: lo, end: cut ? keyAfter(last.key) : end, items: page });
+      }
+      for (const e of page) {
+        hasher?.update(e.key, e.version);
+        out.push(e);
+      }
       if (!last) break;
       if (left <= 0) {
         // The limit stopped the read: record the range up to the last item.
@@ -379,14 +416,15 @@ export class Transaction {
       ...this.rv(),
     });
     this.noteRv(r.read_version);
+    const opened = r.items.map((it, j) =>
+      it.value && it.version ? this.fs.kv.open(stored[ask[j]!]!, it.value) : undefined,
+    );
+    if (this.readHooks.length) {
+      await this.answered({ keys: ask.map((i) => stored[i]!), values: opened });
+    }
     r.items.forEach((it, j) => {
-      if (it.value && it.version) {
-        out[ask[j]!] = {
-          key: it.key,
-          value: this.fs.kv.open(it.key, it.value),
-          version: it.version,
-        };
-      }
+      if (opened[j] && it.version)
+        out[ask[j]!] = { key: it.key, value: opened[j], version: it.version };
     });
     return out;
   }
@@ -432,7 +470,21 @@ export class Transaction {
         ...this.rv(),
       });
       this.noteRv(r.read_version);
-      for (const it of r.items) {
+      const page: KvEntry[] = r.items.map((it) => ({
+        key: it.key,
+        value: this.fs.kv.open(it.key, it.value!),
+        version: it.version!,
+      }));
+      if (this.readHooks.length) {
+        const last = page.at(-1);
+        const cut = last && (r.more || page.length >= left);
+        await this.answered({
+          begin: cut && rev ? last.key : lo,
+          end: cut && !rev ? keyAfter(last.key) : hi,
+          items: page,
+        });
+      }
+      for (const it of page) {
         // Own writes that come first.
         while (m < mine.length && before(mine[m]!.key, it.key)) {
           const e = ownEntry(mine[m++]!);
@@ -450,7 +502,7 @@ export class Transaction {
           continue;
         }
         if (this.clears.some((c) => inRange(it.key, c.begin, c.end))) continue;
-        yield { key: it.key, value: this.fs.kv.open(it.key, it.value!), version: it.version! };
+        yield it;
         if (--left <= 0) return;
       }
       const last = r.items.at(-1);

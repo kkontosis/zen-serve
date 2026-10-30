@@ -32,16 +32,16 @@ export interface NodeStore {
 export interface TreeKeys {
   /** For each key, whether it ends a node at `level` by hash. */
   boundaries(level: number, keys: Uint8Array[]): boolean[];
-  /** `PRF16(K_node, node)`. */
+  /** `PRF16(K_node, node)`, or `PRF32` in an authenticated database (§14.3). */
   nodeId(node: Uint8Array): Uint8Array;
 }
 
-/** The `TreeKeys` of an index with this fanout. */
-export function treeKeys(ik: IndexKeys, fanout: number): TreeKeys {
+/** The `TreeKeys` of an index with this fanout and id length (16, or 32 when authenticated). */
+export function treeKeys(ik: IndexKeys, fanout: number, idLen = 16): TreeKeys {
   return {
     boundaries: (level, keys) =>
       keys.length ? Array.from(ik.boundaries(level, keys, fanout), (x) => x === 1) : [],
-    nodeId: (b) => ik.nodeId(b),
+    nodeId: idLen === 32 ? (b) => ik.nodeId32(b) : (b) => ik.nodeId(b),
   };
 }
 
@@ -435,6 +435,56 @@ export async function rewrite(
   const put = [...rw.fresh.values()].filter((w) => !rw.gone.has(hex(w.id)));
   const del = [...rw.gone.entries()].filter(([h]) => !rw.fresh.has(h)).map(([, id]) => id);
   return { root: newRoot, put, del, changed: true };
+}
+
+/** Longer than any suffix `lookup` finds: entries extend their prefix by at most 64 bytes. */
+const AFTER = new Uint8Array(65).fill(0xff);
+
+/**
+ * For each prefix, the level-0 entry of the tree that starts with it, or
+ * undefined. At most one entry may start with a prefix, and it extends the
+ * prefix by at most 64 bytes (the state tree's entries, §14.2: the prefix
+ * of a key, then its 32-byte VH). The batch descends once: one `get` per
+ * level.
+ */
+export async function lookup(
+  store: NodeStore,
+  root: RootRecord | undefined,
+  prefixes: Uint8Array[],
+): Promise<(Uint8Array | undefined)[]> {
+  const out: (Uint8Array | undefined)[] = prefixes.map(() => undefined);
+  if (!root || !prefixes.length) return out;
+  // Every entry starting with `p` is ≤ p ‖ FF…FF, and every other entry
+  // above `p` is above it too: the last entry ≤ it is the one, if any.
+  const bound = prefixes.map((p) => bytes.concat(p, AFTER));
+  let at = new Map<string, { id: Uint8Array; qs: number[] }>([
+    [hex(root.root), { id: root.root, qs: prefixes.map((_, i) => i) }],
+  ]);
+  while (at.size) {
+    const want = [...at.values()];
+    const nodes = await store.get(want.map((w) => w.id));
+    const next = new Map<string, { id: Uint8Array; qs: number[] }>();
+    want.forEach((w, j) => {
+      const n = nodes[j]!;
+      for (const q of w.qs) {
+        const i = route(n, bound[q]!);
+        const e = n.entries[i]!;
+        if (n.level === 0) {
+          const k = e as Uint8Array;
+          const p = prefixes[q]!;
+          if (k.length >= p.length && bytes.equal(k.subarray(0, p.length), p)) out[q] = k;
+          continue;
+        }
+        const id = childOf(e);
+        const h = hex(id);
+        const g = next.get(h);
+        if (g) g.qs.push(q);
+        else next.set(h, { id, qs: [q] });
+      }
+    });
+    at = next;
+  }
+  return out;
 }
 
 /**

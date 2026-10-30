@@ -11,6 +11,7 @@ import {
   zw,
 } from '@zen/client';
 import type { CrdtKeys, IndexKeys, Info, Limits } from '@zen/wasm';
+import { NsAuth, STATE_INDEX } from './auth.js';
 import {
   bindingOf,
   type ChangeBody,
@@ -92,6 +93,14 @@ import {
 export interface DbOptions {
   /** The app's schema version (default 0). */
   schema?: number;
+  /**
+   * The integrity level of a new database (§14; default `basic`). With
+   * `authenticated`, the database is created so, and opening one stored as
+   * `basic` is refused (`format`). A database stored as `authenticated`
+   * opens so whatever this says. Authenticated databases need integrity
+   * attached to the fs (`fs.integrity`) before unlocking.
+   */
+  integrity?: 'basic' | 'authenticated';
   /** For each step `k` in `1..schema`, its migration (§8.1). */
   migrations?: Record<number, MigrationFn>;
   /** Where warnings go (table scans). Default: `console.warn`. */
@@ -216,11 +225,12 @@ const IMPORT_MAX = 4096;
 /** How long `close` waits for running transactions. */
 const CLOSE_WAIT_MS = 5000;
 
-/** A cached row: its fields at `version` (§7.7). */
+/** A cached row: its fields at `version` (§7.7); `vh` its VH when authenticated (§14.6). */
 interface CachedRow {
   version: Uint8Array;
   fields: Fields;
   parts: number;
+  vh?: Uint8Array;
 }
 
 const isTooLarge = (e: unknown) =>
@@ -229,6 +239,8 @@ const isTooLarge = (e: unknown) =>
 interface CatalogEntry {
   record: TableRecord | undefined;
   version: Uint8Array | undefined;
+  /** The record's VH when authenticated (§14.6). */
+  vh?: Uint8Array;
 }
 
 /** The records of store `db/<ns>` (§9.3). */
@@ -302,6 +314,8 @@ export class Db {
   readonly crdtCache: CrdtCache;
   /** @internal The queue of CRDT writes (§19.7). */
   crdtQueue!: CrdtQueue;
+  /** @internal In an authenticated database (§14): its state tree and checks. */
+  nsAuth: NsAuth | undefined;
 
   private constructor(
     readonly fs: UnlockedFs,
@@ -413,12 +427,52 @@ export class Db {
     return db;
   }
 
+  /** The integrity level (§14). */
+  get integrity(): 'basic' | 'authenticated' {
+    return this.nsAuth ? 'authenticated' : 'basic';
+  }
+
+  /** @internal Node id length: 16, or 32 in an authenticated database (§14.3). */
+  get idLen(): number {
+    return this.nsAuth ? 32 : 16;
+  }
+
+  /**
+   * The opening rule of the integrity level (§3.1): the stored level must
+   * be known, and `basic` when the app asked for `authenticated`.
+   */
+  private checkLevel(stored: string): void {
+    if (stored !== 'basic' && stored !== 'authenticated') {
+      throw new DbError('format', `integrity level ${stored}`);
+    }
+    if (this.opts.integrity === 'authenticated' && stored === 'basic') {
+      throw new DbError('format', 'the database is basic; its integrity level never changes');
+    }
+  }
+
+  private authenticate(): void {
+    if (this.nsAuth) return;
+    const integ = this.fs.integrity;
+    if (!integ) {
+      throw new DbError(
+        'unsupported',
+        'an authenticated database needs integrity attached to the fs (fs.integrity, §14.1)',
+      );
+    }
+    this.nsAuth = new NsAuth(this.fs, integ, this.keys, this.indexKeys(STATE_INDEX));
+    // Records cached before the checks were on have no VH: read them again.
+    this.catalog.clear();
+    this.rows.clear();
+    this.nodes.clear();
+  }
+
   /** Open offline from the kept DbRecord and catalog: the schema must be the app's (§3.1). */
   private async openKept(k: Kept): Promise<void> {
     const target = this.opts.schema ?? 0;
     const rec = k.record;
     if (rec.format !== FORMAT) throw new DbError('format', `database format ${rec.format}`);
-    if (rec.integrity !== 'basic') throw new DbError('format', `integrity level ${rec.integrity}`);
+    this.checkLevel(rec.integrity);
+    if (rec.integrity === 'authenticated') this.authenticate();
     if (rec.schema !== target) {
       throw new DbError(
         'offline',
@@ -474,27 +528,43 @@ export class Db {
   private async init(): Promise<DbRecord> {
     const target = this.opts.schema ?? 0;
     const key = this.keys.dbRecord();
-    const rec = await this.transaction(async (tx) => {
-      const sys = SYSTEM_TABLES.map((n) => this.keys.tableRecord(n));
-      const [b, ...have] = await tx.raw.getAll([key, ...sys]);
-      // The system tables come with the DbRecord, or on the first open of
-      // a database created before them (§11.5).
-      have.forEach((h, i) => {
-        if (!h) tx.raw.set(sys[i]!, encodeTableRecord(systemTable(SYSTEM_TABLES[i]!)));
+    const integ = this.fs.integrity;
+    let rec: DbRecord | undefined;
+    // A first pass finds the level; an authenticated database is then read
+    // again, verified, before anything is written (§3.1).
+    for (;;) {
+      rec = await this.transaction(async (tx) => {
+        const sys = SYSTEM_TABLES.map((n) => this.keys.tableRecord(n));
+        const [b, ...have] = await tx.raw.getAll([key, ...sys]);
+        const stored = b && decodeDbRecord(b);
+        if (stored) this.checkLevel(stored.integrity);
+        // Checkpoints name the database, but the server has none: rolled back (§14.7).
+        if (!stored && integ?.floor(`3${bytes.hex(this.keys.db.prefix)}`)) {
+          throw integ.raise({
+            kind: 'rollback',
+            object: 'db',
+            id: this.keys.db.prefix,
+            detail: 'no DbRecord, but checkpoints name the database',
+          });
+        }
+        const r = stored ?? {
+          format: FORMAT,
+          schema: 0,
+          integrity: this.opts.integrity ?? 'basic',
+          createdHlc: this.fs.session.clock.tick(),
+        };
+        if (r.integrity === 'authenticated' && !this.nsAuth) return r;
+        // The system tables come with the DbRecord, or on the first open of
+        // a database created before them (§11.5).
+        have.forEach((h, i) => {
+          if (!h) tx.raw.set(sys[i]!, encodeTableRecord(systemTable(SYSTEM_TABLES[i]!)));
+        });
+        if (!stored) tx.raw.set(key, encodeDbRecord(r));
+        return r;
       });
-      if (b) return decodeDbRecord(b);
-      const r = {
-        format: FORMAT,
-        schema: 0,
-        integrity: 'basic',
-        createdHlc: this.fs.session.clock.tick(),
-      };
-      tx.raw.set(key, encodeDbRecord(r));
-      return r;
-    });
-    if (rec.format !== FORMAT) throw new DbError('format', `database format ${rec.format}`);
-    if (rec.integrity !== 'basic') {
-      throw new DbError('format', `integrity level ${rec.integrity}`);
+      if (rec.format !== FORMAT) throw new DbError('format', `database format ${rec.format}`);
+      if (rec.integrity === 'basic' || this.nsAuth) break;
+      this.authenticate();
     }
     if (rec.schema > target) {
       throw new DbError(
@@ -508,10 +578,22 @@ export class Db {
     return { ...rec, schema: target };
   }
 
-  /** Read every TableRecord into the catalog cache. */
+  /** Read every TableRecord into the catalog cache (verified when authenticated, §14.6). */
   async loadCatalog(): Promise<void> {
     const [begin, end] = this.keys.tables();
     this.catalog.clear();
+    if (this.nsAuth) {
+      const got = await this.transaction((tx) => tx.raw.rangeStored(begin, end));
+      for (const e of got) {
+        const t = decodeTableRecord(e.value);
+        this.catalog.set(t.name, {
+          record: t,
+          version: e.version,
+          vh: zw.stateValueHash(e.value),
+        });
+      }
+      return;
+    }
     for await (const e of this.fs.kv.rangeStored(begin, end)) {
       const t = decodeTableRecord(e.value);
       this.catalog.set(t.name, { record: t, version: e.version });
@@ -1090,8 +1172,11 @@ export class Db {
     const b = p && (await p.get(id));
     if (!b) return undefined;
     try {
-      if (!bytes.equal(this.indexKeys(index).nodeId(b), id)) throw new Error('another node');
-      const n = decodeNode(b);
+      const ik = this.indexKeys(index);
+      if (!bytes.equal(this.nsAuth ? ik.nodeId32(b) : ik.nodeId(b), id)) {
+        throw new Error('another node');
+      }
+      const n = decodeNode(b, this.idLen);
       this.cacheNode(bytes.hex(id), n);
       return n;
     } catch {
@@ -1142,8 +1227,13 @@ export class Db {
   }
 
   /** @internal */
-  catalogSet(name: string, record: TableRecord | undefined, version: Uint8Array | undefined) {
-    this.catalog.set(name, { record, version });
+  catalogSet(
+    name: string,
+    record: TableRecord | undefined,
+    version: Uint8Array | undefined,
+    vh?: Uint8Array,
+  ) {
+    this.catalog.set(name, { record, version, ...(vh ? { vh } : {}) });
     const p = this.persisted?.db;
     if (!p) return;
     if (record) p.put(tableKey(name), encodeTable(encodeTableRecord(record), version));

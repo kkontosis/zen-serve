@@ -2,6 +2,7 @@
 // collected per shard and applied to the tree once, at commit; reads merge
 // the shards' trees with the transaction's own pending changes.
 import { bytes, ZenError } from '@zen/client';
+import { checkNode } from '../auth.js';
 import type { IndexDef } from '../catalog.js';
 import type { Value } from '../cbor.js';
 import { sortKey } from '../sortkey.js';
@@ -36,7 +37,8 @@ export function shardOf(tx: DbTransaction, ix: IndexDef, pkElement: Uint8Array):
  * Nodes of one index, read at the transaction's snapshot without entering
  * its read set, through the database's node cache. A node that is gone
  * means the root changed since it was read: `conflict` re-runs the
- * transaction from a fresh root (§5.4.3).
+ * transaction from a fresh root (§5.4.3). In an authenticated database a
+ * node fetched from the server must match its id (§14.3).
  */
 export class TxNodeStore implements NodeStore {
   constructor(
@@ -68,8 +70,18 @@ export class TxNodeStore implements NodeStore {
     for (let j = 0; j < left.length; j++) {
       const e = got[j];
       if (!e) throw new ZenError(409, 'conflict', 'a private index changed while it was read');
-      const n = decodeNode(e.value);
-      db.cacheNode(hex(ids[left[j]!]!), n, e.value);
+      const id = ids[left[j]!]!;
+      const integ = db.nsAuth?.integrity;
+      const n = integ
+        ? checkNode(
+            integ,
+            db.keys.db.prefix,
+            (b) => db.indexKeys(this.index).nodeId32(b),
+            id,
+            e.value,
+          )
+        : decodeNode(e.value);
+      db.cacheNode(hex(id), n, e.value);
       out[left[j]!] = n;
     }
     return out;
@@ -95,7 +107,7 @@ export async function applyPrivate(
 ): Promise<void> {
   const root = await tx.indexRoot(ix, shard);
   const r = await rewrite(
-    treeKeys(tx.db.indexKeys(ix.id), ix.fanout ?? DEFAULT_FANOUT),
+    treeKeys(tx.db.indexKeys(ix.id), ix.fanout ?? DEFAULT_FANOUT, tx.db.idLen),
     new TxNodeStore(tx, ix.id),
     root,
     [...ops.values()],

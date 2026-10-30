@@ -381,12 +381,22 @@ export class OnSubscription {
 
   private async drain(): Promise<void> {
     const n = this.opts.cursor !== undefined ? Math.max(1, this.opts.batch ?? 1) : 1;
+    let conflicts = 0;
     while (this.queue.length && !this.stopped) {
       const batch = this.queue.splice(0, n);
       try {
         if (this.opts.cursor !== undefined) await this.durable(batch);
         else await this.plain(batch[0]!);
+        conflicts = 0;
       } catch (e) {
+        // Writers that kept winning (an authenticated database's writers all
+        // conflict, §14.5) aren't a failed handler: run the batch again later.
+        if (isCode(e, 'conflict') && !this.stopped) {
+          this.queue.unshift(...batch);
+          const ms = Math.min(20 * 2 ** conflicts++, 1000) * (0.5 + Math.random());
+          await new Promise((r) => setTimeout(r, ms));
+          continue;
+        }
         // A durable handler failed: stop here, so a restart retries from the cursor.
         this.stopped = true;
         this.queue.length = 0;

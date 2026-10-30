@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { bytes, initWasm, zw } from '@zen/client';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { decodeNsRoot, encodeNsRoot, esc, type NsRoot } from '../src/auth.js';
 import type { TableRecord } from '../src/catalog.js';
 import { decode, encode, type Value } from '../src/cbor.js';
 import { mergeState, viewOf } from '../src/crdt.js';
@@ -233,6 +234,75 @@ describe('private index (§5.4)', () => {
     expect(new Map([...store.m].map(([id, b]) => [id, hex(b)]))).toEqual(
       new Map(P().after.nodes.map((n: J) => [n.id, n.node])),
     );
+  });
+});
+
+describe('the authenticated tier (§14)', () => {
+  const A = () => V.authenticated;
+  const values = (): { suffix: Uint8Array; plaintext: Uint8Array }[] =>
+    A().values.map((v: J) => ({ suffix: unhex(v.suffix), plaintext: unhex(v.plaintext) }));
+
+  it('VH and entries; esc keeps order and the entry prefix', () => {
+    for (const v of A().values) {
+      const p = unhex(v.plaintext);
+      expect(hex(zw.stateValueHash(p))).toBe(v.vh);
+      const e = zw.stateEntry(unhex(v.suffix), p);
+      expect(hex(e)).toBe(v.entry);
+      const prefix = bytes.concat(esc(unhex(v.suffix)), new Uint8Array(2));
+      expect(hex(e.subarray(0, prefix.length))).toBe(hex(prefix));
+      expect(hex(e.subarray(prefix.length))).toBe(v.vh);
+    }
+    expect([...esc(new Uint8Array([1, 0, 2, 0]))]).toEqual([1, 0, 0xff, 2, 0, 0xff]);
+  });
+
+  it('the incremental tree with 32-byte ids gives the vector trees and NsRoots', async () => {
+    const fsKeys = zw.FsKeys.fromBundle(unhex(K.fs_epoch0.bundle));
+    const dbKeys = fsKeys.db(V.database.ns);
+    const st = dbKeys.state();
+    const tk = treeKeys(st, 4, 32);
+    const store = new MemStore(32);
+    const vs = values();
+    const entry = (v: { suffix: Uint8Array; plaintext: Uint8Array }) =>
+      zw.stateEntry(v.suffix, v.plaintext);
+    const r1 = await rewrite(
+      tk,
+      store,
+      undefined,
+      vs.map((v) => ({ key: entry(v), add: true })),
+    );
+    store.apply(r1);
+    expect(new Map([...store.m].map(([id, b]) => [id, hex(b)]))).toEqual(
+      new Map(A().tree.nodes.map((n: J) => [n.id, n.node])),
+    );
+    const ns1: NsRoot = { seq: 1n, prev: new Uint8Array(32), tree: r1.root! };
+    expect(hex(encodeNsRoot(ns1))).toBe(A().ns_root.encoded);
+    expect(hex(zw.nsRootHash(encodeNsRoot(ns1)))).toBe(A().ns_root.nh);
+    // Value 2 changes, value 5 is deleted.
+    const changed = { ...vs[2]!, plaintext: unhex(A().changed) };
+    const r2 = await rewrite(tk, store, r1.root, [
+      { key: entry(vs[2]!), add: false },
+      { key: entry(changed), add: true },
+      { key: entry(vs[A().deleted]!), add: false },
+    ]);
+    store.apply(r2);
+    expect(new Map([...store.m].map(([id, b]) => [id, hex(b)]))).toEqual(
+      new Map(A().after.nodes.map((n: J) => [n.id, n.node])),
+    );
+    const ns2 = decodeNsRoot(unhex(A().ns_root_after.encoded));
+    expect(ns2).toEqual({ seq: 2n, prev: unhex(A().ns_root.nh), tree: r2.root });
+    expect(hex(encodeNsRoot(ns2))).toBe(A().ns_root_after.encoded);
+    // Strict decoding.
+    const bad = encode(
+      new Map<Value, Value>([
+        [1, 1],
+        [2, 0],
+        [3, new Uint8Array(32)],
+      ]),
+    );
+    expect(() => decodeNsRoot(bad)).toThrow();
+    st.free();
+    dbKeys.free();
+    fsKeys.free();
   });
 });
 

@@ -781,6 +781,13 @@ export class ServeHandle<S = RawStep> {
           this.forget(conn);
           return;
         }
+        // The handler's database (authenticated, zendb.md §14) or the fs was
+        // found rolled back: stepping again would build on it (svc.md §12).
+        if (isCode(e, 'integrity')) {
+          this.report(e, conn.conn);
+          await this.giveUp(conn, true);
+          return;
+        }
         // A handshake step whose outcome isn't known can't be redone: the
         // handshake has moved on in memory (svc.md §7.1).
         if (

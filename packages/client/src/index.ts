@@ -33,6 +33,7 @@ export {
   type Outcome,
   type Path,
   type RangeOptions,
+  type ReadAnswer,
   sendCommit,
   Transaction,
   type TxEntry,

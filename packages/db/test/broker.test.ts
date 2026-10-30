@@ -265,6 +265,45 @@ describe('on (§11.2)', () => {
     again.close();
   });
 
+  it('a durable handler that keeps losing conflicts runs again later, not stopped', async () => {
+    const name = ns();
+    const db = await shop(name);
+    const t = db.topic('busy', name);
+    await db.table('log').insert({ id: 'hot', n: 0 });
+    let errors = 0;
+    let runs = 0;
+    // One attempt per transaction, and a writer bumping the row it reads.
+    const sub = await db.on<number>(
+      t,
+      async (m, tx) => {
+        runs++;
+        const hot = await tx.table('log').get('hot');
+        await sleep(5);
+        await tx.table('log').put({ id: 'hot', n: (hot?.n as number) + 1 });
+        await tx.table('log').insert({ id: `e${m.body}` });
+      },
+      { cursor: 'busy', onError: () => errors++, txn: { attempts: 1 } },
+    );
+    let writing = true;
+    const writer = (async () => {
+      while (writing) {
+        await db.table('log').update('hot', (r) => ({ ...r, n: (r.n as number) + 1 }));
+      }
+    })();
+    for (let i = 1; i <= 5; i++) await db.emit(t, 'n', i);
+    await until(() => runs > 8);
+    writing = false;
+    await writer;
+    await until(
+      async () => (await logRows(db)).filter((r) => String(r.id).startsWith('e')).length === 5,
+    );
+    expect(runs).toBeGreaterThan(5); // some conflicted and ran again
+    expect(errors).toBe(0);
+    expect(sub.active).toBe(true);
+    await sub.close();
+    await db.close();
+  });
+
   it("start: 'earliest' reads the whole history; a stored cursor wins", async () => {
     const name = ns();
     const db = await shop(name);

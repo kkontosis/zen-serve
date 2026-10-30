@@ -1,7 +1,9 @@
 // Handler checkpoints (svc.md §12, formats.md §14 entry type 5): echo
 // handlers with integrity name each connection's cursors in their device
 // checkpoints; a successor syncs them before resuming a claim, and aborts a
-// connection whose claim is older than what was checkpointed.
+// connection whose claim is older than what was checkpointed. With an
+// authenticated handler database (zendb.md §14), a successor also catches
+// that database rolled back.
 import { readFile } from 'node:fs/promises';
 import { type Socket, connect as tcp } from 'node:net';
 import { bytes, type Integrity, IntegrityError, zw } from '@zen/client';
@@ -35,7 +37,12 @@ afterEach(async () => {
 type SvcEntry = Extract<CheckpointEntry, { type: 'svc' }>;
 
 /** A worker with integrity (a checkpoint after every step), its errors, and its db. */
-async function worker(user: string, fetch?: typeof globalThis.fetch) {
+async function worker(
+  user: string,
+  fetch?: typeof globalThis.fetch,
+  ns = NS,
+  authenticated = false,
+) {
   const ctx: WorkerContext = await signInWorker({
     url: w.url,
     device: w.user(user).deviceFile,
@@ -44,7 +51,11 @@ async function worker(user: string, fetch?: typeof globalThis.fetch) {
     ...(fetch ? { fetch } : {}),
   });
   closers.push(() => ctx.close());
-  const db = await ctx.open(NS, { ...DB_OPTIONS, warn: () => {} });
+  const db = await ctx.open(ns, {
+    ...DB_OPTIONS,
+    warn: () => {},
+    ...(authenticated ? { integrity: 'authenticated' as const } : {}),
+  });
   const errors: { e: unknown; conn?: Uint8Array }[] = [];
   const handle = () => {
     const h = serveEcho(db, { onError: (e, conn) => errors.push({ e, conn }) });
@@ -166,6 +177,42 @@ describe('handler checkpoints', () => {
     expect(bytes.equal(err.alarm.id!.slice(-old!.conn.length), old!.conn)).toBe(true);
     await p.closed; // aborted
     expect(p.got()).toBe('1: a\n2: b\n3: c\n4: d\n');
+  });
+
+  it('a rolled-back handler database: the successor catches it and gives the connection up', async () => {
+    const a = await worker('alice', undefined, 'echo-auth-db', true);
+    expect(a.db.integrity).toBe('authenticated');
+    // The successor's device opens the database now, and handles later.
+    const b = await worker('bob', undefined, 'echo-auth-db', true);
+    const h = a.handle();
+    const p = await peer();
+    await say(p, 'a', '1: a\n');
+    // The server freezes the database as it is (its NsRoot and state tree); writes still apply.
+    const [begin, end] = a.db.keys.range('n', new Uint8Array(16));
+    const keys = [a.db.keys.nsRoot()];
+    for await (const e of a.db.fs.kv.rangeStored(begin, end)) keys.push(e.key);
+    await lie(
+      w.admin,
+      keys.map((key) => ({ kind: 'kv' as const, fs: 1, key })),
+    );
+    try {
+      await say(p, 'b', '2: b\n');
+      await h.stop(); // checkpoints the NsRoot after `b`
+      expect(a.errors).toEqual([]);
+      // The successor syncs before it resumes; the database it reads is behind.
+      b.handle();
+      p.s.write('c\n');
+      await until(() => b.errors.length > 0, 10_000, 'the rollback report');
+      const err = b.errors[0]!.e as IntegrityError;
+      expect(err).toBeInstanceOf(IntegrityError);
+      expect(err.alarm).toMatchObject({ kind: 'rollback', object: 'db' });
+      expect(err.alarm.detail).toContain('went back');
+      await p.closed; // given up
+      expect(p.got()).toBe('1: a\n2: b\n');
+    } finally {
+      await truth(w.admin);
+      p.s.end();
+    }
   });
 
   it('a withheld checkpoint: the successor sees the older one (the window); the handler alarms itself', async () => {

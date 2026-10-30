@@ -105,6 +105,12 @@ export class Migrator {
     checkAppTable(name);
     const crdt = opts.merge === 'crdt';
     if (crdt) {
+      if (this.db.nsAuth) {
+        throw new DbError(
+          'bad_value',
+          'CRDT tables are not offered in authenticated databases (§14.1)',
+        );
+      }
       checkCrdtServer(this.db);
       if (opts.pad) throw new DbError('bad_value', 'CRDT tables are not padded');
       if (opts.changes?.image === 'full') {

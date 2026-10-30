@@ -271,7 +271,7 @@ async function fetchRows(
       continue;
     }
     const r = await tt.decode(t, els[i]!, e.value);
-    tx.noteRow(e.key, e.version, r);
+    tx.noteRow(e.key, e.version, r, e.value);
     out.push(r.fields);
   }
   return out;
@@ -575,7 +575,7 @@ export class Query<T extends Fields = Fields> {
           if (rows.length >= want) break;
           const pk = decodeRow(e.value).pk;
           const r = await tt.decode(t, encode(pk), e.value);
-          tx.noteRow(e.key, e.version, r);
+          tx.noteRow(e.key, e.version, r, e.value);
           if (keep(r.fields)) rows.push({ pk, row: r.fields });
         }
       }
