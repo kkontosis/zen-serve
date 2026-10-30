@@ -150,6 +150,8 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 | Hybrid signature (Ed25519 + ML-DSA-65): sign / verify / key from seed | 2.6 / 0.7 / 0.9 ms |
 | Device keyslot (X-Wing encapsulation) | 0.75 ms |
 | Sealing a 64 KiB chunk (XChaCha20-Poly1305) | 0.47 ms, ~140 MB/s |
+| Tree state (fs.md §9.1) of 100,000 nodes, built from scratch (a replica's first check after opening) | ~0.5–0.6 s to set the leaves, then 60–130 ms for the first `root()` |
+| Tree state, one node changed then `root()` | ~55–95 µs; 1,000 changes then one `root()`: ~10 ms + 7 ms |
 
 ### 5.3 Runtime operations that are slow by design
 

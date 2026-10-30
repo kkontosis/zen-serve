@@ -327,7 +327,19 @@ export class Topic {
     if (e.key_token && equal(e.key_token, this.ephemeralToken())) {
       throw new ZenError(0, 'decrypt', 'an ephemeral message in the log');
     }
-    const b = this.open(e.key_token, e.envelope);
+    let b: EventBody;
+    try {
+      b = this.open(e.key_token, e.envelope);
+    } catch (err) {
+      if (!isCode(err, 'decrypt')) throw err;
+      // Name the event, so a failure says what was stored (TD-TEST-OPEN-FAILURES).
+      const peek = zw.peekSealed(e.envelope);
+      throw new ZenError(
+        0,
+        'decrypt',
+        `${(err as ZenError).message}: event ${hex(e.offset)} of topic ${hex(this.id)} (kind ${peek.kind}, epoch ${peek.epoch}, ${e.key_token ? `key token ${hex(e.key_token)}` : 'no key'}, ${e.envelope.length} bytes)`,
+      );
+    }
     check?.see(e.offset, b);
     return {
       offset: e.offset,

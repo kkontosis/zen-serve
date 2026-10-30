@@ -1796,6 +1796,22 @@ async fn purge_trash(
         }
         if !doomed.is_empty() {
             add_quota(&mut t, fs, bytes, nkeys);
+            // A purge record extends the op chain (formats.md §11.5), so
+            // `(ops, chain)` names the node set. A normal read: a commit on
+            // the tree conflicts with the round.
+            let hk = keys::tree_header(fs, tree);
+            let mut h = match t.get(&hk).await? {
+                Some(v) => Header::decode(&v)?,
+                None => Header::default(),
+            };
+            let ids: Vec<Id> = doomed.iter().map(|(n, _)| *n).collect();
+            h.ops += 1;
+            h.chain = zfs::chain_next(
+                &h.chain,
+                &zfs::purge_bytes(fs, tree, &ids),
+                &zfs::PURGE_DEVICE,
+            );
+            t.set(&hk, &h.encode());
             t.set_versionstamped_value(&keys::tree_head(fs, tree), &[], &[]);
         }
         Ok(PurgeRound {

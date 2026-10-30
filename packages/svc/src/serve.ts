@@ -5,6 +5,7 @@
 // handler and gives the handler its view of each step.
 import {
   bytes,
+  IntegrityError,
   isCode,
   REVEAL_BAD_KEY,
   type Service,
@@ -15,7 +16,7 @@ import {
   zw,
 } from '@zen/client';
 import type { Db, DbTransaction, DbTxnOptions } from '@zen/db';
-import type { SvcClaim, SvcInfo, SvcPeer, SvcReveal, SvcStep } from '@zen/wasm';
+import type { CheckpointEntry, SvcClaim, SvcInfo, SvcPeer, SvcReveal, SvcStep } from '@zen/wasm';
 import { SVC_ABORT, SVC_CLOSE, SVC_FIN } from './flags.js';
 import { Input } from './input.js';
 import {
@@ -228,6 +229,8 @@ export class ServeHandle<S = RawStep> {
     while (this.busy.size) await Promise.allSettled([...this.busy]);
     await this.sub?.close().catch(() => {});
     this.stream?.close();
+    // A successor resumes from the newest cursors (svc.md §12).
+    if (this.lease) await this.db.fs.integrity?.checkpoint().catch(() => {});
     if (this.lease) await this.svc.releaseLease(this.lease).catch(() => {});
     for (const c of this.held.values()) free(c);
     this.held.clear();
@@ -442,6 +445,7 @@ export class ServeHandle<S = RawStep> {
             break;
           }
           if (lease !== this.lease) break;
+          if (got.length && !(await this.verified(lease, got, signal))) break;
           for (const c of got) this.claimed(c, signal);
           if (got.length < room) break;
         }
@@ -449,6 +453,41 @@ export class ServeHandle<S = RawStep> {
     } finally {
       this.claiming = false;
     }
+  }
+
+  /**
+   * With integrity attached, sync the fs's checkpoints before resuming
+   * claims (svc.md §12), so `load` checks them against what the previous
+   * handlers checkpointed. When the server lies (an alarm), the batch's
+   * connections are aborted; false: stop claiming.
+   */
+  private async verified(
+    lease: Uint8Array,
+    got: SvcClaim[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const integrity = this.db.fs.integrity;
+    if (!integrity) return true;
+    let err: unknown;
+    try {
+      await this.retry(signal, () => integrity.sync());
+    } catch (e) {
+      err = e;
+    }
+    if (signal.aborted) return false;
+    if (!err && integrity.trusted) return true;
+    if (err && !(err instanceof IntegrityError)) {
+      // Not a verdict (the server failed): hand the claims back for later.
+      this.report(err);
+      for (const c of got) await this.svc.release(lease, c.conn, c.token, false).catch(() => {});
+      return false;
+    }
+    const why = err ?? integrity.alarms.at(-1);
+    for (const c of got) {
+      this.report(why, c.conn);
+      await this.svc.release(lease, c.conn, c.token, true).catch(() => {});
+    }
+    return false;
   }
 
   /** Take a claimed connection: check, open its state, re-reveal, then step. */
@@ -500,6 +539,8 @@ export class ServeHandle<S = RawStep> {
    * are those this side last saw. Throws when it can't be served.
    */
   private load(conn: Conn<S>, c: SvcClaim, same: boolean): void {
+    // Below what a handler checkpointed (svc.md §12): a rollback alarm.
+    this.db.fs.integrity?.observe(this.entry(conn, c.in_acked, c.out_head));
     const seen = this.seen.get(conn.key);
     if (seen && (c.in_acked < seen.inAcked || c.out_head < seen.outHead)) {
       throw new ZenError(
@@ -559,6 +600,11 @@ export class ServeHandle<S = RawStep> {
     }
   }
 
+  /** A connection's checkpoint entry (formats.md §14.1, type 5). */
+  private entry(conn: Conn<S>, inAcked: bigint, outHead: bigint): CheckpointEntry {
+    return { type: 'svc', svc: this.svc.id, conn: conn.conn, inAcked, outHead };
+  }
+
   private see(key: string, inAcked: bigint, outHead: bigint): void {
     const s = this.seen.get(key);
     this.seen.set(key, {
@@ -573,6 +619,8 @@ export class ServeHandle<S = RawStep> {
     free(conn);
     this.held.delete(conn.key);
     const lease = this.lease;
+    // A live connection goes to a successor: checkpoint its cursors first.
+    if (lease && !close) await this.db.fs.integrity?.checkpoint().catch(() => {});
     if (lease) {
       await this.svc.release(lease, conn.conn, conn.token, close).catch((e) => {
         if (!isCode(e, 'claim_lost') && !isCode(e, 'conn_closed')) this.report(e, conn.conn);
@@ -774,7 +822,12 @@ export class ServeHandle<S = RawStep> {
       this.load(conn, c, c.in_acked === conn.input.base && c.out_head === conn.outHead);
     } catch (e) {
       if (!(isCode(e, 'claim_lost') || isCode(e, 'conn_closed'))) this.report(e, conn.conn);
-      if (isCode(e, 'rollback') || isCode(e, 'decrypt') || isCode(e, 'format')) {
+      if (
+        isCode(e, 'rollback') ||
+        isCode(e, 'integrity') ||
+        isCode(e, 'decrypt') ||
+        isCode(e, 'format')
+      ) {
         await this.giveUp(conn, true);
       } else {
         this.forget(conn);
@@ -865,6 +918,7 @@ export class ServeHandle<S = RawStep> {
     if (b.step) {
       conn.at = Date.now();
       this.see(conn.key, b.inTo, b.outHead);
+      this.db.fs.integrity?.note(this.entry(conn, b.inTo, b.outHead), { count: true });
       conn.input.advance(b.inTo);
       conn.outHead = b.outHead;
       conn.hasState ||= b.sealed;

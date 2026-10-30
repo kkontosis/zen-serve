@@ -644,6 +644,23 @@ pub fn write_paged_bytes(
     b
 }
 
+/// Canonical bytes of a purge record (formats.md §11.5): one trash-purge
+/// round's removed nodes, in the order removed. Its device is 32 zero bytes.
+pub fn purge_bytes(fs_id: u32, tree: &Id, nodes: &[Id]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(25 + 16 * nodes.len());
+    b.push(5);
+    b.extend_from_slice(&fs_id.to_be_bytes());
+    b.extend_from_slice(tree);
+    b.extend_from_slice(&(nodes.len() as u32).to_be_bytes());
+    for n in nodes {
+        b.extend_from_slice(n);
+    }
+    b
+}
+
+/// The device of a purge record: the server.
+pub const PURGE_DEVICE: [u8; 32] = [0; 32];
+
 /// `chain_n = BLAKE3.derive_key("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op) ‖ device)`.
 pub fn chain_next(prev: &[u8; 32], op_bytes: &[u8], device: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key(labels::TREE_OP_CHAIN);

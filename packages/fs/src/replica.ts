@@ -10,6 +10,7 @@ import {
   type BroadcastChannelLike,
   bytes,
   CHUNK_SIZE,
+  type ChangeBatch,
   type ChannelFactory,
   type ChunkIndex,
   defaultChannel,
@@ -17,11 +18,13 @@ import {
   displayNames,
   type FileSource,
   type FileVersion,
+  IntegrityError,
   isCode,
   type LockManagerLike,
   Owner,
   ROOT,
   type SealedStore,
+  stateNodeOf,
   TRASH,
   type Tree,
   type TreeChange,
@@ -30,7 +33,7 @@ import {
   ZenError,
   zw,
 } from '@zen/client';
-import type { Info, NodeMeta } from '@zen/wasm';
+import type { CheckpointEntry, Info, NodeMeta } from '@zen/wasm';
 import { FileHandle, type OpenFlags, type OpenOptions } from './handle.js';
 import {
   buildOverlay,
@@ -110,6 +113,8 @@ export interface ReplicaStatus {
   queued: number;
   /** A batch of them is being sent. */
   sending: boolean;
+  /** The integrity alarm that stopped the feed (fs.md §9), if any. */
+  alarm?: IntegrityError;
 }
 
 /** Options of the write calls. */
@@ -227,6 +232,13 @@ export class Replica {
    */
   private inFlight: { id: string; nodes: Set<string>; floor: Uint8Array } | undefined;
   private infoP: Promise<Info> | undefined;
+  // Tree state (fs.md §9.1), with integrity attached: built at the first
+  // check, then kept with the node table.
+  private ts: zw.TreeState | undefined;
+  /** This replica sent operations since its last check. */
+  private wrote = false;
+  /** The alarm that stopped the feed. */
+  private alarm: IntegrityError | undefined;
 
   private constructor(
     readonly fs: UnlockedFs,
@@ -348,6 +360,7 @@ export class Replica {
     const old = this.nodes.get(key);
     if (old?.parent) this.kids.get(bytes.hex(old.parent))?.delete(key);
     this.nodes.set(key, n);
+    this.ts?.set(stateNodeOf(n.state));
     if (n.parent) {
       const p = bytes.hex(n.parent);
       const set = this.kids.get(p) ?? new Set<string>();
@@ -361,6 +374,7 @@ export class Replica {
     if (!old) return;
     if (old.parent) this.kids.get(bytes.hex(old.parent))?.delete(key);
     this.nodes.delete(key);
+    this.ts?.remove(old.id);
   }
 
   /** Apply feed changes (newer offsets win, so overlapping polls are harmless). */
@@ -410,17 +424,23 @@ export class Replica {
           this.rec.put('sync', FULL, new Uint8Array([1]));
           this.seen = new Set();
         }
+        if (this.alarm) throw this.alarm;
         const from = this.full ? undefined : this.cursor;
-        for await (const b of this.tree.changes(from)) {
+        let last: Fed | undefined;
+        for await (const f of this.feed(from)) {
+          const b = f.batch;
           if (b.resync) {
             this.full = true;
             this.seen = new Set();
             this.rec.put('sync', FULL, new Uint8Array([1]));
+            last = undefined;
             continue;
           }
           const ids = this.apply(b.changes);
           this.saveCursor(b.cursor);
           await this.announce(ids);
+          if (b.head) last = f;
+          if (!this.full) this.check(f);
         }
         this.online = true;
         if (this.full) {
@@ -438,9 +458,63 @@ export class Replica {
           this.seen = new Set();
           this.rec.delete('sync', FULL);
           await this.announce(gone);
+          // The node table is now the server's at the last head.
+          if (last) this.check(last);
         }
       });
     return this.catching;
+  }
+
+  /**
+   * The change feed with, for each batch, the tree's floor before it was
+   * asked for (integrity attached), so a floor raised meanwhile isn't held
+   * against an answer that predates it.
+   */
+  private async *feed(from: Uint8Array | undefined, waitMs?: number): AsyncGenerator<Fed> {
+    const integrity = this.fs.integrity;
+    const key = entryKeyOf(this.id);
+    const it = this.tree.changes(from, {
+      ...(waitMs !== undefined ? { waitMs } : {}),
+      heads: !!integrity,
+    });
+    try {
+      for (;;) {
+        const floorAt = integrity?.floor(key) ?? null;
+        const r = await it.next();
+        if (r.done) return;
+        yield { batch: r.value, floorAt };
+      }
+    } finally {
+      await it.return(undefined);
+    }
+  }
+
+  /**
+   * Check the tree state at a caught-up batch against the floors (fs.md §9):
+   * only when the node table is exactly the server's there, i.e. nothing
+   * newer was applied (the other feed loop) and no full sync is under way.
+   */
+  private check(f: Fed): void {
+    const integrity = this.fs.integrity;
+    const head = f.batch.head;
+    if (!integrity || !head || this.full) return;
+    const at = f.batch.cursor;
+    if (at ? !this.cursor || !bytes.equal(at, this.cursor) : !!this.cursor) return;
+    if (!this.ts) {
+      this.ts = new zw.TreeState();
+      for (const n of this.nodes.values()) this.ts.set(stateNodeOf(n.state));
+    }
+    const count = this.wrote;
+    this.wrote = false;
+    try {
+      integrity.observe(
+        { type: 'tree', tree: this.id, ops: head.ops, chain: head.chain, state: this.ts.root() },
+        { count, floorAt: f.floorAt },
+      );
+    } catch (e) {
+      if (e instanceof IntegrityError) this.alarm = e;
+      throw e;
+    }
   }
 
   /** The owner's loop: catch up, then long-poll, until closed or no longer owner. */
@@ -454,8 +528,9 @@ export class Replica {
           await this.catchUp();
           this.schedulePins();
           backoff = BACKOFF_MIN;
-          for await (const b of this.tree.changes(this.cursor, { waitMs: this.waitMs })) {
-            if (this.stopped) return;
+          for await (const f of this.feed(this.cursor, this.waitMs)) {
+            const b = f.batch;
+            if (this.stopped || this.alarm) return;
             if (b.resync) {
               this.full = true;
               break;
@@ -463,9 +538,15 @@ export class Replica {
             const ids = this.apply(b.changes);
             this.saveCursor(b.cursor);
             await this.announce(ids);
+            this.check(f);
           }
         } catch (e) {
           if (this.stopped) return;
+          // The server showed an older or another history: stop following it.
+          if (e instanceof IntegrityError) {
+            console.warn(`zen-fs: integrity: ${e.message}`);
+            return;
+          }
           if (!isCode(e, 'network')) console.warn(`zen-fs: sync failed: ${(e as Error).message}`);
           this.online = false;
           await new Promise((r) => setTimeout(r, backoff));
@@ -482,6 +563,7 @@ export class Replica {
    * up; another tab reloads what the owner announced meanwhile (nothing to do).
    */
   async sync(): Promise<void> {
+    if (this.alarm) throw this.alarm;
     if (!this.owner.isOwner) return;
     try {
       await this.catchUp();
@@ -1049,6 +1131,7 @@ export class Replica {
   /** The sender's report: `entries` are committed. */
   private async done(entries: QueueEntry[], dots: Map<string, Uint8Array>): Promise<void> {
     const keys = new Set(entries.map((e) => e.key));
+    this.wrote = true;
     for (const [k, d] of dots) {
       this.learned.set(k, d);
       this.sentDots.set(k, d);
@@ -1626,6 +1709,7 @@ export class Replica {
       pins: this.pins.size,
       queued: this.queue.length,
       sending: this.sender.sending,
+      ...(this.alarm ? { alarm: this.alarm } : {}),
     };
   }
 
@@ -1651,6 +1735,8 @@ export class Replica {
     await this.rec.flush();
     this.owner.close();
     this.chan?.close();
+    this.ts?.free();
+    this.ts = undefined;
     await this.release?.();
   }
 
@@ -1658,6 +1744,17 @@ export class Replica {
   static async wipe(local: SealedStore, fs: number, tree: Uint8Array): Promise<void> {
     for (const s of replicaStores(fs, tree)) await local.clear(s);
   }
+}
+
+/** A feed batch and the tree's floor before it was asked for. */
+interface Fed {
+  batch: ChangeBatch;
+  floorAt: CheckpointEntry | null;
+}
+
+/** The key of a tree's checkpoint entries (`entryKey`). */
+function entryKeyOf(tree: Uint8Array): string {
+  return `2${bytes.hex(tree)}`;
 }
 
 /** Messages on the tab channel. */

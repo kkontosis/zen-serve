@@ -127,6 +127,7 @@ export {
   type Prepared,
   type ReadStreamOptions,
   ROOT,
+  stateNodeOf,
   TRASH,
   Tree,
   TreeBatch,

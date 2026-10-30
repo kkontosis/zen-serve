@@ -526,6 +526,32 @@ export class Integrity {
     if (opts.count !== false) this.changed();
   }
 
+  /**
+   * Check a server answer about an object against the floors (formats.md
+   * §14.4), then `note` it. The same tree `ops` (or root `seq`) with another
+   * state is a fork; below the floor is a rollback. `floorAt` is the floor
+   * when the answer was asked for (`floor(key)` then; `null`: none): a floor
+   * raised by checkpoints that arrived meanwhile may be newer than the answer
+   * honestly is, so the rollback check uses it instead of the current one.
+   * `count` (default false): count toward the cadence, for what this device
+   * wrote; what it only verified rides in its next checkpoint.
+   */
+  observe(
+    entry: CheckpointEntry,
+    opts: { count?: boolean; floorAt?: CheckpointEntry | null } = {},
+  ): void {
+    if (entry.type === 'topic') throw new Error('topics check their reads themselves');
+    const cur = this.floors.get(entryKey(entry));
+    const was = opts.floorAt === undefined ? cur : (opts.floorAt ?? undefined);
+    const why = (cur && divergent(cur, entry)) || (was && divergent(was, entry));
+    if (why)
+      throw this.raise({ kind: 'fork', object: objectOf(entry), id: idOf(entry), detail: why });
+    const low = was && lowerThan(was, entry);
+    if (low)
+      throw this.raise({ kind: 'rollback', object: objectOf(entry), id: idOf(entry), detail: low });
+    this.note(entry, { count: opts.count ?? false });
+  }
+
   /** Count a change toward the cadence (formats.md §14.3), and schedule a checkpoint. */
   private changed(): void {
     if (!this.deviceFp || this.closed) return;

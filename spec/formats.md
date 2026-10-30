@@ -398,6 +398,15 @@ The chain starts at 32 zero bytes. Each operation accepted by the server extends
 chain_n = BLAKE3.derive_key("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(op_bytes) ‖ device_fp(32))
 ```
 
+**Purge records.** Each trash-purge round that removes nodes (fs.md §6) extends the chain too, in the same transaction as the removal, so `(ops, chain)` names every change of a tree's node set (fs.md §9):
+
+```
+purge  = 0x05 ‖ u32(fs) ‖ tree ‖ u32(n) ‖ n × node      (the round's nodes, in the order removed)
+```
+
+* Its device is 32 zero bytes (the server), and `ops` counts it like an operation.
+* Clients never build one: they compare `(ops, chain)` with what the server and checkpoints say. A client that replays the chain from operations it holds can do so only up to a tree's first purge.
+
 
 ### 11.6 Page
 

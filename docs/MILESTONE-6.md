@@ -182,6 +182,26 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * the Playwright smoke
   * **CI:** the `client` job builds `zen-server --features test-utils`.
   * Pushed 6ea8fa8. **The push run (395) was green; the pull_request run (396) was red in `client`**, at one test outside this step: `apps/chat` "who's online" (TD-TEST-OPEN-FAILURES item 4, first seen on 84c8c02 in milestone 5.5). Its diagnostic now says more: within 1.5 s, alice, carol and dave answered and bob (the asker) didn't; asked again with 10 s, alice, bob and dave answered and carol didn't. So a reply is **lost, not slow**, and a different one each time. The plan to find and fix the cause is "Step 6.3: the red on run 396" below.
+  * Fixed and logged in "Step 6.3: the red on run 396" below. PR #56 merged at 883c9ba.
+* **Step 6.4** (fs and svc): planned below ("Step 6.4 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (08750c1), PR #57.
+  * `spec:` commit 1865927: formats.md §11.5 purge records; fs.md §6 and §9 (same ops, same state; when a replica checks; rollback and fork); api.md §12 (`tree/chain` counts purges); svc.md §12 (sync before resuming; checkpoint before release; cadence; the handler's database left for 6.5).
+  * **Rust** (efd97cc): zen-core `fs::purge_bytes` and `PURGE_DEVICE`; `fs.json` gains `purge` (only that file changed on regeneration). zen-server `purge_trash` reads the tree header normally and extends `ops`/`chain` with one purge record per round that removes nodes, in the round's transaction. `tests/fs.rs` `sweeper_purges_trash_and_collects_chunks` checks the record (ops 6 → 7, the chain over `[file, dir]`, leaves first) and that a caught-up `changes` answer carries it. Negative control: with the server change reverted the test fails (`(6, …)` vs `(7, …)`).
+  * **Client, fs, svc, apps** (e97489f):
+    * `tree.ts`: `ChangeBatch.head`, `changes(…, {heads: true})`, `stateNodeOf`.
+    * `integrity.ts`: `observe(entry, {count?, floorAt?})`. **Changed from the plan:** the rollback check uses the floor as it was *before* the answer was asked for (`floorAt`): a checkpoint that arrives while a `changes` request is in flight can honestly name a higher `ops` than the answer. The fork check (same `ops`, another chain or state) uses both floors, since it never holds honestly.
+    * `replica.ts`: the feed goes through `feed()`, which takes the tree's floor before each request; the `TreeState` is built at the first check from the node table and kept by `setNode`/`dropNode` from then on (so tabs that never check never build it); `check` runs after a caught-up batch only when the saved cursor is that batch's and no full sync is under way, and after a full sync once the unseen nodes are dropped. An `IntegrityError` stops `run`, makes `sync()` rethrow, and shows in `status().alarm`. `done()` marks `wrote`, so a replica's own writes count toward the cadence.
+    * `serve.ts`: `note` after each committed step (`count: true`); `verified()` syncs before resuming a batch of claims (network errors retry; another error hands the claims back; an alarm, or an fs already untrusted, aborts them); `load` calls `observe` (current floor: a handler's checkpoint can't name more than the server committed); `giveUp(conn, false)` and `stop()` checkpoint first; `resync` aborts on `integrity`.
+    * `apps/shared/node.ts`: `WorkerSignIn.integrity` (pins kept in the vault directory when there is one) and `fetch`; `WorkerContext.integrity`; `close()` closes the integrity (a last checkpoint); `ZEN_INTEGRITY=1`.
+  * **Tests:** `packages/fs/test/integrity.test.ts` (5: honest incl. a from-scratch replica and a reopen; purge; rollback via `server.fork()`; fork via a third client that verified S1 and follows S2; wrong merge via a tampered `changes` response) and `apps/echo/test/integrity.test.ts` (3: honest with a successor on another device; a replayed older claim with the real token; a withheld checkpoint). 3× green. **Negative controls** (each run once, then restored):
+    * rollback check off (`lowerThan` skipped): the rollback test fails ("no alarm");
+    * the state compared nowhere (chain only, in `divergent` and `lowerThan`): the wrong-merge test fails ("no alarm");
+    * same-`ops` comparisons off entirely: the fork and wrong-merge tests fail ("no alarm"); with only `divergent` off, `lowerThan` still catches both, as a rollback;
+    * the svc floor check in `load` off: the successor accepts the replayed claim silently (the test times out waiting for the report);
+    * the server's purge record reverted (and the test waiting for the trash to empty instead of for `ops`): `ops` stays 5 after the purge, and a replica that held the trashed file raises a false fork ("tree state changed at the same ops").
+  * **Docs:** CLIENT.md §12 (trees, relayed connections), SVC.md §6 (handler checkpoints, the window), TECH_DEBT TD-SVC-STATE-ROLLBACK narrowed to the handler's database and the window, STATS §5.2 (tree state: 100,000 nodes from scratch ~0.5–0.6 s plus 60–130 ms for the first root; a change then `root()` ~55–95 µs; measured while the full vitest run was going, so upper bounds).
+  * Local: the full vitest run green (578 passed, 12 skipped: the opt-in benches); `cargo test -p zen-server --test fs --test crdt` on local FDB green.
+  * Pushed ae68e8e. **The push run (406) was green; the pull_request run (407) was red in `client`**, at one test outside this step: `packages/db/test/patterns.test.ts` "retry 'delay'", `decrypt` reading the topic's events. Not reproduced in 21 local runs; reading found no cause. Recorded as TD-TEST-OPEN-FAILURES item 6, and `Topic.decode` now names the event that didn't open (offset, topic, kind, epoch, key token, size), so a recurrence says what was stored.
+  * **CI green on both runs of c756b0c** (push 408, pull_request 409). Step 6.4 is done, waiting on review and merge of PR #57.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -231,6 +251,7 @@ Two races in `@zen/db`'s request path (`packages/db/src/txn.ts` `ask`, `packages
   * Tests that failed without the fix: `txn.test.ts` "a row read twice while the cache changes in between: the commit conflicts, no lost update" (it committed once, on stale data), and `kv.test.ts` "expectKey: the first version expected of a key stands, so two versions conflict" (it committed).
   * Item 1 of TD-TEST-OPEN-FAILURES is marked resolved, with its cause.
   * The full vitest run, 3× after the fix: 570 passed, 12 skipped (the opt-in benches).
+* **CI green on both runs of 37699a0** (push 399, pull_request 400). Step 6.3 is done. PR #56 merged at 883c9ba.
 
 ## Facts the design rests on (survey)
 
@@ -1104,6 +1125,196 @@ Every attack test first asserts that the attack works (the server really serves 
 * A detected attack throws from the detecting call and stops checkpoint writes; the rest is app policy.
 * Streams check gaps and rewrites only; freshness is checked at the end of reads and by `verifyHead`.
 * A gap in the middle of a topic is tested with hand-sealed events, not a new adversary lie: the server can only withhold tails, which the adversary covers.
+
+## Step 6.4 in detail
+
+Step 6.4 puts trees and relayed connections into device checkpoints:
+* `@zen/fs` replicas compute the tree state (fs.md §9.1), check each caught-up point against the floors, and note `[2, tree, ops, chain, state]`.
+* `@zen/svc` handlers note `[5, svc, conn, in_acked, out_head]` after each committed step. A successor syncs the fs's checkpoints before it resumes a claim, and refuses a claim below the floor (svc.md §12; TD-SVC-STATE-ROLLBACK, except for the handler's database, which waits on 6.5).
+
+Both are opt-in, like topics in 6.3: they use the `Integrity` attached to the fs (`fs.integrity(opts)`), and nothing changes without one.
+
+**Survey (what this step builds on):**
+* **The replica** (`packages/fs/src/replica.ts`):
+  * It keeps every node the change feed delivered in `nodes` (each `TreeNode` keeps its raw `NodeState`), stored under `nodes`, with the cursor under `sync`.
+  * `apply` takes a batch: newer offsets win, a change without a state drops the node.
+  * `catchUp` (serialized) runs a full sync when there's no cursor, or after a `resync`, and drops the nodes the full sync didn't return. `run` is the owner's long-poll loop.
+  * **They aren't serialized with each other**, so one can apply changes newer than a batch the other is still handling.
+  * Only the owner (Web Lock, or the store's lock file) follows the feed. Other tabs reload what it announces.
+* **The feed** (`Tree.changes`): yields only batches with changes. It drops `ops`/`chain`, which the server sends when `more` is false (6.2).
+* **The wasm `TreeState`** (6.1): `set(StateNode)`, `remove(node)`, `root()`, `size`. `StateNode` is camelCase (`moveHlc`, …) and `NodeState` is snake_case (`move_hlc`, …), so the client needs a mapping.
+* **`Integrity`** (6.3):
+  * `note(entry)` raises the floor (a different `chain`/`state` at the same `ops` from another writer is a fork) and queues the entry for the next checkpoint. `floor(entryKey(e))` reads the floor back.
+  * `mergeEntry`, `lowerThan` and `divergent` already know trees and connections.
+  * Nothing yet checks a server answer about a tree or a connection *against* the floor.
+* **The server's trash purge** (`tree.rs` `purge_trash`, run by the sweeper): it removes node records and leaves tombstones, **without advancing the tree's op count or chain**. So two honest replicas at the same `ops`, one before a purge and one after, hold different node sets. That contradicts fs.md §9's rule that devices at the same `ops` hold the same state, and every purge would raise a false fork. Nothing else changes a node record outside an operation: undo and redo are part of applying one, and the move-log trim, tombstone drop and chunk GC don't touch records.
+* **svc** (`packages/svc/src/serve.ts`):
+  * `claimed` → `load` checks cursors against `seen`, the highest cursors this process saw. A fresh process, or a handler on another device, has no such floor (the TD).
+  * The step commit's cursors are recorded with `see(…, b.inTo, b.outHead)`.
+  * `giveUp(conn, close)` releases a connection, and `stop()` releases the lease.
+  * Claims come from `/v1/svc/next`, a write transaction, so the 6.2 adversary (reads only) can't lie in a claim.
+* **Test harnesses:**
+  * `packages/fs/test/helpers.ts` provides `world`/`installation` (a client with a `net` switch) and `solo()` options. Sweeper tests set `limits.crdt_horizon_secs`, and `limits.sweep_interval_secs` (minimum 1 s) exists.
+  * `apps/shared` provides `startWorld` and `signInWorker` (device file, passphrase), and the echo service with in-process handlers.
+  * 6.3's `slowFs` showed a `fetch` wrapper on a client works for per-session tampering.
+
+### Spec (`spec:` commit)
+
+* **formats.md §11.5: a purge record.** A purge round (one transaction) extends the tree's op chain:
+  ```
+  purge = 0x05 ‖ u32(fs) ‖ tree ‖ u32(n) ‖ n × node      (the nodes in the order removed)
+  chain_n = H("zen/v1/tree-op-chain", chain_{n−1} ‖ lp(purge) ‖ 0³²)   (the device is 32 zero bytes: the server)
+  ```
+  `ops` counts it. Clients never build one; they only compare `(ops, chain)`. The sentence on `verifyChain`-style replay says a replay from a client's own records covers a tree until its first purge.
+* **fs.md §6:** the trash-purge bullet says that each round adds a purge record to the op chain, so `(ops, chain)` names every change of the node set.
+* **fs.md §9 (tree state):**
+  * At the same `ops`, honest replicas hold the same state, since operations and purges are all in the chain.
+  * **When a replica checks:** a replica checks only where its node table is exactly the server's at a `changes` response with `more: false`. That means it has applied that response and nothing newer, and after a full sync, it has also dropped the nodes the full sync didn't return.
+  * **What it checks** against the floor (formats.md §14.4):
+    * an `ops` below the floor is a rollback
+    * the same `ops` with another `chain` or `state` is a fork
+* **api.md §12** (`tree/chain`): `ops` counts operations and purge rounds.
+* **svc.md §12:**
+  * A successor syncs the fs's device checkpoints before it resumes claimed connections.
+  * A handler writes a checkpoint before it releases a live connection or its lease.
+  * The cadence is the device's (`sig_every`): every noted step counts.
+
+### zen-core and the server
+
+* **zen-core `fs.rs`:** `purge_op_bytes(fs, tree, nodes) -> Vec<u8>`.
+* **Vectors:** `vectors.rs` adds `purge_op` and its chain step to `fs.json` (after the existing op chain), regenerated.
+* **zen-server `tree.rs` `purge_trash`:**
+  * When `doomed` isn't empty, read the tree header normally (`get`, so the round conflicts with a concurrent commit on the tree, which retries).
+  * Set `ops += 1` and `chain = chain_next(chain, purge_op_bytes(fs, tree, doomed ids), [0; 32])`, and write it back in the same transaction as the removal and the tombstones.
+* **Tests:**
+  * `crates/zen-server/tests/fs.rs`: the existing purge test also checks that `tree/chain` moved by exactly one record per round, equal to `chain_next` over the purged ids in order.
+  * A `changes` response with `more: false` after the purge carries the new `(ops, chain)`.
+  * Both backends (FDB once).
+
+### `@zen/client`
+
+* **`tree.ts`:**
+  * `ChangeBatch.head?: {ops, chain}`, present when the response had `more: false`.
+  * `changes(cursor, {heads: true})` also yields batches with no changes when they carry a head, so a follower sees every caught-up point. Without `heads`, nothing changes for existing callers.
+  * `stateNodeOf(s: NodeState): StateNode`, the mapping for `zw.TreeState`.
+* **`integrity.ts`:**
+  * **`observe(entry, {count?})`:** the freshness check of a server answer about an object (formats.md §14.4), then `note`:
+    * `divergent` from the floor is a **fork**
+    * `lowerThan` the floor is a **rollback**
+    * otherwise it's noted
+  * `count` defaults to false: what a device verified rides in its next checkpoint without forcing one. Writers pass true.
+  * Exported for 6.5 too (namespaces and volumes).
+
+### `@zen/fs` (`replica.ts`)
+
+* **The state:** a `zw.TreeState` kept with the server's node table:
+  * `set` in `apply` and `load`, `remove` when `apply` drops a node and when a full sync drops the ones it didn't return
+  * freed on `close`
+  * only the owner keeps it (other tabs don't follow the feed)
+* **The check, with an `Integrity` attached** (`fs.integrity`):
+  * Both feed loops pass `{heads: true}`.
+  * A batch with a `head` is checked when the replica isn't in a full sync and its saved cursor is that batch's cursor (or the request's cursor, for an empty batch): nothing newer was applied by the other loop.
+  * After a full sync, the last head is checked once the unseen nodes are dropped, under the same cursor condition.
+  * The check is `integrity.observe({type: 'tree', tree, ops, chain, state: treeState.root()}, {count})`, where `count` is true when this replica sent operations since its last check.
+* **An alarm** (an `IntegrityError`):
+  * The feed loop stops: no retries, no further applies. `sync()` rethrows the error, and `status()` gains `alarm?`.
+  * Local writes still queue and send: the server can't forge them, and what to do is app policy (docs).
+* **Cost:** one leaf hash per changed node, and one bucket plus two inner nodes per change at `root()`. On `load`, the state is rebuilt from the stored nodes (one leaf hash each). STATS gets a number for 100,000 nodes.
+
+### `@zen/svc` (`serve.ts`), with `db.fs.integrity` attached
+
+* **After each committed step**, next to `see(…)`, call `integrity.note({type: 'svc', svc, conn, inAcked, outHead}, {count: true})`. Only known-applied commits are noted; an unknown outcome goes through `resync` as today.
+* **Before resuming claims:** in `claim()`, when `next` returned connections, `await integrity.sync()` once for the batch (network errors retry through `retry`). An `IntegrityError` there is reported, and the batch's connections are given up with `close` (the server is lying).
+* **In `load`:**
+  * The floor check: `integrity.floor(entryKey(svc entry))` with `in_acked` or `out_head` below it raises a **rollback** alarm (`object: 'svc'`, `id: svc ‖ conn`). The existing path then reports it and aborts the connection, as a regression against `seen` does today.
+  * The claim's cursors are then observed (`count: false`).
+* **Before a release:**
+  * `giveUp(conn, false)` (a live connection handed back) awaits `integrity.checkpoint()` first, and so does `stop()` before `releaseLease`. A successor then sees the newest cursors.
+  * A crash leaves the window since the last checkpoint (cadence, or `sigEvery: 1`).
+  * Closing connections (`close: true`) don't checkpoint: no one resumes them.
+* **Cumulative bodies** carry one entry per connection served. Ended connections' entries go first when a body is full, since they're unchanged the longest (formats.md §14.1).
+
+### `apps/shared` (`node.ts`)
+
+* `WorkerSignIn.integrity?: Omit<IntegrityOptions, 'device'> | true`: attaches `fs.integrity({device: {device, cert}, …})` from the device file before unlocking.
+* `WorkerSignIn.fetch?`: for tests that tamper with one handler's transport.
+* `workerFromEnv` reads `ZEN_INTEGRITY=1`.
+
+### Tests
+
+**`packages/fs/test/integrity.test.ts` (new)**, replicas with `Integrity` and signers:
+* **`honest`:**
+  * Two installations (two devices) write concurrently and follow each other.
+  * At every `ops` both replicas checked, their states are equal, and equal to a third replica's full sync from scratch (incremental equals scratch).
+  * Each device's checkpoint carries the tree entry. Syncs report nothing.
+  * A replica reopened from its store rebuilds the same state, and checks again with no alarm.
+* **`purge`** (`crdt_horizon_secs: 1`, `sweep_interval_secs: 1`):
+  * A subtree is trashed, and A's replica checks at `ops = n` with it still there.
+  * After the purge, B's replica (a full sync) is at `n + 1` with it gone, and `tree.chain().ops` is `n + 1`.
+  * No alarm on either side, after both checkpoint and sync.
+  * Negative control, run once by hand with the server change reverted: B is at `n` without the subtree, which gives a false fork (logged).
+* **`rollback`** (whole-store copy, `server.fork()`):
+  * B's replica checks at `ops = n` and closes. A writes on the original, its replica reaches `n + 2`, and A checkpoints. B syncs on the original (floor `n + 2`).
+  * B reopens its replica on the copy, with the same stores (the attack works: the copy serves `n`). `sync()` throws a tree rollback.
+  * `status().alarm` is set, and the feed has stopped.
+* **`fork`** (`server.fork()`):
+  * A writes op X on S1, and B writes op Y on S2. Each replica checks at the same `ops` with different chains, with no alarm on its own side.
+  * B moves to S1 with its pins (a new session, the same local store): its sync of A's checkpoint, or its replica's next check, gives a tree fork.
+* **`wrong merge`** (one session's transport tampered):
+  * B's client rewrites one node's meta in its `changes` responses, so `(ops, chain)` are the server's but the state isn't.
+  * The attack works (B's replica shows the old name), and B's check against A's checkpoint at the same `ops` is a fork ("tree state changed at the same ops").
+  * Negative control: with the state comparison off, no alarm.
+* **Each attack test fails with its check disabled** (logged).
+
+**`apps/echo/test/integrity.test.ts` (new)**, echo handlers with `integrity: {sigEvery: 1}`:
+* **`honest`:**
+  * Lines echo. After each step, the device's head checkpoint has the connection's entry with the cursors the server holds.
+  * `stop()` writes a checkpoint before releasing.
+  * A successor (a new context, fresh pins) resumes the connection after syncing, with no alarm, and the echo continues in order.
+* **`rolled-back claim`:**
+  * H1 serves a connection for a few lines, then stops (checkpoint, release, requeue).
+  * H2 has fresh pins and a transport that replaces its claim's cursors, state and pending with H1's first claim of the same connection, recorded earlier (an older, consistent snapshot, with the real token).
+  * Without the check, H2 would accept it and echo the old lines again (the attack works with the check disabled).
+  * With it, H2 reports a rollback (`object: 'svc'`) and the connection is aborted (the peer sees it close).
+* **`withheld checkpoint`:** the 6.2 lie `checkpoints` on H1's device after its first checkpoint. H2 then sees H1's older entry only, which is the documented window, but H1's own next sync reports a rollback (6.3), so the handler stops trusting the fs. This test documents the limit and asserts both behaviours.
+
+**Existing suites:** `packages/fs`, `packages/fuse`, `packages/svc`, `apps/echo` and `packages/client` (`tree`, `integrity`) unchanged and green, plus the server's `fs.rs`/`crdt.rs` on both backends.
+
+### Docs
+* **docs/CLIENT.md §12:** trees (`observe`, when replicas check, alarms stop the feed) and connections.
+* **docs/SVC.md:** handler checkpoints (cadence, release, successor sync, the window, what's left for 6.5).
+* **spec/TECH_DEBT.md:** TD-SVC-STATE-ROLLBACK narrowed to the handler's database (closed in 6.5).
+* **docs/STATS.md:** the replica state cost.
+* **docs/MILESTONE-6.md:** the log.
+
+### Files
+* **Spec:** `spec/{formats,fs,api,svc,TECH_DEBT}.md`
+* **Rust:**
+  * `crates/zen-core/src/{fs,vectors}.rs`, `spec/test-vectors/fs.json`
+  * `crates/zen-server/src/tree.rs`, `crates/zen-server/tests/fs.rs`
+* **Client and packages:**
+  * `packages/client/src/{tree,integrity,index}.ts`
+  * `packages/fs/src/replica.ts`, `packages/fs/test/integrity.test.ts` (new)
+  * `packages/svc/src/serve.ts`
+* **Apps:** `apps/shared/node.ts`, `apps/echo/test/integrity.test.ts` (new)
+* **Docs:** `docs/{CLIENT,SVC,STATS,MILESTONE-6}.md`
+
+### Verification
+* **Rust:**
+  * `cargo fmt --check`; clippy `-D warnings` (default, `--no-default-features`, `--all-features`)
+  * `cargo test -p zen-core --features test-utils`; regenerate the vectors (only `fs.json` changes)
+  * `cargo test -p zen-server --test fs --test crdt`, embedded and on local FDB
+* **JS:**
+  * `scripts/build-wasm.sh`, `npm run check`
+  * the two new test files 3×; `packages/fs`, `packages/fuse`, `packages/svc`, `apps/echo`, and `packages/client` `tree`/`integrity` once; then the full vitest run
+* **Attacks:** each attack test fails with its check disabled (logged).
+* **CI:** green on both runs.
+
+**Defaults chosen (overridable):**
+* **Purge records** in the op chain rather than leaving trash out of the state. Leaving it out would make a node's leaf depend on its ancestors, so a move into the trash would rehash its whole subtree.
+* **Reads don't force checkpoints** (`count: false`): only writers' changes count toward the cadence.
+* **After an alarm**, a replica stops following the feed but keeps sending writes. A handler aborts the claimed connections it can't verify.
+* **Tampering is per session, at the transport**, for the wrong-merge and claim tests. The 6.2 adversary lies to every reader, and can't lie in claims, which are write transactions.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.

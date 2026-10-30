@@ -878,6 +878,12 @@ async fn sweeper_purges_trash_and_collects_chunks() {
         )
         .await
         .unwrap();
+    assert_eq!(before.ops, Some(6));
+    let chain0 = tree_chain(&h, &a).await;
+    assert_eq!(
+        (chain0.ops, Some(chain0.chain.clone())),
+        (6, before.chain.clone())
+    );
     let chunk = |n: u8| ChunksGet {
         fs: 1,
         ids: vec![ByteBuf::from(id(n).to_vec())],
@@ -904,6 +910,16 @@ async fn sweeper_purges_trash_and_collects_chunks() {
         .await
         .unwrap();
     assert!(kept.chunks[0].data.is_some(), "referenced chunks stay");
+    // The purge round extended the op chain by one record (formats.md
+    // §11.5): the subtree, leaves first, by the server.
+    let chain1 = tree_chain(&h, &a).await;
+    let want = zfs::chain_next(
+        &chain0.chain.clone().try_into().unwrap(),
+        &zfs::purge_bytes(1, &TREE, &[id(2), id(1)]),
+        &zfs::PURGE_DEVICE,
+    );
+    assert_eq!((chain1.ops, chain1.chain.clone()), (7, want.to_vec()));
+    let mut seen_head = false;
     // The old cursor eventually needs a full resync (tombstones dropped);
     // until then it sees the tombstones.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -927,6 +943,10 @@ async fn sweeper_purges_trash_and_collects_chunks() {
                     c.changes.iter().all(|c| c.state.is_none()),
                     "only tombstones: {c:?}"
                 );
+                // A caught-up response names the new head.
+                assert_eq!(c.ops, Some(7));
+                assert_eq!(c.chain.as_deref(), Some(&want[..]));
+                seen_head = true;
             }
             Err(e) => {
                 assert_eq!(e.1.code, "resync");
@@ -936,8 +956,22 @@ async fn sweeper_purges_trash_and_collects_chunks() {
         assert!(Instant::now() < deadline, "tombstones dropped");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    assert!(seen_head, "the tombstones were seen before the resync");
     let s = full_sync(&h, &a).await;
     assert_eq!(s.keys().copied().collect::<Vec<_>>(), vec![id(3)]);
+}
+
+async fn tree_chain(h: &Harness, u: &Dev) -> TreeChain {
+    h.call(
+        "/v1/fs/tree/chain",
+        Some(&u.tok),
+        &TreeRef {
+            fs: 1,
+            tree: TREE.to_vec(),
+        },
+    )
+    .await
+    .unwrap()
 }
 
 /// A skipped (cycle) move can name a node that is purged later; a late move

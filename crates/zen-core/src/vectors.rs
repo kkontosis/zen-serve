@@ -384,6 +384,8 @@ fn fs_vectors() -> Result<Value> {
         &sealed_paged_v2,
     );
     let paged_chain = fs::chain_next(&chain, &paged_op, &device);
+    let purge_op = fs::purge_bytes(fsk.fs_id, &tree, &[node, [0x77; 16]]);
+    let purge_chain = fs::chain_next(&paged_chain, &purge_op, &fs::PURGE_DEVICE);
     Ok(json!({
         "description": "CRDT filesystem objects (formats.md §11) for the fixture fs at epoch 0.",
         "fs_data_key": h(fsk.fs_data_key().as_ref()),
@@ -405,6 +407,8 @@ fn fs_vectors() -> Result<Value> {
         "file_chunk": {"rng_seed": "fs-file-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_file_chunk)},
         "write_paged": {"op": h(&paged_op), "chain": h(&paged_chain),
                         "description": "a paged write after the op_chain steps"},
+        "purge": {"nodes": [h(&node), h(&[0x77; 16])], "op": h(&purge_op), "chain": h(&purge_chain),
+                  "description": "a purge record (device: 32 zero bytes) after write_paged"},
     }))
 }
 

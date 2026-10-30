@@ -124,6 +124,13 @@ The server relays bytes it can't read when the protocol is encrypted end to end 
 
 For a plaintext protocol (SMTP before STARTTLS, a raw service) the server also sees the bytes in transit, and stores them until they are acked, unless the service has a sealed inbox. Output is stored sealed until its step has committed, then with its key until it is written. A malicious server can replay an old snapshot of a connection ([TD-SVC-STATE-ROLLBACK](../spec/TECH_DEBT.md#td-svc-state-rollback)); svc.md §12 has the details.
 
+**Handler checkpoints** bound that replay (svc.md §12). With integrity attached to the fs (docs/CLIENT.md §12; `signInWorker({integrity})` or `ZEN_INTEGRITY=1` for workers):
+* After each committed step, the handler notes the connection's cursors `(in_acked, out_head)`; they ride in its next device checkpoint (every `sigEvery` changes, `delayMs` after the last one).
+* Before it hands a live connection back, or releases its lease (`stop()`), it writes a checkpoint, so a successor knows the newest cursors.
+* A successor syncs the fs's checkpoints before it resumes claimed connections, and aborts a connection whose claim is below the newest verified entry (a `rollback` alarm, `object: 'svc'`). If the sync itself alarms, the claimed connections are aborted: the server is lying.
+* **The window:** a handler that crashes leaves the steps since its last checkpoint unvouched (`sigEvery: 1` checkpoints every step), and a server that withholds a handler's newest checkpoints shows a successor the older ones. The handler then finds its own head below its pin at its next sync.
+* **Not yet covered:** the handler's database (zendb.md §14) rolled back together with the connection, until authenticated namespaces.
+
 ## 7. Costs
 
 [STATS.md §5.5](STATS.md#55-relayed-service-costs-measured) has measured step latency per layer, throughput, the takeover pause and the cost of an idle connection. In short: every step is a commit, so a request and its reply cost a few round trips to the server, and throughput is bounded by how much input one step takes.
@@ -136,5 +143,5 @@ For a plaintext protocol (SMTP before STARTTLS, a raw service) the server also s
 * SSH: public keys only, no PTY, no forwarding ([TD-SVC-SSH-SCOPE](../spec/TECH_DEBT.md#td-svc-ssh-scope)).
 * `tcp-auth` connectors can't slow the server's sends ([TD-SVC-CONNECT-BACKPRESSURE](../spec/TECH_DEBT.md#td-svc-connect-backpressure)).
 * Changing a sealed inbox's key needs the old seed until its connections end ([TD-SVC-INBOX-ROTATION](../spec/TECH_DEBT.md#td-svc-inbox-rotation)).
-* A malicious server can roll a connection back ([TD-SVC-STATE-ROLLBACK](../spec/TECH_DEBT.md#td-svc-state-rollback)).
+* A malicious server can roll a handler's database back with a connection; the connection's cursors are checkpointed (§6, [TD-SVC-STATE-ROLLBACK](../spec/TECH_DEBT.md#td-svc-state-rollback)).
 * The mail app is inbound only, with an IMAP subset ([TD-MAIL-SCOPE](../spec/TECH_DEBT.md#td-mail-scope)).
