@@ -1,9 +1,11 @@
 // Milestone 6 integrity formats through wasm, against
 // spec/test-vectors/integrity.json: device checkpoints (formats.md §14),
-// signed fs headers (§12.1), event chains (§5.1), tree states (fs.md §9.1).
+// exported pins (§14.5), signed fs headers (§12.1), event chains (§5.1),
+// tree states (fs.md §9.1).
 import { readFileSync } from 'node:fs';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { fromHex, hex } from '../src/bytes.js';
+import { type DevicePin, decodePins, encodePins } from '../src/integrity.js';
 import { initWasm, zw } from '../src/wasm.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: vector JSON
@@ -129,6 +131,26 @@ describe('integrity.json', () => {
     t.remove(nodes[1].node);
     expect(hex(t.root())).toBe(ts.without_second);
     t.free();
+  });
+  it('exported pins encode and decode (formats.md §14.5)', () => {
+    const p = V.pins;
+    const head = (h: J) => ({ version: BigInt(h.version), hash: fromHex(h.hash) });
+    const devices: [Uint8Array, DevicePin][] = p.devices.map((d: J) => [
+      fromHex(d.device),
+      { seq: BigInt(d.seq), hash: fromHex(d.hash) } as DevicePin,
+    ]);
+    expect(hex(encodePins(p.fs, head(p.acl), head(p.header), devices))).toBe(p.bytes);
+    const d = decodePins(fromHex(p.bytes));
+    expect(d.fs).toBe(p.fs);
+    expect([d.acl.version, hex(d.acl.hash)]).toEqual([BigInt(p.acl.version), p.acl.hash]);
+    expect([d.header.version, hex(d.header.hash)]).toEqual([
+      BigInt(p.header.version),
+      p.header.hash,
+    ]);
+    expect(d.devices.map((x) => [hex(x.device), x.seq, hex(x.hash)])).toEqual(
+      p.devices.map((x: J) => [x.device, BigInt(x.seq), x.hash]),
+    );
+    expect(() => decodePins(fromHex(p.bytes).subarray(1))).toThrow();
   });
 });
 

@@ -792,8 +792,38 @@ fn integrity_vectors() -> Result<Value> {
     t.remove(&nodes[1].node);
     let removed = t.root();
 
+    // Exported pins (§14.5): the ACL and header heads, two devices.
+    let pins = crate::integrity::ExportedPins {
+        fs: fsk.fs_id,
+        acl: body.acl,
+        header: crate::integrity::Head {
+            version: v2.version,
+            hash: v2.hash(),
+        },
+        devices: vec![
+            crate::integrity::Seen {
+                device: [0x01; 32],
+                seq: 9,
+                hash: [0x19; 32],
+            },
+            crate::integrity::Seen {
+                device: fp,
+                seq: body.seq,
+                hash: checkpoint_hash(&body_bytes),
+            },
+        ],
+    };
+    let mut pins = pins;
+    pins.devices.sort_by_key(|d| d.device);
+    let pins_bytes = pins.encode()?;
+    let pin_devices: Vec<Value> = pins
+        .devices
+        .iter()
+        .map(|d| json!({"device": h(&d.device), "seq": d.seq, "hash": h(&d.hash)}))
+        .collect();
+
     Ok(json!({
-        "description": "Device checkpoints (formats.md §14), signed fs headers (§12.1), event chains (§5.1), tree states (fs.md §9.1). fs from keys.json fs_epoch0; device and user as in signatures.json. hlc values are decimal strings (they exceed 2^53).",
+        "description": "Device checkpoints (formats.md §14), exported pins (§14.5), signed fs headers (§12.1), event chains (§5.1), tree states (fs.md §9.1). fs from keys.json fs_epoch0; device and user as in signatures.json. hlc values are decimal strings (they exceed 2^53).",
         "checkpoint": {
             "device_rng_seed": "device",
             "device_public": h(&dev.public().encode()),
@@ -812,6 +842,13 @@ fn integrity_vectors() -> Result<Value> {
             "v2": {"msg": h(&v2.msg()), "hash": h(&v2.hash()), "signed": h(&v2.encode())},
         },
         "event_chain": {"chain_id": h(&[0x0C; 12]), "events": events},
+        "pins": {
+            "fs": pins.fs,
+            "acl": {"version": pins.acl.version, "hash": h(&pins.acl.hash)},
+            "header": {"version": pins.header.version, "hash": h(&pins.header.hash)},
+            "devices": pin_devices,
+            "bytes": h(&pins_bytes),
+        },
         "tree_state": {
             "nodes": leaves,
             "empty": h(&empty),
