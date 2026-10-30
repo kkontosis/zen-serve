@@ -202,6 +202,8 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * Local: the full vitest run green (578 passed, 12 skipped: the opt-in benches); `cargo test -p zen-server --test fs --test crdt` on local FDB green.
   * Pushed ae68e8e. **The push run (406) was green; the pull_request run (407) was red in `client`**, at one test outside this step: `packages/db/test/patterns.test.ts` "retry 'delay'", `decrypt` reading the topic's events. Not reproduced in 21 local runs; reading found no cause. Recorded as TD-TEST-OPEN-FAILURES item 6, and `Topic.decode` now names the event that didn't open (offset, topic, kind, epoch, key token, size), so a recurrence says what was stored.
   * **CI green on both runs of c756b0c** (push 408, pull_request 409). Step 6.4 is done, waiting on review and merge of PR #57.
+  * PR #57 merged at a166e73.
+* **Step 6.5** (the zen-db authenticated tier): planned below ("Step 6.5 in detail"). Restarted from main; the log above is now in the repo copy too.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -1315,6 +1317,257 @@ Both are opt-in, like topics in 6.3: they use the `Integrity` attached to the fs
 * **Reads don't force checkpoints** (`count: false`): only writers' changes count toward the cadence.
 * **After an alarm**, a replica stops following the feed but keeps sending writes. A handler aborts the claimed connections it can't verify.
 * **Tampering is per session, at the transport**, for the wrong-merge and claim tests. The 6.2 adversary lies to every reader, and can't lie in claims, which are write transactions.
+
+## Step 6.5 in detail
+
+Step 6.5 builds the zen-db authenticated tier (zendb.md §14, `integrity: "authenticated"`). Today a server can serve an older valid row, an older RootRecord together with its older tree, an older catalog record, or leave a row out of a scan, and nothing notices. In an authenticated namespace:
+* every value the client reads is checked against a **namespace root** (`NsRoot`) read in the same transaction;
+* the `NsRoot` is checked against the floors from device checkpoints (entry type 3, `[3, ns, seq, hash]`), which writers note after each commit.
+
+The same work closes the rest of TD-SVC-STATE-ROLLBACK: a handler's database can't be rolled back beyond the checkpoint window.
+
+**Changed from the milestone design** ("NsRoot over index roots plus a row tree per table"): **one state tree per namespace covers every value under `D`**. That means rows, parts, catalog records, unique, fast and sealed entries, RootRecords, message parts and system tables, all except index nodes. The tree is keyed by stored key, so:
+* every index kind and every feature is authenticated without code of its own;
+* range reads (scans, fast lookups, the catalog) can be checked for completeness;
+* its write locality is the stored-key locality the server already sees.
+
+**Survey (what this step builds on):**
+* **Reads** happen only through the M4 `Transaction` (`packages/client/src/kv.ts`): `getEntries` (with `get`/`getAll`), `snapshotGet`, `rangeStored` and `snapshotRangeStored`. That's 23 call sites in `packages/db`, plus one outside a transaction: `Db.loadCatalog`, through `fs.kv.rangeStored`.
+* **Writes:** `raw.writes` holds every set or delete, already sealed (`kv.open` gives the plaintext back). `raw.clears` holds the cleared ranges: paged table and index drops (`migrate.ts` `clearPage`, at most `max_range_items` keys each) and the scheduler's `gc` (`sched.ts`).
+* **The prolly tree** (`index/prolly.ts` `rewrite`, `scan`; `index/node.ts`) is generic over entry bytes and `TreeKeys`. Node ids are 16 bytes everywhere: `decodeNode` checks `child.length === 16`, `decodeRoot` checks `root`, and `entryLen` counts 17 bytes for a child id. The Rust reference is `zen-core/src/db/prolly.rs` (`build`, `Entry::Child {child: [u8; 16]}`), and wasm `IndexKeys.build`/`nodeId`.
+* **Caches:**
+  * rows (`cachedRow`, with a version, persisted by `encodeCachedRow`), and the catalog (`catalogEntry`, with a version): both are used through `useCached` → `expectKey`, and read-only transactions check them at `finish`;
+  * nodes, by id (`cacheNode`, and `keptNode`, which checks the id).
+* **Transactions:** a new `DbTransaction` per attempt (`db.ts` `transaction`). `finish()` applies private-index and sealed changes, and is the last point before the commit is built.
+* **Integrity** (`@zen/client`, 6.3/6.4):
+  * `fs.integrity` gives the attached `Integrity`;
+  * `observe(entry, {floorAt, count})` and `floor(entryKey(e))`;
+  * `mergeEntry`, `lowerThan` and `divergent` already handle `db` entries (seq, and hash at the same seq);
+  * `raise(alarm)` is public.
+* **The opening path:** `Db.open` → `init()` runs one transaction, which reads the DbRecord and creates it with `integrity: 'basic'`; `openKept` is the offline path. Both refuse an integrity other than `basic`.
+* **svc:** the step loop reports a step error and resyncs (`serve.ts`); only `resync` aborts on `integrity`. Echo writes one `lines` row per step (`tx.table('lines').insert`).
+* **The adversary** `kv` lie freezes one stored key (value or absence, also inside ranges). `testing/adversary.ts` `lie(session, [{kind: 'kv', fs, key}])`.
+
+### Spec (`spec:` commit)
+
+**zendb.md §14 rewritten** (the authenticated tier, normative):
+* **§14.1 Levels.**
+  * `basic`, as today.
+  * `authenticated`, chosen at creation (`DbRecord.integrity`) and never changed.
+  * An authenticated namespace needs integrity attached to the fs (formats.md §14), with or without a signer. The client refuses to open one without it.
+  * **Not offered** in authenticated namespaces: CRDT tables (§19), whose merged state is the server's. `createTable` refuses `merge: "crdt"` with `bad_value`.
+* **§14.2 The state tree.** A prolly tree (§5.4.1), fanout 64, with the keys of the reserved index id `0¹⁶` (`K_boundary`, `K_node`), nodes at `D ‖ ("n", 0¹⁶, node_id)`. Its level-0 entries, one per stored value under `D` except `("n", …)` nodes and the `NsRoot`:
+  ```
+  entry      = esc(suffix) ‖ 0x00 ‖ VH            suffix = the stored key without the stored-key prefix of D
+  esc(x)     = x with each 0x00 replaced by 0x00 0xFF   (as in §5.1; order-preserving and prefix-free)
+  VH         = H("zen/v1/db-state-value", plaintext of the sealed value)
+  ```
+  * So entries sort in stored-key order, the entry of a key is the one starting with `esc(suffix) ‖ 0x00`, and a stored-key range `[b, e)` is the entry range `[esc(b′) ‖ 0, esc(e′) ‖ 0)`.
+  * VH covers the plaintext, so re-sealing under a new epoch changes nothing. A Row's parts are values of their own.
+* **§14.3 Node ids.** In an authenticated namespace every node id, the state tree's and private indexes', is `PRF32(K_node, CBOR(Node))`: children are `bytes(32)`, and so is `RootRecord.root`.
+  * A reader checks each node it fetches against its id.
+  * Why 32 bytes: a member and the server together can't find two nodes with one id, so one root names one state, even against members.
+* **§14.4 NsRoot** at `D ‖ ("ns")`:
+  ```
+  NsRoot = { 1: v = 1, 2: seq: u64 (1, 2, …), 3: prev: bytes(32),     // NH(previous NsRoot), zeros for seq 1
+             4?: tree: [root: bytes(32), height: u8, count: u64] }    // absent: no values
+  NH     = H("zen/v1/db-ns-root", CBOR(NsRoot))
+  ```
+  No `NsRoot` means seq 0: a namespace with no values.
+* **§14.5 Writing.**
+  * Every commit that writes or clears a value under `D`:
+    1. reads the `NsRoot` (into its read set);
+    2. removes each written, deleted or cleared key's entry (found by its prefix) and adds the new one;
+    3. rewrites the tree (§5.4.4);
+    4. writes `NsRoot {seq + 1, prev = NH(old), tree}`.
+  * So **every writer of an authenticated namespace conflicts on its `NsRoot`**: use one for balances, permissions and other state where freshness matters more than write concurrency.
+  * After the commit applies, the device's checkpoints carry `[3, ns = stored-key prefix of D, seq, NH]` (formats.md §14), counted toward the cadence.
+* **§14.6 Reading.**
+  * A transaction reads the `NsRoot` once, at its first read under `D`. For every value the server returns under `D`:
+    * **a point read:** the tree's entry for the key must exist with this VH, or be absent with the value;
+    * **a range read:** the entries in the covered range must be exactly the returned items, with their VHs. The covered range is the whole range, or up to the last item when a limit or page stopped it.
+  * A cached record (row or catalog) is used only when the tree's entry still has its VH; otherwise it is dropped and read again.
+  * **A mismatch:**
+    * The client re-reads the latest `NsRoot`. If it moved, the transaction conflicts and retries: a long-mode read, or a short read that raced, can honestly be newer than the transaction's root.
+    * If it didn't move, it's a **rollback** alarm (`object: "db"`).
+    * A node that doesn't match its id is `invalid`.
+* **§14.7 Freshness.** The `NsRoot` read is checked against the floor of `[3, ns]` (formats.md §14.4):
+  * a lower `seq` is a rollback; the same `seq` with another `NH` is a fork;
+  * at the floor's `seq + 1`, `prev` must be the floor's `NH`, or it's a fork;
+  * the floor used for the rollback check is the one at the start of the transaction's attempt (as fs.md §9: a checkpoint arriving mid-transaction can honestly be newer than its read version).
+  * The `NsRoot` read is noted (not counted). The window between a write and its device's next checkpoint is the cadence's (`sigEvery: 1` closes it).
+* **§14.8 Cost** (informative): per uncached point read, about `height` node reads, sharing the upper levels with every other read; per commit, about `2 × height` node writes and deletes per touched region, plus the `NsRoot`. STATS has the numbers.
+* The paragraph on `sig/db-root` stays: no signature per commit.
+
+**Elsewhere in the spec:**
+* **zendb.md:**
+  * §2.1 table: `("ns")` and the state-tree nodes.
+  * §3.1: `integrity: "basic" | "authenticated"`, with the opening rule (below).
+  * §5.4.2: ids are 32 bytes in authenticated namespaces.
+  * §15: leakage (the state tree's node count and write locality follow stored keys; the `NsRoot` rewrite per commit shows commits, which the server sees anyway).
+  * §17: the new vectors.
+* **formats.md §14.1:** the type-3 sentence names zendb.md §14.4 and the 48-byte prefix.
+* **labels.md and `labels.rs`:** `zen/v1/db-state-value` and `zen/v1/db-ns-root`.
+* **svc.md §12:** a handler's database, when authenticated, is covered the same way. TECH_DEBT **TD-SVC-STATE-ROLLBACK closed**: what's left is the cadence window, documented in svc.md §12 and docs/SVC.md.
+
+**Opening rule (§3.1):** `Db.open(fs, ns, {integrity})`.
+* With `integrity: 'authenticated'`, the database is created that way, the open is verified from the first read, and a stored `basic` DbRecord is refused (`format`).
+* Without the option, a stored `authenticated` record switches the `Db` to verified mode, and the open re-runs verified.
+* A missing record with a floor for the namespace is a rollback, not a new database: an absent `NsRoot` is seq 0.
+
+### zen-core and wasm
+
+* **`db/mod.rs`:**
+  * `IndexKeys::node_id32` (`PRF32`; add `prf32` to `kdf.rs` next to `prf16`, same construction with 32 output bytes)
+  * `DbKeys::state()` = `index(&[0; 16])`
+* **`db/prolly.rs`:**
+  * `Entry::Child.child` becomes `Vec<u8>`
+  * `build(keys, fanout, entries, id_len)` with `id_len` 16 or 32; existing callers pass 16, and the existing vectors stay byte-identical
+* **New `db/auth.rs`:**
+  * `state_entry(suffix, plaintext)` and `value_hash`
+  * `NsRoot {seq, prev, tree}` with `encode`/`decode` (strict) and `hash`
+  * `state_tree(keys, values: &[(suffix, plaintext)]) -> Tree` (fanout 64, 32-byte ids)
+* **Vectors** (`zendb.json`, a new `authenticated` section; only that section changes):
+  * state keys for the fixture namespace
+  * ten values, then their entries
+  * the tree at fanout 4: every node's bytes and 32-byte id
+  * `NsRoot` seq 1 and seq 2 (after changing one value and deleting one): bytes and `NH`
+* **wasm (`db.rs`):**
+  * `IndexKeys.nodeId32`, and `build(entries, fanout, idLen)`
+  * `stateEntry(suffix, plaintext)`, `stateValueHash`, `nsRootHash`
+  * Rebuild with `scripts/build-wasm.sh`.
+
+### `@zen/client` (`kv.ts`)
+
+* **`Transaction.onRead(fn)`:** hooks awaited after each server answer, before own writes are overlaid. Their argument is one of:
+  * `{keys, values}` for `getEntries` and `snapshotGet` (the keys asked of the server, opened values or undefined);
+  * `{begin, end, reverse, items}` for each page of `rangeStored` and `snapshotRangeStored`, where `[begin, end)` is the range that page covers (to the last item when a limit or `more` stopped it).
+* A hook that throws fails the read. Nothing else changes, so existing users are unaffected.
+
+### `@zen/db`
+
+* **`index/node.ts`:**
+  * `decodeNode(b, idLen)`, `decodeRoot(b, idLen)`
+  * `entryLen` counts the id's CBOR head: a 16-byte id is 17 bytes, a 32-byte one is 34
+  * `Db.idLen` (16, or 32 when authenticated), passed everywhere nodes and roots are decoded
+  * `treeKeys(ik, fanout, idLen)` picks `nodeId` or `nodeId32`; `TxNodeStore` checks fetched nodes against their id when authenticated (`invalid` alarm); `keptNode` uses the same check
+* **`index/prolly.ts`:** `lookup(store, root, prefixes)` finds the entry starting with each prefix, descending level by level with one `store.get` per level for the whole batch.
+* **New `auth.ts`:**
+  * **`NsAuth`, one per `Db`:**
+    * `ns` = `keys.db.prefix()`, the state `TreeKeys`, the `NsRoot` key, and the prefixes it skips: `("n")` and `("ns")`
+    * `encodeNsRoot`/`decodeNsRoot` (TS CBOR, like `node.ts`)
+    * `entryOf(key, plaintext)`
+  * **`TxAuth`, one per attempt** (made in the `DbTransaction` constructor when authenticated):
+    * `floorAt = integrity.floor(key)`, taken at construction
+    * `raw.onRead(verify)`
+    * **`root()`:** reads the `NsRoot` once (`raw.get`, so it's in the read set), checks `prev` against the floor, and `observe`s `{type: 'db', ns, seq, hash}` with `floorAt`
+    * **`verify(read)`:** skips keys outside `D` and the skipped prefixes. Point reads go through `lookup`; ranges go through `scan` over the mapped entry range and are compared item by item. A mismatch takes the §14.6 path: a fresh `NsRoot` read through a new short `Transaction` (latest version); if it moved, `ZenError(409, 'conflict')`, else `integrity.raise({kind: 'rollback', object: 'db', id: ns, detail})`.
+    * **`current(key, vh)`** for caches: whether the tree's entry still has this VH.
+    * **`finish()`:** called last in `DbTransaction.finish` when `raw.writes` or `raw.clears` touch `D` (outside the skipped prefixes). It builds the changes:
+      * for each cleared range, scan the tree and remove every entry in it;
+      * for each write, remove the old entry (`lookup`) and add `entryOf(key, kv.open(…))` for a set.
+      
+      Then it `rewrite`s the tree with 32-byte ids, writes and deletes nodes, and sets the new `NsRoot`. `raw.onCommit` notes `{seq + 1, NH}` with `count: true`.
+* **`txn.ts`:**
+  * The constructor makes `TxAuth`; `finish()` calls `auth.finish()` after the sealed indexes and CRDT stamping, before `checkLimits`.
+  * **Caches:** `useCached` gains the cached VH. When authenticated, `read` and `tableRecordOrNone` check `current(key, vh)` first, and a stale entry is dropped and read again.
+  * A read-only authenticated transaction skips the end-of-transaction version check of cached records: the tree check replaced it.
+* **`db.ts`:**
+  * `DbOptions.integrity?: 'basic' | 'authenticated'`
+  * `init()` and `openKept` follow the opening rule
+  * `createTable` refuses CRDT tables in authenticated namespaces
+  * `loadCatalog` reads inside a transaction when authenticated
+  * `CachedRow` and catalog entries keep `vh`; `encodeCachedRow` gains an optional field, so old kept rows decode without one and are read again
+  * `Db.integrity` names the level
+* **`migrate.ts` and `sched.ts`:** unchanged. Their clears are paged or bounded, and `TxAuth.finish` handles them.
+
+### `@zen/svc` and the apps
+
+* **`serve.ts`:** a step whose error is `integrity` gives the connection up with `close` (as `resync` does), instead of reporting and resyncing again and again.
+* **`apps/ledger`:** `AUTH_DB_OPTIONS = {...DB_OPTIONS, integrity: 'authenticated'}`, exported. `ledger.test.ts` runs its two balance-invariant tests over both: the authenticated run attaches integrity to each trader's fs. The UI keeps `basic`; docs/EXAMPLES.md §5 says how to switch.
+* **`apps/echo`:** unchanged code. The integrity test file opens the echo database authenticated.
+
+### Tests
+
+**`packages/db/test/authenticated.test.ts` (new):** spawned server with the adversary on, integrity attached, two installations (devices).
+
+* **`honest`:**
+  * create; CRUD; queries over every index kind (private, unique `none`, fast, sealed); a migration that adds an index (backfill) and drops a table (paged clears)
+  * the scheduler (a delayed emit and a `gc`); a large row with parts; a large message body
+  * a reopen from the local store (kept rows and nodes)
+  * Both devices' checkpoints carry the `db` entry, `sync` reports nothing, and there are no alarms.
+* **`state equals scratch`** (property): after 300 random puts, deletes and clears, the `NsRoot`'s tree root equals the reference `IndexKeys.build` over every value under `D` (read with `snapshotRange`, nodes and `NsRoot` left out, 32-byte ids).
+* **`concurrent writers`:** two devices, three loops each, move balances 30 times; the sum is unchanged, conflicts happened (counted), and there are no alarms.
+* **`row rollback`:**
+  * lie `kv` on a row's key, then the other device updates the row;
+  * on a `basic` copy of the setup, the stale row is served silently (the attack works);
+  * authenticated, a `get` and a query raise a `db` rollback.
+* **`index root rollback`:** lie `kv` on a private index's RootRecord; a range query raises a rollback.
+* **`withheld row`:** lie `kv` on an absent row key, then insert it elsewhere; a scan and a fast lookup raise a rollback (the item is missing from the range).
+* **`stale cache`:** a cached row whose tree entry changed is read again, with no alarm, in a read-only and in a write transaction.
+* **`NsRoot rollback`:**
+  * lie `kv` on the `NsRoot` key; the writer commits twice and checkpoints;
+  * a reader that synced raises a rollback (seq below the floor);
+  * a fresh reader that didn't sync sees a consistent old state: the window, asserted and documented.
+* **`fork`** (`server.fork()`): one device writes on each side. Each side alone sees no alarm; after the checkpoints cross, the same seq with another `NH`, or a broken `prev`, is a fork.
+* **`opening`:**
+  * `integrity: 'authenticated'` over a stored `basic` database gives `format`;
+  * without integrity attached, the open is refused;
+  * a database created authenticated reopens verified without the option;
+  * an absent DbRecord and `NsRoot` with a floor raise a rollback, not a new database.
+* **`refused`:** a CRDT table in an authenticated namespace gives `bad_value`.
+
+**`apps/echo/test/integrity.test.ts` (one more test):** "a rolled-back handler database":
+* H1 serves `a`; lie `kv` on the echo database's `NsRoot`; H1 serves `b` (its own next read alarms: the root is below its own note); H1 stops.
+* The successor syncs, its `lines` insert reads the database, and it raises a rollback.
+* The connection is aborted (the peer sees it close).
+
+**Negative controls** (each run once, then restored, and logged):
+* the point-read VH check off: the row rollback test fails
+* the range completeness check off: the withheld row test fails
+* the node id check off: no test needs it (logged as such)
+* `observe` of the `NsRoot` off: the `NsRoot` rollback and echo tests fail
+* the `prev` check off: the fork test still alarms by same-seq hash, so logged which check caught it
+
+**Existing suites:** all of `packages/db` (basic is unchanged, so the existing tests stay as they are); `apps/ledger` (both runs); `apps/echo`; `packages/svc`; `packages/client` `kv`; the vectors tests (Rust and TS).
+
+### Docs
+* **docs/DB.md:** a new "Authenticated namespaces" section: what's checked, the contention rule, refused CRDT tables, needing integrity, alarms, cost.
+* **docs/CLIENT.md §12:** a namespaces bullet.
+* **docs/SVC.md §6:** the handler's database.
+* **docs/EXAMPLES.md §5:** the ledger option.
+* **spec/TECH_DEBT.md:** TD-SVC-STATE-ROLLBACK closed.
+* **docs/STATS.md:** authenticated vs basic, measured with `bench.test.ts`'s harness (an opt-in bench case): point read (cold, warm), insert, a 20-row transaction (ops and bytes), and a 100-row scan.
+* **docs/MILESTONE-6.md:** the log.
+
+### Files
+* **Spec:** `spec/{zendb,formats,labels,svc,TECH_DEBT}.md`
+* **Rust:**
+  * `crates/zen-core/src/{kdf,labels,vectors}.rs`, `crates/zen-core/src/db/{mod,prolly,auth (new)}.rs`
+  * `spec/test-vectors/zendb.json`
+  * `crates/zen-wasm/src/db.rs`
+* **Client:** `packages/client/src/kv.ts`
+* **zen-db:** `packages/db/src/{auth (new),txn,db,index/node,index/prolly,index/private}.ts`, plus `packages/db/test/{authenticated (new),vectors,bench}.test.ts`
+* **svc:** `packages/svc/src/serve.ts`
+* **Apps:** `apps/ledger/{src/ledger.ts,test/ledger.test.ts}`, `apps/echo/test/integrity.test.ts`
+* **Docs:** `docs/{DB,CLIENT,SVC,EXAMPLES,STATS,MILESTONE-6}.md`
+
+### Verification
+* **Rust:**
+  * `cargo fmt --check`; clippy `-D warnings` on zen-core and zen-wasm (default, `--all-features`, wasm32)
+  * `cargo test -p zen-core --features test-utils`; regenerate the vectors (only `zendb.json`'s new section changes)
+* **JS:**
+  * `scripts/build-wasm.sh`, `npm run check`
+  * the new test file and the echo integrity file 3×; `packages/db`, `apps/ledger`, `apps/echo`, `packages/svc` and the client `kv` tests once; then the full vitest run
+* **Attacks:** the negative controls above.
+* **CI:** green on both runs.
+
+**Defaults chosen (overridable):**
+* **One state tree per namespace** over every value, rather than per-table row trees and roots in the `NsRoot`: one mechanism covers every index kind and range completeness.
+* **Integrity attached is required** for an authenticated namespace: without checkpoints, there's consistency but no freshness, and one alarm path is simpler.
+* **CRDT tables are refused** in authenticated namespaces.
+* **The ledger UI stays `basic`;** its tests run both levels.
+* **A mismatch first re-reads the `NsRoot`:** if it moved, the transaction conflicts and retries rather than alarming, so long mode and racing short reads stay honest.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.
