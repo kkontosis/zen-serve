@@ -226,6 +226,8 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Bench** (STATS §5.4, measured side by side on two fs): reads cost the same (row get cached 1.1 / 1.1 ms, not cached 2.3 / 2.6); an insert into 1,000 rows 601 B → 8,953 B and 1 → 6 ops; a 20-row transaction 8 KB → 81 KB.
   * **Docs:** DB.md §7.1 (new) and the error table, CLIENT.md §12, SVC.md §6 and §8, EXAMPLES.md §5, STATS.md §5.4.
   * **Checks (all clean):** `cargo fmt --check`; clippy `-D warnings` on zen-core and zen-wasm (host `--all-targets`, `--all-features`, `--no-default-features`, wasm32); `cargo test -p zen-core --features test-utils`; `scripts/build-wasm.sh`; `npm run check`; the new test file, the echo file and both ledgers 8× after the consumer fix; the full vitest run after the consumer fix (600 passed, 13 skipped: the opt-in benches); the Playwright smoke (17 passed).
+  * Pushed 0113929. **CI green on both runs** (push 415, pull_request 416). PR #58 merged.
+* **Step 6.6** (`crates/zen-client`, Rust): planned below ("Step 6.6 in detail"). Restarted from main; the log above is now in the repo copy too.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -1590,6 +1592,242 @@ The same work closes the rest of TD-SVC-STATE-ROLLBACK: a handler's database can
 * **CRDT tables are refused** in authenticated namespaces.
 * **The ledger UI stays `basic`;** its tests run both levels.
 * **A mismatch first re-reads the `NsRoot`:** if it moved, the transaction conflicts and retries rather than alarming, so long mode and racing short reads stay honest.
+
+## Step 6.6 in detail
+
+Step 6.6 builds `crates/zen-client`, a native Rust client: what `zen-blk` (6.7) and `zen-ublk` (6.8) need, and a CLI for checking pins out of band. It covers:
+* sign-in with a device key file
+* the ACL walk with a pin
+* the fs header (signed or not) and unlocking with a device keyslot
+* KV reads, transactions and commits, with `fence`
+* named leases
+* integrity: checkpoints, sync, floors, pins kept in a file, exported pins
+
+It is a port of the matching parts of `@zen/client`, with the same rules, so a TS and a Rust device verify each other. Topics, streams, trees, svc and zen-db stay TS-only (docs say so).
+
+**Survey (what this step builds on):**
+* **No Rust client exists.** The nearest is zen-server's test harness (`tests/common/mod.rs`):
+  * `call` (a CBOR POST with a Bearer token, `ErrorBody` on non-200)
+  * `sign_in_at` (challenge, `session_message`, the device's `SIG_SESSION` signature, `SessionRequest`)
+  * `claim`, `signed_acl`, `checkpoint_of`
+* **zen-core has every primitive:**
+  * keys: `FsKeys`, `token::kv_key`
+  * sealing: `seal::{seal_value, open_value, peek}`
+  * keyslots: `keyslot::{create_device, open(Unlock::Device)}`
+  * the header: `header::{FsHeader, SignedHeader, is_signed, validate_header_successor}`, and `FsHeader::keys_at` for older epochs
+  * signatures: `sig::{SigningIdentity, DeviceSecret, verify_device_cert}`, `kdf::acl_hash`
+  * checkpoints: `integrity::{CheckpointBody, Entry, sign_checkpoint, verify_checkpoint, seal_checkpoint, open_checkpoint, checkpoint_hash}`
+  * the clock: `fs::Clock`
+* **zen-proto** has every wire type, `to_cbor`/`from_cbor`, `session_message`, `valid_origin`. The ACL chain rules are in the TS client (`acl.ts` `verifyNext`) and the server (`acl.rs` `validate_successor`), not zen-core.
+* **TLS:** `zen_tls_rustcrypto::provider()` is pure Rust, with `X25519MLKEM768` first. reqwest 0.13 is in the lock with `rustls-no-provider`, `rustls-platform-verifier` and `hyper-rustls`.
+* **The TS logic to port:**
+  * `integrity.ts` (1,118 lines): `mergeEntry`, `lowerThan`, `divergent`, `raiseFloor`, `note`/`observe`, `checkpointNow` (with the 409 adopt-and-merge and idempotent resends), `buildBody` (cumulative, oldest dropped when too big), `advance`, `checkClaims`/`checkAcl`, `checkSeen`, `syncNow`, `encodePins`/`decodePins`
+  * `kv.ts`: `Transaction` with short and long mode, `expectKey` (the first version stands), range hashing in long mode, `sendCommit`'s replays with one `commit_id`, the retry loop
+  * `acl.ts`; `fs.ts`: header get with signed-header checks, `keysFor` by epoch
+* **The device key file** is zen-mount's: JSON `{identity_seed, device_seed, cert}` in hex (`packages/fuse/src/cli.ts`, `apps/shared/node.ts`).
+* **The exported pins record** (`1 ‖ u32 fs ‖ acl ‖ header ‖ u32 n ‖ n × (fp ‖ u64 seq ‖ HC)`) is defined only in `integrity.ts`, not in the spec.
+* **Forking a server in Rust tests:** `zen_server::dump::copy(from, to, force)` copies a running store into a fresh embedded one, which a second server then opens. That's the Rust counterpart of `TestServer.fork()`.
+* **CI:** `rust` and `pure-rust` run `cargo test --all` (embedded). `client` builds `zen-server --features test-utils` before vitest.
+
+### Spec (`spec:` commit, small)
+
+* **formats.md §14.5, exported pins (new):** the record above, moved from the TS client into the spec, so both clients read each other's.
+  * Fields: version byte 1; then `acl` and `header` as `u64 version ‖ hash(32)`, with `[0, zeros]` for none; then device entries sorted by fp.
+  * Comparing: each device entry is checked as a `seen` link (§14.4 rule 3), and the ACL and header as claims (rule 5).
+* **integrity.json:** a `pins` vector (an fs, an ACL head, a header head, two devices) with its bytes. Only that section changes on regeneration.
+
+### zen-core
+
+* **`integrity.rs`:** `ExportedPins {fs, acl: Head, header: Head, devices: Vec<Seen>}` with `encode` and a strict `decode` (version 1, exact length, devices sorted and unique).
+* **`vectors.rs`:** the `pins` vector; `tests/vectors.rs` reads it back.
+* **The ACL chain rule** isn't moved: zen-proto can't depend on zen-core (zen-core's `test-utils` depends on zen-proto), and the server's `validate_successor` also checks put-time rules. zen-client's `acl.rs` has its own `verify_next` (formats.md §9.3 rules 1–2 and the signature), a port of TS `verifyNext`.
+
+### `crates/zen-client` (new: library and the `zen-client` binary)
+
+**Dependencies:**
+* zen-core, zen-proto, zen-tls-rustcrypto
+* `reqwest` (`rustls-no-provider`), `rustls`, `rustls-platform-verifier`, `tokio`
+* `serde`, `serde_json`, `base64`, `getrandom`
+* `clap` (the binary)
+
+No C: the crate builds in the `pure-rust` job.
+
+**Modules:**
+* **`error.rs`:** `Error::Api {status, code, message, retry_after}`, plus `Network`, `Integrity(Alarm)`, `Format`, `Crypto`, `Io`. `retryable()` is true for 409 `conflict`/`too_old`, as in TS. `Alarm {kind, object, id, detail}` mirrors `IntegrityAlarm`.
+* **`transport.rs`:**
+  * `Transport::new(url, TlsOptions {ca: Option<pem>})`
+  * reqwest with a `rustls::ClientConfig` on `zen_tls_rustcrypto::provider()`, verifying with the platform verifier, or only the given CA when `ca` is set
+  * TLS 1.3 only, a 30 s request timeout
+  * `call<Q, R>(path, bearer, &Q)`: a CBOR POST. Errors decode `ErrorBody`. 503, and 429 with `Retry-After`, are retried (3 attempts), as in TS.
+* **`client.rs`:**
+  * `Client::connect(url, opts)`: `origin` defaults to the URL's origin, checked with `valid_origin`
+  * `info()`
+  * `sign_in_device(&DeviceKey) -> Session`: challenge, `session_message`, `SIG_SESSION`, `SessionRequest`
+  * `session_from_token(bytes)` for an API token or a resumed session
+* **`device.rs`:** `DeviceKey {identity: SigningIdentity, device: DeviceSecret, cert}`.
+  * `load(path)`/`save(path)` use the zen-mount JSON, saved with mode 0600.
+  * `DeviceKey::new(identity_seed, device_seed)` issues the cert, for tests and setup.
+  * `fp()` is the device fp; `member()` is an ACL `Member`.
+* **`session.rs`:** `Session {transport, token, device: Option<DeviceKey>, clock: fs::Clock}`.
+  * `call` re-signs in once on 401 when it holds a device key, then resends. That's safe: commits resend with their `commit_id`, and checkpoint puts are idempotent. A long-running `zen-ublk` outlives `session_ttl_secs`.
+  * The clock's wall time is corrected by `/v1/info` `time_ms`, as `TreeClock` does.
+* **`acl.rs`:** `Acl` (in the session) keeps the verified head.
+  * `head()` walks from the pin with `verify_next`. A head below the pin, or a missing pinned version, gives `acl_chain`, as in TS.
+  * `pin(bytes)`, `pinned()`, `entries(from)`.
+  * `put_next(signer, edit)`, so tests (and admins) can update.
+* **`fs.rs`:**
+  * `Fs {session, id}`.
+  * **`header()`:**
+    * decodes the signed or unsigned form
+    * a signed one is verified against an admin of the verified ACL (`SignedHeader::verify` with the admin's member identity)
+    * with integrity attached, `check_header` (the formats.md §12.1 pin rules)
+  * **Writing:**
+    * `init(slots, signed: bool)`: `FsHeader::new`, `create_device` for the key's own device, a CAS on absence
+    * `add_device_slot(&DevicePublic)`
+    * `edit_header(f)`: signs the successor when the stored header is signed, with the `DeviceKey`'s identity (`signer_needed` without one), and checks with `validate_header_successor` locally first
+  * **`unlock_device(&DeviceSecret) -> UnlockedFs`:** it tries each type-3 slot whose recipient is this device (`device_recipient`), else `no_slot`.
+  * `UnlockedFs::keys_for(sealed)` picks the epoch from `seal::peek` via `FsHeader::keys_at`. A newer epoch than the header's re-reads the header once, then gives `epoch_ahead`, as in TS.
+* **`kv.rs`:**
+  * **`Kv`:** `key(path)` (`kv_key`), `get`, `get_many`, `range(prefix | [begin, end), limit, reverse)` (pages through `more`; values opened with their stored key).
+  * **`Transaction` (one per attempt):**
+    * `get`/`get_many`/`range` record read conflicts in short mode (one read version), or `expect`s and a range hash in long mode (zen-core's range hash, as `zw.RangeHasher`)
+    * `snapshot_get`
+    * `expect_key` (the first version stands)
+    * `set`/`delete`/`clear_range`
+    * `fence(name, token)`
+    * `on_commit`
+    * own writes are overlaid on reads
+  * `build()` gives `Commit`.
+  * **`UnlockedFs::transaction(opts, async |tx| …)`:** the TS loop, with attempts (default 8), backoff, `retryable`, and an empty transaction committing nothing. It uses Rust async closures (`AsyncFnMut`; Rust here is 1.97, edition 2024).
+  * `send_commit` replays one `commit_id` on network errors and `commit_unknown` (4 attempts).
+* **`lease.rs`:** `Lease::acquire(fs, name, ttl)`, `renew`, `release`, `token()`. Errors are `not_leader` and `claim_lost`. `Transaction::fence_lease(&Lease)`.
+* **`integrity.rs`:** a port of `integrity.ts`.
+  * **Options:** `IntegrityOptions {signer: Option<DeviceKey>, pins: Option<PathBuf>, sig_every (64), delay (5 s), on_alarm}`.
+  * **Shared state:** `Arc<Mutex<State>>` with one async lock serializing `checkpoint` and `sync`, like TS's `serial`.
+  * **The same functions and rules:** `note(entry, count)`, `observe(entry, floor_at, count)`, `floor(key)`, `check_header`, `checkpoint()` (cumulative body, the `max_value_bytes` budget, 409 adopt-and-merge, idempotent resend), `sync()` (rules 1–5, the ACL and header claims, `seen` links, the own head), `export_pins()`/`compare_pins(bytes)` through zen-core's `ExportedPins`, `close()`. Alarms make it untrusted and stop checkpoints.
+  * **The cadence:** a tokio task armed by `note` fires `delay` after the last counted change; `sig_every` changes write at once. A `tokio::sync::Notify` cancels the task on `close`.
+  * **Entries:** all five types are decoded, merged and kept, since bodies are cumulative and other devices' bodies carry topics and trees too. Only `vol` and `db` entries come from Rust writers in this milestone.
+* **`pins.rs`: the pins file**, one per fs. Deterministic CBOR `{1: v = 1, 2: fs, 3?: signed ACL bytes, 4?: [version, HH], 5: [[fp, seq, HC, body]]}`.
+  * Written atomically: a temporary file in the same directory, fsync, rename, mode 0600.
+  * Loaded at `Integrity::attach`, raising the floors from each body, as TS `load` does.
+  * A file of another fs, or one that doesn't decode, is refused (`format`), not ignored: losing pins silently would hide a rollback.
+* **`main.rs`: the `zen-client` binary.**
+  * Usage: `zen-client --url URL --device-key FILE --fs N [--pins FILE] [--origin O] [--ca FILE] COMMAND`.
+  * **Commands:**
+    * `sync`
+    * `checkpoint`
+    * `pins export [--out FILE]` (raw bytes, or hex on stdout)
+    * `pins compare FILE|-`
+    * `kv get PATH`, `kv set PATH VALUE`, `kv list PATH` (a path is `/`-separated UTF-8 elements, as TS `['a', 'b']`)
+    * `header` (version, signed, slots)
+  * **Exit codes:** an alarm prints it as JSON on stderr and exits 3; other errors exit 1.
+  * Every command attaches integrity with the pins file and syncs first, so `kv get` is checked against the floors.
+
+### Tests (`crates/zen-client/tests/`, the server in-process)
+
+**The harness** (`tests/common/mod.rs`):
+* `zen-server` as a dev-dependency (`test-utils`, the adversary on)
+* on the embedded backend always: these test the client, and a fork needs a store copy
+* `claim(admin, others)` with each user's device in the ACL
+* `fork()`: `dump::copy` into a fresh embedded store, then a second server on it
+* `lie(...)`: CBOR `{lies, clear}` to `/v1/test/adversary`
+
+**Tests:**
+* **`sign_in`:**
+  * a device key file round trip, then sign-in, `info`, and the session's calls
+  * a cert not in the ACL → 401
+  * a wrong origin → refused
+  * a 401 after the session is revoked (`/v1/auth/logout`) re-signs in once and the call succeeds
+  * API token sessions work
+* **`acl_walk`:**
+  * versions 1 → 3 verified and pinned
+  * `verify_next` unit cases: a version skip, a wrong `prev_hash`, a non-admin signer, a bad signature
+  * a fork copy left at version 1 while the original goes to 3: a client pinned at 3 talking to the copy gets `acl_chain`
+* **`header_and_unlock`:**
+  * `init` unsigned, then `edit_header` adds a second device's slot, and that device unlocks
+  * a device with no slot → `no_slot`
+  * `init(signed)`: edits keep signing (versions 2, 3); another session verifies them
+  * without an identity → `signer_needed`
+  * a header rotated with zen-core's `FsHeader::rotate`: values sealed in epoch 1 still open, and new ones seal in epoch 2
+* **`kv`:**
+  * `get`/`range` with paging (`limit`, `more`, `reverse`), `set`/`delete`/`clear_range`
+  * own writes are seen in reads
+  * short mode: 2 × 20 concurrent increments end at 40, with conflicts seen
+  * long mode: an `expect` conflict, and a range hash that a concurrent insert breaks
+  * a commit resent with its `commit_id` applies once
+  * values written by Rust open in TS, and back (in the vitest below)
+* **`leases`:**
+  * acquire, renew, release
+  * a fenced commit applies; after another device takes the lease, the old holder's fenced commit gets `claim_lost` and writes nothing
+* **`checkpoints`:**
+  * device A notes `vol` entries and checkpoints; B syncs and gets A's floor; B's next body `seen`s A, and A's sync checks it
+  * `sig_every = 3` writes after 3 notes, `delay` after a pause, and `close` writes the last one
+  * bodies are cumulative; the budget drops the oldest entries (`max_value_bytes` set small)
+  * pins survive a new `Integrity` from the same file, and a corrupt pins file is refused
+  * two `Integrity`s of one device race (409), merge, and both entries reach the head with no alarm
+* **`attacks`** (each first asserts the attack works, then that it is detected):
+  * **`checkpoints_withheld`:** lie `checkpoints` on A at seq 2; A writes 3 and 4. A's own `sync` → rollback. B alone sees nothing, but `compare_pins(A.export_pins())` → fork.
+  * **`vol_rollback`:** an app-level root record (a kv value holding `{seq, hash}`, as 6.7's volume root will). A writes seq 1 → 3, noting each, and checkpoints; lie `kv` at seq 1 earlier. B syncs, reads the frozen record and `observe`s it → rollback. Without syncing, B accepts it: the window, asserted.
+  * **`header_rollback`:** lie `header`; the admin signs v2; its next `header()` → rollback, and B learns v2 from the admin's checkpoint and alarms too.
+  * **`fork`:** `fork()`; device D writes checkpoint k on each side. A client pinned on side 1, talking to side 2 → fork (same seq, another HC). `compare_pins` across the sides → fork.
+  * **`invalid`:** a checkpoint sealed under the fs keys but signed by another member's device for D's fp → `invalid`.
+* **`tls`:** a server with `[tls]` and a test CA (`zen_tls_rustcrypto::testing::server_cert`); `TlsOptions {ca}` signs in over HTTPS; without the CA, it's refused (unknown issuer).
+* **Negative controls** (each run once, then restored, and logged): the own-head check off (`checkpoints_withheld`'s A side), `check_seen` off (its B side), `observe`'s `lower_than` off (`vol_rollback`), the header pin check off, the same-seq HC check off (`fork`).
+
+### Interop with the TS client (`packages/client/test/rustclient.test.ts`, new)
+
+* It runs the built `target/debug/zen-client` against a spawned server (adversary on). If the binary is missing, the test fails and says how to build it (no skips).
+* **Setup:** a TS admin claims the server. The ACL has a TS device and a Rust device (a device key file written by the test). The TS admin `init`s the fs with signed headers and a slot for each device.
+* **Cases:**
+  * Rust `kv set a/b v1` → TS `kv.get(['a', 'b'])` is `v1`; TS writes `c`, and Rust `kv get c` prints it.
+  * Rust `checkpoint` → TS `integrity.sync()` verifies the Rust device's checkpoint, with no alarm. TS checkpoints → Rust `sync` exits 0. Each `seen`s the other.
+  * `pins compare`: TS `exportPins()` → Rust exits 0; Rust `pins export` → TS `comparePins` returns `[]`.
+  * **Fork:** after `server.fork()`, the TS device checkpoints on the copy. Rust `pins compare` of that export exits 3 with a fork.
+  * The pins vector: TS's encoder gives the `integrity.json` bytes (`integrityvectors.test.ts`, through exported `encodePins`/`decodePins`).
+* **CI** (`client` job): `cargo build -p zen-server --features test-utils -p zen-client`.
+
+### Docs
+
+* **docs/CLIENT.md §13 (new), "The Rust client":**
+  * what it covers and what stays TS-only
+  * the device key file
+  * the pins file (keep it with the device key; losing it reopens the rollback window back to the first sync)
+  * the CLI and its exit codes
+  * comparing pins out of band between a phone (TS) and a server (Rust)
+* **README:** the crate in the layout list.
+* **docs/STATS.md:** native checkpoint cost (sign, seal, verify; vs WASM's ~2.6 ms sign), measured with an opt-in `#[ignore]` bench test.
+* **docs/MILESTONE-6.md:** the log.
+
+### Files
+
+* **Spec:** `spec/formats.md`, `spec/test-vectors/integrity.json`
+* **Rust:**
+  * `crates/zen-core/src/{integrity,vectors}.rs`, `crates/zen-core/tests/vectors.rs`
+  * `crates/zen-client/{Cargo.toml, src/{lib,error,transport,client,device,session,acl,fs,kv,lease,integrity,pins,main}.rs, tests/{common/mod.rs, sign_in.rs, acl.rs, header.rs, kv.rs, lease.rs, checkpoints.rs, attacks.rs, tls.rs}}`
+  * root `Cargo.toml` (member)
+* **TS:** `packages/client/src/integrity.ts` (export the pins codec internally), `packages/client/test/{rustclient.test.ts (new), integrityvectors.test.ts}`
+* **CI:** `.github/workflows/ci.yml` (the client job's build line)
+* **Docs:** `docs/{CLIENT,STATS,MILESTONE-6}.md`, `README.md`
+
+### Verification
+
+* **Rust:**
+  * `cargo fmt --check`
+  * clippy `--all-targets -D warnings`: default, `--no-default-features`, `--all-features`
+  * `cargo test -p zen-client` 3×, `cargo test -p zen-core --features test-utils`
+  * regenerate the vectors (only `integrity.json`'s `pins` changes)
+  * `cargo check -p zen-client --no-default-features` (pure Rust)
+* **JS:** `npm run check`; `rustclient.test.ts` and `integrityvectors.test.ts` 3×; the client `integrity` tests once.
+* **Attacks:** the negative controls above.
+* **CI:** green on both runs.
+
+**Defaults chosen (overridable):**
+* **Scope:** device sign-in and tokens only (no passkey, OPAQUE or mTLS). No topics, streams, trees, svc or zen-db. `zen-blk` needs KV, leases and checkpoints.
+* **One crate** with the library and a small CLI. The CLI is also the out-of-band pin tool the milestone promised.
+* **Pins in a plain file** next to the device key, not sealed: whoever can change it can also read the device key.
+* **Re-sign-in on 401** with the device key, for long-running daemons.
+* **Embedded backend only** in zen-client's tests: the backends are tested by zen-server's.
+* **The exported pins record goes into the spec** (formats.md §14.5): it is the cross-client format.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.
