@@ -26,6 +26,9 @@ pub struct Server {
     pub dir: tempfile::TempDir,
     pub cfg: Config,
     pub url: String,
+    /// The origin clients sign: the first server's, also on a fork (the
+    /// copied store pinned it).
+    pub origin: Option<String>,
 }
 
 impl Drop for Server {
@@ -57,6 +60,7 @@ impl Server {
             dir,
             cfg,
             url,
+            origin: None,
         }
     }
 
@@ -73,11 +77,17 @@ impl Server {
                 .await
                 .unwrap();
         }
-        Self::launch(cfg, dir).await
+        let mut s = Self::launch(cfg, dir).await;
+        s.origin = Some(self.origin.clone().unwrap_or_else(|| self.url.clone()));
+        s
     }
 
     pub fn client(&self) -> Client {
-        Client::connect(&self.url, ClientOptions::default()).unwrap()
+        let opts = ClientOptions {
+            origin: self.origin.clone(),
+            ..Default::default()
+        };
+        Client::connect(&self.url, opts).unwrap()
     }
 
     pub async fn session(&self, k: &DeviceKey) -> Session {

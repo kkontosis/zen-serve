@@ -93,10 +93,10 @@ async fn the_acl_is_walked_and_pinned() {
     let srv = Server::start().await;
     let (admin, bob, carol) = (key(1), key(2), key(3));
     srv.claim(&admin, &[&bob]).await;
-    // A copy left at version 1.
+    // A copy left at version 1 (after a first sign-in pinned the origin).
+    let a = srv.session(&admin).await;
     let old = srv.fork().await;
 
-    let a = srv.session(&admin).await;
     a.acl()
         .update(&admin.identity, |d| d.members.push(carol.member()))
         .await
