@@ -742,6 +742,7 @@ So any chain of handled messages can be followed back to its first cause.
 * **Plain handlers.** Without `cursor` the handler gets the message only. The stream resumes after the last offset it delivered across reconnects (M4), so a running process misses nothing and sees nothing twice.
 * **Durable handlers.** With `cursor`, the handler is `handler(msg, tx)`. It runs in a transaction that also reads and advances the cursor row, and skips events at or before it. So the handler's database effects happen **exactly once per device and cursor name**, even across crashes.
   * Events may be batched: one transaction per batch of up to `batch` events (default 1).
+  * A handler that throws stops the subscription (a restart retries from the cursor). A batch whose transaction still conflicts after its attempts runs again after a backoff: other writers winning isn't a failed handler, and in an authenticated database (§14.5) every writer conflicts with every other.
 * **Prefix subscriptions** deliver the events of every topic under a prefix. Events of topics the class can't open, because their path isn't known, arrive unopened (M4).
 
 ### 11.3 Consume
@@ -1043,6 +1044,8 @@ A transaction reads the NsRoot once, at its first read under `D`. For every valu
 * **a range read:** the tree's entries in the range the answer covers (the whole range, or up to the last item when a limit or a page stopped it) must be exactly the returned values, with their VHs.
 
 A cached record (a row, a catalog record) is used only while the tree's entry for its key still has its VH; otherwise it is dropped and read again. The tree check replaces the version check of cached records (§7.7).
+
+A state-tree node that is missing counts as a mismatch too: nodes are deleted only by the commit that replaces the NsRoot (§5.4.3).
 
 **A mismatch.** The client reads the latest NsRoot again. If it moved, the transaction conflicts and runs again: a long-mode read, or one that raced a commit, can honestly be newer than the transaction's NsRoot. If it didn't, the answer is a **rollback** (formats.md §14.4, object `db`).
 
