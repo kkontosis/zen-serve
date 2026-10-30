@@ -52,6 +52,9 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/tree-state` | leaves and inner nodes of a filesystem tree's state hash (fs.md §9) |
 | `zen/v1/db-state-value` | `VH`, the hash of a value's plaintext in an authenticated zen-db database's state tree (zendb.md §14.2) |
 | `zen/v1/db-ns-root` | `NH`, the hash of an NsRoot, chaining a namespace's roots and naming them in checkpoints (zendb.md §14.4) |
+| `zen/v1/blk-leaf` | `leaf(i)`, the hash of a stored block of a volume (blk.md §2) |
+| `zen/v1/blk-node` | `hash(l, j)`, the hash of a volume's tree node (blk.md §2) |
+| `zen/v1/blk-root` | `RH`, the hash of a volume's root record, chaining its roots and naming them in checkpoints (blk.md §3) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 

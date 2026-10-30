@@ -353,6 +353,17 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** The app shows a relayed protocol end to end, with exactly-once storage across handler kills; a mail provider is out of the milestone's scope.
 * **What it would take:** Sender checks on receipt (SPF and DMARC from DNS, DKIM signatures over the stored bytes) recorded in a header; for IMAP, a MIME parser over the stored parts (ENVELOPE, BODYSTRUCTURE, part sections, BODY/TEXT search), mailboxes as a table with `APPEND`, `COPY` and `MOVE`, keywords, CONDSTORE (the modseq is there already), and a view kept outside the connection state; a submission service (port 587 with STARTTLS and AUTH against app passwords) and an outbound queue (a consumer group that delivers by MX, with retries and bounces); `BDAT` and `SMTPUTF8` in the handler; and per-user mailboxes as sub-filesystems or per-user keys once zen-db has row-level read rights.
 
+## TD-BLK-SNAPSHOTS
+
+* **Status:** open
+* **Context:** A block volume (blk.md) has a fixed size and one history. There are no snapshots or clones (DESIGN.md §5), it can't be resized, and it can't be deleted. A read-only opener holds the root it verified at open: once the writer moves the root, its reads of changed blocks fail with `volume_changed` rather than going on at the old root.
+* **Why deferred:** Milestone 6 builds the engine and its freshness; the volume operations around it don't change the formats of blk.md, only add to them.
+* **What it would take:**
+  * **Snapshots and clones:** a root record that names a parent volume and seq, with copy-on-write of blocks and nodes (a block absent in the clone reads through to the parent at that seq), and a reference count or a sweep before the parent's old values can go.
+  * **Resize:** a root record whose `blocks` differs from its predecessor's, with the tree's depth changing at powers of 128 (a new top node over the old one, or the old top's first child when shrinking) and the cut-off blocks deleted in the same commits.
+  * **Delete:** paged clears of the volume's keys (a clear over more than `max_range_items` keys is refused), and a tombstone root record that stays, so a server can't resurrect a deleted volume by serving its old root.
+  * **Readers at a snapshot:** a read-only opener that keeps the values of its root, which needs the snapshots above, since the writer deletes and overwrites them.
+
 ## TD-TEST-OPEN-FAILURES
 
 * **Status:** open
