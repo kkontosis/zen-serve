@@ -93,6 +93,11 @@ impl DbKeys {
         Ok(IndexKeys(self.0.index(&id16(index_id)?)))
     }
 
+    /// The keys of the state tree of an authenticated database (zendb.md §14.2).
+    pub fn state(&self) -> IndexKeys {
+        IndexKeys(self.0.state())
+    }
+
     /// The token keys of a CRDT table.
     pub fn crdt(&self, table_id: &[u8]) -> R<CrdtKeys> {
         Ok(CrdtKeys(self.0.crdt(&id16(table_id)?)))
@@ -129,16 +134,25 @@ impl IndexKeys {
         self.0.node_id(node).to_vec()
     }
 
+    /// `PRF32(K_node, node)`, in an authenticated database (zendb.md §14.3).
+    #[wasm_bindgen(js_name = nodeId32)]
+    pub fn node_id32(&self, node: &[u8]) -> Vec<u8> {
+        self.0.node_id32(node).to_vec()
+    }
+
     /// The canonical tree of a set of sort keys (the reference of zendb.md
     /// §5.4.1): `[id, encoded node, …]`, bottom level first, then the root
-    /// record as the last element (absent for an empty set).
+    /// record as the last element (absent for an empty set). Node ids are
+    /// `id_len` bytes: 16 (default), or 32 in an authenticated database.
     pub fn build(
         &self,
         entries: Vec<js_sys::Uint8Array>,
         fanout: u32,
+        id_len: Option<u32>,
     ) -> R<Vec<js_sys::Uint8Array>> {
         let e = entries.into_iter().map(|a| a.to_vec()).collect();
-        let t = zdb::prolly::build(&self.0, fanout, e).map_err(core_err)?;
+        let t = zdb::prolly::build(&self.0, fanout, e, id_len.unwrap_or(16) as usize)
+            .map_err(core_err)?;
         let mut out = Vec::with_capacity(2 * t.nodes.len() + 1);
         for (id, n) in &t.nodes {
             out.push(js_sys::Uint8Array::from(&id[..]));
@@ -175,6 +189,25 @@ impl TopicKeys {
     pub fn group_id(&self, name: &str) -> Vec<u8> {
         self.0.group_id(name.as_bytes()).to_vec()
     }
+}
+
+/// The state-tree entry of a value (zendb.md §14.2):
+/// `esc(suffix) ‖ 0x00 0x00 ‖ VH(plaintext)`.
+#[wasm_bindgen(js_name = stateEntry)]
+pub fn state_entry(suffix: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    zdb::auth::state_entry(suffix, plaintext)
+}
+
+/// `VH = H("zen/v1/db-state-value", plaintext)` (zendb.md §14.2).
+#[wasm_bindgen(js_name = stateValueHash)]
+pub fn state_value_hash(plaintext: &[u8]) -> Vec<u8> {
+    zdb::auth::value_hash(plaintext).to_vec()
+}
+
+/// `NH = H("zen/v1/db-ns-root", encoded NsRoot)` (zendb.md §14.4).
+#[wasm_bindgen(js_name = nsRootHash)]
+pub fn ns_root_hash(encoded: &[u8]) -> Vec<u8> {
+    zdb::auth::ns_root_hash(encoded).to_vec()
 }
 
 /// `H("zen/v1/db-parts-digest", bytes)`.

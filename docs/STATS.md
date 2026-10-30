@@ -203,12 +203,18 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 | CRDT indexer: a patch until an index query finds it | 25 | – | – |
 | Loro: a local edit until another installation imports it | 4.2 | – | – |
 | Loro: open from a snapshot plus a 100-event tail | 11.7 | – | – |
+| Basic / authenticated: row get, not cached (1,000 rows) | 2.3 / 2.6 | – | – |
+| Basic / authenticated: row get, cached | 1.1 / 1.1 | – | – |
+| Basic / authenticated: row insert | 2.9 / 6.1 | 1 / 6 | 601 / 8,953 |
+| Basic / authenticated: a transaction updating 20 rows | 31 / 35 | 20 / 46 | 8,108 / 81,397 |
+| Basic / authenticated: a scan of 100 rows | 10.1 / 7.9 | – | – |
 
 Reading it:
 * **Indexes.** A unique or fast index adds one write. A private index rewrites its path of nodes (here two levels) and the root, about 4 KB per insert; decoys double that. A sealed index rewrites its whole blob, padded to a power-of-two number of parts: 90 KB per insert even at 1,000 rows, so it suits small or rarely written tables.
 * **Queries.** Index reads cost one to three round trips; a scan reads every row, so an unindexed filter on 1,000 rows is about 15 times a range page.
 * **CRDT writes** are queued: they resolve in microseconds, and the queue sends them after `crdtBatchMs` (10 ms by default), which is most of the 14 ms "waiting" figure. Their commits carry the change event too.
 * **The broker.** The emit-to-handler latency is a commit plus the stream's watch wake-up. `per_key` with 8 handlers in flight doubles sequential throughput, from one client.
+* **Authenticated databases** (zendb.md §14). The basic and authenticated lines were measured side by side, on two fs, with one table each. Reads cost about the same: the NsRoot read takes the place of a cached row's version check, and the state tree's upper nodes stay cached, so a lookup adds no round trip once warm (the scan difference is noise). Writes carry the state-tree leaves they touch and the NsRoot: a one-row insert into 1,000 rows grows from 601 bytes to about 9 KB (fanout 64, height 2), and a transaction of 20 scattered rows touches about 20 leaves. The real cost is contention: every writer conflicts on the NsRoot (docs/DB.md §7.1).
 * These are single-client numbers against a local server: they show relative costs and the round trips, not the throughput of a server under load.
 
 ### 5.5 Relayed service costs (measured)

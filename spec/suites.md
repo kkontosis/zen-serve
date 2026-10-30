@@ -8,7 +8,7 @@ Every stored object records a one-byte suite id right after `format_version`. A 
 |---|---|---|
 | AEAD | XChaCha20-Poly1305 | 32-byte key, 24-byte random nonce, 16-byte tag |
 | KDF | BLAKE3 `derive_key` | `KDF(label, key, info) = BLAKE3.derive_key(label, key ‖ info)`, `key` always 32 bytes |
-| PRF | BLAKE3 keyed hash | `PRF16(key, data) = BLAKE3.keyed_hash(key, data)[0..16]` |
+| PRF | BLAKE3 keyed hash | `PRF16(key, data) = BLAKE3.keyed_hash(key, data)[0..16]`; `PRF32(key, data) = BLAKE3.keyed_hash(key, data)` |
 | Fingerprint | BLAKE3 `derive_key` | `FP(x) = BLAKE3.derive_key("zen/v1/fingerprint", x)` |
 | Password KDF | Argon2id v1.3 | 32-byte output; params stored per keyslot; creation floor m ≥ 64 MiB (G25) |
 | KEM | X-Wing (ML-KEM-768 + X25519) | IETF draft-connolly-cfrg-xwing-kem **-06**; 32-byte decapsulation seed |

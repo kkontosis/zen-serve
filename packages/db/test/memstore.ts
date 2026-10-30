@@ -11,11 +11,14 @@ export class MemStore implements NodeStore {
   readonly m = new Map<string, Uint8Array>();
   root: Uint8Array | undefined;
 
+  /** `idLen`: node ids of 16 bytes, or 32 (an authenticated database's). */
+  constructor(readonly idLen = 16) {}
+
   async get(ids: Uint8Array[]): Promise<Node[]> {
     return ids.map((id) => {
       const b = this.m.get(hex(id));
       if (!b) throw new Error(`missing node ${hex(id)}`);
-      return decodeNode(b);
+      return decodeNode(b, this.idLen);
     });
   }
 
@@ -31,6 +34,6 @@ export class MemStore implements NodeStore {
   }
 
   rootRecord() {
-    return this.root && decodeRoot(this.root);
+    return this.root && decodeRoot(this.root, this.idLen);
   }
 }

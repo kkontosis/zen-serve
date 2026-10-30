@@ -7,8 +7,10 @@ import {
   type Transaction,
   type Tree,
   ZenError,
+  zw,
 } from '@zen/client';
 import type { CommitResult } from '@zen/wasm';
+import { TxAuth } from './auth.js';
 import {
   appendMsg,
   type Binding,
@@ -34,10 +36,10 @@ import type { Db } from './db.js';
 import { DbError } from './errors.js';
 import { TxFiles } from './files.js';
 import { fastChange } from './index/fast.js';
-import type { RootRecord } from './index/node.js';
+import type { Node, RootRecord } from './index/node.js';
 import { decodeRoot } from './index/node.js';
-import { applyPrivate, fieldPart, privateChange, sortKeyOf } from './index/private.js';
-import type { Change } from './index/prolly.js';
+import { applyPrivate, fieldPart, privateChange, sortKeyOf, TxNodeStore } from './index/private.js';
+import type { Change, NodeStore } from './index/prolly.js';
 import { readSealed, SEALED_MAX_BYTES, SealedState, sealedChange } from './index/sealed.js';
 import type { IndexTx } from './index/types.js';
 import { uniqueChange } from './index/unique.js';
@@ -73,6 +75,8 @@ interface Used {
   key: Uint8Array;
   version: Uint8Array | undefined;
   drop: () => void;
+  /** Checked against the state tree (§14.6): no version check at `finish`. */
+  verified: boolean;
 }
 
 /** A zen-db transaction. Every method may run several times (§7.1). */
@@ -115,6 +119,8 @@ export class DbTransaction implements IndexTx {
   private readonly afters: (() => void)[] = [];
   /** Set by a request: the inbox's subscriptions starting. */
   private inboxReady: Promise<void> | undefined;
+  /** In an authenticated database: this attempt's NsRoot and checks (§14). */
+  readonly auth: TxAuth | undefined;
 
   constructor(
     readonly db: Db,
@@ -133,6 +139,28 @@ export class DbTransaction implements IndexTx {
     });
     // Rows this commit wrote have new versions: drop their cached copies.
     raw.onCommit(() => db.rowsWritten(raw));
+    this.auth = db.nsAuth && new TxAuth(db.nsAuth, this);
+  }
+
+  /** @internal The nodes of a tree, at this transaction's snapshot. */
+  nodeStore(index: Uint8Array): NodeStore {
+    return new TxNodeStore(this, index);
+  }
+
+  /** @internal */
+  cacheNode(id: Uint8Array, n: Node, b: Uint8Array): void {
+    this.db.cacheNode(bytes.hex(id), n, b);
+  }
+
+  /**
+   * @internal Whether a cached record may be used: in an authenticated
+   * database, only while the state tree's entry for its key still has its
+   * VH (§14.6; `vh` undefined: absent).
+   */
+  async fresh(key: Uint8Array, vh: Uint8Array | undefined, present: boolean): Promise<boolean> {
+    if (!this.auth) return true;
+    if (present && !vh) return false;
+    return this.auth.current(key, vh);
   }
 
   /**
@@ -155,13 +183,18 @@ export class DbTransaction implements IndexTx {
     const h = bytes.hex(key);
     if (this.cached.has(h)) return;
     this.raw.expectKey(key, version);
-    this.cached.set(h, { key, version, drop });
+    this.cached.set(h, { key, version, drop, verified: !!this.auth });
   }
 
-  /** @internal Keep a row read in this transaction in the row cache. */
-  noteRow(key: Uint8Array, version: Uint8Array | undefined, r: ReadRow): void {
+  /** @internal Keep a row read in this transaction (its stored plaintext `b`) in the row cache. */
+  noteRow(key: Uint8Array, version: Uint8Array | undefined, r: ReadRow, b: Uint8Array): void {
     if (!version || this.raw.owns(key)) return;
-    this.db.cacheRow(bytes.hex(key), { version, fields: r.fields, parts: r.parts });
+    this.db.cacheRow(bytes.hex(key), {
+      version,
+      fields: r.fields,
+      parts: r.parts,
+      ...(this.auth ? { vh: zw.stateValueHash(b) } : {}),
+    });
   }
 
   get keys(): Keys {
@@ -387,7 +420,7 @@ export class DbTransaction implements IndexTx {
     if (this.roots.has(h)) return this.roots.get(h);
     this.live();
     const b = await this.raw.get(key);
-    const r = b ? decodeRoot(b) : undefined;
+    const r = b ? decodeRoot(b, this.db.idLen) : undefined;
     this.roots.set(h, r);
     return r;
   }
@@ -436,7 +469,11 @@ export class DbTransaction implements IndexTx {
       const [e] = await this.raw.snapshotGet([key]);
       return e ? this.db.decodeTable(e.value) : undefined;
     }
-    const cached = this.db.catalogEntry(name);
+    let cached = this.db.catalogEntry(name);
+    if (cached && !(await this.fresh(key, cached.vh, !!cached.record))) {
+      this.db.catalogStale(name);
+      cached = undefined;
+    }
     let rec: TableRecord | undefined;
     if (cached) {
       this.useCached(key, cached.version, () => this.db.catalogStale(name));
@@ -445,7 +482,12 @@ export class DbTransaction implements IndexTx {
       const [e] = await this.raw.snapshotGet([key]);
       this.raw.expectKey(key, e?.version);
       rec = e ? this.db.decodeTable(e.value) : undefined;
-      this.db.catalogSet(name, rec, e?.version);
+      this.db.catalogSet(
+        name,
+        rec,
+        e?.version,
+        e && this.auth ? zw.stateValueHash(e.value) : undefined,
+      );
     }
     if (rec) this.tables.set(name, rec);
     return rec;
@@ -492,9 +534,11 @@ export class DbTransaction implements IndexTx {
       this.raw.onCommit(() => this.db.cacheSealed(h, bytes.hex(digest), keys));
     }
     await this.crdtW?.stamp();
+    // The state tree and the NsRoot come last: they cover every other write (§14.5).
+    await this.auth?.finish();
     if (this.raw.empty) {
-      if (!this.cached.size) return;
-      const used = [...this.cached.values()];
+      const used = [...this.cached.values()].filter((u) => !u.verified);
+      if (!used.length) return;
       let now: Awaited<ReturnType<Transaction['snapshotGet']>>;
       try {
         now = await this.raw.snapshotGet(used.map((u) => u.key));
@@ -903,7 +947,11 @@ export class TableTx<T extends Fields = Fields> {
     if (fresh) tx.db.dropRow(bytes.hex(key));
     else if (!tx.raw.owns(key)) {
       const h = bytes.hex(key);
-      const c = tx.db.cachedRow(h);
+      let c = tx.db.cachedRow(h);
+      if (c && !(await tx.fresh(key, c.vh, true))) {
+        tx.db.dropRow(h);
+        c = undefined;
+      }
       if (c) {
         tx.useCached(key, c.version, () => tx.db.dropRow(h));
         return { fields: c.fields, parts: c.parts };
@@ -920,7 +968,7 @@ export class TableTx<T extends Fields = Fields> {
     }
     if (!e) return undefined;
     const r = await this.decode(t, pkEl, e.value);
-    tx.noteRow(key, e.version, r);
+    tx.noteRow(key, e.version, r, e.value);
     return r;
   }
 

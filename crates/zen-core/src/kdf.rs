@@ -21,6 +21,11 @@ pub fn prf16(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
     h.as_bytes()[..16].try_into().expect("16 <= 32")
 }
 
+/// `PRF32(key, data) = BLAKE3.keyed_hash(key, data)` (suites.md).
+pub fn prf32(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(key, data).as_bytes()
+}
+
 /// `FP(public_bytes) = BLAKE3.derive_key("zen/v1/fingerprint", public_bytes)`.
 pub fn fingerprint(public_bytes: &[u8]) -> [u8; 32] {
     blake3::derive_key(crate::labels::FINGERPRINT, public_bytes)

@@ -1,5 +1,6 @@
 // Prolly-tree nodes and root records (spec/zendb.md §5.4.2, §5.4.6). The
-// Rust reference is zen-core's `db::prolly`.
+// Rust reference is zen-core's `db::prolly`. Node ids are 16 bytes, or 32
+// in an authenticated database (§14.3).
 import { bytes } from '@zen/client';
 import { decode, encode, headLen, type Value } from '../cbor.js';
 import { DbError } from '../errors.js';
@@ -28,7 +29,14 @@ export const entryCount = (e: Entry): number => (e instanceof Uint8Array ? 1 : e
 /** Encoded length of an entry. */
 export function entryLen(e: Entry): number {
   if (e instanceof Uint8Array) return headLen(e.length) + e.length;
-  return 1 + headLen(e.key.length) + e.key.length + 17 + headLen(e.count);
+  return (
+    1 +
+    headLen(e.key.length) +
+    e.key.length +
+    headLen(e.child.length) +
+    e.child.length +
+    headLen(e.count)
+  );
 }
 
 /** Encoded length of an unsalted, unpadded node with `n` entries of `entriesLen` bytes. */
@@ -87,7 +95,8 @@ function count(v: Value | undefined): number {
   return v;
 }
 
-export function decodeNode(b: Uint8Array): Node {
+/** Decode a node whose child ids are `idLen` bytes (16, or 32 when authenticated). */
+export function decodeNode(b: Uint8Array, idLen = 16): Node {
   const m = decode(b);
   if (!(m instanceof Map)) throw corrupt();
   const level = count(m.get(1));
@@ -100,7 +109,7 @@ export function decodeNode(b: Uint8Array): Node {
     }
     if (!Array.isArray(e) || e.length !== 3) throw corrupt();
     const [key, child, c] = e;
-    if (!(key instanceof Uint8Array) || !(child instanceof Uint8Array) || child.length !== 16) {
+    if (!(key instanceof Uint8Array) || !(child instanceof Uint8Array) || child.length !== idLen) {
       throw corrupt();
     }
     return { key, child, count: count(c) };
@@ -136,10 +145,10 @@ export function encodeRoot(r: RootRecord): Uint8Array {
   );
 }
 
-export function decodeRoot(b: Uint8Array): RootRecord {
+export function decodeRoot(b: Uint8Array, idLen = 16): RootRecord {
   const m = decode(b);
   if (!(m instanceof Map)) throw corrupt();
   const root = m.get(1);
-  if (!(root instanceof Uint8Array) || root.length !== 16) throw corrupt();
+  if (!(root instanceof Uint8Array) || root.length !== idLen) throw corrupt();
   return { root, height: count(m.get(2)), count: count(m.get(3)) };
 }

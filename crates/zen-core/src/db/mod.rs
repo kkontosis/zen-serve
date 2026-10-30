@@ -6,12 +6,13 @@
 //! naming key, which never leaves this crate, or is the reference the
 //! TypeScript code is checked against (spec/test-vectors/zendb.json).
 
+pub mod auth;
 pub mod cbor;
 pub mod prolly;
 pub mod sortkey;
 
 use crate::encoding::lp;
-use crate::kdf::{Key32, kdf, prf16};
+use crate::kdf::{Key32, kdf, prf16, prf32};
 use crate::keys::FsKeys;
 use crate::labels;
 use crate::rng::Rng;
@@ -52,6 +53,12 @@ impl DbKeys {
             boundary: kdf(labels::DB_BOUNDARY, &self.k_db, index_id),
             node: kdf(labels::DB_NODE_ID, &self.k_db, index_id),
         }
+    }
+
+    /// The keys of the state tree of an authenticated database (§14.2):
+    /// those of the reserved index id `0¹⁶`.
+    pub fn state(&self) -> IndexKeys {
+        self.index(&[0; 16])
     }
 
     /// The token key of a CRDT table (§19.2).
@@ -109,6 +116,11 @@ impl IndexKeys {
     /// `node_id = PRF16(K_node, CBOR(Node))`.
     pub fn node_id(&self, node: &[u8]) -> [u8; 16] {
         prf16(&self.node, node)
+    }
+
+    /// `node_id = PRF32(K_node, CBOR(Node))`, in an authenticated database (§14.3).
+    pub fn node_id32(&self, node: &[u8]) -> [u8; 32] {
+        prf32(&self.node, node)
     }
 }
 

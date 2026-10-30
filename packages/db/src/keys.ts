@@ -51,4 +51,5 @@ export class Keys {
   sealedHead = (index: Uint8Array) => this.key('s', index);
   sealedPart = (index: Uint8Array, i: number) => this.key('s', index, u32(i));
   msgPart = (id: Uint8Array, i: number) => this.key('m', id, u32(i));
+  nsRoot = () => this.key('ns');
 }

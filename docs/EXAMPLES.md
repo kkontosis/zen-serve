@@ -206,6 +206,8 @@ Family pocket money or team credits: balances that must never go negative, a ful
 
 **Grants:** fs `read`/`write`; `read`/`append`/`consume` on `("ledger")` and `("zen", "db", "ledger")`.
 
+**Authenticated** (zendb.md §14, milestone 6): balances are where a rolled-back value hurts most. `AUTH_DB_OPTIONS` opens the ledger as an authenticated database: every balance read is checked against the namespace root, and device checkpoints keep that root fresh. The fs needs integrity attached (`signInWorker({integrity: true})`), and every transfer then conflicts with every other, so throughput falls with the number of writers. The tests run the invariants at both levels (`apps/ledger/test/suite.ts`); the UI stays `basic`.
+
 **Milestone 5 demo:**
 1. Many concurrent random transfers.
 2. Check:

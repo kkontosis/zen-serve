@@ -6,7 +6,7 @@ import { bytes, initWasm, zw } from '@zen/client';
 import type { IndexKeys } from '@zen/wasm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { decodeNode, nodeBucket } from '../src/index/node.js';
-import { type Change, rewrite, scan, treeKeys } from '../src/index/prolly.js';
+import { type Change, lookup, rewrite, scan, treeKeys } from '../src/index/prolly.js';
 import { sortKey } from '../src/sortkey.js';
 import { MemStore } from './memstore.js';
 
@@ -229,5 +229,43 @@ describe('decoys (§5.4.6)', () => {
       expect(store.m.size).toBe(ref.nodes.size);
       expect(store.rootRecord()?.count ?? 0).toBe(model.size);
     }
+  });
+});
+
+describe('lookup by prefix (the state tree, §14.2)', () => {
+  it('finds the one entry starting with each prefix, with 32-byte ids, in one descent per level', async () => {
+    const rnd = xorshift(77);
+    const tk = treeKeys(ik, 4, 32);
+    const store = new MemStore(32);
+    // Entries `esc(suffix) ‖ 00 00 ‖ VH`, as the state tree holds them.
+    const suffix = (i: number) => bytes.utf8(`k${i}${i % 3 ? '' : '\0z'}`);
+    const entry = (i: number) => zw.stateEntry(suffix(i), bytes.utf8(`v${i}`));
+    const prefix = (i: number) => {
+      const e = entry(i);
+      return e.subarray(0, e.length - 32);
+    };
+    const live = new Set<number>();
+    for (let i = 0; i < 300; i++) if (rnd() < 0.6) live.add(i);
+    const r = await rewrite(
+      tk,
+      store,
+      undefined,
+      [...live].map((i) => ({ key: entry(i), add: true })),
+    );
+    store.apply(r);
+    let gets = 0;
+    const counting = {
+      get: (ids: Uint8Array[]) => {
+        gets++;
+        return store.get(ids);
+      },
+    };
+    const asked = Array.from({ length: 300 }, (_, i) => i);
+    const got = await lookup(counting, store.rootRecord(), asked.map(prefix));
+    asked.forEach((i, j) => {
+      expect(got[j] && hex(got[j])).toBe(live.has(i) ? hex(entry(i)) : undefined);
+    });
+    expect(gets).toBe(store.rootRecord()!.height);
+    expect(await lookup(store, undefined, [prefix(1)])).toEqual([undefined]);
   });
 });

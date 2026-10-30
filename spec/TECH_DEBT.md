@@ -289,12 +289,13 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-SVC-STATE-ROLLBACK
 
-* **Status:** open
+* **Status:** closed (milestone 6, step 5), but for the checkpoint window
 * **Context:** A relayed connection's state (formats.md §13, kind 9) holds a TLS or SSH engine's keys and sequence numbers. Its authenticated data binds the connection and the cursors, so the server can't pair it with other cursors. But a malicious server can serve an older, consistent snapshot of the whole connection and the handler's database (zendb.md §14). The engine then reuses record sequence numbers; if its new output differs (timestamps, randomness), the server sees two records under one nonce (svc.md §12).
 * **Why deferred:** Detecting a consistent rollback needs state outside the server: signed, gossiped checkpoints. That is milestone 6's authenticated tier. Honest failures can't cause reuse, because uncommitted output is never revealed (svc.md §5).
 * **Mitigations until then:** A handler aborts a connection when a claim shows cursors lower than it has seen (svc.md §6). TLS 1.2 AES-GCM explicit nonces carry a 32-bit prefix drawn at random for each batch of records (svc.md §7.1), so a rolled-back sequence number repeats a nonce only with probability 2^-32 per batch.
 * **What it would take:** Put `(conn, out_head)` in the handler-signed checkpoint of milestone 6 (zendb.md §14), and have a successor refuse a state older than the newest checkpoint it can verify.
 * **Narrowed (milestone 6, step 4):** handlers name each connection's `(in_acked, out_head)` in their device checkpoints, checkpoint before a release, and a successor syncs and refuses a claim below the newest verified entry (svc.md §12, docs/SVC.md §6). Left: the handler's database, which can still be rolled back together with a connection whose cursors are within the window, until authenticated namespaces (milestone 6, step 5); and the window itself (steps since a crashed handler's last checkpoint; `sigEvery: 1` closes it).
+* **Closed (milestone 6, step 5):** a handler's database opened `integrity: "authenticated"` (zendb.md §14) is checked on every read against its NsRoot, whose floor rides in the same device checkpoints; a step that finds it rolled back gives the connection up (svc.md §12, docs/SVC.md §6). What remains is the window, documented in svc.md §12: steps since a crashed handler's last checkpoint. `sigEvery: 1` closes it.
 
 ## TD-SVC-TLS-HANDSHAKE-RESUME
 

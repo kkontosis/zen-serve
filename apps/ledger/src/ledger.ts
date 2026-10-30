@@ -82,6 +82,13 @@ export const DB_OPTIONS: DbOptions = {
   },
 };
 
+/**
+ * `DB_OPTIONS` on an authenticated database (zendb.md §14): every read is
+ * checked against the namespace root, and the fs needs integrity attached.
+ * Writers then conflict on that root (docs/EXAMPLES.md §5).
+ */
+export const AUTH_DB_OPTIONS: DbOptions = { ...DB_OPTIONS, integrity: 'authenticated' };
+
 /** The change topic of `entries`. */
 export const entriesTopic = (db: Db): Topic => db.topic('ledger', 'entries');
 /** The change topic of `statements` (for UIs that show them). */
