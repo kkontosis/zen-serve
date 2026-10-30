@@ -250,7 +250,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Checks (all clean):** `cargo fmt --check`; clippy `--all-targets -D warnings` on zen-client and zen-core (default, `--no-default-features`, `--all-features`); `cargo test -p zen-core --features test-utils`; `cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown`; `cargo test -p zen-client` 3×; `npm run check`; the two TS files 3×.
   * Pushed 9f5c676. **CI green on both runs** (push 420, pull_request 421): rust, pure-rust, fdb and client all pass. Step 6.6 is done, waiting on review and merge of PR #59. This line reaches `docs/MILESTONE-6.md` at the restart from main.
   * PR #59 merged at 311012b.
-* **Step 6.7** (`crates/zen-blk`): planned below ("Step 6.7 in detail"). Restarted from main; the log above is now in the repo copy too.
+* **Step 6.7** (`crates/zen-blk`): planned below ("Step 6.7 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (3f600ab), PR #60.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
