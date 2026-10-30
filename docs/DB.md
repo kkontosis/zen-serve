@@ -170,6 +170,23 @@ await db.table<Item>('items').get(id, { read: 'cache' });     // a cached row, u
 * **CRDT tables** read and queue writes offline as in §19.
 * **The clock** ticks from the device's wall clock until the server is reached; queued edits are re-stamped if the server refuses their time. Give the session a `ClockStore` to keep the HLC and the counter actor across restarts.
 
+### 7.1 Authenticated databases
+
+`integrity: 'authenticated'` (zendb.md §14) makes every read checkable: the server can no longer serve an older row, an older index root or catalog record, or leave a row out of a scan, without the client noticing.
+```ts
+const fs = session.fs(1);
+await fs.integrity({ device: { device, cert } });     // docs/CLIENT.md §12; needed first
+const ufs = await fs.unlock(how);
+const db = await Db.open(ufs, 'bank', { schema, migrations, integrity: 'authenticated' });
+```
+* **What is checked.** One **state tree** per database holds a hash of every value under the database: rows and their parts, the catalog, unique, fast and sealed entries, index roots, message parts and the system tables. Private-index nodes are named by 32-byte keyed hashes, checked when fetched. The tree's root is in the **NsRoot**, which every write commit rewrites with `seq + 1` and the previous root's hash. Each transaction reads the NsRoot once; every value the server returns, and every range page, must match the tree. A cached row or catalog record is used only while the tree still has its hash.
+* **Freshness.** The NsRoot itself is checked against device checkpoints (docs/CLIENT.md §12): a root below what a verified checkpoint or this device named is a rollback, another root at the same `seq` a fork. Within the window before the writer's next checkpoint, a consistent older snapshot passes; `sigEvery: 1` closes the window.
+* **Alarms.** A mismatch first re-reads the latest NsRoot. If it moved, the transaction just conflicts and runs again (long mode, or a read that raced a commit). If it didn't, the read throws an `IntegrityError` (`rollback`, object `db`), and the fs is untrusted from then on; what to do next is the app's policy.
+* **Contention.** Every writer of the database rewrites its NsRoot, so **all writers conflict with each other**, even on unrelated rows. Use an authenticated database for balances, permissions and other state where freshness matters more than write throughput, and keep busy, low-value data in a basic one. Durable `on` handlers and consumers outlast a run of conflicts: their batch or delivery runs again after a backoff, instead of stopping or being nacked.
+* **Not offered:** CRDT tables (`createTable` with `merge: 'crdt'` gives `bad_value`), since their merged state is the server's.
+* **The level never changes.** A database is created at the level asked for. Opening a basic one with `integrity: 'authenticated'` gives `format`. An authenticated one opens verified whatever the option says, and needs integrity attached (`unsupported` otherwise). A database whose DbRecord is gone while checkpoints name it is a rollback, not a new database.
+* **Cost** (docs/STATS.md §5.4): reads cost about the same, since the tree's upper nodes stay cached. A write commit adds the state-tree leaves it touches and the NsRoot: about 9 KB for a one-row insert into 1,000 rows, and 80 KB for a 20-row transaction.
+
 ## 8. Tabs, the owner and the proxy
 
 In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lock `zen/db/<fs>/<ns>`.
@@ -196,12 +213,12 @@ In a browser, one tab per database is the **owner** (§9.2). It holds the Web Lo
 | `needs_index` | a limited `orderBy` that no index provides |
 | `too_large` | a commit over the server's limits, a sort key over 4,096 bytes, a sealed index over `maxBytes`, a long-mode range over one response |
 | `corrupt` | a stored value that fails its checks |
-| `format` | an unknown format, integrity level or index kind |
+| `format` | an unknown format, integrity level or index kind; `integrity: 'authenticated'` on a basic database |
 | `building` | a unique index whose backfill found duplicates |
 | `closed` | the database was closed (a call after `close()`, or a transaction still running); a manual transaction used after `commit` or `abort`; a request pending when the database closed |
 | `poisoned` | a message that doesn't decode, or whose body parts are gone |
 | `timeout` | a request without a reply in time; no owner tab answering |
-| `unsupported` | a CRDT table on a server without `"crdt_rows"` |
+| `unsupported` | a CRDT table on a server without `"crdt_rows"`; an authenticated database on an fs without integrity attached |
 | `offline` | a CRDT read that needs the server while it can't be reached (§19) |
 
 ---

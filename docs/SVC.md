@@ -129,7 +129,7 @@ For a plaintext protocol (SMTP before STARTTLS, a raw service) the server also s
 * Before it hands a live connection back, or releases its lease (`stop()`), it writes a checkpoint, so a successor knows the newest cursors.
 * A successor syncs the fs's checkpoints before it resumes claimed connections, and aborts a connection whose claim is below the newest verified entry (a `rollback` alarm, `object: 'svc'`). If the sync itself alarms, the claimed connections are aborted: the server is lying.
 * **The window:** a handler that crashes leaves the steps since its last checkpoint unvouched (`sigEvery: 1` checkpoints every step), and a server that withholds a handler's newest checkpoints shows a successor the older ones. The handler then finds its own head below its pin at its next sync.
-* **Not yet covered:** the handler's database (zendb.md §14) rolled back together with the connection, until authenticated namespaces.
+* **The handler's database.** Opened `integrity: 'authenticated'` (docs/DB.md §7.1), it is checked on every read against its NsRoot, whose floor rides in the same checkpoints. A successor that finds it rolled back gets an `integrity` error from the step, and gives the connection up. The window is the same: steps since a crashed handler's last checkpoint. A basic handler database can still be rolled back with a connection whose cursors are within the window.
 
 ## 7. Costs
 
@@ -143,5 +143,5 @@ For a plaintext protocol (SMTP before STARTTLS, a raw service) the server also s
 * SSH: public keys only, no PTY, no forwarding ([TD-SVC-SSH-SCOPE](../spec/TECH_DEBT.md#td-svc-ssh-scope)).
 * `tcp-auth` connectors can't slow the server's sends ([TD-SVC-CONNECT-BACKPRESSURE](../spec/TECH_DEBT.md#td-svc-connect-backpressure)).
 * Changing a sealed inbox's key needs the old seed until its connections end ([TD-SVC-INBOX-ROTATION](../spec/TECH_DEBT.md#td-svc-inbox-rotation)).
-* A malicious server can roll a handler's database back with a connection; the connection's cursors are checkpointed (§6, [TD-SVC-STATE-ROLLBACK](../spec/TECH_DEBT.md#td-svc-state-rollback)).
+* A malicious server can roll a connection and its handler's database back within the checkpoint window; beyond it, cursors and an authenticated database are caught (§6, [TD-SVC-STATE-ROLLBACK](../spec/TECH_DEBT.md#td-svc-state-rollback), closed but for the window).
 * The mail app is inbound only, with an IMAP subset ([TD-MAIL-SCOPE](../spec/TECH_DEBT.md#td-mail-scope)).
