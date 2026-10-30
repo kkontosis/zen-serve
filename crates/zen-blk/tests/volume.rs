@@ -628,15 +628,19 @@ async fn a_rolled_back_block_or_node_is_detected() {
     assert!(e.alarm().unwrap().detail.contains("leaf"), "{e}");
     truth(&admin).await;
 
-    // A level-1 node: its older value, under a current parent.
+    // A level-1 node: its older value, with the block it lacks withheld,
+    // under a current parent. The old node and block agree with each other.
     v.write(7 * BS, &block_of("seven")).await.unwrap();
     v.flush().await.unwrap();
     lie(
         &admin,
-        vec![Lie::Kv {
-            fs: 1,
-            key: ByteBuf::from(keys.node(1, 0)),
-        }],
+        [keys.node(1, 0), keys.block(8)]
+            .into_iter()
+            .map(|k| Lie::Kv {
+                fs: 1,
+                key: ByteBuf::from(k),
+            })
+            .collect(),
     )
     .await;
     v.write(8 * BS, &block_of("eight")).await.unwrap();
