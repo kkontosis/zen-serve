@@ -45,7 +45,7 @@ pub fn hex(b: &[u8]) -> String {
 /// Parse hex (either case); `None` if it isn't.
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

@@ -498,3 +498,63 @@ async fn a_checkpoint_signed_by_another_device_is_invalid() {
     assert_eq!(al.id.as_deref(), Some(kd.fp().as_slice()));
     let _ = (&e.key, &e.i);
 }
+
+/// Native checkpoint cost (docs/STATS.md): sign, seal, open, verify. Opt-in:
+/// `cargo test -p zen-client --test integrity -- --ignored --nocapture bench`.
+#[test]
+#[ignore]
+fn bench_checkpoint_cost() {
+    use std::time::Instant;
+    use zen_core::integrity::{open_checkpoint, sign_checkpoint, verify_checkpoint};
+    let k = key(2);
+    let keys = zen_core::keys::FsKeys::generate(1, &mut zen_core::rng::OsRng).unwrap();
+    let body = CheckpointBody {
+        fs: 1,
+        device: k.fp(),
+        seq: 1,
+        prev: [0; 32],
+        hlc: 1,
+        acl: Head::default(),
+        header: Head::default(),
+        objects: (0..10).map(|n| vol(n, 1)).collect(),
+        seen: (0..4u8)
+            .map(|n| Seen {
+                device: [n + 1; 32],
+                seq: 1,
+                hash: [n; 32],
+            })
+            .collect(),
+    };
+    let n = 50;
+    let time = |name: &str, f: &mut dyn FnMut()| {
+        f();
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        println!(
+            "{name}: {:.3} ms",
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        );
+    };
+    let mut signed = Vec::new();
+    time("sign", &mut || {
+        signed = sign_checkpoint(&k.device, &body).unwrap()
+    });
+    let mut sealed = Vec::new();
+    time("seal", &mut || {
+        sealed = seal_checkpoint(&keys, &k.fp(), 1, &signed, &mut zen_core::rng::OsRng).unwrap()
+    });
+    time("open", &mut || {
+        open_checkpoint(&keys, &k.fp(), 1, &sealed).unwrap();
+    });
+    let dp = k.public();
+    time("verify", &mut || {
+        verify_checkpoint(&dp, &signed).unwrap();
+    });
+    println!(
+        "body {} B, sealed {} B",
+        body.encode().unwrap().len(),
+        sealed.len()
+    );
+}

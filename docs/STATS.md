@@ -257,3 +257,19 @@ Reading it:
 * **An idle connection** costs the server a task, its socket and buffers (the input reader keeps a 32 KiB buffer), and its records in storage; the handler keeps its keys and cursors. It costs no steps: nothing runs until input or a wake-up comes.
 * **Debug builds** are slower: the debug server with development WASM measured 22.6 ms for a raw step, and 2.7, 0.8 and 1.1 MB/s for the three mirrors.
 * As with §5.4, these are single-client figures on one machine: they show what a step costs, not a server under load.
+
+### 5.6 Device checkpoints in the native client (measured)
+
+`cargo test --release -p zen-client --test integrity -- --ignored --nocapture bench` (4 cores, one thread). The body has 10 volume entries and 4 `seen` heads: 977 bytes, 4,404 sealed (the hybrid signature is 3,375 of them).
+
+| Operation | Release | Debug build |
+|---|---|---|
+| Sign (Ed25519 + ML-DSA-65) | 0.19–0.23 ms | 2.8 ms |
+| Seal (kind 11, XChaCha20-Poly1305) | 0.017 ms | 0.88 ms |
+| Open | 0.016 ms | 0.87 ms |
+| Verify | 0.14 ms | 1.6 ms |
+
+Reading it:
+* **Native signing is about 13× faster than WASM** (2.6 ms, §5.2), so a native writer can afford `sig_every: 1` far more easily: a checkpoint costs a fifth of a millisecond of CPU, and its put one round trip.
+* **A sync** costs a verify per device whose head moved, plus one per `seen` link that isn't pinned yet: with ten devices, under 2 ms of CPU; the round trips (heads, then a get per moved device) dominate.
+* **Debug builds** compile zen-core without optimization (it is a workspace member; only dependencies get `opt-level = 3`), and the generic cipher code is instantiated in it, which is why sealing is 50× slower there.

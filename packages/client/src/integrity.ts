@@ -228,7 +228,7 @@ function divergent(a: CheckpointEntry, b: CheckpointEntry): string | undefined {
 }
 
 /** Encode pins for out-of-band comparison: `1 ‖ u32 fs ‖ acl ‖ header ‖ u32 n ‖ n × (fp ‖ u64 seq ‖ HC)`. */
-function encodePins(
+export function encodePins(
   fs: number,
   acl: ChainHead,
   header: ChainHead,
@@ -250,14 +250,14 @@ function encodePins(
   );
 }
 
-interface Pins {
+export interface Pins {
   fs: number;
   acl: ChainHead;
   header: ChainHead;
   devices: { device: Uint8Array; seq: bigint; hash: Uint8Array }[];
 }
 
-function decodePins(b: Uint8Array): Pins {
+export function decodePins(b: Uint8Array): Pins {
   const fail = () => new ZenError(0, 'format', 'not exported pins');
   if (b.length < 1 + 4 + 2 * 40 + 4 || b[0] !== 1) throw fail();
   const v = new DataView(b.buffer, b.byteOffset, b.byteLength);

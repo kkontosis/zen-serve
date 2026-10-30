@@ -322,12 +322,15 @@ pub struct DevicePin {
     pub body: CheckpointBody,
 }
 
+/// A writer's chain on a topic: (writer device, chain id).
+type ChainKey = ([u8; 32], [u8; 12]);
+
 /// The floor of a topic: the newest head, and each writer's chain position.
 #[derive(Debug, Clone, Default)]
 struct TopicPin {
     head: Option<[u8; 12]>,
-    /// By (writer, chain id): (dseq, dhash).
-    chains: HashMap<([u8; 32], [u8; 12]), (u64, [u8; 32])>,
+    /// By chain: (dseq, dhash).
+    chains: HashMap<ChainKey, (u64, [u8; 32])>,
 }
 
 #[derive(Default)]
@@ -1084,7 +1087,7 @@ impl Integrity {
                         return Err(self.raise(fork(format!("another checkpoint {}", p.seq))));
                     }
                 }
-                None if seq - p.seq < self.keep() => {
+                None if seq.saturating_sub(p.seq) < self.keep() => {
                     return Err(self.raise(fork(format!("pinned checkpoint {} is gone", p.seq))));
                 }
                 None => {}

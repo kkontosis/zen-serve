@@ -496,8 +496,39 @@ const sub = await integrity.watch(await session.stream());   // or sync on every
 * **Signed headers** (§12.1). `fs.init(slots, {signed: true})` or `ufs.signHeader()` signs the header with the admin's identity (`session.useIdentity(identity)`); every later edit (slots, policy, rotation) signs its successor and fails with `signer_needed` without the identity. Readers verify the signature against an admin of the verified ACL, and with integrity attached pin `(version, HH)`.
 * **Enrollment.** A session without a device key (passkey, OPAQUE, API token, mTLS) enrolls one: `session.enrollDevice(identity, {vault})` makes a device key, certifies it with the user identity and registers it (api.md §15.2); `session.approveDevice(devicePublic, identity)` certifies a key made elsewhere (a phone showing its key as a code to a laptop that holds the identity). An enrolled device signs checkpoints; signing in by device key still needs its cert in the ACL.
 * **Not covered:** a server that keeps two groups apart forever (fork consistency; an independent witness is TD-WITNESS), and rollbacks within the cadence window of a device that hasn't checkpointed yet (`sigEvery: 1` closes it).
+* **Native programs** use the same checkpoints and pins through the Rust client (§13).
 
-## 13. Security notes
+## 13. The Rust client
+
+[`crates/zen-client`](../crates/zen-client) is a native client for programs that aren't in a browser or Node: the block device (zen-blk, zen-ublk) and the `zen-client` CLI. It covers what they need, with the same rules as `@zen/client`, so a TS device and a Rust device verify each other's checkpoints:
+
+* **Sign-in** with a device key (method 1), or a session or API token (`Client::session_from_token`). A device-key session signs in again on its own after a 401 (expired or revoked), and resends: commits carry their `commit_id` and checkpoint puts are idempotent, so a resend applies at most once. A long-running daemon outlives `session_ttl_secs`.
+* **The ACL** walked from the pinned version (`session.acl().head()`), as in §3.
+* **The fs header**, signed or not (§12, "Signed headers"), `init` with device keyslots, `add_device_slot`, `edit_header`, `sign_header`, `rotate`, and `unlock_device` with the device's own keyslot. Older epochs open through the header's chain.
+* **KV** reads and transactions (short and long mode, `expect_key`, own writes overlaid, retries on `conflict`/`too_old`), commits replayed with one `commit_id`, and **fences**: `tx.fence_lease(&lease)` makes a commit fail with `claim_lost` once another device holds the lease (api.md §16). `Lease::acquire`, `renew`, `release`.
+* **Integrity** (§12): `fs.integrity(IntegrityOptions {signer, pins, sig_every, delay, on_alarm})`, then `note`, `observe`/`observe_at`, `checkpoint`, `sync`, `export_pins`, `compare_pins`, `close`. Bodies of every entry type are verified and carried forward; Rust writers note volumes and namespaces.
+* **TLS**: rustls on the pure-Rust provider (zen-tls-rustcrypto, with the hybrid X25519MLKEM768 key exchange), TLS 1.3 only, verifying with the platform's roots or only a given CA (`TlsOptions {ca}`). The crate builds without a C compiler.
+* **Not in it:** topics, streams, trees, relayed services, zen-db, and sign-in by passkey, OPAQUE or client certificate. Those stay in the TS packages.
+
+**Files.** The **device key file** is zen-mount's (§9): JSON `{identity_seed, device_seed, cert}` in hex, mode 0600. The **pins file** holds what this device verified for one fs: the pinned ACL version, the header pin and each device's head (formats.md §14.4), as CBOR, written atomically with mode 0600. Keep it with the device key: without it, the next run starts over and trusts whatever the server serves at its first sync. A pins file that doesn't decode, or is another fs's, is refused rather than ignored.
+
+**The CLI.**
+
+```
+zen-client --url URL --device-key FILE --fs N [--pins FILE] [--origin O] [--ca FILE] COMMAND
+  sync                     verify every device's newest checkpoint
+  checkpoint               sync, then write a checkpoint of this device (prints its seq)
+  pins export [--out F]    exported pins (formats.md §14.5): raw to F, or hex on stdout
+  pins compare F|-         compare another client's pins (raw or hex)
+  kv get|set|list PATH     values by path: /-separated UTF-8 elements
+  header                   {signed, epoch, slots}
+```
+
+Every command signs in, attaches integrity with the pins file (default: the key file's path + `.pins-<fs>`), unlocks the fs with the device's keyslot and syncs first, so `kv get` is checked against the floors too. An alarm prints as JSON on stderr (`{kind, object, id?, detail}`) and exits **3**; other errors exit 1.
+
+**Comparing pins between a phone and a server.** The phone (TS) shows `integrity.exportPins()` as a QR code or sends it over chat; on the server, `zen-client … pins compare -` reads it. Exit 0: both views are one history so far. The other way, `zen-client … pins export` prints hex, which `integrity.comparePins(fromHex(…))` checks.
+
+## 14. Security notes
 
 * **Secrets stay in WASM memory** behind handles (`FsKeys`, `SigningIdentity`, `DeviceSecret`, `PasswordKey`, OPAQUE state); `free()` and `UnlockedFs.close()` zeroize them. Values passed in from JS (passwords, recovery keys) are copied; JS strings can't be wiped.
 * **Argon2id parameters.** The floor is 64 MiB, t=1. Browsers should register with 256 MiB, t=3 (the default of `addPassphrase`); 1 GiB takes ~8 s in WASM (docs/STATS.md §5.2). The parameters the server returns are bounded on use (formats.md §6), so a hostile server can't make a client hang.
