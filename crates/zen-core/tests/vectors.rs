@@ -605,6 +605,23 @@ fn integrity_vectors_verify_from_files() {
         assert_eq!(prev.to_vec(), hx(&e["hash"]));
     }
 
+    // Exported pins: decode to the listed fields, and encode back.
+    let p = &v["pins"];
+    let pins = zen_core::integrity::ExportedPins::decode(&hx(&p["bytes"])).unwrap();
+    assert_eq!(u64::from(pins.fs), p["fs"].as_u64().unwrap());
+    for (got, want) in [(&pins.acl, &p["acl"]), (&pins.header, &p["header"])] {
+        assert_eq!(got.version, want["version"].as_u64().unwrap());
+        assert_eq!(got.hash.to_vec(), hx(&want["hash"]));
+    }
+    let devs = p["devices"].as_array().unwrap();
+    assert_eq!(pins.devices.len(), devs.len());
+    for (d, w) in pins.devices.iter().zip(devs) {
+        assert_eq!(d.device.to_vec(), hx(&w["device"]));
+        assert_eq!(d.seq, w["seq"].as_u64().unwrap());
+        assert_eq!(d.hash.to_vec(), hx(&w["hash"]));
+    }
+    assert_eq!(pins.encode().unwrap(), hx(&p["bytes"]));
+
     // Tree states from the listed node states.
     let ts = &v["tree_state"];
     let arr = |x: &Value| -> [u8; 32] { hx(x).try_into().unwrap() };

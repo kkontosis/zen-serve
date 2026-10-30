@@ -525,6 +525,88 @@ fn uint(v: &Value) -> Result<u64> {
     }
 }
 
+/// Version byte of [`ExportedPins`].
+pub const PINS_VERSION: u8 = 1;
+
+/// A client's pins, exported for an out-of-band comparison (spec/formats.md §14.5):
+///
+/// ```text
+/// u8 1 || u32 fs || acl(u64 version || hash32) || header(u64 version || hash32)
+///      || u32 n || n × (device(32) || u64 seq || HC(32))
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedPins {
+    /// The fs.
+    pub fs: u32,
+    /// The pinned ACL head (`Head::default()` if none).
+    pub acl: Head,
+    /// The pinned signed header (`Head::default()` if none).
+    pub header: Head,
+    /// Every pinned device head, sorted by device.
+    pub devices: Vec<Seen>,
+}
+
+impl ExportedPins {
+    /// Encode. Fails when `devices` is out of order or repeats one.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if !self.devices.windows(2).all(|w| w[0].device < w[1].device) {
+            return Err(Error::Format);
+        }
+        let n = u32::try_from(self.devices.len()).map_err(|_| Error::Format)?;
+        let mut out = Vec::with_capacity(89 + 72 * self.devices.len());
+        out.push(PINS_VERSION);
+        out.extend_from_slice(&self.fs.to_be_bytes());
+        for h in [&self.acl, &self.header] {
+            out.extend_from_slice(&h.version.to_be_bytes());
+            out.extend_from_slice(&h.hash);
+        }
+        out.extend_from_slice(&n.to_be_bytes());
+        for d in &self.devices {
+            out.extend_from_slice(&d.device);
+            out.extend_from_slice(&d.seq.to_be_bytes());
+            out.extend_from_slice(&d.hash);
+        }
+        Ok(out)
+    }
+
+    /// Decode, refusing another version, a wrong length and unsorted devices.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != PINS_VERSION {
+            return Err(Error::Format);
+        }
+        let fs = r.u32()?;
+        let mut head = || -> Result<Head> {
+            Ok(Head {
+                version: r.u64()?,
+                hash: r.array()?,
+            })
+        };
+        let (acl, header) = (head()?, head()?);
+        let n = r.u32()? as usize;
+        if bytes.len() != 89 + 72 * n {
+            return Err(Error::Format);
+        }
+        let mut devices = Vec::with_capacity(n);
+        for _ in 0..n {
+            devices.push(Seen {
+                device: r.array()?,
+                seq: r.u64()?,
+                hash: r.array()?,
+            });
+        }
+        r.finish()?;
+        let p = ExportedPins {
+            fs,
+            acl,
+            header,
+            devices,
+        };
+        p.encode()?;
+        Ok(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +722,45 @@ mod tests {
         assert_eq!(open_checkpoint(&fs, &fp, 1, &sealed).unwrap(), signed);
         assert!(open_checkpoint(&fs, &fp, 2, &sealed).is_err());
         assert!(open_checkpoint(&fs, &[0; 32], 1, &sealed).is_err());
+    }
+
+    #[test]
+    fn exported_pins_round_trip_and_strict() {
+        let p = ExportedPins {
+            fs: 7,
+            acl: Head {
+                version: 3,
+                hash: [0xAC; 32],
+            },
+            header: Head::default(),
+            devices: vec![
+                Seen {
+                    device: [0x01; 32],
+                    seq: 2,
+                    hash: [0x12; 32],
+                },
+                Seen {
+                    device: [0x02; 32],
+                    seq: 9,
+                    hash: [0x29; 32],
+                },
+            ],
+        };
+        let b = p.encode().unwrap();
+        assert_eq!(b.len(), 89 + 2 * 72);
+        assert_eq!(ExportedPins::decode(&b).unwrap(), p);
+        let mut bad = b.clone();
+        bad[0] = 2;
+        assert!(ExportedPins::decode(&bad).is_err());
+        assert!(ExportedPins::decode(&b[..b.len() - 1]).is_err());
+        let mut longer = b.clone();
+        longer.push(0);
+        assert!(ExportedPins::decode(&longer).is_err());
+        let mut swapped = p.clone();
+        swapped.devices.reverse();
+        assert!(swapped.encode().is_err());
+        let mut unsorted = b.clone();
+        unsorted[89..89 + 32].fill(0x03);
+        assert!(ExportedPins::decode(&unsorted).is_err());
     }
 }
