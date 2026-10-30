@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod blk;
 pub mod db;
 mod encoding;
 pub mod error;

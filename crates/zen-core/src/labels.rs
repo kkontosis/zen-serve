@@ -79,6 +79,12 @@ pub const TREE_STATE: &str = "zen/v1/tree-state";
 pub const DB_STATE_VALUE: &str = "zen/v1/db-state-value";
 /// Hash: `NH` of a zen-db NsRoot (spec/zendb.md §14.4).
 pub const DB_NS_ROOT: &str = "zen/v1/db-ns-root";
+/// Hash: `leaf(i)` of a stored block of a volume (spec/blk.md §2).
+pub const BLK_LEAF: &str = "zen/v1/blk-leaf";
+/// Hash: `hash(l, j)` of a volume's tree node (spec/blk.md §2).
+pub const BLK_NODE: &str = "zen/v1/blk-node";
+/// Hash: `RH` of a volume's root record (spec/blk.md §3).
+pub const BLK_ROOT: &str = "zen/v1/blk-root";
 
 /// OPAQUE: prefix of the AKE context, `label ‖ 0x00 ‖ origin` (sign-in
 /// method 3).
@@ -181,6 +187,9 @@ pub const ALL: &[&str] = &[
     TREE_STATE,
     DB_STATE_VALUE,
     DB_NS_ROOT,
+    BLK_LEAF,
+    BLK_NODE,
+    BLK_ROOT,
     OPAQUE_CONTEXT,
     AAD_KV,
     AAD_EVENT,
