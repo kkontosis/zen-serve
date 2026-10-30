@@ -619,4 +619,18 @@ The client reports a rollback or fork to the application and stops trusting the 
 
 **What it does not catch.** A server can split clients into groups that never see each other's checkpoints, and show each group a consistent history: fork consistency. The groups detect it as soon as any checkpoint crosses over, or when they compare pins out of band. An independent witness that cross-checks heads is later work (TD-WITNESS).
 
+### 14.5 Exported pins
+
+To compare views out of band (a QR code, a chat message, a CLI), a client exports its pins as a fixed binary record:
+
+```
+pins   = u8 1 ‖ u32 fs ‖ acl ‖ header ‖ u32 n ‖ n × (device(32) ‖ u64 seq ‖ hash(32))
+acl    = u64 version ‖ hash(32)        // the pinned ACL head (§9.2 H); [0, 32 zero bytes] when none
+header = u64 version ‖ hash(32)        // the pinned signed header (§12.1 HH); [0, 32 zero bytes] when none
+```
+
+* The device entries are the pinned heads `(seq, HC)` of every device, the exporter's own included, sorted by device, one per device.
+* A decoder refuses another version byte, a length other than `89 + 72·n`, and devices out of order or repeated.
+* **Comparing** another client's export with one's own view: each device entry is checked as a `seen` link (§14.4 rule 3), and the ACL and header heads as the claims of a checkpoint (rule 5: an ACL version the server can't produce, or another hash at a version, is a rollback or a fork; another header hash at the pinned version is a fork). No alarm means both views are one history so far.
+
 Vectors: `test-vectors/integrity.json`.
