@@ -763,7 +763,7 @@ So any chain of handled messages can be followed back to its first cause.
   |---|---|
   | commit succeeds | next delivery |
   | the handler throws | `nack`; after `maxAttempts` the event is dead-lettered (api.md §8.4), or retried forever with `onPoison: "block"` |
-  | `conflict` / `too_old` | the transaction retries: same delivery, handler run again |
+  | `conflict` / `too_old` | the transaction retries: same delivery, handler run again; once its attempts run out, again after a backoff (not a `nack`) |
   | 412 `cursor_moved` / `claim_lost` | someone else committed it or took the key: drop the delivery |
   | 412 `not_leader` | the lease was lost: drop the deliveries, campaign again |
 
