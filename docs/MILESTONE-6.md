@@ -225,7 +225,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * the node id check: no test needs it. The server can't swap sealed nodes between keys (the AAD binds the key); the check guards against a member colluding with the server.
   * **Bench** (STATS §5.4, measured side by side on two fs): reads cost the same (row get cached 1.1 / 1.1 ms, not cached 2.3 / 2.6); an insert into 1,000 rows 601 B → 8,953 B and 1 → 6 ops; a 20-row transaction 8 KB → 81 KB.
   * **Docs:** DB.md §7.1 (new) and the error table, CLIENT.md §12, SVC.md §6 and §8, EXAMPLES.md §5, STATS.md §5.4.
-  * **Checks (all clean):** `cargo fmt --check`; clippy `-D warnings` on zen-core and zen-wasm (host `--all-targets`, `--all-features`, `--no-default-features`, wasm32); `cargo test -p zen-core --features test-utils`; `scripts/build-wasm.sh`; `npm run check`; the new test file, the echo file and both ledgers 8× after the consumer fix; the full vitest run (599 passed, 13 skipped: the opt-in benches, before the consumer fix; the broker file again after it, 18 passed); the Playwright smoke (17 passed).
+  * **Checks (all clean):** `cargo fmt --check`; clippy `-D warnings` on zen-core and zen-wasm (host `--all-targets`, `--all-features`, `--no-default-features`, wasm32); `cargo test -p zen-core --features test-utils`; `scripts/build-wasm.sh`; `npm run check`; the new test file, the echo file and both ledgers 8× after the consumer fix; the full vitest run after the consumer fix (600 passed, 13 skipped: the opt-in benches); the Playwright smoke (17 passed).
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
