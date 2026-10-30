@@ -371,5 +371,5 @@ With `inbox`:
     * A successor syncs the fs's device checkpoints before it resumes the connections a claim returned. The claimed cursors are checked against the floor, then noted (they ride in the successor's next checkpoint).
     * A handler writes a checkpoint before it hands back a live connection or releases its lease. Connections it closes need none: no one resumes them.
     * The cadence is the device's (`sig_every`): every committed step counts as a change. A crash leaves the window since the last checkpoint.
-    * The handler's database (zendb.md §14) isn't covered until authenticated namespaces (milestone 6, step 5).
+    * **The handler's database**, when it is authenticated (zendb.md §14), is covered the same way: every read is checked against its NsRoot, whose floor the predecessor's checkpoints raised. A step that finds a rolled-back database fails with `integrity`, and the handler gives the connection up with `close`. What stays open is the window: steps since a crashed handler's last checkpoint, for the connection and the database alike.
   * Honest failures never cause reuse: an uncommitted record is never revealed.

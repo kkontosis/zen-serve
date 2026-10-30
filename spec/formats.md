@@ -574,7 +574,7 @@ HC(body) = BLAKE3.derive_key("zen/v1/checkpoint-hash", body)
 
 * **Topic** (type 1): `head` is the offset of the newest event of the topic the device has read through or appended (the zero offset if none). `chains` lists the device's own chains on the topic (§5.1), sorted by `chain_id`, with the newest `dseq` that committed and `dhash = HE(its body)`: the `dprev` its next event will carry.
 * **Tree** (type 2): the op count and op chain of the tree (§11.5) at a point where the device's replica was caught up, and the tree state there (fs.md §9).
-* **Namespace** (type 3) and **volume** (type 4): a zen-db authenticated namespace (by its stored-key prefix, zendb.md §14) or a block volume, with the `seq` of its newest root and the hash of that root. Their roots are defined with them (milestone 6, later steps).
+* **Namespace** (type 3) and **volume** (type 4): a zen-db authenticated namespace (by its stored-key prefix, the 48-byte stored key of `D`) or a block volume, with the `seq` of its newest root and the hash of that root: for a namespace, the NsRoot and its `NH` (zendb.md §14.4). Volume roots are defined with volumes (milestone 6, a later step).
 * **Connection** (type 5): a relayed connection (svc.md §12), with the cursors after the newest step the device committed or verified.
 * **Order.** `objects` is sorted by type, then by its id bytes (`topic`, `tree`, `ns`, `vol`, then `svc` followed by `conn`), and holds at most one entry per object. `seen` is sorted by device, holds at most one entry per device, and never the signer.
 * A decoder refuses another `v`, unknown entry types, entries out of order or repeated, ids of the wrong size and trailing bytes.

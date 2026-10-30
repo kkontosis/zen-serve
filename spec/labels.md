@@ -28,7 +28,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/password-sig` | Argon2id output of a password (formats.md §7.5) | empty | identity seed of a password-derived key |
 | `zen/v1/db` | NK | `u32(fs_id) ‖ lp(ns)` | root secret of a zen-db database (zendb.md §2.2) |
 | `zen/v1/db-boundary` | K_db | `index_id` (16 B) | PRF key choosing private-index node boundaries and shards (zendb.md §5.4) |
-| `zen/v1/db-node-id` | K_db | `index_id` (16 B) | PRF key of private-index node ids (zendb.md §5.4.2) |
+| `zen/v1/db-node-id` | K_db | `index_id` (16 B) | PRF key of private-index node ids (zendb.md §5.4.2); with `index_id = 0¹⁶`, of the state tree (§14.2) |
 | `zen/v1/db-crdt` | K_db | `table_id` (16 B) | PRF key of a CRDT table's field and element tokens (zendb.md §19.2) |
 | `zen/v1/svc-aead` | the topic data key D_svc of a service id | empty | service key `K_svc`: seals svc states and output-key escrows (formats.md §13) |
 | `zen/v1/svc-inbox` | X-Wing shared secret of a connection | `u32(fs_id) ‖ lp(svc) ‖ conn` (16 B) | key sealing a connection's input chunks (formats.md §13.3) |
@@ -50,6 +50,8 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/fs-header-chain` | `HH` of a signed fs header, chaining header versions (formats.md §12.1) |
 | `zen/v1/event-chain` | `HE(body)` of a version-2 event body, chaining a writer's events on a topic (formats.md §5.1) |
 | `zen/v1/tree-state` | leaves and inner nodes of a filesystem tree's state hash (fs.md §9) |
+| `zen/v1/db-state-value` | `VH`, the hash of a value's plaintext in an authenticated zen-db database's state tree (zendb.md §14.2) |
+| `zen/v1/db-ns-root` | `NH`, the hash of an NsRoot, chaining a namespace's roots and naming them in checkpoints (zendb.md §14.4) |
 
 ## AAD domains (`label ‖ 0x00 ‖ header ‖ context`)
 

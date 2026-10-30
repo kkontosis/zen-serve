@@ -53,7 +53,8 @@ A **database** is `(fs, ns)`, where `ns` is a text name chosen by the app. An fs
 | `D ‖ ("u", index_id, value)` | `{1: pk}` | unique-index entry (§5.2) |
 | `D ‖ ("f", index_id, value, pk)` | `{1: pk}` | fast-index entry (§5.3) |
 | `D ‖ ("r", index_id, u32(shard))` | RootRecord (§5.4) | root of a private index tree |
-| `D ‖ ("n", index_id, node_id)` | Node (§5.4) | node of a private index tree |
+| `D ‖ ("n", index_id, node_id)` | Node (§5.4) | node of a private index tree; with `index_id = 0¹⁶`, of the state tree (§14.2) |
+| `D ‖ ("ns")` | NsRoot (§14.4) | authenticated databases only: the namespace root |
 | `D ‖ ("s", index_id)`, `D ‖ ("s", index_id, u32(i))` | SealedHead, raw bytes | a sealed index: its head and parts (§5.7) |
 | `D ‖ ("p", index_id)`, `D ‖ ("p", index_id, u32(i))` | OHead, stash slots | an oblivious index: its head and stash (§5.8) |
 | `D ‖ ("q", index_id, u32(bucket))` | Z slots | an oblivious index: one ORAM bucket (§5.8) |
@@ -98,7 +99,7 @@ The catalog is the set of `("cat", …)` keys. Clients cache it with each record
 ```
 DbRecord = { 1: format = 1,
              2: schema: u32,                  // the app's schema version, 0 for a new database
-             3: integrity: "basic",           // "authenticated" is reserved for milestone 6 (§14)
+             3: integrity: "basic" | "authenticated",   // §14
              4: created_hlc: u64 }
 ```
 
@@ -107,7 +108,11 @@ DbRecord = { 1: format = 1,
   * a `schema` newer than the app's → refuse with `schema_newer`
   * an older `schema` → migrate (§8)
   * no DbRecord → create one at schema 0, then migrate
-* An `integrity` other than `"basic"` is refused until milestone 6.
+* **The integrity level** (§14) is chosen by the app at creation (`integrity: "authenticated"`, default `"basic"`):
+  * an `integrity` the client doesn't know → refuse (`format`)
+  * the app asks for `"authenticated"` and the stored record says `"basic"` → refuse (`format`): a level never changes
+  * the stored record says `"authenticated"` and the app didn't ask → open authenticated: the record is read again, verified (§14.6)
+  * no DbRecord while integrity has a floor for the database (§14.7) → a rollback, not a new database
 * **Opening offline.** With a local store (§9.3), every open keeps the server's info (`/v1/info`: limits and features), the DbRecord (at the schema it opened with) and the catalog. When the server can't be reached at open, the database opens from them if the format and integrity pass and the kept `schema` **equals** the app's; migrations wait for the next online open, so a due one makes the open fail with `offline`. Nothing kept: the network error stands. The instance reports it opened offline (`db.offline`).
 
 ### 3.2 TableRecord and IndexDef
@@ -272,11 +277,11 @@ The tree for a set of entries is defined level by level, so two clients with the
 
 ```
 Node       = { 1: level: u8,
-               2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), count: u64]] (above),
+               2: entries: [bytes] (level 0) | [[first_key: bytes, child: bytes(16), count: u64]] (above),   // child: bytes(32) when authenticated (§14.3)
                3?: salt: bytes(16),     // only with decoys (§5.4.6)
                4?: pad: bytes }         // only with decoys: zero bytes up to the node size bucket
-node_id    = PRF16(K_node, CBOR(Node))
-RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }      // height = the root's level + 1
+node_id    = PRF16(K_node, CBOR(Node))            // PRF32 in an authenticated database (§14.3)
+RootRecord = { 1: root: bytes(16), 2: height: u8, 3: count: u64 }      // height = the root's level + 1; root: bytes(32) when authenticated
 ```
 
 * A node is stored at `D ‖ ("n", index_id, node_id)`.
@@ -972,15 +977,89 @@ The cases of DESIGN-3 §3.2, plus the ones a client library adds:
 
 ## 14. Integrity
 
-* **Basic, the only level now.**
+Two levels, chosen when a database is created (`DbRecord.integrity`, §3.1) and never changed.
+
+### 14.1 Levels
+
+* **`basic`.**
   * Every value is AEAD-sealed and bound to its key: no forgery, no swapping between keys.
-  * The server **can** serve an older valid version of a value, or an older RootRecord together with the nodes of that older tree. It can also withhold events (G26).
+  * The server **can** serve an older valid version of a value, or an older RootRecord together with the nodes of that older tree, or leave values out of a range read. It can also withhold events (G26).
   * A member can forge another member's `sender_fp`, since all members hold the topic keys (DESIGN-2 §2.6).
-* **Reserved for milestone 6 (the authenticated tier, specified with its code in a later step of milestone 6):**
-  * the DbRecord value `integrity: "authenticated"`
-  * a namespace root over each index root, a row tree and the catalog, chained by `seq` inside its sealed value, and named by device checkpoints (formats.md §14, entry type 3) instead of a signature per commit. The purpose `zen/v1/sig/db-root` stays reserved.
-  * Private-index node ids are already keyed hashes of their content, so a root id commits to a whole index. Milestone 6 reuses this.
-* **Events** are chained per writer (formats.md §5.1), and device checkpoints carry topic heads, so withheld events are detected (G26). A member can still forge another member's `sender_fp` inside an event; the chain of a forged sender doesn't extend the real sender's checkpointed chain.
+* **`authenticated`.** Everything above, and every value a client reads is checked against a **namespace root** (§14.4) read in the same transaction, which device checkpoints keep fresh (§14.7). An older value, an older index root, an older catalog record, or a value left out of a range read is detected, up to the checkpoint window (formats.md §14.3).
+  * It needs integrity attached to the fs (formats.md §14), with or without a signer: the client refuses to open an authenticated database without it.
+  * **Not offered:** CRDT tables (§19), whose merged state is the server's. `createTable` refuses `merge: "crdt"` in an authenticated database (`bad_value`).
+  * **Events** are covered as in `basic`: chained per writer (formats.md §5.1), with topic heads in device checkpoints.
+
+### 14.2 The state tree
+
+An authenticated database has one **state tree**: a prolly tree (§5.4.1) with fanout 64 and the keys of the reserved index id `0¹⁶` (`K_boundary`, `K_node`), its nodes at `D ‖ ("n", 0¹⁶, node_id)`. It holds one level-0 entry per value stored under `D`, except the nodes of every tree (`D ‖ ("n", …)`) and the NsRoot (`D ‖ ("ns")`):
+
+```
+entry  = esc(suffix) ‖ 0x00 0x00 ‖ VH
+suffix = the value's stored key without the stored key of D (16-byte tokens, formats.md §3.2)
+esc(x) = x with each 0x00 replaced by 0x00 0xFF
+VH     = H("zen/v1/db-state-value", plaintext of the sealed value)
+```
+
+* `esc(·) ‖ 0x00 0x00` is order-preserving and prefix-free, so entries sort in stored-key order and **the entry of a key** is the one entry that starts with `esc(suffix) ‖ 0x00 0x00`.
+* **A stored-key range** `[b, e)` under `D` holds exactly the keys whose entries are in `[esc(b′), esc(e′))`, where `b′` and `e′` are the bounds without the stored key of `D` (a bound at or below `D` is no lower bound, one at or above the end of `D` no upper bound).
+* VH covers the plaintext, so re-sealing a value under a new epoch changes nothing. The parts of a large row or body (§4.2, §10.3) are values of their own; the Row names them by digest.
+* Every kind of index is covered by the entries it stores (unique, fast and sealed entries, RootRecords), and private-index nodes by their ids (§14.3).
+
+### 14.3 Node ids
+
+In an authenticated database every node id, of the state tree and of private indexes, is `PRF32(K_node, CBOR(Node))` (suites.md): children are `bytes(32)`, and so is `RootRecord.root`.
+
+* A reader checks each node it fetches against its id; a node that doesn't match is `invalid` (formats.md §14.4).
+* Why 32 bytes: a member and the server together can't find two nodes with one id (a 16-byte id falls to a birthday search at 2^64), so one root names one state, even against members.
+
+### 14.4 NsRoot
+
+```
+NsRoot = { 1: v = 1,
+           2: seq: u64,                                   // 1, 2, …
+           3: prev: bytes(32),                            // NH(previous NsRoot), zeros for seq 1
+           4?: tree: [root: bytes(32), height: u8, count: u64] }   // the state tree; absent when empty
+NH     = H("zen/v1/db-ns-root", CBOR(NsRoot))
+```
+
+* It is stored, sealed like every value, at `D ‖ ("ns")`. No NsRoot means seq 0: a database with no values.
+* Decoding is strict: deterministic CBOR, `v = 1`, `seq ≥ 1`, no unknown keys.
+
+### 14.5 Writing
+
+Every commit that writes, deletes or clears a value under `D`:
+1. reads the NsRoot, into its read set (§7.4);
+2. removes the entry of each written, deleted or cleared key (found by its prefix, §14.2) and adds the new entry of each written one;
+3. rewrites the state tree (§5.4.4), writing its new nodes and deleting the old ones;
+4. writes `NsRoot {seq + 1, prev = NH(old), tree}`.
+
+So **every writer of an authenticated database conflicts with every other on its NsRoot**: use one for balances, permissions and other state where freshness matters more than write concurrency. After the commit applies, the writer's device checkpoints carry `[3, ns, seq, NH]` (formats.md §14.1), counted toward the cadence; `ns` is the stored key of `D` (48 bytes).
+
+### 14.6 Reading
+
+A transaction reads the NsRoot once, at its first read under `D`. For every value the server returns under `D` (not this transaction's own writes):
+* **a point read:** the tree's entry for the key must exist with this value's VH, or be absent with the value;
+* **a range read:** the tree's entries in the range the answer covers (the whole range, or up to the last item when a limit or a page stopped it) must be exactly the returned values, with their VHs.
+
+A cached record (a row, a catalog record) is used only while the tree's entry for its key still has its VH; otherwise it is dropped and read again. The tree check replaces the version check of cached records (§7.7).
+
+**A mismatch.** The client reads the latest NsRoot again. If it moved, the transaction conflicts and runs again: a long-mode read, or one that raced a commit, can honestly be newer than the transaction's NsRoot. If it didn't, the answer is a **rollback** (formats.md §14.4, object `db`).
+
+### 14.7 Freshness
+
+The NsRoot a transaction reads is checked against the floor of `[3, ns]` from device checkpoints and this device's own notes (formats.md §14.4):
+* a lower `seq` is a rollback, and the same `seq` with another `NH` a fork;
+* at the floor's `seq + 1`, `prev` must be the floor's `NH`, else it is a fork;
+* the floor used for the rollback check is the one when the transaction's attempt started: a checkpoint that arrives meanwhile can honestly be newer than its read version (as fs.md §9).
+
+The NsRoot read is then noted (not counted toward the cadence). A database whose NsRoot or DbRecord is absent while a floor names it was rolled back, not deleted. The window between a write and its device's next checkpoint is the cadence's; `sigEvery: 1` closes it.
+
+### 14.8 Cost (informative)
+
+* Per uncached point read, about `height` node reads of the state tree, sharing its upper levels with every other read; a batch of point reads descends once.
+* Per commit, about `2 × height` node writes and deletes per region of entries touched, plus the NsRoot.
+* docs/STATS.md has the numbers. There is no signature per commit; the purpose `zen/v1/sig/db-root` stays reserved.
 
 ## 15. Leakage
 
@@ -1000,6 +1079,7 @@ The server never sees database, table, field or index names, values, keys, messa
 * **sealed:** the index's size class, and when it is written or read (§5.7)
 * **oblivious:** the capacity, and the number and timing of operations. Not which entries, nor whether an operation read or wrote (§5.8.3).
 * catalog and migration activity
+* **authenticated databases** (§14): the state tree's node count, so roughly the number of values, and which of its nodes each commit replaces, which follows the stored keys the commit writes (already visible); the NsRoot rewritten by every write commit, and read by every transaction
 * **a revoked member who kept NK** can compute key tokens, boundaries and node ids. So they can test guesses about names, values and node contents against what they still see. Rotation doesn't change NK (G2); renaming the keys needs the explicit migration of G2.
 
 **Broker**
@@ -1116,6 +1196,7 @@ Generated by zen-core's `gen_vectors` into `spec/test-vectors/zendb.json`, check
 * an oblivious index: the bucket, Block, head and stash encodings, and one access with a fixed RNG
 * Msg encodings, BodyRef, an event id for causation
 * local records (kind 8, §9.3): sealed records with a fixed RNG, bound to the fs, the store and the key
+* the authenticated tier (§14): the state tree's keys, the entries of ten values, their tree at fanout 4 with 32-byte ids, and the NsRoot of seq 1 and 2 with its NH
 
 Tests (G23):
 * **properties:**
