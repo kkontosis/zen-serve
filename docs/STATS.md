@@ -273,3 +273,19 @@ Reading it:
 * **Native signing is about 13× faster than WASM** (2.6 ms, §5.2), so a native writer can afford `sig_every: 1` far more easily: a checkpoint costs a fifth of a millisecond of CPU, and its put one round trip.
 * **A sync** costs a verify per device whose head moved, plus one per `seen` link that isn't pinned yet: with ten devices, under 2 ms of CPU; the round trips (heads, then a get per moved device) dominate.
 * **Debug builds** compile zen-core without optimization (it is a workspace member; only dependencies get `opt-level = 3`), and the generic cipher code is instantiated in it, which is why sealing is 50× slower there.
+
+### 5.7 The block engine (measured)
+
+`cargo test --release -p zen-blk --test volume bench -- --ignored --nocapture` (4 cores; the server in the same process, embedded backend, loopback). A 256 MiB volume (65,536 blocks, depth 3), `batch_blocks` 256.
+
+| Operation | Release |
+|---|---|
+| Sequential write of 64 MiB, a flush every 4 MiB | 1.31 s, 49 MiB/s |
+| Random 4 KiB read, a fresh reader | 0.14 ms |
+| Random 4 KiB read, the writer (its nodes cached) | 0.14 ms |
+| A flush of one block (what ext4's `fsync` waits for) | 1.6 ms |
+
+Reading it:
+* **A read is one round trip** either way: the nodes a block's path lacks are fetched in the same `get` as the block, so a cold reader costs about what a warm one does. Only the bytes differ (up to `depth` nodes of 4 KiB more, until the level-1 node is cached).
+* **A flush is one commit per 256 blocks:** the blocks, about one level-1 node per touched region, the nodes above, and the root record. Sequential writes touch one level-1 node per 128 blocks, so a 1 MiB commit carries about 1.04 MiB of blocks and nodes.
+* **Every commit replaces the top node and the root record,** so commits of one volume are serial; one writer per volume is the model anyway.

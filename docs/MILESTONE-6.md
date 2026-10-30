@@ -251,6 +251,30 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * Pushed 9f5c676. **CI green on both runs** (push 420, pull_request 421): rust, pure-rust, fdb and client all pass. Step 6.6 is done, waiting on review and merge of PR #59. This line reaches `docs/MILESTONE-6.md` at the restart from main.
   * PR #59 merged at 311012b.
 * **Step 6.7** (`crates/zen-blk`): planned below ("Step 6.7 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (3f600ab), PR #60.
+  * `spec:` commit cfbd5e9: new spec/blk.md (keys, leaves and the tree, the root record, writing, reading, freshness with the writer's pin and the window, leakage); formats.md §14.1 names the vol id and RH, §8 points at zendb.md §14 and blk.md; labels `blk-leaf`, `blk-node`, `blk-root`; the spec README row; TECH_DEBT TD-BLK-SNAPSHOTS (snapshots and clones, resize, delete with a tombstone, readers at a snapshot).
+  * **zen-core** (aae466e): `blk.rs` (`depth`, `node_of`/`slot_of`, `leaf`, `node_hash`, node bytes, `VolumeKeys`, `RootRecord` with a strict decode, `root_hash`, the reference `tree`), unit tests (decode refusals, the tree by hand, keys); new `blk.json` (regenerating changed only that file); `tests/vectors.rs` reads it back.
+  * **zen-blk** (c179f22): `pin.rs`, `tree.rs` (the verified tree: levels ≥ 2 and the top kept, level 1 in an LRU; `plan`, top-down `verify`, copy-on-write `apply`), `volume.rs` (open, reads, buffered writes and discards, flush in commits within the server's limits, the unknown-outcome path, lease renewals, the idle flush, close). zen-client gains only `pub use write_private` (the atomic file write the pins file uses).
+  * **Changes from the plan:**
+    * No `keys.rs`: the stored keys are zen-core's `VolumeKeys`, which the vectors use too.
+    * Reads and commits share an async read-write lock on the tree: a commit holds it from fetching its paths until the new root is in place, so a read never checks a node fetched after a commit against the tree from before it. Reads run concurrently with each other.
+    * Blocks and nodes are fetched raw (`/v1/kv/get`), since the leaf is over the sealed bytes; commits are built as `Commit`s and sent with `send_commit`, so the leaf can be computed before sending.
+    * A writer whose read or commit finds a moved root gets `lease_lost` (another writer moved it), not `volume_changed`.
+    * Read-only openers given a pin file check and raise it too, so a reader can carry a pin from one server to another (the fork test).
+  * **Found while testing:** the window test first froze only the root record: the reader then fetched the current nodes under the old root and alarmed at once ("node (2, 0) doesn't match its parent"). That's right, but it isn't the window; the test now freezes a consistent snapshot (the root, its two nodes and the block), as in 6.5.
+  * **Tests** (`tests/volume.rs`, the zen-client harness by `#[path]`): 12 and the opt-in bench, 3× green (about 36 s each, the model test most of it):
+    * basics: create/open/read/write (zeros, aligned and unaligned, `range`, `read_only`, `exists`, `not_found`, `integrity_needed` without integrity and without a signer); 2,000 random operations over 100 MiB (depth 3, batch 16, a reopen every 400) against a model, the stored root and nodes checked against the reference tree every fourth flush and at the end, and a fresh reader over the whole volume; batches (3 × 256 blocks commit on their own; with `max_commit_bytes` 2 MB a batch of 1,000 splits into several commits); the idle flush
+    * writers: a crash (500 ms lease: `busy` while it lasts; the pin file one commit behind; A and B read back, the unflushed C doesn't); a second writer (`busy`, read-only works, then it writes after the close); a stale fence (renewals paused, the lease lapses, B writes; A's commit on paths it holds gets `lease_lost`, writes nothing, and its later writes fail)
+    * attacks: a reader whose root moved (`volume_changed`, no alarm); a rolled-back root as a consistent snapshot (the writer's pin catches it with no checkpoint yet; another device before the checkpoint accepts it, the window; a third after the checkpoint alarms); a rolled-back block (the leaf), then a rolled-back node with the block it lacks withheld (the node), and the writer's own read after a reopen; a fork (`Server::fork`: each side writes its own seq 3; a reader that pinned side 1's root, on side 2, alarms)
+    * the checkpoint entry `[4, vol id, seq, RH]` in the writer's head body, and in another device's floor after a sync
+  * **Negative controls** (each run once, then restored):
+    * the pin's rollback check off: the writer side of the rolled-back root test opens without an alarm;
+    * `observe_at` off: the third device opens without an alarm;
+    * the leaf check off: the rolled-back block is served;
+    * the node check off: first, the leaf check still caught it (the old node has no slot for block 8, which was stored); the test now also withholds block 8, so the old node and block agree, and with the node check off zeros are served;
+    * the fence off: the stale writer's flush succeeds;
+    * the pin's same-seq check off: the forked reader opens without an alarm.
+  * **Bench** (STATS §5.7, release): sequential writes 49 MiB/s with a flush every 4 MiB; a random 4 KiB read 0.14 ms, cold or warm (a read's missing nodes come in the same request as its block); a one-block flush 1.6 ms.
+  * **Docs:** README (the crate), STATS §5.7.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
