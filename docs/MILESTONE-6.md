@@ -227,7 +227,27 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Docs:** DB.md §7.1 (new) and the error table, CLIENT.md §12, SVC.md §6 and §8, EXAMPLES.md §5, STATS.md §5.4.
   * **Checks (all clean):** `cargo fmt --check`; clippy `-D warnings` on zen-core and zen-wasm (host `--all-targets`, `--all-features`, `--no-default-features`, wasm32); `cargo test -p zen-core --features test-utils`; `scripts/build-wasm.sh`; `npm run check`; the new test file, the echo file and both ledgers 8× after the consumer fix; the full vitest run after the consumer fix (600 passed, 13 skipped: the opt-in benches); the Playwright smoke (17 passed).
   * Pushed 0113929. **CI green on both runs** (push 415, pull_request 416). PR #58 merged.
-* **Step 6.6** (`crates/zen-client`, Rust): planned below ("Step 6.6 in detail"). Restarted from main; the log above is now in the repo copy too.
+* **Step 6.6** (`crates/zen-client`, Rust): planned below ("Step 6.6 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (29b23dc), PR #59.
+  * `spec:` commit bd6aa12: formats.md §14.5, exported pins (the record, its decoder's refusals, how a comparison is checked).
+  * **zen-core** (d458c62): `integrity::ExportedPins` with `encode` and a strict `decode`; `integrity.json` gains `pins` (regenerating changed only that file: its description and the new section); `tests/vectors.rs` reads it back.
+  * **zen-client** (4902c1d, cbd94a7): the library and the `zen-client` binary, as planned: `error`, `transport`, `client`, `session`, `device`, `acl` (its own `verify_next`), `fs` (a `KeyRing` per unlock holds the epochs, so integrity binds to keys without pointing back at the `Fs`), `kv`, `lease`, `integrity`, `pins`, `main`. It builds without C (rustls on zen-tls-rustcrypto, TLS 1.3 only).
+  * **Changes from the plan:**
+    * The tests are two files, `tests/client.rs` (sign-in, the ACL, headers and keyslots, KV, leases, TLS) and `tests/integrity.rs` (checkpoints, the cadence, the body budget, the pins file, two processes, the five attacks, the bench), not eight: each test binary links the whole server (about 240 MB here).
+    * The cadence timer is a generation counter in the state (bumping it cancels the armed timer), not a `Notify`.
+    * `Integrity::checkpoint_always()` writes one even without changes; the CLI's `checkpoint` uses it, since a checkpoint also carries the newest `seen` links and claims.
+    * A newer epoch than the slot's gives `epoch_ahead` at once, as the TS client does (no header re-read).
+    * Forks in Rust tests: `dump::copy` into a fresh embedded store and a second server. The copy keeps the first server's pinned origin, so its clients sign that origin, and a copy taken before any sign-in has nothing pinned (the ACL test signs in first).
+  * **Found while testing:** a forged checkpoint can't be made with `sign_checkpoint` (it refuses another device's body), so the `invalid` test signs the body by hand: user 2's second device E puts, under device D's fingerprint, a body E signed. The server accepts it (both devices are the user's), and a verifier reports `invalid` (the signature isn't D's).
+  * **Tests:** `client.rs` 6, `integrity.rs` 10 (and the opt-in bench), the `pins` unit test, 3× green. **Negative controls** (each run once, then restored):
+    * the own-head check in `sync` off: the withheld-checkpoints test still passes, since `advance` refuses a head below the pin by itself (each catches it alone, as in the TS client); with both off, A still alarms, as a fork ("head can't be produced") instead of a rollback, so the test fails on the kind. That run first panicked on `seq - p.seq` in `advance`, reachable only with the guard off; it is now `saturating_sub`;
+    * `check_seen` off: the withheld-checkpoints test fails (B's `compare_pins` finds nothing);
+    * `observe_at`'s `lower_than` off: the rolled-back root test fails (no alarm);
+    * the header pin's rollback branch off: the header test fails;
+    * the same-seq hash check in `advance` off: the fork test fails (C on the other side syncs without an alarm).
+  * **Interop** (3a6cd2e): `packages/client/test/rustclient.test.ts`, 3 tests (values both ways and the signed header; checkpoints verified both ways with `seen` links, pins compared both ways; a fork: the TS device writes on a copy, the Rust client on the original compares its pins and exits 3 with a `fork` of the TS device). The TS pins codec is exported (internally) and `integrityvectors.test.ts` checks it against the vector. 3× green; the client `integrity` tests once. CI's client job builds `-p zen-client` too.
+  * **Bench** (STATS §5.6, release): sign 0.19–0.23 ms, seal 0.017, open 0.016, verify 0.14 (WASM signs in 2.6 ms); a debug build is 10–50× slower, since zen-core is a workspace member and isn't optimized there.
+  * **Docs:** CLIENT.md §13 (new: the Rust client, its files, the CLI and exit codes, comparing pins between a phone and a server; Security notes are now §14), README (the crate), STATS §5.6.
+  * **Checks (all clean):** `cargo fmt --check`; clippy `--all-targets -D warnings` on zen-client and zen-core (default, `--no-default-features`, `--all-features`); `cargo test -p zen-core --features test-utils`; `cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown`; `cargo test -p zen-client` 3×; `npm run check`; the two TS files 3×.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
