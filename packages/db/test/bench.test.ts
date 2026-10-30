@@ -20,6 +20,8 @@ const quiet = { warn: () => {} };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let w: World;
 let fs: UnlockedFs;
+/** fs 2, with integrity attached: authenticated databases (zendb.md §14). */
+let afs: UnlockedFs;
 let n = 0;
 const ns = () => `bench${++n}`;
 const lines: string[] = [];
@@ -27,6 +29,9 @@ const lines: string[] = [];
 beforeAll(async () => {
   w = await world({ limits: { claim_ttl_ms: 1000 } });
   fs = await w.session.fs(1).init((k) => [zw.createDeviceSlot(k, w.admin.device.devicePublic)]);
+  const f2 = w.session.fs(2);
+  await f2.integrity({ device: { device: w.admin.device, cert: w.admin.cert } });
+  afs = await f2.init((k) => [zw.createDeviceSlot(k, w.admin.device.devicePublic)]);
 });
 afterAll(async () => {
   console.log(
@@ -170,6 +175,40 @@ describe.skipIf(!process.env.ZEN_BENCH)('zen-db costs', () => {
       await measure(`insert, ${label} index`, 20, (i) =>
         db.table<Row>('r').insert({ id: `n${i}`, v: 2 * i + 1 }),
       );
+      await db.close();
+    }
+  });
+
+  it('authenticated vs basic, at 1,000 rows (§14)', async () => {
+    for (const level of ['basic', 'authenticated'] as const) {
+      const o = (extra: DbOptions = {}) =>
+        Db.open(level === 'basic' ? fs : afs, `lvl-${level}`, {
+          ...quiet,
+          locks: null,
+          scheduler: false,
+          integrity: level,
+          schema: 1,
+          migrations: { 1: (m) => m.createTable('r', { pk: ['id'] }) },
+          ...extra,
+        });
+      const db = await o();
+      await preload(db, 1000);
+      const t = db.table<Row>('r');
+      const cold = await o({ rowCache: 0 });
+      await measure(`${level}: row get, not cached`, 20, (i) => cold.table<Row>('r').get(`p${i}`));
+      await t.get('p1');
+      await measure(`${level}: row get, cached`, 20, () => t.get('p1'));
+      await measure(`${level}: row insert`, 20, (i) => t.insert({ id: `a${i}`, v: i }));
+      await measure(`${level}: a transaction updating 20 rows`, 10, (i) =>
+        db.transaction(async (tx) => {
+          const tt = tx.table<Row>('r');
+          for (let k = 0; k < 20; k++) await tt.put({ id: `p${(i * 20 + k) % 1000}`, v: -i });
+        }),
+      );
+      await measure(`${level}: a scan of 100 rows`, 10, () =>
+        cold.table<Row>('r').query().limit(100).all(),
+      );
+      await cold.close();
       await db.close();
     }
   });

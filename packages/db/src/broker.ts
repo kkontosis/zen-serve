@@ -773,6 +773,12 @@ export class ConsumerHandle {
           await pause(backoff, signal);
           continue;
         }
+        // Other writers that kept winning aren't a failed handler (§11.3):
+        // the same delivery runs again, after a backoff.
+        if (isCode(e, 'conflict') && !signal.aborted) {
+          await pause(backoff, signal);
+          continue;
+        }
         if (!this.manual && (await this.failed(c, d, m, e))) return;
         this.report(e, m);
         await this.nack(c, d, signal);
