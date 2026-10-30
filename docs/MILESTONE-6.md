@@ -248,6 +248,9 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Bench** (STATS §5.6, release): sign 0.19–0.23 ms, seal 0.017, open 0.016, verify 0.14 (WASM signs in 2.6 ms); a debug build is 10–50× slower, since zen-core is a workspace member and isn't optimized there.
   * **Docs:** CLIENT.md §13 (new: the Rust client, its files, the CLI and exit codes, comparing pins between a phone and a server; Security notes are now §14), README (the crate), STATS §5.6.
   * **Checks (all clean):** `cargo fmt --check`; clippy `--all-targets -D warnings` on zen-client and zen-core (default, `--no-default-features`, `--all-features`); `cargo test -p zen-core --features test-utils`; `cargo check -p zen-core -p zen-proto --target wasm32-unknown-unknown`; `cargo test -p zen-client` 3×; `npm run check`; the two TS files 3×.
+  * Pushed 9f5c676. **CI green on both runs** (push 420, pull_request 421): rust, pure-rust, fdb and client all pass. Step 6.6 is done, waiting on review and merge of PR #59. This line reaches `docs/MILESTONE-6.md` at the restart from main.
+  * PR #59 merged at 311012b.
+* **Step 6.7** (`crates/zen-blk`): planned below ("Step 6.7 in detail"). Restarted from main; the log above is now in the repo copy too.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -1848,6 +1851,164 @@ No C: the crate builds in the `pure-rust` job.
 * **Re-sign-in on 401** with the device key, for long-running daemons.
 * **Embedded backend only** in zen-client's tests: the backends are tested by zen-server's.
 * **The exported pins record goes into the spec** (formats.md §14.5): it is the cross-client format.
+
+## Step 6.7 in detail
+
+Step 6.7 builds `crates/zen-blk`, the block engine: a fixed-size volume of 4,096-byte blocks inside an fs, on `zen-client`. Blocks are sealed KV values. A Merkle tree over the blocks and a hash-chained root record make every read verifiable, and the root's `seq` rides in device checkpoints (entry type 4). One writer at a time holds a fenced lease; read-only openers need none. The frontends (FUSE file export, ublk) come in 6.8 and only call this engine.
+
+**Survey (what this step builds on):**
+* **Stored keys** (`zen_core::token`): a path `(e1, …, en)` becomes `t1 ‖ … ‖ tn`, 16 bytes per element, each `PRF16` of the chain so far. So the token of `("blk", name)` is a 32-byte prefix of every key of the volume, the server sees neither the name nor the block index, and nearby blocks don't sort together (DESIGN.md §2.7's "shuffled index" comes free). A cached `NameChain` for `("blk", name, "b")` costs one `child()` per block key.
+* **Sealing:** `seal::seal_value(keys, stored_key, value)` (kind 1, a random 24-byte nonce, the stored key in the AAD). So a block can't be moved to another index, volume or fs; it can only be replaced by an older value of the same key.
+* **zen-client** (6.6): `UnlockedFs::{key, get_many, transaction}`, `Transaction::{set, delete, fence_lease, commit}` (`send_commit` replays one `commit_id`), `Lease::{acquire, renew, release}` (`not_leader`, `claim_lost`), `Integrity::{note, observe_at, floor, raise, checkpoint, sync}`, `AlarmObject::Vol`, `Error::Local{code, …}`.
+* **The checkpoint entry** `Entry::Vol {vol, seq, hash}` exists (formats.md §14.1 type 4), with `vol` "the volume's stored-key prefix"; `merge_entry`, `lower_than` and `divergent` already handle it. "Volume roots are defined with volumes" is still open in the spec.
+* **Server limits** (api.md §2): `max_value_bytes` 90,000; `max_commit_bytes` 8,000,000, counting 512 bytes per operation; `max_commit_ops` 10,000; a clear over more than `max_range_items` keys is refused.
+* **Tests:** zen-client's `tests/common/mod.rs` (`Server::start_with` with the adversary, `fork()`, `claim`, `lie(Lie::Kv …)`, `truth`), which zen-blk's tests include with `#[path]` rather than copy. Each test binary links the whole server (about 240 MB), so one test file.
+* **Labels:** nothing for blocks is registered yet.
+
+### Spec (`spec:` commit)
+
+**spec/blk.md (new): block volumes.**
+* **A volume** is named by bytes `name` (1–64) inside an fs. Its keys are KV stored keys (formats.md §3.1):
+  ```
+  root record   ("blk", name, "r")
+  block i       ("blk", name, "b", u64be(i))
+  tree node     ("blk", name, "t", u8(level) ‖ u64be(j))
+  lease name    the stored key of ("blk", name, "lease")      (48 bytes; api.md §16)
+  vol id        the stored key of ("blk", name)               (32 bytes; the checkpoint entry's id)
+  ```
+  Every value is sealed as kind 1 (formats.md §4). The block size is 4,096; a volume has `blocks` blocks, fixed at creation (resizing is TD-BLK-SNAPSHOTS).
+* **Leaves.** `leaf(i) = H("zen/v1/blk-leaf", u64(i) ‖ sealed)` over the stored bytes of block `i`, or 32 zero bytes when the block is absent. An absent block reads as zeros. The leaf covers the whole sealed value, so any older value of the block is another leaf; no per-block counter is needed (DESIGN.md §2.5's `write_counter`).
+* **The tree.** Fan-out 128. Depth `D` = the least `d ≥ 1` with `128^d ≥ blocks` (a 1 TiB volume has `D = 4`). The node at level `l` (1..D), index `j`, holds the 128 child hashes of level `l − 1` (leaves at level 0), 4,096 bytes:
+  ```
+  node(l, j)    = child(l−1, 128j) ‖ … ‖ child(l−1, 128j + 127)        (missing children are zeros)
+  hash(l, j)    = H("zen/v1/blk-node", u8(l) ‖ u64(j) ‖ node(l, j)), or zeros when every child is zero
+  root          = hash(D, 0)
+  ```
+  A node whose children are all zero is not stored. So an empty volume stores only its root record, and storage follows what was written.
+* **The root record**, deterministic CBOR (zendb.md §1):
+  ```
+  Root = { 1: v = 1, 2: seq: u64 (1, 2, …), 3: prev: bytes(32),     // RH(previous record), zeros for seq 1
+           4: blocks: u64, 5: block_size: u32 = 4096, 6: root: bytes(32),
+           7: writer: bytes(32),                                     // the device fp that wrote it
+           8: hlc: u64 }
+  RH   = H("zen/v1/blk-root", CBOR(Root))
+  ```
+  Creating a volume writes seq 1 (root zeros) with an `expect` that the record is absent. A decoder refuses another `v` or `block_size`, `blocks` 0, and trailing bytes.
+* **Writing.** One writer at a time, holding the lease (api.md §16). Every commit:
+  * is fenced with the lease's token (a writer that lost its lease writes nothing, 412 `claim_lost`);
+  * carries the blocks it writes (or deletes, for a discard), every node on their paths whose hash changed (deleting nodes that became empty), and the next root record (`seq + 1`, `prev` = RH of the current one);
+  * so each commit moves the volume from one verified state to the next, atomically.
+  
+  A flush returns once its commits applied. Writes not yet flushed may be lost in a crash, and any subset of them may have applied, as with a disk's write cache. After a commit applies, the writer's next checkpoint carries `[4, vol id, seq, RH]`, counted toward the cadence (formats.md §14.3).
+* **Reading.** A reader holds a root record it verified. A block is accepted only when its leaf matches the path of nodes from the root, each node checked against its parent's slot. A mismatch:
+  * The reader re-reads the root record. If it moved, the volume changed under the reader (`volume_changed`; a writer never sees this, since it wrote every root).
+  * If not, it's a **rollback** (`object: "vol"`).
+* **Freshness** (formats.md §14.4): the root record read at open is checked against the floor of `[4, vol id]`: a lower `seq` is a rollback, the same `seq` with another RH a fork, and at the floor's `seq + 1`, `prev` must be the floor's RH (a fork otherwise). A writer also keeps its own newest root in a local file, so a rollback of its own writes is caught on the next open even before a checkpoint carries them (DESIGN.md §2.6, "single writer").
+* **Leakage:** the number of stored blocks and nodes, which blocks and nodes each commit touches, when, and how often the writer flushes; the server doesn't learn indexes or contents. A discard shows as deletes. The fixed block size hides write lengths.
+* **Not yet:** snapshots, clones, resize and delete (TD-BLK-SNAPSHOTS).
+
+**Elsewhere in the spec:**
+* **formats.md §14.1:** the type-4 sentence names blk.md and the 32-byte vol id; "defined with volumes" goes.
+* **labels.md and `labels.rs`:** `zen/v1/blk-leaf`, `zen/v1/blk-node`, `zen/v1/blk-root`.
+* **spec/README.md:** the blk.md row.
+* **TECH_DEBT.md:** TD-BLK-SNAPSHOTS (snapshots and clones, as DESIGN.md §5; resize; delete, which needs paged clears and a tombstone record so a deleted volume can't be resurrected; read-only openers that pin a snapshot instead of failing with `volume_changed`).
+
+### zen-core (new `crates/zen-core/src/blk.rs`)
+
+* `BLOCK_SIZE = 4096`, `FANOUT = 128`, `depth(blocks)`.
+* `leaf(idx, sealed) -> [u8; 32]`, `node_hash(level, j, &[[u8; 32]; 128]) -> [u8; 32]` (zeros for an empty node).
+* `RootRecord {seq, prev, blocks, root, writer, hlc}` with `encode`, a strict `decode`, and `hash()` (RH).
+* `tree(blocks, leaves: &BTreeMap<u64, [u8; 32]>) -> Tree {root, nodes: BTreeMap<(u8, u64), [[u8; 32]; 128]>}`: the reference, for tests and vectors.
+* **Vectors** (`spec/test-vectors/blk.json`, new, from `vectors.rs`): the fixture fs, volume `disk` with 20,000 blocks (depth 3); the stored keys of its root, the lease, blocks 0, 1 and 16,500 and their nodes; the three blocks' plaintexts, sealed bytes (`DetRng`) and leaves; every stored node's non-zero slots and hash; root records seq 1 (empty) and seq 2 (the three blocks): CBOR and RH. Regenerating changes only that file. `tests/vectors.rs` reads it back; unit tests cover the decode refusals and `tree` against hand-built cases (one block, a full node, the last block of a non-power-of-128 volume).
+
+### `crates/zen-blk` (new library)
+
+**Dependencies:** zen-client, zen-core, zen-proto, tokio, getrandom. Dev: zen-server (`test-utils`), tempfile, zen-core (`test-utils`).
+
+**API:**
+```rust
+pub struct VolumeOptions {
+    pub lease_ttl: Duration,            // 30 s; renewed every ttl / 3
+    pub batch_blocks: usize,            // 256 (1 MiB): a commit's block budget, and the dirty limit
+    pub idle_flush: Option<Duration>,   // Some(5 s): flush this long after the last write
+    pub cache_nodes: usize,             // 4,096 level-1 nodes (16 MiB); levels ≥ 2 are always kept
+    pub pin: Option<PathBuf>,           // the local root pin; None: in memory only (tests)
+}
+impl Volume {
+    pub async fn create(fs: &UnlockedFs, name: &[u8], size: u64, o: VolumeOptions) -> Result<Volume>;  // the writer
+    pub async fn open(fs: &UnlockedFs, name: &[u8], o: VolumeOptions) -> Result<Volume>;               // the writer
+    pub async fn open_read_only(fs: &UnlockedFs, name: &[u8], o: VolumeOptions) -> Result<Volume>;
+    pub fn size(&self) -> u64;
+    pub fn root(&self) -> (u64, [u8; 32]);                       // seq, RH
+    pub async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()>;   // buffered
+    pub async fn discard(&self, offset: u64, len: u64) -> Result<()>;    // whole blocks; edges are zero-written
+    pub async fn flush(&self) -> Result<()>;
+    pub async fn close(self) -> Result<()>;                      // flush, checkpoint, release the lease
+}
+```
+`Volume` is `Clone` (an `Arc`), so a frontend can serve requests concurrently. Errors are `Error::Local` with codes `exists`, `not_found`, `busy` (another writer holds the lease), `lease_lost`, `read_only`, `range` (past the end), `volume_changed`, `format`; integrity failures are alarms through `Integrity::raise` (`object: Vol`). An attached `Integrity` is required (`integrity_needed` otherwise), with a signer for a writer: without checkpoints, other devices get consistency but not freshness.
+
+**Modules:**
+* **`keys.rs`:** the cached name chains and the stored keys of the spec's table.
+* **`tree.rs`:** the verified tree.
+  * The root hash; level-≥2 nodes kept; level-1 nodes in an LRU of clean nodes.
+  * `path(idx)`: which nodes a block needs and which are missing; the missing ones are fetched together with the blocks in one `get_many`, and checked top-down against the parents.
+  * `apply(changes) -> (new nodes, deleted nodes, root)`: copy-on-write of the touched nodes, so a failed commit leaves the tree as it was.
+* **`pin.rs`:** the local pin file, CBOR `{1: v = 1, 2: vol id, 3: seq, 4: RH}`, written atomically (temporary file, fsync, rename, directory fsync, mode 0600) after each commit; a file of another volume, or one that doesn't decode, is refused (`format`), as zen-client's pins file.
+* **`volume.rs`:**
+  * **Open:** `integrity.sync()`; take the floor; read the root record; check it against the floor (`observe_at`, and the `prev` rule at floor + 1) and against the local pin (lower: rollback; same seq, other RH: fork; pin + 1 with another `prev`: fork). A writer first acquires the lease (`not_leader` → `busy`) and starts the renewal task; a renewal that fails marks the volume `lease_lost`.
+  * **Writes** go to a dirty map (block → 4,096 bytes); an unaligned write reads the edge blocks first. Reaching `batch_blocks` dirty blocks flushes from inside `write`.
+  * **Flush** (serialized): takes the dirty map (new writes start a new one; reads see both), splits it into commits of at most `batch_blocks` blocks and within `max_commit_bytes` and `max_commit_ops`, and for each: fetches and verifies the missing level-1 paths, seals the blocks, `tree.apply`, then one transaction (blind writes, `fence_lease`, no reads). On success: the new root, the pin file, `integrity.note(Vol, count)`. On `claim_lost`: `lease_lost` from then on. On an unknown outcome after `send_commit`'s replays: re-read the root record; ours means applied, the old one means resend, anything else is an error.
+  * **Reads:** the dirty and flushing maps first; then one `get_many` for the blocks and missing nodes; each block's leaf is checked against its verified path and opened. A mismatch takes the spec's path (`volume_changed` for a reader whose root moved, else a rollback).
+  * **Idle flush:** a task armed by each write, `idle_flush` after the last one (the generation counter of zen-client's cadence).
+  * **Close:** flush, `integrity.checkpoint()`, release the lease.
+
+### Tests (`crates/zen-blk/tests/volume.rs`, the server in-process, the adversary on)
+
+* **`create_open_read_write`:** a 64 MiB volume reads as zeros; aligned and unaligned writes read back before and after `flush`; another session's writer (after `close`) reads the same; each flush advances `seq`; `create` again gives `exists`; `open` of an unknown name gives `not_found`; reading past the end gives `range`.
+* **`model`** (property): 2,000 random operations (writes of 1–40 blocks, aligned or not, discards, reads, flushes, a close and reopen every few hundred) over a 100 MiB volume (depth 3, `batch_blocks` 16), seeded `DetRng`, against an in-memory model. After each flush, the stored root equals `zen_core::blk::tree` over the leaves of every stored block (read raw with `range_prefix`).
+* **`batching`:** a write of 3 × `batch_blocks` with no flush commits on its own (`seq` advances); a flush of 1,000 dirty blocks with `batch_blocks` 256 takes 4 commits.
+* **`idle_flush`:** with `idle_flush` 200 ms, a write is committed without a flush.
+* **`crash`** (`lease_ttl` 500 ms): write A, flush, write B, then drop the volume without closing (renewals stop). A reopen after the lease lapses reads A and not B. Then the pin file left one or two commits behind (a crash after the commit, before the pin write: a copy of the older file restored) reopens without an alarm.
+* **`second_writer`:** while A holds the volume, B's `open` gives `busy`; B's `open_read_only` reads A's flushed data; after A's `close`, B opens as writer (token 2).
+* **`stale_fence`:** A's renewals paused (a test hook) until the lease lapses; B opens and writes; A writes and flushes: `lease_lost`, nothing of A's is stored, B's data is intact, and A's later writes fail too.
+* **`volume_changed`:** a reader opened at seq k; the writer commits a change to block 5; the reader's read of block 5 gives `volume_changed` (no alarm), and a reopen reads the new data.
+* **`rollback_root`:** lie `kv` on the root record at seq k; the writer commits twice and checkpoints.
+  * The writer reopened (a new `Volume`, the same pin file, a fresh `Integrity` without pins) gives a rollback from the pin alone.
+  * A reader on another device that synced gives a rollback; one that didn't sync accepts seq k: the window, asserted.
+* **`rollback_block_and_node`:** lie `kv` on one block (its older value), then on one level-1 node: a reader's read gives a rollback each time, and so does the writer's own read of that block after a reopen (its cache dropped).
+* **`fork`** (`Server::fork()`): the writer commits on S1 and checkpoints; on the copy, the same device (a fresh process, no pin file) writes other data at the same `seq`. A reader that pinned S1's root and checkpoint, moved to S2, gives a fork (same `seq`, another RH).
+* **`checkpoint_entry`:** the writer's checkpoint carries `[4, vol id, seq, RH]`; another device's floor gets it after `sync`.
+* **`bench`** (`#[ignore]`, release): sequential write of 64 MiB with flushes every 4 MiB, random 4 KiB reads cold and warm, a flush of one block (the latency ext4 sees for `fsync`).
+* **Negative controls** (each run once, then restored, and logged): the local pin check off (`rollback_root`, writer side), `observe_at` off (reader side), the leaf check off and the node check off (`rollback_block_and_node`), the fence off (`stale_fence`), the same-`seq` RH check off (`fork`).
+
+### Docs
+* **README:** the crate row.
+* **docs/STATS.md §5.7:** the bench numbers (docs/BLK.md and STATS §6 stay in 6.9).
+* **docs/MILESTONE-6.md:** the log.
+
+### Files
+* **Spec:** `spec/{blk (new),formats,labels,README,TECH_DEBT}.md`, `spec/test-vectors/blk.json` (new)
+* **zen-core:** `crates/zen-core/src/{blk (new),lib,labels,vectors}.rs`, `crates/zen-core/tests/vectors.rs`
+* **zen-blk:** `crates/zen-blk/{Cargo.toml, src/{lib,keys,tree,pin,volume}.rs, tests/volume.rs}`; root `Cargo.toml` (member)
+* **zen-client:** only if the engine needs a small addition (none expected); `tests/common/mod.rs` stays where it is
+* **Docs:** `README.md`, `docs/{STATS,MILESTONE-6}.md`
+
+### Verification
+* `cargo fmt --check`; clippy `--all-targets -D warnings` on zen-blk and zen-core (default, `--no-default-features`, `--all-features`)
+* `cargo test -p zen-core --features test-utils`; regenerate the vectors (only `blk.json` is new, nothing else changes)
+* `cargo test -p zen-blk` 3×; `cargo test -p zen-client` once (the shared harness)
+* the negative controls above
+* CI green on both runs (`rust` and `pure-rust` run the new tests)
+
+**Defaults chosen (overridable):**
+* **One root record** holds the size and the root, rather than a separate `meta` record: one read at open, and a future resize is just another link of the chain.
+* **The leaf covers the sealed bytes,** with no per-block write counter: a counter adds nothing once the leaf binds the whole value.
+* **Tree nodes are sealed** like every other value (cost ~17 µs each), so the engine needs only the KV API.
+* **Writes are blind** (no read set): the fence is what excludes other writers.
+* **An attached `Integrity` is required,** as for authenticated zen-db namespaces; the local pin file is per volume, next to the pins file.
+* **Read-only openers fail with `volume_changed`** when a writer moves the root under them, rather than pinning a snapshot (TD).
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.
