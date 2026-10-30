@@ -3485,6 +3485,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zen-client"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "clap",
+ "getrandom 0.4.3",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zen-core",
+ "zen-proto",
+ "zen-server",
+ "zen-tls-rustcrypto",
+]
+
+[[package]]
 name = "zen-core"
 version = "0.1.0"
 dependencies = [
