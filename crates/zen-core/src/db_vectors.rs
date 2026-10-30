@@ -5,6 +5,7 @@
 //! `{"float": <number> | "Infinity" | "-Infinity"}`, `{"text": "…"}`,
 //! `{"bytes": "<hex>"}`, `[…]` for arrays, `{"map": [[key, value], …]}`.
 
+use crate::db::auth::{self, NsRoot};
 use crate::db::cbor::{self, Value};
 use crate::db::prolly;
 use crate::db::sortkey::{self, Field, Type};
@@ -317,7 +318,7 @@ fn prolly_vectors(dbk: &DbKeys) -> Result<J> {
     let ix = dbk.index(&INDEX_ID);
     let (kb, kn) = ix.raw();
     let base = entries(0..40)?;
-    let tree = prolly::build(&ix, 4, base.clone())?;
+    let tree = prolly::build(&ix, 4, base.clone(), 16)?;
     // Insert 3 entries, delete 5: the tree must equal the one built from scratch.
     let mut changed: Vec<Vec<u8>> = base
         .iter()
@@ -340,7 +341,7 @@ fn prolly_vectors(dbk: &DbKeys) -> Result<J> {
         })
         .collect::<Result<_>>()?;
     changed.extend(extra.iter().cloned());
-    let tree2 = prolly::build(&ix, 4, changed)?;
+    let tree2 = prolly::build(&ix, 4, changed, 16)?;
     let boundaries: Vec<J> = base
         .iter()
         .take(8)
@@ -365,6 +366,59 @@ fn prolly_vectors(dbk: &DbKeys) -> Result<J> {
         "inserted": extra.iter().map(|e| h(e)).collect::<Vec<_>>(),
         "deleted": [3, 4, 17, 30, 39],
         "after": tree_json(&tree2),
+    }))
+}
+
+fn authenticated_vectors(dbk: &DbKeys) -> Result<J> {
+    let st = dbk.state();
+    let (kb, kn) = st.raw();
+    let n = dbk.prefix().len();
+    // Ten values under D: the DbRecord, rows, a part, a unique entry and a root.
+    let mut keys: Vec<Vec<u8>> = vec![dbk.key(&[b"cat".as_ref(), b"db"])];
+    for i in 0..6 {
+        keys.push(dbk.key(&[b"t".as_ref(), &TABLE_ID, &enc(&t(&format!("u{i}")))]));
+    }
+    keys.push(dbk.key(&[
+        b"o".as_ref(),
+        &TABLE_ID,
+        &enc(&t("u0")),
+        &0u32.to_be_bytes(),
+    ]));
+    keys.push(dbk.key(&[b"u".as_ref(), &INDEX_ID, &enc(&t("x"))]));
+    keys.push(dbk.key(&[b"r".as_ref(), &INDEX_ID, &0u32.to_be_bytes()]));
+    let mut values: Vec<(Vec<u8>, Vec<u8>)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k[n..].to_vec(), format!("value {i}").into_bytes()))
+        .collect();
+    let tree = auth::state_tree(&st, &values, 4)?;
+    let r1 = NsRoot {
+        seq: 1,
+        prev: [0; 32],
+        tree: auth::state_root(&tree),
+    };
+    // Change value 2, delete value 5: a fresh tree, the next NsRoot.
+    values[2].1 = b"value 2, changed".to_vec();
+    values.remove(5);
+    let tree2 = auth::state_tree(&st, &values, 4)?;
+    let r2 = NsRoot {
+        seq: 2,
+        prev: r1.hash(),
+        tree: auth::state_root(&tree2),
+    };
+    Ok(json!({
+        "description": "The authenticated tier (zendb.md §14) of the fixture database: the state tree's keys (index id 0¹⁶), ten values (suffix = stored key without D, plaintext as UTF-8 hex) with their VH and entry, their tree at fanout 4 with 32-byte ids, the NsRoot of seq 1, then the tree and NsRoot of seq 2 after value 2 changed to `changed` and value 5 was deleted.",
+        "k_boundary": h(&kb), "k_node": h(&kn),
+        "values": keys.iter().enumerate().map(|(i, k)| {
+            let p = format!("value {i}").into_bytes();
+            json!({"suffix": h(&k[n..]), "plaintext": h(&p), "vh": h(&auth::value_hash(&p)), "entry": h(&auth::state_entry(&k[n..], &p))})
+        }).collect::<Vec<_>>(),
+        "tree": tree_json(&tree),
+        "ns_root": {"encoded": h(&r1.encode()), "nh": h(&r1.hash())},
+        "changed": h(b"value 2, changed"),
+        "deleted": 5,
+        "after": tree_json(&tree2),
+        "ns_root_after": {"encoded": h(&r2.encode()), "nh": h(&r2.hash())},
     }))
 }
 
@@ -510,6 +564,7 @@ pub fn zendb_vectors() -> Result<J> {
         "sort_keys": sort_key_vectors()?,
         "rows": row_vectors()?,
         "prolly": prolly_vectors(&dbk)?,
+        "authenticated": authenticated_vectors(&dbk)?,
         "sealed_index": sealed_index_vectors(&dbk)?,
         "crdt": crdt_vectors(&dbk)?,
         "broker": msg_vectors()?,

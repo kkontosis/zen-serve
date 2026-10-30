@@ -380,11 +380,78 @@ fn zendb_vectors_read_back() {
         &ix,
         4,
         p["entries"].as_array().unwrap().iter().map(hx).collect(),
+        16,
     )
     .unwrap();
     assert_eq!(
         hex::encode(built.root.unwrap().encode()),
         p["tree"]["root"]["record"].as_str().unwrap()
+    );
+    // The authenticated tier (§14): entries, the state tree, the NsRoot chain.
+    let a = &z["authenticated"];
+    let st = dbk.state();
+    let (kb, kn) = st.raw();
+    assert_eq!(hex::encode(kb), a["k_boundary"].as_str().unwrap());
+    assert_eq!(hex::encode(kn), a["k_node"].as_str().unwrap());
+    let mut values: Vec<(Vec<u8>, Vec<u8>)> = a["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let (s, p) = (hx(&v["suffix"]), hx(&v["plaintext"]));
+            assert_eq!(
+                hex::encode(db::auth::value_hash(&p)),
+                v["vh"].as_str().unwrap()
+            );
+            assert_eq!(
+                hex::encode(db::auth::state_entry(&s, &p)),
+                v["entry"].as_str().unwrap()
+            );
+            (s, p)
+        })
+        .collect();
+    let tree = db::auth::state_tree(&st, &values, 4).unwrap();
+    let nodes = |t: &db::prolly::Tree| -> Vec<(String, String)> {
+        t.nodes
+            .iter()
+            .map(|(id, n)| (hex::encode(id), hex::encode(n.encode())))
+            .collect()
+    };
+    let want = |j: &serde_json::Value| -> Vec<(String, String)> {
+        j["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["id"].as_str().unwrap().into(),
+                    n["node"].as_str().unwrap().into(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(nodes(&tree), want(&a["tree"]));
+    let r1 = db::auth::NsRoot {
+        seq: 1,
+        prev: [0; 32],
+        tree: db::auth::state_root(&tree),
+    };
+    assert_eq!(
+        hex::encode(r1.encode()),
+        a["ns_root"]["encoded"].as_str().unwrap()
+    );
+    assert_eq!(hex::encode(r1.hash()), a["ns_root"]["nh"].as_str().unwrap());
+    values[2].1 = hx(&a["changed"]);
+    values.remove(a["deleted"].as_u64().unwrap() as usize);
+    let tree2 = db::auth::state_tree(&st, &values, 4).unwrap();
+    assert_eq!(nodes(&tree2), want(&a["after"]));
+    let enc2 = hx(&a["ns_root_after"]["encoded"]);
+    let r2 = db::auth::NsRoot::decode(&enc2).unwrap();
+    assert_eq!((r2.seq, r2.prev), (2, r1.hash()));
+    assert_eq!(r2.tree, db::auth::state_root(&tree2));
+    assert_eq!(
+        hex::encode(r2.hash()),
+        a["ns_root_after"]["nh"].as_str().unwrap()
     );
 }
 
@@ -405,9 +472,9 @@ fn prolly_is_history_independent_and_bounded() {
             .collect();
         set.sort();
         set.dedup();
-        let a = build(&ix, fanout, set.clone()).unwrap();
+        let a = build(&ix, fanout, set.clone(), 16).unwrap();
         set.reverse();
-        let b = build(&ix, fanout, set).unwrap();
+        let b = build(&ix, fanout, set, 16).unwrap();
         assert_eq!(a.root, b.root);
         assert!(
             a.nodes

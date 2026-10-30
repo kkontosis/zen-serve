@@ -2,7 +2,8 @@
 //!
 //! The client library builds and edits trees incrementally; this is the
 //! reference: the whole tree for a set of entries, used for the vectors and to
-//! check the incremental code.
+//! check the incremental code. Node ids are 16 bytes, or 32 in an
+//! authenticated database (§14.3).
 
 use super::IndexKeys;
 use super::cbor::{self, Value, head_len};
@@ -22,8 +23,8 @@ pub enum Entry {
     Child {
         /// Key of the child's first entry.
         first_key: Vec<u8>,
-        /// The child's node id.
-        child: [u8; 16],
+        /// The child's node id (16 or 32 bytes).
+        child: Vec<u8>,
         /// Level-0 entries under the child.
         count: u64,
     },
@@ -65,8 +66,16 @@ impl Entry {
         match self {
             Entry::Key(k) => head_len(k.len() as u64) + k.len(),
             Entry::Child {
-                first_key, count, ..
-            } => 1 + head_len(first_key.len() as u64) + first_key.len() + 17 + head_len(*count),
+                first_key,
+                child,
+                count,
+            } => {
+                1 + head_len(first_key.len() as u64)
+                    + first_key.len()
+                    + head_len(child.len() as u64)
+                    + child.len()
+                    + head_len(*count)
+            }
         }
     }
 }
@@ -112,8 +121,8 @@ impl Node {
 /// `{1: root, 2: height, 3: count}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootRecord {
-    /// The root node id.
-    pub root: [u8; 16],
+    /// The root node id (16 or 32 bytes).
+    pub root: Vec<u8>,
     /// Number of levels (the root's level + 1).
     pub height: u8,
     /// Level-0 entries in the tree.
@@ -136,7 +145,7 @@ impl RootRecord {
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     /// `(node_id, node)`, level by level, left to right.
-    pub nodes: Vec<([u8; 16], Node)>,
+    pub nodes: Vec<(Vec<u8>, Node)>,
     /// `None` for an empty index.
     pub root: Option<RootRecord>,
 }
@@ -163,9 +172,16 @@ pub fn chunk(keys: &IndexKeys, fanout: u32, level: u8, items: Vec<Entry>) -> Vec
     nodes
 }
 
-/// Build the canonical tree of a set of sort keys (any order, no duplicates).
-pub fn build(keys: &IndexKeys, fanout: u32, mut entries: Vec<Vec<u8>>) -> Result<Tree> {
-    if fanout < 2 {
+/// Build the canonical tree of a set of sort keys (any order, no duplicates),
+/// with node ids of `id_len` bytes: 16 (`PRF16`), or 32 (`PRF32`) in an
+/// authenticated database.
+pub fn build(
+    keys: &IndexKeys,
+    fanout: u32,
+    mut entries: Vec<Vec<u8>>,
+    id_len: usize,
+) -> Result<Tree> {
+    if fanout < 2 || (id_len != 16 && id_len != 32) {
         return Err(Error::Param);
     }
     entries.sort();
@@ -191,8 +207,13 @@ pub fn build(keys: &IndexKeys, fanout: u32, mut entries: Vec<Vec<u8>>) -> Result
                 salt: None,
                 pad: None,
             };
-            let id = keys.node_id(&node.encode());
-            tree.nodes.push((id, node));
+            let b = node.encode();
+            let id = if id_len == 32 {
+                keys.node_id32(&b).to_vec()
+            } else {
+                keys.node_id(&b).to_vec()
+            };
+            tree.nodes.push((id.clone(), node));
             up.push(Entry::Child {
                 first_key,
                 child: id,
@@ -200,7 +221,7 @@ pub fn build(keys: &IndexKeys, fanout: u32, mut entries: Vec<Vec<u8>>) -> Result
             });
         }
         if single {
-            let Entry::Child { child, count, .. } = up[0] else {
+            let Some(Entry::Child { child, count, .. }) = up.pop() else {
                 unreachable!()
             };
             tree.root = Some(RootRecord {
