@@ -413,6 +413,73 @@ async fn an_idle_volume_flushes() {
     v.close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_partial_writes_into_one_block_all_land() {
+    let kw = key(2);
+    let (srv, _) = world(&[&kw]).await;
+    let w = dev(&srv, &kw).await;
+    let v = Volume::create(&w.u, b"disk", 64 * MIB, opts())
+        .await
+        .unwrap();
+    // 16 pieces of 256 bytes of block 3, written at once: each write reads
+    // the block, then buffers it, so unordered they'd lose each other.
+    let base = 3 * BS;
+    let piece = |p: u64| vec![p as u8 + 1; 256];
+    let mut tasks = Vec::new();
+    for p in 0..16u64 {
+        let v = v.clone();
+        tasks.push(tokio::spawn(async move {
+            v.write(base + p * 256, &piece(p)).await.unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let want: Vec<u8> = (0..16).flat_map(piece).collect();
+    assert!(read(&v, base, BLOCK_SIZE).await == want, "before the flush");
+    v.flush().await.unwrap();
+    v.close().await.unwrap();
+    let r = Volume::open_read_only(&w.u, b"disk", opts()).await.unwrap();
+    assert!(read(&r, base, BLOCK_SIZE).await == want, "after the flush");
+    no_alarms(&[&w]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discarding_absent_blocks_commits_nothing() {
+    let kw = key(2);
+    let (srv, _) = world(&[&kw]).await;
+    let w = dev(&srv, &kw).await;
+    let size = 1024 * MIB;
+    let blocks = size / BS;
+    let v = Volume::create(&w.u, b"disk", size, opts()).await.unwrap();
+    // mkfs discards the whole device: on an empty volume, nothing to commit.
+    v.discard(0, size).await.unwrap();
+    v.flush().await.unwrap();
+    assert_eq!(
+        v.root().0,
+        1,
+        "no commit for blocks that were never written"
+    );
+
+    // Three written blocks (one batch apart from nothing else): discarding
+    // everything deletes just those, in one commit.
+    for i in [0u64, 100, 200] {
+        v.write(i * BS, &block_of("x")).await.unwrap();
+    }
+    v.flush().await.unwrap();
+    assert_eq!(v.root().0, 2);
+    v.discard(0, size).await.unwrap();
+    v.flush().await.unwrap();
+    assert_eq!(v.root().0, 3, "one commit deletes the three");
+    let keys = VolumeKeys::new(&w.u.keys(), b"disk");
+    assert!(raw_prefix(&w.s, &keys.block(0)[..48]).await.is_empty());
+    let index: HashMap<Vec<u8>, u64> = (0..blocks).map(|i| (keys.block(i), i)).collect();
+    check_against_reference(&w, b"disk", blocks, &index).await;
+    assert_eq!(read_block(&v, 100).await.unwrap(), vec![0; BLOCK_SIZE]);
+    v.close().await.unwrap();
+    no_alarms(&[&w]);
+}
+
 // ----------------------------------------------------------------- writers
 
 #[tokio::test(flavor = "multi_thread")]

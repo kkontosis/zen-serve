@@ -217,6 +217,23 @@ impl Tree {
         }
     }
 
+    /// Block `i`'s leaf in this tree, given every node on its path in
+    /// `have` (as [`Tree::verify`] leaves them).
+    pub fn leaf_in(&self, i: u64, have: &HashMap<Pos, Arc<Node>>) -> Hash {
+        let mut expected = self.record.root;
+        for l in (1..=self.depth).rev() {
+            if expected == ZERO {
+                break;
+            }
+            match have.get(&(l, node_of(l, i))) {
+                Some(n) => expected = n[slot_of(l, i)],
+                // Not fetched: unknown, so not shown absent.
+                None => return [0xff; 32],
+            }
+        }
+        expected
+    }
+
     /// Keep nodes that checked out.
     pub fn keep(&self, nodes: Vec<(Pos, Arc<Node>)>) {
         let mut c = self.cache();
