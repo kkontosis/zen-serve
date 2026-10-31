@@ -1,8 +1,10 @@
 //! The ublk frontend: `/dev/ublkbN` (feature `ublk`; docs/BLK.md).
 //!
 //! Each queue thread runs libublk's smol executor with one task per tag. A
-//! request's [`Disk`] future runs on the tokio runtime, and the queue awaits
-//! its `JoinHandle` (which works from any executor). The device reports a
+//! request's [`Disk`] future runs on the tokio runtime. A queue thread sleeps
+//! in its ring until a completion arrives, so a tag waits for the result
+//! through the ring: an io_uring read of the tag's eventfd, which the tokio
+//! task writes once the result is ready ([`on_ring`]). The device reports a
 //! volatile write cache and FUA, so the kernel sends FLUSH and FUA writes:
 //! without it, ext4 would treat buffered writes as durable.
 
@@ -13,6 +15,66 @@ use libublk::io::{UblkDev, UblkQueue};
 use libublk::{BufDesc, UblkError, UblkFlags, sys};
 use std::rc::Rc;
 use tokio::runtime::Handle;
+
+/// A tag's eventfd: the tokio side writes it, the ring reads it.
+struct EventFd(i32);
+
+impl EventFd {
+    fn new() -> std::io::Result<EventFd> {
+        // SAFETY: eventfd takes no pointers; the fd is owned by the result.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(EventFd(fd))
+    }
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        // SAFETY: the fd is ours and closed once.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// Writes the eventfd when dropped: after the result is sent, or when the
+/// task panics, so the ring's read always completes.
+struct Ring(i32);
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        let one = 1u64.to_ne_bytes();
+        // SAFETY: writes 8 bytes from a live buffer to an fd that outlives
+        // this (the tag waits for this write before closing it).
+        unsafe { libc::write(self.0, one.as_ptr().cast(), 8) };
+    }
+}
+
+/// Run `f` on tokio, and wait for it through the queue's ring.
+async fn on_ring<T, F>(q: &UblkQueue<'_>, efd: &EventFd, rt: &Handle, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let ring = Ring(efd.0);
+    rt.spawn(async move {
+        let _ring = ring;
+        let _ = tx.send(f.await);
+    });
+    let mut b = [0u8; 8];
+    loop {
+        let sqe =
+            io_uring::opcode::Read::new(io_uring::types::Fd(efd.0), b.as_mut_ptr(), 8).build();
+        q.ublk_submit_sqe(sqe).await;
+        match rx.try_recv() {
+            Ok(v) => return Some(v),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return None,
+            // Not written yet (an interrupted read): read again.
+            Err(_) => {}
+        }
+    }
+}
 
 /// The device's shape.
 #[derive(Debug, Clone, Copy)]
@@ -102,7 +164,14 @@ fn init(dev: &mut UblkDev, disk: &Disk) -> Result<(), UblkError> {
 }
 
 /// One request: the byte count, or `-errno`.
-async fn handle(q: &UblkQueue<'_>, tag: u16, buf: &mut [u8], disk: &Disk, rt: &Handle) -> i32 {
+async fn handle(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    buf: &mut [u8],
+    efd: &EventFd,
+    disk: &Disk,
+    rt: &Handle,
+) -> i32 {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
@@ -115,38 +184,51 @@ async fn handle(q: &UblkQueue<'_>, tag: u16, buf: &mut [u8], disk: &Disk, rt: &H
     let d = disk.clone();
     let done = match op {
         sys::UBLK_IO_OP_READ => {
-            rt.spawn(async move { d.read(off, bytes).await.map(Some) })
-                .await
+            on_ring(
+                q,
+                efd,
+                rt,
+                async move { d.read(off, bytes).await.map(Some) },
+            )
+            .await
         }
         sys::UBLK_IO_OP_WRITE => {
             let data = buf[..bytes].to_vec();
-            rt.spawn(async move { d.write(off, &data, fua).await.map(|_| None) })
-                .await
+            on_ring(q, efd, rt, async move {
+                d.write(off, &data, fua).await.map(|_| None)
+            })
+            .await
         }
-        sys::UBLK_IO_OP_FLUSH => rt.spawn(async move { d.flush().await.map(|_| None) }).await,
+        sys::UBLK_IO_OP_FLUSH => {
+            on_ring(q, efd, rt, async move { d.flush().await.map(|_| None) }).await
+        }
         sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
-            rt.spawn(async move { d.discard(off, bytes as u64).await.map(|_| None) })
-                .await
+            on_ring(q, efd, rt, async move {
+                d.discard(off, bytes as u64).await.map(|_| None)
+            })
+            .await
         }
         _ => return -libc::EOPNOTSUPP,
     };
     match done {
-        Ok(Ok(Some(b))) => {
+        Some(Ok(Some(b))) => {
             buf[..bytes].copy_from_slice(&b);
             bytes as i32
         }
-        Ok(Ok(None)) => bytes as i32,
-        Ok(Err(errno)) => -errno,
-        Err(_) => -libc::EIO,
+        Some(Ok(None)) => bytes as i32,
+        Some(Err(errno)) => -errno,
+        None => -libc::EIO,
     }
 }
 
 async fn io_task(q: &UblkQueue<'_>, tag: u16, disk: Disk, rt: Handle) -> Result<(), UblkError> {
+    let efd = EventFd::new()
+        .map_err(|e| UblkError::OtherError(-e.raw_os_error().unwrap_or(libc::EIO)))?;
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
     q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
         .await?;
     loop {
-        let res = handle(q, tag, buf.as_mut_slice(), &disk, &rt).await;
+        let res = handle(q, tag, buf.as_mut_slice(), &efd, &disk, &rt).await;
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
             .await?;
     }

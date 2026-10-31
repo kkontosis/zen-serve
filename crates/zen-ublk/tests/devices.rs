@@ -72,6 +72,17 @@ impl World {
         c.stdout(Stdio::piped());
         tokio::task::spawn_blocking(move || {
             let mut child = c.spawn().unwrap();
+            // A daemon not ready within 60 s is killed, so the test fails
+            // instead of hanging.
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (r, pid) = (ready.clone(), child.id() as i32);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(60));
+                if !r.load(std::sync::atomic::Ordering::SeqCst) {
+                    // SAFETY: kill sends a signal to our own child.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            });
             let mut out = BufReader::new(child.stdout.take().unwrap());
             let mut line = String::new();
             out.read_line(&mut line).unwrap();
@@ -83,6 +94,7 @@ impl World {
                 })
                 .trim()
                 .to_string();
+            ready.store(true, std::sync::atomic::Ordering::SeqCst);
             Daemon {
                 child: Some(child),
                 path: PathBuf::from(path),

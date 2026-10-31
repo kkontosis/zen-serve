@@ -71,6 +71,8 @@ jobs:
   # as root (crates/zen-ublk/tests/devices.rs).
   devices:
     runs-on: ubuntu-latest
+    # A hung device fails in minutes, not after GitHub's 6 hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -13,7 +13,7 @@ path = "src/main.rs"
 [features]
 # The ublk frontend (/dev/ublkbN). libublk's bindings are generated at
 # build time (bindgen): it needs libclang and the kernel headers.
-ublk = ["dep:libublk", "dep:smol"]
+ublk = ["dep:libublk", "dep:smol", "dep:io-uring"]
 # The tests that need root and the kernel's devices (tests/devices.rs):
 # FUSE, loop devices, mkfs.ext4 and mount; the ublk ones also need `ublk`.
 device-tests = []
@@ -22,6 +22,7 @@ device-tests = []
 clap = { version = "4", features = ["derive"] }
 # Pure Rust: no libfuse, mounts through fusermount3.
 fuser = { version = "0.18", default-features = false }
+io-uring = { version = "0.7", optional = true }
 libc = "0.2"
 libublk = { version = "0.4.8", optional = true }
 serde_json = "1"

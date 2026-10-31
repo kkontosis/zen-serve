@@ -4323,6 +4323,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fuser",
+ "io-uring",
  "libc",
  "libublk",
  "serde",
