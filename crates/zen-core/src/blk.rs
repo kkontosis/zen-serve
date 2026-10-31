@@ -83,13 +83,12 @@ pub fn node_bytes(node: &Node) -> Vec<u8> {
 
 /// A node from its stored plaintext (exactly 4,096 bytes).
 pub fn node_from_bytes(b: &[u8]) -> Result<Node> {
-    if b.len() != FANOUT * 32 {
+    let (chunks, rest) = b.as_chunks::<32>();
+    if chunks.len() != FANOUT || !rest.is_empty() {
         return Err(Error::Format);
     }
     let mut n = [ZERO; FANOUT];
-    for (c, chunk) in n.iter_mut().zip(b.chunks_exact(32)) {
-        c.copy_from_slice(chunk);
-    }
+    n.copy_from_slice(chunks);
     Ok(n)
 }
 
