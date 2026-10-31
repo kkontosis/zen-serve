@@ -33,6 +33,7 @@ pub use fs::{Fs, StoredHeader, UnlockedFs};
 pub use integrity::{Integrity, IntegrityOptions};
 pub use kv::{KvEntry, Mode, RangeOptions, Transaction, TxnOptions};
 pub use lease::Lease;
+pub use pins::write_private;
 pub use session::Session;
 pub use transport::TlsOptions;
 pub use zen_core::integrity::{Entry, ExportedPins, Head, Seen};

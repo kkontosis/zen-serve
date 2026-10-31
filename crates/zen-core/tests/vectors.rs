@@ -662,3 +662,67 @@ fn integrity_vectors_verify_from_files() {
     t.remove(&nodes[1].node);
     assert_eq!(t.root(), arr(&ts["without_second"]));
 }
+
+#[test]
+fn blk_vectors_verify_from_files() {
+    use std::collections::BTreeMap;
+    use zen_core::blk::{self, RootRecord};
+    let v = load("blk.json");
+    let fs = fs_from_file();
+    let keys = blk::VolumeKeys::new(&fs, v["volume"].as_str().unwrap().as_bytes());
+    assert_eq!(keys.vol_id(), hx(&v["vol_id"]));
+    assert_eq!(keys.root(), hx(&v["root_key"]));
+    assert_eq!(keys.lease(), hx(&v["lease"]));
+    let blocks = v["blocks"].as_u64().unwrap();
+    assert_eq!(u64::from(blk::depth(blocks)), v["depth"].as_u64().unwrap());
+
+    // Each block opens under its key, and its leaf is over the sealed bytes.
+    let mut leaves = BTreeMap::new();
+    for b in v["stored_blocks"].as_array().unwrap() {
+        let i = b["index"].as_u64().unwrap();
+        assert_eq!(keys.block(i), hx(&b["key"]));
+        let sealed = hx(&b["sealed"]);
+        assert_eq!(
+            seal::open_value(&fs, &keys.block(i), &sealed).unwrap(),
+            hx(&b["plaintext"])
+        );
+        assert!(seal::open_value(&fs, &keys.block(i + 1), &sealed).is_err());
+        let l = blk::leaf(i, &sealed);
+        assert_eq!(l.to_vec(), hx(&b["leaf"]));
+        leaves.insert(i, l);
+    }
+    // The nodes, rebuilt from their listed slots, hash as listed and form the tree.
+    let t = blk::tree(blocks, &leaves);
+    let nodes = v["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), t.nodes.len());
+    for n in nodes {
+        let (l, j) = (
+            n["level"].as_u64().unwrap() as u8,
+            n["index"].as_u64().unwrap(),
+        );
+        assert_eq!(keys.node(l, j), hx(&n["key"]));
+        let mut node = [blk::ZERO; blk::FANOUT];
+        for s in n["slots"].as_array().unwrap() {
+            node[s[0].as_u64().unwrap() as usize].copy_from_slice(&hx(&s[1]));
+        }
+        assert_eq!(blk::node_hash(l, j, &node).to_vec(), hx(&n["hash"]));
+        assert_eq!(t.nodes[&(l, j)], node);
+    }
+    assert_eq!(t.root.to_vec(), hx(&v["root"]));
+
+    // Root records: decode to the listed fields, hash, and chain.
+    let mut prev = [0u8; 32];
+    for r in v["records"].as_array().unwrap() {
+        let rec = RootRecord::decode(&hx(&r["cbor"])).unwrap();
+        assert_eq!(rec.seq, r["seq"].as_u64().unwrap());
+        assert_eq!(rec.prev, prev);
+        assert_eq!(rec.blocks, blocks);
+        assert_eq!(rec.root.to_vec(), hx(&r["root"]));
+        assert_eq!(rec.writer.to_vec(), hx(&r["writer"]));
+        assert_eq!(rec.hlc.to_string(), r["hlc"].as_str().unwrap());
+        assert_eq!(rec.hash().to_vec(), hx(&r["hash"]));
+        prev = rec.hash();
+    }
+    assert_eq!(prev.to_vec(), hx(&v["records"][1]["hash"]));
+    assert_eq!(v["records"][1]["root"], v["root"]);
+}

@@ -152,7 +152,7 @@ impl PinsFile {
 }
 
 /// Write `bytes` to `path` atomically, readable by its owner only.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let io = |e: std::io::Error| Error::Io(format!("{}: {e}", path.display()));
     let dir = path
         .parent()

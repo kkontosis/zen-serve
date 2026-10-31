@@ -41,6 +41,7 @@ pub fn generate() -> Result<Vec<(&'static str, Value)>> {
         ("zendb.json", crate::db_vectors::zendb_vectors()?),
         ("svc.json", svc_vectors()?),
         ("integrity.json", integrity_vectors()?),
+        ("blk.json", blk_vectors()?),
     ])
 }
 
@@ -856,5 +857,91 @@ fn integrity_vectors() -> Result<Value> {
             "all": h(&three),
             "without_second": h(&removed),
         },
+    }))
+}
+
+/// The plaintext of block `i` in `blk.json`: `"block <i> "` repeated to 4,096 bytes.
+pub fn fixture_block(i: u64) -> Vec<u8> {
+    format!("block {i} ")
+        .into_bytes()
+        .into_iter()
+        .cycle()
+        .take(crate::blk::BLOCK_SIZE)
+        .collect()
+}
+
+fn blk_vectors() -> Result<Value> {
+    use crate::blk::{self, RootRecord, VolumeKeys};
+    use std::collections::BTreeMap;
+    let fsk = fixture_fs();
+    let keys = VolumeKeys::new(&fsk, b"disk");
+    let blocks = 20_000u64;
+    let writer = fixture_device().public().fingerprint();
+
+    let mut rng = DetRng::new("blk-seal");
+    let mut leaves = BTreeMap::new();
+    let mut stored = Vec::new();
+    for i in [0u64, 1, 16_500] {
+        let key = keys.block(i);
+        let plain = fixture_block(i);
+        let sealed = seal::seal_value(&fsk, &key, &plain, &mut rng)?;
+        let l = blk::leaf(i, &sealed);
+        leaves.insert(i, l);
+        stored.push(json!({
+            "index": i, "key": h(&key), "plaintext": h(&plain),
+            "sealed": h(&sealed), "leaf": h(&l),
+        }));
+    }
+    let t = blk::tree(blocks, &leaves);
+    let nodes: Vec<Value> = t
+        .nodes
+        .iter()
+        .map(|((l, j), n)| {
+            let slots: Vec<Value> = n
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c != blk::ZERO)
+                .map(|(k, c)| json!([k, h(c)]))
+                .collect();
+            json!({
+                "level": l, "index": j, "key": h(&keys.node(*l, *j)),
+                "slots": slots, "hash": h(&blk::node_hash(*l, *j, n)),
+            })
+        })
+        .collect();
+    let r1 = RootRecord {
+        seq: 1,
+        prev: [0; 32],
+        blocks,
+        root: blk::ZERO,
+        writer,
+        hlc: fs::hlc(1_790_000_000_000, 0),
+    };
+    let r2 = RootRecord {
+        seq: 2,
+        prev: r1.hash(),
+        root: t.root,
+        hlc: fs::hlc(1_790_000_000_500, 1),
+        ..r1.clone()
+    };
+    let rec = |r: &RootRecord| {
+        json!({
+            "seq": r.seq, "prev": h(&r.prev), "blocks": r.blocks, "root": h(&r.root),
+            "writer": h(&r.writer), "hlc": r.hlc.to_string(),
+            "cbor": h(&r.encode()), "hash": h(&r.hash()),
+        })
+    };
+    Ok(json!({
+        "description": "Block volumes (blk.md): volume \"disk\" of 20,000 blocks (depth 3) in the fs of keys.json fs_epoch0; blocks sealed as kind 1 with DetRng(\"blk-seal\"), in this order; nodes list their non-zero slots as [slot, hash]; root records seq 1 (empty) and 2 (the three blocks), writer the fixture device of signatures.json. hlc values are decimal strings.",
+        "volume": "disk",
+        "blocks": blocks,
+        "depth": blk::depth(blocks),
+        "vol_id": h(&keys.vol_id()),
+        "root_key": h(&keys.root()),
+        "lease": h(&keys.lease()),
+        "stored_blocks": stored,
+        "nodes": nodes,
+        "root": h(&t.root),
+        "records": [rec(&r1), rec(&r2)],
     }))
 }

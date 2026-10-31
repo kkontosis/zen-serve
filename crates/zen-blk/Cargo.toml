@@ -1,0 +1,21 @@
+[package]
+name = "zen-blk"
+version = "0.1.0"
+description = "zen-serve block engine: fixed-size volumes of sealed blocks in an fs, a Merkle block tree, chained roots, one fenced writer"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+getrandom = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+zen-client = { path = "../zen-client" }
+zen-core = { path = "../zen-core" }
+zen-proto = { path = "../zen-proto" }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+zen-core = { path = "../zen-core", features = ["test-utils"] }
+# The server in-process, with the test adversary; as in zen-client's tests.
+zen-server = { path = "../zen-server", default-features = false, features = ["test-utils"] }
