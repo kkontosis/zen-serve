@@ -372,6 +372,8 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * The untar source is a tarball of `crates`, `spec` and `docs` made with GNU tar's deterministic flags, not `git ls-files`: CI runs the test binary as root in a checkout owned by the runner user, where git refuses ("dubious ownership").
     * **Found while measuring:** a TS `sync()` over ten devices costs ~50 ms whether one device moved or all ten. Traced (each call timed): `advance` re-reads the ACL head (`/v1/acl/get`) and re-fetches the pinned checkpoint for every known device, then fetches the moved heads: about two round trips per device. Correct but repeated; the Rust client does the same. Recorded as TD-INTEGRITY-SYNC-COST rather than changed in a docs step. Its fix keeps the comparison at the pinned seq (a client moved to a forked server finds the fork there, as the 6.3 fork test shows) and moves it to the heads answer, a spec change.
     * The bench's first run failed at its own setup (one recovery key kept for two fs); fixed in the bench.
+  * **`devices-bench` on 7b1b2bb** (run 451, started by hand): green, both benches; the figures are in STATS §6.3 and BLK.md §7. The same run's `devices` job and the full suite here were green too.
+  * **Local checks:** the device tests as root (5 passed; the ublk ones skip here, saying so; nothing left mounted or attached); the full vitest run (604 passed, 15 skipped: the opt-in benches, now including the integrity bench's 2); `bench_fuse` twice and the integrity bench twice (release); fmt, clippy `-p zen-ublk --all-targets --features device-tests,ublk`; the links and § references of every touched doc; every TD cited has an entry (but `TD-CONSUME-PROCESS-HOLDER`, which MILESTONE-4.5 records as dropped).
   * **Docs:** new docs/INTEGRITY.md (the ten sections planned); docs/BLK.md §5–§9; STATS §1.1 (three rows) and §6; spec/TECH_DEBT.md TD-WITNESS, TD-FS-VERSIONS-INTEGRITY, TD-FUSE-INTEGRITY and TD-INTEGRITY-SYNC-COST; docs/API.md "Integrity (milestone 6)"; CLIENT.md §12 (the pointer, volumes); GAPS G26 done; DESIGN-3 §6 item 6 reworded and done; README (status, building blocks, docs row).
     * **Changed from the plan:** the integrity pitfalls are a new spec/OPS.md §5, and the device tests and their benches a new §1.4: §4 is advice for developing, not operating. §1's table gains the integrity bench.
 
@@ -2625,11 +2627,16 @@ Tests (at step 9):
   * zen-client: `tests/client.rs` 6, `tests/integrity.rs` 10 and a bench.
   * zen-blk: `tests/volume.rs` 14 (2,000 random operations against a model and the reference tree, crashes, a second writer, a stale fence, four attacks) and a bench.
   * zen-ublk: `tests/disk.rs` 5 and 2 unit tests; `tests/devices.rs` 5 as root (FUSE and ublk: ext4 round trips, a writer SIGKILLed, then `e2fsck`) and 2 benches.
-* **Node:** `packages/client` `integrity` 13, `integrityvectors` 5, `rustclient` 3 (interop with the Rust CLI, a fork across them); `packages/fs` `integrity` 5; `packages/db` `authenticated` 13; `apps/echo` `integrity` 4; `apps/ledger` both invariant suites, basic and authenticated. The full run: FULLRUN.
+* **Node:** `packages/client` `integrity` 13, `integrityvectors` 5, `rustclient` 3 (interop with the Rust CLI, a fork across them); `packages/fs` `integrity` 5; `packages/db` `authenticated` 13; `apps/echo` `integrity` 4; `apps/ledger` both invariant suites, basic and authenticated. The full run: 604 passed, 15 skipped (the opt-in benches), 69 files.
 * **Every attack test** first shows the attack works (the reader is served the stale or forked answer), then that it's caught. **Negative controls:** each detection was run once with its check disabled and its test failed; where another check caught it anyway, the log says which (6.3–6.8).
 * **CI:** the `client` job builds the server with `test-utils` and the Rust client; a new `devices` job runs the device tests as root with the ublk driver (`ZEN_TEST_REQUIRE_UBLK=1`); `devices-bench` runs the benches when started by hand.
 
-Measurements: MEASUREMENTS
+Measurements (docs/STATS.md §5.6, §5.7, §6):
+* **Native checkpoints** sign in 0.2 ms (WASM 2.6 ms); a TS checkpoint end to end is 6–7 ms and 4.5 KB with 10 entries, 9–13 ms and 12.7 KB with 100.
+* **A sync** over ten devices takes ~50 ms on loopback whatever moved (TD-INTEGRITY-SYNC-COST).
+* **Event chains** add 52 B per append and no measurable time; a checked read of 1,000 events takes 25–34 ms against 13.
+* **An authenticated namespace** reads at the same cost as a basic one; an insert writes 6 ops and ~9 KB instead of 1 and 0.6 KB.
+* **The block engine** writes 49 MiB/s in process; ext4 over a 1 GiB volume on a CI runner writes 48 MiB/s (FUSE + loop) and 52 MiB/s (ublk), reads 253 and 315 MiB/s cold, and takes 4.3–4.5 ms per synchronous 4 KiB write.
 
 Tech debt:
 * **Resolved within the milestone:** TD-SVC-STATE-ROLLBACK (but for the cadence window, documented); TD-TEST-OPEN-FAILURES items 1 (the ledger sum) and 4 (who's online).

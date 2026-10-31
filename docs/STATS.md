@@ -331,9 +331,15 @@ The same bench: 50 appends of a short payload, and five reads of 1,000 events, o
 
 ### 6.3 ext4 on the devices (measured)
 
-`cargo test --release -p zen-ublk --features device-tests[,ublk] --test devices bench -- --ignored --nocapture --test-threads 1`, as root: the server in the test's process (embedded backend), `zen-ublk` as a child process with its defaults (`--batch-blocks` 256, a 5 s idle flush), an empty 1 GiB volume (depth 3), ext4 with 4 KiB blocks. The untar is the repository's `crates`, `spec` and `docs` at this step (241 files, 4.3 MiB). The FUSE figures are from the development machine (4 cores, two runs). The ublk figures are from CI's `devices-bench` job, on a GitHub-hosted runner (UBLKRUNNER), a different machine: compare the two columns of one machine, not across them.
+`cargo test --release -p zen-ublk --features device-tests[,ublk] --test devices bench -- --ignored --nocapture --test-threads 1`, as root: the server in the test's process (embedded backend), `zen-ublk` as a child process with its defaults (`--batch-blocks` 256, a 5 s idle flush), an empty 1 GiB volume (depth 3), ext4 with 4 KiB blocks. The untar is the repository's `crates`, `spec` and `docs` at this step (241 files, 4.3 MiB). The FUSE figures are from the development machine (4 cores, two runs). The CI figures are from the `devices-bench` job (run 451, on 7b1b2bb), on a GitHub-hosted `ubuntu-latest` runner, a different machine: compare the columns of one machine, not across them. This container has no ublk driver, so ublk is measured only there.
 
-<!-- ext4-stats -->
+| ext4 on a 1 GiB volume | FUSE + loop, development machine | FUSE + loop, CI runner | ublk, CI runner |
+|---|---|---|---|
+| `mkfs.ext4` (with its whole-device discard) | 0.13 s | 0.10 s | 0.10 s |
+| Write 256 MiB, `conv=fsync` | 18–25 MiB/s | 48 MiB/s | 52 MiB/s |
+| Read 256 MiB after `drop_caches` | 113–140 MiB/s | 253 MiB/s | 315 MiB/s |
+| 4 KiB writes, `oflag=dsync` | 11.7 ms each | 4.5 ms each | 4.3 ms each |
+| Untar ~240 files (4.3 MiB), then `sync` | 0.23 s | 0.18 s | 0.12 s |
 
 ### 6.4 Reading it
 
@@ -343,4 +349,5 @@ The same bench: 50 appends of a short payload, and five reads of 1,000 events, o
 * **Choosing `sigEvery`:**
   * The default (64 changes, or 5 s after the last one) costs at most one checkpoint per 64 writes: well under 1 % of the time of the writes themselves.
   * `sigEvery: 1` costs a checkpoint per change: about 7 ms more per change in a browser, and 4.5 KB stored. A handler step (§5.5) takes 16–20 ms, so a checkpoint per step adds about a third.
-* **ext4 over a volume** is bounded by commits. A write that fills a batch flushes before it returns, so sequential writes wait for one commit per MiB. A synchronous 4 KiB write (`O_DSYNC`, as a database's `fsync` does) costs ext4 a data write and a journal commit with its cache flushes, which is several engine commits: about 12 ms over FUSE and loop. Reads that miss the page cache are one request per block the kernel asks for, with readahead making them large.
+* **ext4 over a volume** is bounded by commits. A write that fills a batch flushes before it returns, so sequential writes wait for one commit per MiB. A synchronous 4 KiB write (`O_DSYNC`, as a database's `fsync` does) costs ext4 a data write and a journal commit with its cache flushes, which is several engine commits: 4–12 ms depending on the machine. Reads that miss the page cache are one request per block the kernel asks for, with readahead making them large.
+* **ublk and FUSE + loop are close** on one machine (the CI columns): ublk is about 10 % faster for writes and 25 % for reads, since it skips the loop device and FUSE's copies, but both are bounded by the engine's round trips. `mkfs` costs almost nothing on an empty volume: discarding blocks that were never written commits nothing (spec/blk.md §4).

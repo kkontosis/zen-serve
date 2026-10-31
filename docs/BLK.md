@@ -111,7 +111,14 @@ It doesn't see the name, a block's index or the contents. The fixed block size h
 
 The engine in process (docs/STATS.md §5.7) writes 49 MiB/s sequentially, reads a random block in 0.14 ms, and flushes one block in 1.6 ms. Through ext4 (STATS.md §6.3):
 
-<!-- ext4-table -->
+| ext4 on a 1 GiB volume (CI runner) | FUSE + loop | ublk |
+|---|---|---|
+| Write 256 MiB, `conv=fsync` | 48 MiB/s | 52 MiB/s |
+| Read 256 MiB, cold | 253 MiB/s | 315 MiB/s |
+| A synchronous 4 KiB write (`oflag=dsync`) | 4.5 ms | 4.3 ms |
+| Untar ~240 files, then `sync` | 0.18 s | 0.12 s |
+
+On the 4-core development machine, FUSE + loop measured 18–25 MiB/s, 113–140 MiB/s and 11.7 ms. So ublk is a little faster than FUSE + loop, and both are bounded by the server's round trips: a disk for a filesystem that syncs a few times a second, not for a database that fsyncs every write.
 
 **Tuning:**
 * **`--batch-blocks`** (default 256, 1 MiB) is a commit's size and the buffered blocks that force a flush. Larger batches commit less often (each commit rewrites the top of the tree and the root record), but a flush then waits for a larger commit, and the daemon holds more unflushed data. A commit's blocks are also capped by the server's limits, budgeting a full path of new nodes per block: with the default `max_commit_bytes` (8 MB), about 420 blocks at depth 3 (volumes up to 8 GiB) and 340 at depth 4.
