@@ -333,6 +333,15 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * `cargo test -p zen-blk -p zen-ublk` 3×; `cargo test -p zen-client`; `cargo test -p zen-ublk -p zen-blk --no-default-features`
     * `cargo test -p zen-ublk --features device-tests,ublk --test devices` 3× as root; nothing is left mounted or attached afterwards
     * `rustclient.test.ts` (the CLI refactor)
+  * Pushed cf2db2b. **Both runs (push 438, pull_request 439) are red, in `devices` only**: `rust`, `pure-rust`, `fdb` (clippy `--all-features` builds libublk) and `client` are green.
+    * In `devices`, `modprobe ublk_drv` worked on the hosted runner, and the three FUSE tests passed as root.
+    * Both ublk tests fail at their first `zen-ublk ublk --id 4x`: the daemon exits 1 with "ublk: the control device: io_uring IO failure", after libublk prints "device reload json failed".
+    * **Cause:** `clear_stale(id)` calls `UblkCtrl::new_simple(id)` to look for a device a killed daemon left. `new_simple` for an id ≥ 0 doesn't only open the control device: it reloads that device's json and **reads its info from the driver** (`handle_device_lifecycle_async` → `read_dev_info_async`). That fails when there is no such device, which is the normal case. So `new_simple` returns an error, and `clear_stale` treated it as fatal. Read in libublk 0.4.8 `src/ctrl.rs` 1180–1191.
+    * **Fix (`ublk.rs` `clear_stale`):**
+      1. When `/dev/ublkc<id>` doesn't exist there is no device: return `Ok`.
+      2. Otherwise `new_simple(id)` (which has read the info already, so the separate `read_dev_info` call goes); a live daemon pid gives `busy`, a dead one gets `del_dev`.
+    * **Not yet exercised anywhere:** what comes after the device is added. That covers the I/O path, FLUSH/FUA, the read-only export without `--id`, `kill_dev`/`del_dev` on SIGTERM, and deleting a dead device after SIGKILL. This container has no ublk driver, so the next CI run is the first test of all of it. Each red gets pursued to its cause the same way.
+    * Fixed in e800684. fmt, clippy with `ublk,device-tests`, and the device tests here are clean (the FUSE ones pass; the ublk ones still skip here). Pushed; CI pending.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
