@@ -355,14 +355,17 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * New optional dependency `io-uring = "0.7"` (feature `ublk`; 0.7.15 is already in the lock through libublk).
     * **CI guard:** the `devices` job gets `timeout-minutes: 20`, so a hang fails within 20 minutes instead of 6 hours. The test helper's `serve` also gives up after 60 s without a `ready` line.
     * The hung run can't be cancelled from here (no tool for it). It stops at GitHub's 6-hour limit unless cancelled in the Actions UI.
-    * Fixed in 64e4771.
+    * Fixed in 64e4771. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean (the FUSE device tests pass; the ublk ones skip). Pushed; CI pending.
   * **CI on ab1297c (push 442, pull_request 443):** `rust`, `pure-rust`, `fdb` and `client` are green. `devices` ran into its 20-minute timeout. The 3 FUSE tests passed; both ublk tests hung.
     * **Cause, from the log:** each `zen-ublk ublk` daemon panicked within a second in a tokio blocking thread: libublk `ctrl.rs:1469`, "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor."
       * libublk 0.4.8 keeps the control io_uring **per thread** (`thread_local! CTRL_URING`). Only the thread that ran the `UblkCtrl` constructor has one.
       * The daemon built the control device in one `spawn_blocking` thread, then ran `run_target` (its ADD/START commands) in another, and `kill_dev`/`del_dev` in more. Every thread after the first had no ring.
       * The daemon then never printed `ready`. After the 60 s watchdog's SIGKILL, the test still didn't finish: the process exit or its `wait()` never returned with the device added but not started. This is most likely in the kernel, which I can't see from the log.
     * **Fix (`ublk.rs`):** `ensure_ring()` makes the calling thread's control ring if it has none. It goes through libublk's public `ublk_init_ctrl_task_ring`, building an `IoUring<squeue::Entry128>` of depth 16 as libublk's default does. It's called at the start of every function that sends a control command from a thread: `serve` (`run_target`), `stop` (`kill_dev`), `delete` (`del_dev`) and `clear_stale`.
-    * Fixed in f0b6bfb. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean. Pushed; CI pending. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean (the FUSE device tests pass; the ublk ones skip). Pushed; CI pending.
+    * Fixed in f0b6bfb. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean. Pushed.
+  * **CI green on both runs of 3d3eb3b** (push 444, pull_request 445): rust, pure-rust, fdb, client and devices all pass. In `devices`, the ublk tests ran over `/dev/ublkbN` for the first time: ext4 round trip, then a killed writer, its stale device deleted, `e2fsck`. Step 6.8 is done.
+  * PR #61 merged.
+* **Step 6.9** (docs, bench, outcome): planned below ("Step 6.9 in detail"). Restarted from main; the log above is now in the repo copy too.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -2333,6 +2336,228 @@ If `modprobe` fails on hosted runners even with the extra modules, the job keeps
 * **A failed lease or an alarm fails closed with `EIO`,** and the device stays until it's stopped.
 * **Transient errors retry for 60 s** before `EIO`.
 * **`zen-ublk` shares zen-client's pins file** by default, and keeps a volume pin next to it.
+
+## Step 6.9 in detail
+
+Step 6.9 closes the milestone. Everything is built, but the docs are spread across CLIENT.md §12–13, DB.md §7.1, SVC.md §6, BLK.md and the specs, and nothing says what integrity covers as a whole. This step adds:
+* one guide to integrity
+* the rest of BLK.md
+* the measurements that are still missing: integrity in the TS client, and ext4 over the two devices
+* the tech debt entries
+* the milestone's Outcome
+
+It changes no formats and no behavior. The only new code is two opt-in benches and a CI job that runs only when started by hand.
+
+**Survey (what this step builds on):**
+* **Docs:**
+  * **The API is in place:**
+    * CLIENT.md §12 is the TS integrity API and §13 the Rust client; DB.md §7.1, SVC.md §6 and docs/BLK.md (§1–4: running it, durability, integrity) cover their objects.
+    * spec/formats.md §14 is normative. Its "What it does not catch" paragraph, and CLIENT.md §12, name **TD-WITNESS**, which TECH_DEBT doesn't have yet.
+  * **What's still missing:**
+    * docs/BLK.md was written in 6.8 to be finished here (the design, the threats, the numbers).
+    * docs/API.md has an area section per milestone ("Relayed services (milestone 5.5)"), but none for checkpoints, devices or leases.
+* **Measured already** (STATS):
+  * §5.2: WASM sign 2.6 ms, verify 0.7 ms, tree state
+  * §5.4: authenticated vs basic zen-db
+  * §5.6: native checkpoints
+  * §5.7: the block engine in process
+* **Not measured:**
+  * a TS checkpoint end to end (sign, seal, put) and a sync over several devices
+  * the cost of event chains on an append
+  * ext4 over FUSE and loop, and over ublk
+  * storage per checkpoint, per chained event and per volume (§1.1)
+* **Tech debt:**
+  * TD-SVC-STATE-ROLLBACK is already closed (6.5, but for the window), and TD-BLK-SNAPSHOTS exists (6.7). TD-TEST-OPEN-FAILURES items 1 and 4 were resolved in 6.3; item 6 is new.
+  * **Gaps found while surveying, with no entry yet:**
+    * **zen-mount doesn't attach integrity** (`packages/fuse` never calls `fs.integrity`). Only `apps/shared` workers (`ZEN_INTEGRITY=1`) and the ledger do.
+    * **A file's versions aren't covered by the tree state.** The leaf (fs.md §9.1) commits to a node's version **count** and change offset, not to its version records or manifests. The replica fetches those by `(node, changed)` (`replica.ts` `versionsOf`, `tree.ts` `versions`) and checks them against nothing. So a server could serve an older, still valid version record set under a node's current change offset, and the replica would show old content. It can't forge content.
+* **The docs' state:**
+  * README says "Milestone 6: in progress".
+  * DESIGN-3 §6 item 6 still says "signed roots over a Merkle row and index tree": 6.5 built one state tree per namespace, with no signature per commit.
+  * GAPS G26 has no status note.
+* **CI:** `workflow_dispatch` already starts the `openssh-pq` job (`if: github.event_name == 'workflow_dispatch'`), the precedent for a job that runs only by hand. The `devices` job has the ublk driver.
+
+### Docs
+
+**docs/INTEGRITY.md (new): the guide**, for app developers and operators. It links to the API sections rather than repeating them.
+1. **What the server can and can't do.**
+   * It can't read, forge or move values.
+   * Without integrity it can serve older values, withhold the newest ones, or fork clients into two histories.
+   * Fork consistency (DESIGN.md §2.6) is the limit: a hard bound, not a gap in the implementation.
+2. **How it works:**
+   * device checkpoints: chained, signed with the hybrid signature, sealed, and cumulative
+   * `seen` links between devices
+   * pins and floors
+   * the cadence and the window it leaves
+   * a diagram of two devices' chains with their `seen` links, and where a fork shows
+3. **What is covered: a table, one row per object:**
+   * the ACL, the signed fs header
+   * topics: chains, gaps, rewrites, withheld tails
+   * trees: `ops`, chain and state
+   * relayed connections
+   * authenticated zen-db namespaces
+   * volumes
+
+   Each row gives what a device notes, where the check happens, the alarm, and the spec section.
+4. **What isn't covered:**
+   * **Basic zen-db namespaces**, and KV values outside these objects: consistency of the AEAD only, no freshness.
+   * **Ephemeral messages:** replay filtering only.
+   * **A file's version records** (the gap above; TD-FS-VERSIONS-INTEGRITY).
+   * **`/unencrypted`.**
+   * **Readers that use keys or groups** check rewrites only, not gaps.
+   * **CRDT tables** are refused in authenticated namespaces.
+   * **The first sync trusts on first use:** a device with no pins accepts what it's first shown.
+5. **Turning it on:**
+   * TS: `fs.integrity`, before `unlock`
+   * Rust: `fs.integrity`, or the CLI
+   * the workers: `ZEN_INTEGRITY=1`
+   * zen-db: `integrity: 'authenticated'`
+   * zen-ublk: always on
+   * zen-mount: not yet (TD-FUSE-INTEGRITY)
+6. **Signers and enrollment:**
+   * a device in the ACL vs a registered one
+   * `enrollDevice` and `approveDevice`
+   * why an enrolled device signs checkpoints but doesn't sign in
+7. **Pins:**
+   * where they live (the local store, the pins file, the volume pin)
+   * what losing them costs (trust on first use again)
+   * keeping them with the device key
+   * comparing out of band: a phone and a server, `exportPins` / `zen-client pins compare`
+8. **Alarms and what to do:**
+   * the five kinds
+   * what each component does: the TS calls throw and stop signing, a replica stops its feed, a handler aborts the connection, zen-ublk fails closed
+   * a suggested app policy
+9. **Choosing the cadence:**
+   * `sigEvery` and `delayMs`
+   * `sigEvery: 1` for handlers and volumes that must close the window
+   * the costs (STATS §6)
+10. **Testing an app against a lying server:**
+    * `spawnServer({adversary: true})`, `lie`, `TestServer.fork()`
+    * the Rust harness's `Server::fork`
+
+**docs/BLK.md, finished** (§1–4 stay; new sections):
+* **§5 How it works.** Keys, leaves, the tree (fan-out 128), the root record chain, a commit (blocks, changed nodes, root, fence), reads checked top-down, and settling a lost answer. It summarizes spec/blk.md and links to it.
+* **§6 What the server sees and can do.**
+  * **It sees:** the leakage (blk.md §7), the number of blocks and nodes, write timing and locality per commit, and discards as deletes.
+  * **It can't:** read, forge, or move blocks.
+  * **Caught:** a rollback, by the writer's pin or by checkpoints.
+  * **The window:** a read-only reader on another device, before the writer's next checkpoint.
+  * **A fork:** caught when checkpoints cross.
+* **§7 Numbers:** the engine (STATS §5.7) and ext4 over each frontend (STATS §6.3), with how to choose `--batch-blocks` and `--idle-flush-ms`.
+* **§8 Limits:**
+  * one writer
+  * a fixed size, no snapshots, no delete (TD-BLK-SNAPSHOTS)
+  * read-only exports fail with `volume_changed` when the writer moves the root
+  * ublk needs the `ublk` feature and libclang to build, and `ublk_drv` to run
+* **§9 Running it under systemd:** a unit for `zen-ublk … ublk --id 0` with `KillSignal=SIGTERM` and a `TimeoutStopSec` above the flush, and why `--id` matters on a restart.
+
+**docs/STATS.md:**
+* **§1.1, three new rows** (computed from the formats; the numbers are rough here and are worked out from the formats when written):
+  * **A checkpoint:** about 4.4 KB sealed with a few entries (the signature is 3,375 B), times `checkpoint_keep` (1,024) per device at most: ~4.5 MB per device. It counts toward the quota.
+  * **A chained event (v2):** +52 B (12 + 8 + 32).
+  * **A volume:**
+    * Per stored block: the 48-byte seal + a 10-byte versionstamp + the key (4 elements, ~72 B), about 3 % over 4 KiB.
+    * Per 128 blocks: one level-1 node, about 0.8 %.
+    * So a fully written volume costs about 4 %, and an empty one its root record.
+* **§6 Integrity: what it costs (new).** A summary table that points to §5.2, §5.4, §5.6 and §5.7, plus the new measurements:
+  * **§6.1 TS checkpoints:**
+    * a `checkpoint()` end to end with 10 and with 100 entries (sign, seal, put): latency and sealed bytes
+    * a `sync()` after 1 and after 10 devices moved
+    * `exportPins` size for 10 devices
+  * **§6.2 Event chains:** `append` latency and commit bytes with and without integrity attached (median of 50), and an unfiltered read of 1,000 events checked vs not.
+  * **§6.3 ext4 on the devices** (release, `--batch-blocks` 256), for FUSE+loop and for ublk:
+    * `mkfs.ext4` of 1 GiB
+    * a sequential 256 MiB write with `conv=fsync`
+    * a sequential read after `drop_caches`
+    * 4 KiB `oflag=dsync` writes (fsync latency)
+    * untarring a source tree (many small files) with a final `sync`
+  * **§6.4 Reading it:**
+    * where the time goes: round trips, not crypto, natively
+    * choosing `sigEvery`
+    * a checkpoint per handler step costs one signature and one put
+  * The ublk figures come from a GitHub runner (2–4 vCPU, a different machine from the 4-core development box), and the table says so.
+
+**spec/TECH_DEBT.md, three new entries:**
+* **TD-WITNESS** (open):
+  * **Context:** fork consistency. Groups that never see each other's checkpoints can't detect the split, except by comparing pins out of band.
+  * **What it would take:** a witness, a log outside the server (another zen-serve, or a transparency log). Clients post their device heads `(fp, seq, HC)` to it after each checkpoint and read the others' heads from it. A head the server doesn't show is a fork. Optionally the witness signs the heads it has seen, and a client waits for that before trusting a sync. Plus the fs setting naming the witness, and a test with a forked server and an honest witness.
+* **TD-FS-VERSIONS-INTEGRITY** (open): the gap above.
+  * **What it would take:** a version digest in the leaf, a hash over the node's version records (dots and sealed manifests), with the spec change (fs.md §9.1, a leaf version 2 and new vectors). The replica checks fetched versions against the node's state. The tree states of 6.4 change, so it lands with a format bump.
+* **TD-FUSE-INTEGRITY** (open): zen-mount attaches no integrity.
+  * **What it would take:** `--integrity` (pins in the store directory, the device key as signer), the replica's alarm surfaced as `EIO` and a log line, and a test.
+
+**Also in TECH_DEBT:**
+* TD-SVC-STATE-ROLLBACK stays closed, unchanged.
+* TD-BLK-SNAPSHOTS stays as written in 6.7.
+
+**Elsewhere:**
+* **docs/API.md:** an "Integrity (milestone 6)" area section, like the relayed services' one. It lists `/v1/checkpoint/{put,heads,get}`, `/v1/devices/{register,get}`, `/v1/lease`, `Commit.fence`, `cksub`/`ckh`, and the signed header, with links to api.md §15 and §16.
+* **CLIENT.md §12:**
+  * a pointer to INTEGRITY.md at the top
+  * "volumes in a later step" becomes "volumes (zen-blk)"
+* **spec/OPS.md §4:** three pitfalls:
+  * **Keep the pins files.** Losing them means trust on first use again.
+  * **An authenticated namespace serializes its writers.**
+  * **`sigEvery: 1` in a browser** costs 2.6 ms of signing per change.
+* **GAPS.md G26:** "**Done (milestone 6):** topic heads and event chains in device checkpoints (formats.md §5.1, §14)".
+* **DESIGN-3 §6 item 6:** reworded to what was built (one state tree per namespace, no signature per commit), and marked done.
+* **README:**
+  * Milestone 6 done, with "outcome at its end"
+  * two lines in the building blocks: integrity, and block devices
+  * docs/INTEGRITY.md and BLK.md in the docs row
+* **docs/MILESTONE-6.md, an Outcome section** in the shape of 5.5's:
+  * **What was built,** per step.
+  * **Differences from the plan:** collected from each step's "Changes from the plan" and "Found while …" in the log. For example: the state tree instead of row trees, the `0x00 0x00` terminator, purge records, `observe` with `floorAt`, the engine's lease fixes, settling a lost answer, libublk's per-thread ring.
+  * **Tests:** counts per crate and package, taken from the runs at this step. The negative controls are summarized.
+  * **CI:** the `devices` job, the `client` job's `test-utils` build, and `devices-bench`.
+  * **Measurements:** STATS §5.6, §5.7 and §6.
+  * **Tech debt:** resolved (TD-SVC-STATE-ROLLBACK; TD-TEST-OPEN-FAILURES items 1 and 4) and new (TD-BLK-SNAPSHOTS, TD-WITNESS, TD-FS-VERSIONS-INTEGRITY, TD-FUSE-INTEGRITY; item 6).
+
+### Benches (opt-in; none runs in a normal CI build)
+
+* **`packages/client/test/integritybench.test.ts`** (new):
+  * It runs only with `ZEN_BENCH=1`, like `packages/db/test/bench.test.ts`, whose skip pattern it copies. It runs against a release server (`ZEN_SERVE_BIN`) and release WASM, as §5.5 did.
+  * It measures the §6.1 and §6.2 numbers above, the median of 20–50 runs each.
+  * Ten devices: one TS device plus nine enrolled ones, each writing one checkpoint per round.
+* **`crates/zen-ublk/tests/devices.rs`, two `#[ignore]` tests, `bench_fuse` and `bench_ublk`:**
+  * They reuse the suite's guards and `serve` helper, on a 1 GiB volume, and print a table.
+  * They run with `cargo test --release -p zen-ublk --features device-tests[,ublk] --test devices bench -- --ignored --nocapture` as root.
+  * `bench_ublk` follows the suite's rule: it skips with a message when there's no `/dev/ublk-control`, and fails when `ZEN_TEST_REQUIRE_UBLK=1`.
+  * The source tree for the untar step is a tarball the test makes from `crates/` (a fixed set of files, deterministic). It needs no download.
+* **CI job `devices-bench`**, which runs only when started by hand:
+  * `if: github.event_name == 'workflow_dispatch'`, the same setup steps as `devices`, then both benches in release, with `ZEN_TEST_REQUIRE_UBLK=1`, `timeout-minutes: 30`.
+  * I start it once on this branch (`actions_run_trigger`), read its log, and record the numbers in STATS §6.3.
+  * The FUSE numbers are also measured here, on the development machine, and both sets are given with their machines.
+
+### Verification
+
+* **Rust:**
+  * `cargo fmt --check`
+  * clippy `-p zen-ublk --all-targets --features device-tests,ublk -D warnings`, plus the workspace's three feature sets (the benches only add tests)
+* **The benches:**
+  * `bench_fuse` here (release, as root), twice, to see the spread
+  * `ZEN_BENCH=1` on the integrity bench, twice
+  * `devices-bench` once in CI, green
+  * Before the release builds, prune `target/debug/deps` and `target/release` as needed: about 6.6 GB is free.
+* **JS:** `npm run check`. The new bench file is skipped without `ZEN_BENCH` (vitest lists it as skipped, as the other benches).
+* **Docs:**
+  * every link and section reference in the new and changed docs resolves (a small script over the `](…)` links and `§` references of the touched files)
+  * every TD named anywhere exists in TECH_DEBT (`grep -o 'TD-[A-Z0-9-]*'` over `docs` and `spec`, compared with the headings)
+* **CI:** green on both runs (push and pull_request). `devices-bench` doesn't run on them.
+
+### Files
+
+* **Docs:**
+  * new: `docs/INTEGRITY.md`
+  * `docs/{BLK,STATS,API,CLIENT,GAPS,DESIGN-3,MILESTONE-6}.md`
+  * `spec/{TECH_DEBT,OPS}.md`, `README.md`
+* **Benches:** `packages/client/test/integritybench.test.ts` (new), `crates/zen-ublk/tests/devices.rs`
+* **CI:** `.github/workflows/ci.yml` (the `devices-bench` job)
+
+**Defaults chosen (overridable):**
+* **The two gaps found while surveying are recorded as tech debt, not fixed here.** The version digest changes fs.md §9.1's leaf and its vectors: a format change, out of place in a docs step. zen-mount's integrity is a feature.
+* **ublk is benched in a CI job started by hand**, since this container has no ublk driver. FUSE is benched both here and there.
+* **INTEGRITY.md is a guide that links to the API sections** (CLIENT.md §12–13, DB.md §7.1, SVC.md §6, BLK.md) rather than moving them.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.
