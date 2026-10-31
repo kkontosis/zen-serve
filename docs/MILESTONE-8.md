@@ -157,6 +157,24 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Checks:**
     * `cargo fmt`; clippy `--all-targets -D warnings` on the workspace (default, `--no-default-features`, `--all-features`)
     * `cargo test -p zen-server` on embedded: all suites pass
+    * `scripts/build-wasm.sh` and `npm run check`: clean
+  * Pushed e9a4b9d (d3fffff before it).
+  * **CI:**
+    * `rust`, `pure-rust`, `fdb` and `client` green on both runs
+    * `devices` red on the push run, green on the pull_request run of the same commit
+    * The red: zen-ublk's `fuse_writer_killed` and `fuse_ext4_round_trip` lost the writer's 2 s lease (`lease_lost`, then EIO, then ext4 read-only)
+    * The cause is in the test, not this PR: `crates/zen-ublk/tests/devices.rs` runs the server in-process on the test's tokio runtime, and the test bodies call blocking code (`losetup`, `mkfs`, `mount`, `std::fs::write` into the FUSE mount, `sync`) from async code. A blocked worker can delay a renewal past the 1.33 s of slack.
+    * Explained in a PR comment, and the failed job re-run once: green. PR #66 merged. Step 8.2 is done.
+  * **Local FDB run:** hung because the local cluster ran out of disk (`DDTeamPivotAvailableSpaceTooSmall` in its logs), not because of the code; CI's `fdb` job covers it. The cluster was stopped and its data removed.
+  * **Pending for the user:** fix the devices test (the proposed fix: start the test server on its own runtime thread in `World`, or `block_in_place` around the blocking helpers), in its own PR or folded into 8.3.
+  * **Decided at the 8.3 plan:** the devices fix rides in 8.3 as its own commit.
+* **Step 8.3** (`@zen/client` write and read paths): planned below ("Step 8.3 in detail").
+  * **First:**
+    1. restart from main (bc37ca9)
+    2. `cp` this file to `docs/MILESTONE-8.md`
+    3. commit `docs: milestone 8 step 3 plan`
+    4. push and open the PR
+  * Then implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -612,6 +630,224 @@ The fixes:
 * **Keep the cap at 64 and add `list`,** rather than raising the cap or letting admins close sessions. Sessions of a user removed from the ACL simply expire, which becomes an OPS pitfall in 8.7.
 * **Close needs no fs right,** only being the session's user.
 * **Each reference counts as a quota key, but the session records don't,** since there are at most 64 per user and fs.
+
+## Step 8.3 in detail
+
+Step 8.3 makes `@zen/client` read version 3 and write it, the default under `chunking: cdc`. It also makes edits and appends cost the pages they touch, makes uploads resumable past the grace period through upload sessions, and pipelines commits and reads.
+
+The replica (`@zen/fs`) and zen-mount keep writing fixed chunks until 8.4. They read v3 files through the client unchanged.
+
+**Survey (`packages/client/src/tree.ts`, 1,596 lines):**
+* **Reading:**
+  * `read` locates chunks by `offset / chunkSize`. `chunkIds(v, first, last)` maps chunk indexes through pages (`pageSize` ids each). `fetchPages` checks each page's digest and its expected count.
+  * `readStream` reads one window of 64 chunks per pull, which is one `chunks/get` request in flight. That's why the probe measured 112–131 MiB/s.
+  * `openVersions` refuses v3 with `format`, and `opener` takes a file key only from v2.
+* **Writing:**
+  * `stage` cuts fixed blocks (`blocks()`), reuses previous chunks by SHA-256, cuts full pages as ids accumulate, and flushes a commit whenever `max_commit_bytes` or `max_commit_ops` would be passed. Each flush awaits its commit before the next one starts.
+  * `UploadState` copies every id and hash at each `onProgress`, which is quadratic over an upload.
+  * `KnownChunk` must start at a block boundary and be whole.
+  * `ChunkIndex` lists every id and hash.
+* **Users of these types:**
+  * `@zen/fs` `handle.ts` and `replica.ts`: a fixed `chunkSize` handle, `KnownChunk` sources, `indexOf` (JSON records), and `base.manifest.chunkSize`
+  * kanban's `attach` (`chunkSize`, `onProgress`); its test worker prints `state.chunks` after each commit
+  * `large.test.ts` (fixed chunks of 1,984 B at a `max_value_bytes` of 2,048)
+* **wasm already has** (8.1): `ManifestV3`, `sealManifestV3`, `openAnyManifest` v3, `encodePage2`, `decodeAnyPage`, `pageCapacity2`, `cdcDefaults`, `FsKeys.chunker`, `fileChunker`, and `Chunker.push`/`finish`/`pending`. It lacks encoders for the four upload-session requests.
+* **The server's default `max_value_bytes` (90,000)** gives CDC defaults of min 8,192, avg 2^15 and max 89,936. At 2,048 (the large tests) `cdcDefaults` is undefined.
+
+### A spec change: v3 pages need not be full
+
+**The problem:** formats.md §11.3 has every v3 page full but the last (`m = ceil(n / page_size)`). Under CDC an edit can change the chunk count by a few, so every page after the edit shifts and must be fetched, re-encoded and uploaded again. That's about 1,300 pages (117 MB each way) for one small edit of a 200 GiB file. Under v2 it doesn't arise: fixed chunks don't shift unless bytes are inserted.
+
+**The change (`spec:` commit):**
+* **formats.md §11.3, v3 paged:**
+  * Each page holds 1 to `page_size` entries, and `ceil(n / page_size) ≤ m ≤ n` (`m = 0` exactly when `n = 0`). `page_size` is then the writer's capacity per page.
+  * A reader finds an offset through the pages' `bytes`, and checks a fetched page against its digest, its `bytes`, and an entry count of at most `page_size`.
+  * The digest is in the sealed manifest, so swapping, reordering or truncating a page is still detected; the count check was redundant with it.
+  * The decoder's rule becomes "`m` outside `ceil(n / page_size)..=n`".
+* **Why now:** no v3 manifest exists yet (8.3 writes the first), and v2 is unchanged.
+* **zen-core:** `ManifestV3::decode`'s check, and its refusal test, which gains `m = n + 1`, `m` below the ceiling and `m > 0` with `n = 0`. The vectors are unchanged, since their full pages stay valid.
+* **Fill rule (writer, below):** a page is cut short only where an edit ends, and a short page is merged with its successor when the two fit in one page. So any two neighbours hold more than `page_size` entries, every page is more than half full on average, and capacity is at worst half of 8.1's figure (about 100 GiB at the defaults).
+* **Repacking:** when a write would need more pages than one manifest holds, `edit` writes again with every page re-cut full (`repack`), which costs fetching all the pages, and fails `too_large` only if that doesn't fit either.
+
+### Reading (v1–v3)
+
+* **Types:**
+  * `AnyManifest` is v1–v3, and `WrittenFile.manifest` and `Upload.manifest` are `ManifestV2 | ManifestV3`.
+  * `FileVersion` gains `chunking: 'fixed' | 'cdc'` (v1 and v2 are fixed).
+  * `opener` takes v3's file key too.
+  * `openVersions` checks v3's inline entries and pages against the write's lists, as for v2.
+* **Locating:**
+  * A private `spans(v, offset, end)` gives the chunks a byte range falls in (`{id, start, len}`), fetching only their pages.
+    * Fixed: by division, as now.
+    * v3 inline: prefix sums over the entries' lengths, computed once per version and memoized.
+    * v3 paged: a binary search over the pages' cumulative `bytes`, then over the page's lengths.
+  * Decoded pages keep ids and lengths in the memo (`PAGE_MEMO` 256) and in the `pageCache` path.
+  * `read` checks each chunk's plaintext length against its entry (v3) or the fixed size.
+* **`readStream`:**
+  * Windows are counted in bytes (4 MiB, aligned to chunk ends).
+  * Up to `readAhead` windows are fetched ahead (default 3, an option), so several `chunks/get` requests are in flight. Order is kept, and memory stays at `readAhead + 1` windows.
+  * Cancelling stops the prefetches.
+* **`chunkIds(v, first, last)`** keeps working by chunk index. For v3 paged it walks the pages from the start (page counts vary), so the replica's prefetch of every id fetches each page once.
+
+### Writing
+
+**Choosing the form:**
+* **What decides:** `WriteOptions.chunking` if given, else `chunkSize` given implies `fixed` (kanban and the replica keep their behavior), else the fs policy (`cdc` by default).
+* **When CDC falls back to fixed:**
+  * the server lacks the `fs_cdc` feature
+  * there are no parameters: no `WriteOptions.cdc` or `TreeOptions.cdc`, and `cdcDefaults(max_value_bytes)` is undefined (small values)
+  * the size is known (a `Uint8Array`, or `WriteOptions.size`) and exceeds the CDC capacity: `pageCapacity2 × max pages × 2^avg_bits`, conservatively
+* **An unknown size that passes the capacity** fails `too_large` with the hint to write with `chunking: 'fixed'`.
+* **Parameters:** a write with a v3 `previous` or base uses that version's parameters, so its cuts resync with it.
+
+**The CDC writer (in `stage`):**
+* **Cutting:** source bytes go through a `Chunker` from `keys.chunker(params)` or `zw.fileChunker(fs, fileKey, params)`. Bytes since the last cut are buffered (at most `max`), and each cut gives one chunk.
+* **Reuse by SHA-256:** a chunk's plaintext SHA-256 is looked up among `previous`'s hashes, as now. Reuse needs only the same key, not the same parameters, since equal hashes mean equal bytes. So an insertion re-uploads only the chunks around it: the cuts resync within about 2 chunks (8.1's vectors).
+* **Pages:** entries `id ‖ len` (form 2), cut into pages of up to `pageCapacity2(max_value_bytes)`, with the fill rule above. Inline up to what one value holds (`(max_value_bytes − sealed empty manifest) / 20`), paged past it.
+* **Index:** `ChunkIndex` gains `lens?: number[]` and `cdc?: CdcParams`. `chunkSize` becomes optional (fixed only).
+
+**Known content in a source (fixed and CDC):**
+* **`KnownChunk`:** `{id, size, hash?}`, where `hash` is now optional.
+* **New `KnownPage`:** `{page: PageRef | PageRefV3}`, a whole page of the base.
+* **Base and validation:**
+  * The base is `WriteOptions.base`, a `FileVersion`, or `previous`'s version.
+  * Known items must be of a base under the write's key, else `bad_value` as now. Known chunks are checked against `previous.chunks` when it lists them; known pages against the base manifest's pages.
+* **Taken over as is when aligned:**
+  * Fixed: at a block boundary and whole. A known page also needs a page boundary, and must be full or last.
+  * CDC: a known chunk when the chunker is at a cut (`pending = 0`). A known page also closes the open page, under the fill rule: when the open page is under half full, the known page is fetched and merged if the two fit.
+  * In either form, the base's last chunk (cut by its end, not its content) is taken over only if it stays last.
+* **Otherwise the writer fetches the item's plaintext from the base** and feeds it through, until a cut lands on a known item's start; from there items pass through again. Today an unaligned item fails `bad_value`.
+* **This is the resync:** the source only says which bytes are new and which are the base's, and the writer fetches the base's bytes only around an edit.
+
+**`Tree.edit(node, base, edits, opts)` (new) → `WrittenFile`:**
+* **Edits:** sorted, non-overlapping `{offset, remove, insert}`, giving a truncate, an overwrite, an insertion, a deletion or an append.
+* **It builds the source:**
+  * known pages for pages untouched by any edit
+  * known chunks for the untouched chunks of a touched page
+  * the inserted bytes, and nothing for the removed ones
+* **Cost:** the touched pages, plus the chunks from the start of the one holding each edit to where the cuts resync (CDC) or to the end of the edit's blocks (fixed). Nothing scales with the file's size.
+* **No index needed:** everything comes from the manifest and the touched pages, so no `previous` or hashes. `Tree.append(node, data, opts)` is `edit` with one edit at the end.
+* **Options:** as `WriteOptions` (`replaces`, `session`, and `repack` when the page count overflows, above). `editUpload` is the same without the write (as `upload`), which 8.4's replica handle uses with a sink.
+* **Fixed form:** an insertion or deletion not a multiple of the chunk size shifts every later block, so the writer reads the base from there on. That's correct but costs the rest of the file, and the docs say so.
+
+**`ChunkIndex` hashes are optional:** `chunkIndex(node, v, {hashes: false})` builds ids and lengths from the pages alone (no content read). A write whose `previous` lacks hashes reuses only through known items.
+
+**Pipelining:**
+* Upload commits are sent with up to `MAX_IN_FLIGHT = 3` in flight. The write commit waits for all of them, and `WriteOptions.parallel` (1–8) overrides the default.
+* `onProgress` is called in commit order, each time with the state after the longest finished prefix. A failed commit fails the upload after the others settle, and the last state reported doesn't include it.
+* Memory: about `parallel × max_commit_bytes` of sealed data.
+
+### Resuming and upload sessions
+
+**`UploadState`, compact and resumable:**
+```
+{ node, chunking, chunkSize? | cdc, size, pages: (PageRef | PageRefV3)[],
+  tail: {id, len, hash?}[], fileKey?, keyEpoch?, session?, expiresMs?,
+  uploaded, pagesUploaded, commits }
+```
+* **`tail`** is the entries since the last full page (at most one page), with hashes when known.
+* **Building it** costs O(pages + tail) per report, not O(n).
+* **Resuming** works for both forms. The source is the rest from `state.size`, which is at a cut (CDC) or a block boundary (fixed), and the chunker restarts there, since cuts depend only on the bytes since the last cut.
+* **Hashes:** a resumed upload's index holds hashes only when every one is known (they aren't kept for full pages). Otherwise it has none.
+* **Breaking change:** `chunks` and `hashes` leave the state. `onProgress` gains a second argument `{chunks, pages}`, the ids that commit put. The kanban uploader worker prints those instead.
+
+**`upload(…, {session: true})` and `writeFile(…, {session: true})`:**
+* **Session lifecycle:**
+  * Open a session (`fs/upload/open`, `ttl_secs` from `opts.sessionTtlSecs`), and send every commit with `upload: {fs, session}`.
+  * Renew between commits once less than half the ttl is left.
+  * `writeFile` closes the session after its write commit. `upload` leaves it open, since the write comes later; it's in `Upload.session`, and the caller closes it with `tree.closeUpload(session)` after the write.
+* **Resuming:** with a state that has a session, the session is renewed first. On 412 `upload_gone` the resume fails with that code: the content may be gone and the upload starts over.
+* **Without a session**, resuming keeps working within `chunk_grace_secs`, as now.
+* **The cap:** `tree.uploads()` lists the caller's open sessions (`fs/upload/list`), so a client that lost its state can close them and get under the cap of 64.
+* **Server support:** `session: true` on a server without `upload_sessions` fails with `unsupported`.
+* **wasm:** encoders and decoders for `UploadOpen`, `UploadSession`, `UploadRenew`, `UploadExpiry`, `UploadClose`, `UploadList` and `UploadSessions` (`wire.rs`).
+
+### `@zen/fs` and other callers (kept working, no new behavior)
+
+* **The replica stays fixed until 8.4:**
+  * `sealWrite` passes `chunking: 'fixed'`.
+  * A v3 base gives the handle the default chunk size: `base.manifest.chunkSize` exists only on fixed versions, now read through `FileVersion.chunking`.
+  * The handle's index of a v3 base isn't usable (no `chunkSize`), so a flush based on a v3 file seals the whole file once, and later flushes reuse as now. Reads of v3 go through `tree.read`, by byte offsets, which is unchanged.
+* **kanban** passes `chunkSize`, so it stays fixed, and its worker uses `onProgress`'s second argument.
+* **Existing suites:**
+  * `large.test.ts` sets fs 1's policy to `fixed`, so it keeps testing v2 as written.
+  * Assertions elsewhere on `version 2` or `chunkSize` are updated where the default now gives v3.
+
+### The devices test (folded in, its own commit)
+
+zen-ublk's `tests/devices.rs` lost a writer lease on CI in 8.2: the in-process server shares the test's runtime with blocking calls (`losetup`, `mkfs`, `mount`, `sync`, writes into the FUSE mount).
+
+The fix: `world()` starts the server on its own thread with its own multi-thread runtime, so the test's blocking calls can't delay lease renewals. CI's `devices` job runs it.
+
+### Tests
+
+**New `packages/client/test/cdc.test.ts`:**
+* **The setup:**
+  * `max_value_bytes` of 8,192 and `TreeOptions.cdc` `{min: 256, avgBits: 10, max: 8,128}`
+  * A page then holds 409 entries, and a CDC version reaches tens of MB with thousands of chunks, so every test runs in seconds.
+* **The cases:**
+  1. **Round trip and form:** inline and paged v3 from bytes, an async generator and a web stream. Entries are within the bounds, and the server stores form-2 pages.
+  2. **An insertion re-uploads ≤ 3 chunks:** 100 bytes inserted mid-file through `writeFile` with `previous`. It also re-uploads at most 2 pages, given the merge under the fill rule.
+  3. **An append fetches only the last page:** `append` on a paged v3 file makes one `pages/get` of the last page and one `chunks/get` of its last chunk, counted with `calls()`. It does the same for v2 (the last page, and the last block if short).
+  4. **`edit` costs touched pages:** an overwrite, an insertion and a deletion mid-file each fetch and upload only the touched pages. Pages are not all full afterwards, and the file reads back. A repeated edit at many places stays within the fill rule's bound (every adjacent pair over `page_size`).
+  5. **Random reads match a model across v1, v2 and v3:** 200 random `read(offset, length)` calls and `readStream` ranges, against the plaintext. Also a forced `repack`.
+  6. **Resuming:**
+     * with a session after the grace: `chunk_grace_secs` 1, the upload killed mid-way, sweeps past the grace, then resumed; it uploads only the rest and reads back
+     * without a session: the same fails 400 (a chunk missing)
+     * an expired session: 412 `upload_gone`
+     * `closeUpload` and `uploads()`
+     * the state stays O(pages + tail): its JSON size after 30 commits is under a bound
+  7. **Pipelining:** with 3 in flight (commits delayed by an edited `session.call`), `onProgress` sizes are non-decreasing and reported in commit order. A failure injected in commit 4 rejects the upload; the last state has 3 commits, and resuming from it reads back.
+  8. **Policy:** `setPolicy({chunking: 'fixed'})` writes v2. A known size over the capacity picks fixed, and an unknown one fails `too_large` with the hint. A server without `fs_cdc` gets fixed (`info` stubbed through `TreeOptions.info`).
+  9. **Refusals:** a page swapped, truncated or with lengths not summing to its `bytes` (the response edited) is refused `format`; so is a known item of another key.
+
+**Updated:**
+* `large.test.ts` (fs 1 fixed; the resume test uses the compact state and the second argument)
+* `tree.test.ts` and `fsvectors.test.ts` where they assert v2
+* kanban's attach test (worker output)
+* `@zen/fs` replica tests: unchanged, run, plus one new case where a replica reads and edits a v3 file written by `writeFile`
+
+**zen-core:** the refusal test for the relaxed `m`.
+
+**Negative controls** (each run once, then restored):
+* Inline v3 located by fixed division: the model test fails.
+* Known chunks taken over unaligned: the insertion test reads back wrong.
+* The fill rule's merge off: test 4's bound fails.
+* `upload` left out of the commits: the session resume test fails (chunks collected).
+* `onProgress` reported as commits finish rather than by prefix: test 7 fails.
+
+### Files
+
+* **Spec:** `spec/formats.md` (§11.3 v3 paged)
+* **zen-core:** `crates/zen-core/src/fs.rs`, `crates/zen-core/tests/fs.rs`
+* **zen-wasm:** `crates/zen-wasm/src/wire.rs`
+* **Client:**
+  * `packages/client/src/{tree,index}.ts`
+  * `packages/client/test/{cdc (new),large,tree,fsvectors}.test.ts`
+* **Callers:**
+  * `packages/fs/src/{replica,handle}.ts` and a replica test
+  * `apps/kanban/workers/uploader.ts` and its test
+* **zen-ublk:** `crates/zen-ublk/tests/devices.rs`
+* **Docs:** `docs/CLIENT.md` (§8–§9: CDC, `edit`/`append`, sessions, the compact state), `docs/MILESTONE-8.md` (the log)
+
+### Verification
+
+* **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` on zen-core, zen-wasm and zen-ublk; `cargo test -p zen-core --features test-utils`
+* **Build and lint:** `scripts/build-wasm.sh`, `npm run check`, biome
+* **Suites:**
+  * `cdc` 3×
+  * `large`, `tree`, `fsvectors`, `stream` and the `@zen/fs` replica suites once
+  * the kanban attach test
+  * the full `npx vitest run`
+* **Negative controls:** the five above.
+* **CI:** green on both runs, including `devices`.
+
+**Defaults chosen (overridable):**
+* **Relaxed v3 page fill** (the spec change above), rather than accepting O(pages) work per CDC edit.
+* **`chunkSize` given implies `fixed`,** so existing callers keep their chunks.
+* **Small servers fall back to fixed** rather than scaling CDC parameters down on their own. Tests pass parameters explicitly.
+* **Up to 3 upload commits and 3 read windows in flight.**
+* **The replica stays fixed until 8.4,** and the devices fix rides in this PR as its own commit.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
