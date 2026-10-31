@@ -288,7 +288,51 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * The zen-blk tests 3× green, and once with `--no-default-features` (the `pure-rust` configuration).
   * **CI green on both runs of a41a906** (push 433, pull_request 434): rust, pure-rust, fdb and client all pass. Step 6.7 is done, waiting on review and merge of PR #60. This line reaches `docs/MILESTONE-6.md` at the restart from main.
   * PR #60 merged.
-* **Step 6.8** (`crates/zen-ublk`, the FUSE export and ublk): planned below ("Step 6.8 in detail"). Restart from main first, so the log above reaches the repo copy too.
+* **Step 6.8** (`crates/zen-ublk`, the FUSE export and ublk): planned below ("Step 6.8 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (c0de3d3), PR #61.
+  * `spec:` commit 30154a2: blk.md §4, two new bullets. A lost answer is settled before the writer reads or commits again. A delete of a block the tree shows absent is left out, and a commit that would change nothing isn't made.
+  * **zen-blk:**
+    * Writes and discards hold a write lock from their edge reads until their blocks are buffered. A full batch flushes after the lock is released.
+    * `commit` drops deletes whose verified leaf is already zero (`Tree::leaf_in`), and a chunk left empty commits nothing.
+    * **Found while implementing:** the unknown-outcome path. When `send` couldn't read the root after its replays either, it gave the error back. The flush then put its blocks back, and the next commit wrote seq + 1 again, over a commit that may have applied: two root records at one seq. Now `State.unknown` keeps `(RH before, RH written)`, and the next read or commit first settles it from the stored root (`settle`):
+      * the old root: nothing applied
+      * its own root: the tree restarts from it, and the pin and the checkpoint entry follow
+      * anything else: `lease_lost`
+  * **zen-client:** new `cli.rs`. `ConnectArgs` (a clap `Args`: the six options, with `pins_path` and `beside_key`) and its `connect` (sign in, attach, unlock, sync), plus `exit_code` and `print_error`. `main.rs` uses them, with the same behavior.
+  * **zen-ublk** (new crate):
+    * `disk.rs`: the adapter. Errnos, transient retries up to `--io-timeout-ms`, fail-closed `Failure {code, message}`.
+    * `fuse.rs`: fuser 0.18 without libfuse, 4 threads, a task per request, `fsync`/`flush` → flush, `fallocate` → discard.
+    * `ublk.rs` (feature `ublk`): libublk 0.4.8. 4 KiB blocks, discard, `VOLATILE_CACHE|FUA`, smol queues awaiting tokio `JoinHandle`s, `clear_stale`.
+    * `main.rs`: `create`, `info`, `fuse DIR` and `ublk`, with `ready <path>`, SIGINT/SIGTERM, and exit codes 0/1/3.
+    * libublk builds here (bindgen with libclang 18), and clippy passes with every feature.
+  * **Changes from the plan:**
+    * `info` prints size and root, without whether a writer holds the lease (that would need a lease request).
+    * An unmount that fails (a loop device still on the file) keeps serving and says so.
+    * Without C: the crate adds none. Its only C is blake3's SIMD code, which zen-client already has, and blake3's `pure` feature (as the server's) turns it off.
+  * **Found while testing:** the FUSE serve loop polled the signal future again after it completed ("`async fn` resumed after completion"), so a SIGTERM exited 101. It's now polled only until the unmount succeeds.
+  * **Tests:**
+    * zen-blk `tests/volume.rs` adds 2: concurrent partial writes into one block all land; discarding absent blocks commits nothing. On an empty 1 GiB volume, the seq stays 1. Of 3 written blocks, one commit deletes exactly those, checked against the reference tree.
+    * zen-ublk `tests/disk.rs`, 5, in the default suite without root:
+      * requests and errnos: unaligned I/O, FUA, discard edges, `EINVAL`, `EROFS`
+      * a lost lease fails closed (exit 1); an alarm fails closed (exit 3)
+      * an outage, through a TCP proxy, is retried; with a 300 ms timeout it gives `EIO`, the disk isn't failed, and the next flush commits
+      * a commit whose answer was lost, while the server stayed away for 5 s, is settled: seq 3, one record per seq, and the reader and the reopen agree
+      * plus 2 unit tests: sizes, default paths
+    * zen-ublk `tests/devices.rs`, 5, feature `device-tests`, as root:
+      * `fuse_file`: size and mode; `pwrite` aligned and not; a short read at the end; `EPERM` on resize; `busy`; read-only `EROFS`
+      * `fuse_ext4_round_trip`: loop, `mkfs.ext4` (with its discard), files, `sync`, stop, restart, `e2fsck -fn`, compare; then read-only with `ro,noload`
+      * `fuse_writer_killed`: SIGKILL after a synced and an unsynced set; `busy` within the lease; then `e2fsck -fy` ≤ 1, `-fn` 0, and the synced set intact
+      * `ublk_ext4_round_trip`, `ublk_writer_killed`: compiled and run here, where they skip (no `/dev/ublk-control`); CI requires them
+  * **Negative controls** (each run once, then restored):
+    * the write lock off: `concurrent_partial_writes` fails ("before the flush")
+    * the skip of absent deletes off: `discarding_absent` fails (1,025 commits instead of 1)
+    * `settle` off: the lost-answer test fails (seq 2: the writer wrote seq 2 again)
+  * **CI:** a new job `devices`. It installs fuse3 and e2fsprogs, runs `modprobe ublk_drv` (falling back to `linux-modules-extra`), runs clippy with `device-tests,ublk`, then the tests as root (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=sudo -E`) with `ZEN_TEST_REQUIRE_UBLK=1`.
+  * **Docs:** new docs/BLK.md (running it, durability, integrity), the README row, CLIENT.md §13 ("Sharing it").
+  * **Checks (all clean):**
+    * `cargo fmt --check`; clippy on the workspace `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`)
+    * `cargo test -p zen-blk -p zen-ublk` 3×; `cargo test -p zen-client`; `cargo test -p zen-ublk -p zen-blk --no-default-features`
+    * `cargo test -p zen-ublk --features device-tests,ublk --test devices` 3× as root; nothing is left mounted or attached afterwards
+    * `rustclient.test.ts` (the CLI refactor)
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
