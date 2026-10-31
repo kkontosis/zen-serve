@@ -155,7 +155,44 @@ async fn populated_on(h: Harness) -> (Harness, Vec<u8>, CommitResult) {
             Err(e) => panic!("/v1/lease: {e:?}"),
         }
     }
+    // An upload session holding a chunk (keyspace.md §3.6).
+    let up: UploadSession = call(
+        &h,
+        "/v1/fs/upload/open",
+        &tok,
+        &UploadOpen {
+            fs: 1,
+            ttl_secs: None,
+        },
+    )
+    .await;
+    let c = Commit {
+        commit_id: cid(3),
+        chunks: vec![ChunkPut {
+            fs: 1,
+            id: vec![0xAB; 16],
+            data: vec![1; 40],
+        }],
+        upload: Some(UploadRef {
+            fs: 1,
+            session: up.session,
+        }),
+        ..Default::default()
+    };
+    let _: CommitResult = call(&h, "/v1/commit", &tok, &c).await;
     (h, tok, r)
+}
+
+/// The one upload session of [`populated`].
+async fn session_of(s: &dyn Storage) -> Vec<u8> {
+    let pfx = zen_server::keys::upload_expiry(1).finish();
+    let all = everything(s).await;
+    let (k, _) = all.iter().find(|(k, _)| k.starts_with(&pfx)).expect("ux");
+    let (elems, _) = zen_store::tuple::unpack_prefix(&k[pfx.len()..], 2).unwrap();
+    match &elems[1] {
+        zen_store::tuple::Elem::Bytes(s) => s.clone(),
+        e => panic!("{e:?}"),
+    }
 }
 
 fn admin_device() -> Vec<u8> {
@@ -194,6 +231,21 @@ async fn export_import_round_trip() {
         let bell = zen_server::keys::ckpt_bell(1);
         assert!(get(src.as_ref(), &bell).await.is_some());
         assert!(get(&dst, &bell).await.is_none());
+        // Upload sessions are data: the record, both indexes, the reference.
+        let s = session_of(&dst).await;
+        assert!(
+            get(&dst, &zen_server::keys::upload_session(1, &s))
+                .await
+                .is_some()
+        );
+        assert!(has(
+            zen_server::keys::upload_user(1, &User::new(1).fp()).finish()
+        ));
+        assert!(
+            get(&dst, &zen_server::keys::upload_ref(1, &s, 1, &[0xAB; 16]))
+                .await
+                .is_some()
+        );
         // The pinned sign-in origin is data, not server metadata.
         let pins = zen_server::keys::origin_pins();
         assert!(everything(&dst).await.iter().any(|(k, _)| *k == pins));
@@ -237,6 +289,23 @@ async fn export_import_round_trip() {
     };
     let second: CommitResult = h2.call("/v1/log/append", Some(&tok), &c).await.unwrap();
     assert!(second.versionstamp > first.versionstamp);
+    // The upload session is still open on the copy, and still holds its
+    // chunk after a sweep.
+    let s = session_of(h2.server.state.store.as_ref()).await;
+    let c = Commit {
+        commit_id: cid(4),
+        upload: Some(UploadRef { fs: 1, session: s }),
+        ..Default::default()
+    };
+    let _: CommitResult = h2.call("/v1/commit", Some(&tok), &c).await.unwrap();
+    zen_server::sweep_once(&h2.server.state).await.unwrap();
+    let refs = get(
+        h2.server.state.store.as_ref(),
+        &zen_server::keys::chunk_refs(1, &[0xAB; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(i64::from_le_bytes(refs.try_into().unwrap()), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

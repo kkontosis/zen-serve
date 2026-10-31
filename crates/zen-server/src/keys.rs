@@ -427,6 +427,46 @@ pub fn page_gc_ptr(fs: u32, id: &[u8]) -> Vec<u8> {
     Key::new().str("pc").int(fs.into()).bytes(id).finish()
 }
 
+/// An upload session (api.md §12.1): `("us", fs, session)` →
+/// `user_fp(32) ‖ u64 expires_version`.
+pub fn upload_session(fs: u32, session: &[u8]) -> Vec<u8> {
+    Key::new().str("us").int(fs.into()).bytes(session).finish()
+}
+
+/// `("ur", fs, session)`: the references a session holds.
+pub fn upload_refs(fs: u32, session: &[u8]) -> Key {
+    Key::new().str("ur").int(fs.into()).bytes(session)
+}
+
+/// One reference of a session: `("ur", fs, session, kind, id)`, kind 1
+/// for a chunk and 2 for a page.
+pub fn upload_ref(fs: u32, session: &[u8], kind: u8, id: &[u8]) -> Vec<u8> {
+    upload_refs(fs, session).int(kind.into()).bytes(id).finish()
+}
+
+/// `("ux", fs)`: the sessions by expiry (0 once closed).
+pub fn upload_expiry(fs: u32) -> Key {
+    Key::new().str("ux").int(fs.into())
+}
+
+/// A session's expiry entry: `("ux", fs, expires_version, session)`.
+pub fn upload_expiry_entry(fs: u32, expires: u64, session: &[u8]) -> Vec<u8> {
+    upload_expiry(fs)
+        .int(expires as i64)
+        .bytes(session)
+        .finish()
+}
+
+/// `("uu", fs, user)`: a user's sessions.
+pub fn upload_user(fs: u32, user: &[u8]) -> Key {
+    Key::new().str("uu").int(fs.into()).bytes(user)
+}
+
+/// A user's session: `("uu", fs, user, session)` → `u64 expires_version`.
+pub fn upload_user_entry(fs: u32, user: &[u8], session: &[u8]) -> Vec<u8> {
+    upload_user(fs, user).bytes(session).finish()
+}
+
 // ---- CRDT rows (keyspace.md §3.8)
 
 /// `("co", fs, object)`: row register.

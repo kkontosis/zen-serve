@@ -341,6 +341,12 @@ pub struct Limits {
     /// Device checkpoints kept per device and fs (api.md §15.1).
     #[serde(default)]
     pub checkpoint_keep: u32,
+    /// Default upload-session lifetime (api.md §12.1).
+    #[serde(default)]
+    pub upload_ttl_secs: u64,
+    /// Longest upload-session lifetime (api.md §12.1).
+    #[serde(default)]
+    pub upload_max_ttl_secs: u64,
 }
 
 // ---------------------------------------------------------------- auth
@@ -1434,6 +1440,10 @@ pub struct Commit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
     pub pages: Vec<PagePut>,
+    /// The upload session the commit's chunks and pages go under (api.md §12.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub upload: Option<UploadRef>,
     /// Filesystem operations (spec/fs.md §3, §4) and CRDT-row operations (api.md §13).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", tsify(optional))]
@@ -2055,6 +2065,127 @@ pub struct PagePut {
     #[serde(with = "serde_bytes")]
     #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
     pub data: Vec<u8>,
+}
+
+/// The upload session of a commit (spec/api.md §6, §12.1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadRef {
+    /// fs_id.
+    pub fs: u32,
+    /// Session id (16 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub session: Vec<u8>,
+}
+
+/// `POST /v1/fs/upload/open` request (spec/api.md §12.1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadOpen {
+    /// fs_id.
+    pub fs: u32,
+    /// Lifetime (default `upload_ttl_secs`, capped at `upload_max_ttl_secs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub ttl_secs: Option<u64>,
+}
+
+/// An open upload session: `POST /v1/fs/upload/open` response, and an
+/// entry of `list`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadSession {
+    /// Session id (16 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub session: Vec<u8>,
+    /// Expiry on the server's clock, in unix milliseconds.
+    pub expires_ms: u64,
+}
+
+/// `POST /v1/fs/upload/renew` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadRenew {
+    /// fs_id.
+    pub fs: u32,
+    /// Session id (16 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub session: Vec<u8>,
+    /// Lifetime from now (default `upload_ttl_secs`, capped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub ttl_secs: Option<u64>,
+}
+
+/// `POST /v1/fs/upload/renew` response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadExpiry {
+    /// Expiry on the server's clock, in unix milliseconds.
+    pub expires_ms: u64,
+}
+
+/// `POST /v1/fs/upload/close` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadClose {
+    /// fs_id.
+    pub fs: u32,
+    /// Session id (16 bytes).
+    #[serde(with = "serde_bytes")]
+    #[cfg_attr(feature = "ts", tsify(type = "Uint8Array"))]
+    pub session: Vec<u8>,
+}
+
+/// `POST /v1/fs/upload/list` request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadList {
+    /// fs_id.
+    pub fs: u32,
+}
+
+/// `POST /v1/fs/upload/list` response: the caller's open sessions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(tsify::Tsify),
+    tsify(large_number_types_as_bigints)
+)]
+pub struct UploadSessions {
+    /// Open, unexpired sessions.
+    pub sessions: Vec<UploadSession>,
 }
 
 /// A filesystem or CRDT-row operation in a commit, tagged by `op` (spec/api.md §6, §13).

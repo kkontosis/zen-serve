@@ -24,6 +24,7 @@ The wire contract of zen-serve. It supersedes the draft in `docs/API.md` where t
   | 409 | `version_mismatch` (ACL / header CAS), `group_exists`, `commit_id_reused`, `name_taken` (a login name another user holds, auth.md §4.2) | no |
   | 412 | `cursor_moved`, `not_leader`, `claim_lost` | not for this event |
   | 412 | `conn_closed` (a relayed connection is closing, closed or reaped, §14) | no |
+  | 412 | `upload_gone` (an upload session that is closed, expired, unknown or another user's, §12.1) | no: open a new session |
   | 413 | `too_large` | no |
   | 429 | `quota` (a quota or rate limit: groups per topic §8.1, ephemeral publishes §9.1, failed password sign-ins §3.6, §3.16, credentials per user §3.7, §3.8, §3.11, §3.13, §3.15, devices per user §15.2, fs quotas §6, §15.1) | later |
   | 429 | `window` (a relayed connection's unwritten output is at `out_window`, §14.5) | once the node writes; the lease doorbell rings |
@@ -631,16 +632,19 @@ An upload session keeps the chunks and pages of a long upload past `chunk_grace_
 POST /v1/fs/upload/open  {fs, ttl_secs?: u64}                   → {session: bytes(16), expires_ms: u64}
 POST /v1/fs/upload/renew {fs, session: bytes(16), ttl_secs?}   → {expires_ms: u64}
 POST /v1/fs/upload/close {fs, session: bytes(16)}              → {}
+POST /v1/fs/upload/list  {fs}                                  → {sessions: [{session: bytes(16), expires_ms: u64}]}
 ```
 
-* **Open** needs fs `write`. The server picks the session id. `ttl_secs` defaults to `upload_ttl_secs` (7 days) and is capped at `upload_max_ttl_secs` (30 days). At most 64 sessions of one user may be open on one fs (429 `quota`).
+* **Open** needs fs `write`. The server picks the session id. `ttl_secs` defaults to `upload_ttl_secs` (7 days) and is capped at `upload_max_ttl_secs` (30 days); a `ttl_secs` of 0 is 400. At most 64 sessions of one user may be open on one fs (429 `quota`); expired sessions don't count, even before the sweeper releases them.
 * **A commit with `upload: {fs, session}`** (§6):
-  * the session must be open, unexpired and the caller's user's, else 412 `upload_gone`, and nothing applies;
+  * the session must be open, unexpired and the caller's user's, else 412 `upload_gone`, and nothing applies. Another user's session is treated as unknown;
+  * the field may come with no puts, and then only checks the session;
   * every chunk and page the commit puts is referenced by the session, once: a put the session already references adds nothing (keyspace.md §3.6, `ur`). A commit with `upload` may put chunks and pages of that `fs` only (400 otherwise);
   * the reference counts like a version's (`cr`/`pr` + 1), so the sweeper keeps the content while the session holds it;
   * each reference counts as one key toward the fs quota (formats.md §9).
 * **Renew** (the session's user, fs `write`) sets the expiry to `ttl_secs` from now, with the same cap. An expired or closed session gets 412 `upload_gone`.
-* **Close** (the session's user) ends it; closing an ended or unknown session is a no-op. After a close or the expiry, the sweeper releases the session's references in bounded rounds (fs.md §6). Each release is an ordinary one, whose grace period starts then, so a `write` committed before the close still holds what it lists, and anything it doesn't list goes one grace period later.
+* **Close** (the session's user; no fs right is needed, so a user who lost `write` can still release what their sessions hold) ends it; closing an ended, unknown or another user's session is a no-op, so the answer never tells whether a session exists. After a close or the expiry, the sweeper releases the session's references in bounded rounds (fs.md §6). Each release is an ordinary one, whose grace period starts then, so a `write` committed before the close still holds what it lists, and anything it doesn't list goes one grace period later.
+* **List** (fs `read`) returns the caller's open, unexpired sessions on the fs, so a client that lost its upload state can close them instead of waiting for them to expire.
 * `expires_ms` is the expiry on the server's clock, in unix milliseconds, for the client to renew in time. The server measures expiry in its own commit versions, as for leases (§8.2).
 * **Leakage:** the server learns which chunks and pages belong to one upload, which the device and the timing of its commits already show.
 
