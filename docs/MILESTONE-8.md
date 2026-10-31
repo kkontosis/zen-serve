@@ -117,6 +117,15 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * `scripts/build-wasm.sh`, `npm run check`, biome
     * `fsvectors` 3×; `large`, `tree`, `keyslots`
     * the full vitest run (607 passed, 15 skipped: the opt-in benches)
+  * Pushed 617b00b. **CI green on both runs.** PR #65 merged. Step 8.1 is done.
+  * The scheduled CI check-in for PR #65 was cancelled.
+* **Step 8.2** (server): planned below ("Step 8.2 in detail").
+  * **First:**
+    1. restart from main (94b5d76)
+    2. `cp` this file to `docs/MILESTONE-8.md`
+    3. commit `docs: milestone 8 step 2 plan`
+    4. push and open the PR
+  * Then implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -398,6 +407,180 @@ G[i]  = u64le(BLAKE3.keyed_hash(K_cdc, u8(i))[0..8])      for i in 0..256
 * **Chunker:** `min` 8 KiB and an average of 32 KiB, capped by `max_value_bytes`.
 * **Lengths in page form 2 in the clear,** since sealed sizes already show them.
 * **Upload-session expiry on the server's clock,** shown to clients as `expires_ms`.
+
+## Step 8.2 in detail
+
+Step 8.2 makes the server accept page form 2 and adds upload sessions (api.md §12.1). The client is unchanged until 8.3: no client sends form 2 or `upload` yet. The tsify types in zen-proto grow, but no TS code uses them.
+
+**Survey:**
+* **Pages:**
+  * `tree.rs` `put_page` (:765) and `collect_pages` (:1905) decode with `zfs::decode_page`, which is form 1 only.
+  * A page's first upload adds one `cr` per entry, and its collection releases one per entry (`release_chunk`: `cr − 1` plus a GC candidate with a `cp` pointer).
+  * `validate` (`commit.rs`) estimates a page's cost as `48 × (data / 16)`. For form 2 (20 B per entry) that over-counts, which is safe.
+* **Commit:** `execute` runs `Engine::put_chunk` for every chunk, then `put_page`, then the CRDT ops, and then `quota::apply(delta)`, where the delta is (bytes, keys) per fs.
+* **Expiry:** leases (`lease.rs`) measure expiry in commit versions: `t.read_version()` plus `ttl × VERSIONS_PER_SEC`.
+* **The sweeper:**
+  * `sweep_once` (`lib.rs`) runs `commit::sweep`, which pages through 1,000 records a transaction, up to 100 transactions a pass.
+  * Next it runs `tree::sweep`: pages before chunks, each `collect_*` bounded by a release budget.
+* **Dump** exports every fs key except the relay prefixes, so `us`, `ur` and `ux` are data without any change.
+* **Info** (`lib.rs` :69): a fixed feature list, and the limits from the config. New `Limits` fields carry `#[serde(default)]`, as `checkpoint_keep` does.
+* **Tests** (`tests/fs.rs`, run on embedded, and on FDB when `ZEN_TEST_FDB` is set):
+  * `two_devices(cfg)` harness
+  * grace tests with `chunk_grace_secs` of 0 or 3 and `sweep_once` called by hand
+  * helpers `chunk_put`, `page_put`, `upload`, `quota_bytes`, `sweep_until`
+
+### Spec fixes (`spec:` commit)
+
+Found while planning. The 8.1 text has two problems:
+1. **`refs` in `us` makes commits conflict:** a commit into a session would rewrite its `us` record, so two commits in flight under one session (8.3 pipelines up to 3) would always conflict. Commits now only read `us`.
+2. **No way to count a user's open sessions:** the 64-per-user cap would need a scan of every session on the fs.
+
+The fixes:
+* **keyspace.md §3.6:**
+  * `us` → `user_fp(32) ‖ u64 expires_version`, where 0 means closed. `refs` is dropped.
+  * New `pack("uu", fs, user_fp, session)` → `u64 expires_version`, the user's sessions. Open counts the user's live entries there, and close and the release clear it.
+  * `ux`: a close moves the entry to `expires_version` 0, so the sweeper finds closed and expired sessions with one range read up to now.
+  * All four keys are data.
+* **api.md §12.1:**
+  * New `POST /v1/fs/upload/list {fs} → {sessions: [{session, expires_ms}]}`, the caller's open sessions on the fs. A client that lost its upload state can then close them instead of waiting up to 30 days to get under the cap.
+  * Another user's session is unknown to the caller: a commit or renew naming it gets 412 `upload_gone`, and a close of it is a no-op, so the endpoint doesn't reveal whether it exists.
+  * Close needs no fs right beyond being the session's user, so a user who loses `write` can still release what their sessions hold.
+  * `ttl_secs` of 0 is 400.
+  * The `upload` field may come with no puts: it then only checks the session.
+* **api.md §1:** `upload_gone` joins the 412 row of the error table ("not for this session; open a new one").
+
+### zen-proto
+
+* **New types:**
+  * `UploadOpen {fs, ttl_secs?}` → `UploadSession {session, expires_ms}`
+  * `UploadRenew {fs, session, ttl_secs?}` → `UploadExpiry {expires_ms}`
+  * `UploadClose {fs, session}` → `Empty`
+  * `UploadList {fs}` → `UploadSessions {sessions: Vec<UploadSession>}`
+  * `UploadRef {fs, session}`
+* **Changed types:**
+  * `Commit.upload: Option<UploadRef>`, with serde default and skipped when `None`. Existing struct literals use `..Default::default()` or get the field.
+  * `Limits.upload_ttl_secs` and `upload_max_ttl_secs`, with `#[serde(default)]`.
+
+### Server
+
+* **Config** (`config.rs`):
+  * `limits.upload_ttl_secs` (604,800) and `upload_max_ttl_secs` (2,592,000)
+  * checked: both at least 1, and the default at most the maximum
+  * the per-user cap is the constant `MAX_UPLOAD_SESSIONS = 64`
+* **Keys** (`keys.rs`):
+  * `upload_session(fs, s)`
+  * `upload_refs(fs, s)` (prefix) and `upload_ref(fs, s, kind, id)`
+  * `upload_expiry(fs)` (prefix) and `upload_expiry_entry(fs, v, s)`
+  * `upload_user(fs, user)` (prefix) and `upload_user_entry(fs, user, s)`
+* **New `upload.rs`:**
+  * **`open`:**
+    * needs fs `write`
+    * reads the `uu` range of the caller with conflicts and counts the entries whose expiry is past the read version: 64 or more gives 429 `quota`
+    * makes a random 16-byte session id
+    * sets `us`, `ux` and `uu` with `expires = read_version + ttl × VERSIONS_PER_SEC`
+    * returns `expires_ms = now_ms + ttl × 1000`
+  * **`renew`:**
+    * reads `us` with conflicts; a missing session, another user's, a closed one or an expired one gives 412 `upload_gone`
+    * moves `ux`, and rewrites `us` and `uu`
+  * **`close`:** for the user's own open session, sets `us` expiry 0, moves `ux` to version 0 and clears `uu`. Anything else is `{}` with nothing written.
+  * **`list`:** the `uu` range of the caller, live entries only. `expires_ms` comes from the version difference.
+  * **`check(t, caller, r) -> Session`:** called in `execute` before the puts. It reads `us` with conflicts (a close or renew that commits meanwhile makes the commit retry), and applies the same refusal rules as renew.
+  * **`reference(t, fs, s, kind, id, delta)`:** if `ur` is absent (a conflicting read, so two commits putting one id under one session can't both count it), it sets `ur`, adds 1 to `cr`/`pr`, and adds 1 key to the delta.
+  * **`sweep(st, now)`:** per fs, page through `ux` up to `now`. For each session, transactions of at most `RELEASE_BUDGET` (5,000) `ur` entries:
+    * clear each one, release it the ordinary way (`cr`/`pr` − 1, a GC candidate) and subtract its key from the quota
+    * in the transaction that reads an empty `ur` range (with conflicts), clear `us`, `ux` and `uu`
+    * up to 100 transactions per pass, as the other sweeps
+* **Why the sweep's race is safe:**
+  * A commit whose read version is past the expiry is refused.
+  * A commit that read `us` before the expiry and commits later either:
+    * adds its `ur` before the sweeper's final empty read, so that round sees it, or
+    * conflicts with the final clear of `us` and retries into 412.
+  * Releases are ordinary, so whatever a `write` committed before the close lists stays referenced by the version.
+* **`tree.rs`:**
+  * `put_page` and `collect_pages` use `decode_any_page`: form 2 counts and releases per entry as form 1 does.
+  * Form-2 pages are refused 400 unless the feature is on (always on here; the check documents the rule).
+  * `Engine` gains `session: Option<(u32, Id)>`. `put_chunk` and `put_page` call `upload::reference` for it, chunks with kind 1 and pages with kind 2.
+  * `release_chunk` and `page_gc_candidate` become `pub(crate)` for the upload sweep.
+* **`commit.rs`:**
+  * `validate`: with `upload`, the session is 16 bytes, its fs is checked, and every chunk and page put is for that fs (400 otherwise). Each put costs 64 more bytes toward `max_commit_bytes` (the `ur` key and the count).
+  * `execute`: `upload::check`, then the engine's session is set.
+* **`lib.rs`:**
+  * routes `/v1/fs/upload/{open,renew,close,list}`
+  * features `fs_cdc` and `upload_sessions`; the two limits in `Info`
+  * `sweep_once` calls `upload::sweep` before `tree::sweep`, so a released chunk becomes a candidate in the same pass, and its grace starts then
+* **Docs:**
+  * `docs/API.md`: the four endpoints and the commit field
+  * the log in both plan copies
+  * STATS and OPS figures wait for 8.7
+
+### Tests (`tests/fs.rs`, embedded and FDB)
+
+1. **`page_form_2_counts_and_releases`:**
+   * form-2 pages are stored and served unchanged by `pages/get`
+   * a paged write over them works
+   * `cr` is +1 per entry (read from the store), including a repeated id
+   * after the version is replaced, with grace 0, the page and then its chunks go
+   * malformed form 2 is refused 400: a short body, length 0, and the flag with `n = 0`
+   * form 1 still works alongside
+2. **`upload_session_keeps_content_past_grace`** (grace 1 s):
+   * open, then put chunks under the session with no `write`, and sweep past the grace: they stay
+   * a second commit under the session puts more chunks, a page and the `write`
+   * close and sweep: what the write lists stays; an abandoned chunk (put, never listed) goes one grace after the close, not before
+   * without `upload`, the same chunks go after the grace (the control already in `chunk_grace_restarts…`)
+3. **`upload_session_expiry_and_renew`:**
+   * open with `ttl_secs` 2, renew to 4, and a commit at 3 s still works
+   * after the expiry: a commit with `upload` is 412 `upload_gone` with nothing applied; renew is 412; close is a no-op
+   * the sweep releases it, and the chunk is collected after the grace
+4. **`upload_session_rights`:**
+   * another user's commit, renew and close: 412, 412, and a no-op that leaves the session working for its owner
+   * a read-only member can't open (403)
+   * a put of another fs in an `upload` commit is 400
+   * `ttl_secs` 0 is 400; a ttl over the max is capped (`expires_ms` checked)
+   * `list` shows only the caller's live sessions
+5. **`upload_session_cap_and_quota`:**
+   * 64 opens work and the 65th is 429; after a close the next open works; an expired, unswept session doesn't count
+   * the fs `keys` quota rises by one per reference (one per id, not per put) and returns to its baseline after the release
+   * a `max_keys` limit refuses a commit whose references would pass it (429)
+6. **`upload_session_parallel_puts_count_once`:**
+   * 8 commits in parallel under one session put the same chunk
+   * `cr` ends at exactly 1, and after the close and sweep the chunk goes after the grace
+7. **`upload_session_big_release`:**
+   * 12,000 one-byte chunks under one session (3 commits)
+   * after the close, one `sweep_once` releases them all over several transactions
+   * no `ur` keys remain, `us`, `ux` and `uu` are cleared, and the quota keys are back
+   * a unit test in `upload.rs` calls the release with a budget of 7 and checks that each call releases at most 7, and that the last clears the record
+8. **`tests/dump.rs`:** an export with an open session, imported into a fresh store; the session still accepts a commit and holds its content past the grace there.
+9. **`/v1/info`** lists the features and limits (in `tests/api.rs`, beside the existing info test); config validation refuses a default over the maximum.
+
+**Negative controls** (each run once, then restored):
+* without the `ur` check, test 6 fails (`cr` > 1)
+* without `reference`, test 2 fails (chunks collected)
+* without the user check in `check`, test 4 fails
+* without the final empty read before clearing `us`, test 7's unit test fails (the record is cleared with refs left)
+* `decode_page` instead of `decode_any_page`, test 1 fails
+
+### Files
+
+* **Spec:** `spec/{api,keyspace}.md`
+* **zen-proto:** `crates/zen-proto/src/lib.rs`
+* **Server:**
+  * `crates/zen-server/src/{upload (new),tree,commit,keys,config,lib}.rs`
+  * `crates/zen-server/tests/{fs,dump,api}.rs`
+  * struct literals of `Commit`, if any lack `..Default::default()`
+* **Docs:** `docs/API.md`, `docs/MILESTONE-8.md`
+
+### Verification
+
+* `cargo fmt --check`; clippy `--all-targets -D warnings` on the workspace (default, `--no-default-features`, `--all-features`), and zen-proto with `ts` on wasm32
+* `cargo test -p zen-server` (fs, dump, api, and the units), on embedded and once with `ZEN_TEST_FDB`
+* `scripts/build-wasm.sh` and `npm run check`, since the proto types reach TS; the client `fs`, `large` and `tree` tests once
+* the negative controls above
+* CI green on both runs
+
+**Defaults chosen (overridable):**
+* **Keep the cap at 64 and add `list`,** rather than raising the cap or letting admins close sessions. Sessions of a user removed from the ACL simply expire, which becomes an OPS pitfall in 8.7.
+* **Close needs no fs right,** only being the session's user.
+* **Each reference counts as a quota key, but the session records don't,** since there are at most 64 per user and fs.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
