@@ -1,7 +1,7 @@
 //! zen-ublk as a real block device (feature `device-tests`; needs root,
 //! FUSE, loop devices, e2fsprogs; the ublk tests also feature `ublk` and
-//! the ublk driver). The server runs in-process; `zen-ublk` runs as a child
-//! process, so a writer can be killed for real.
+//! the ublk driver). The server runs in-process on a runtime of its own;
+//! `zen-ublk` runs as a child process, so a writer can be killed for real.
 //!
 //! The ublk tests skip, saying so, only when the kernel has no
 //! `/dev/ublk-control`; with `ZEN_TEST_REQUIRE_UBLK=1` (CI) they fail.
@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_zen-ublk");
@@ -34,8 +35,24 @@ struct World {
     tuning: Vec<&'static str>,
 }
 
+/// The server's runtime. The test bodies call blocking code (`losetup`,
+/// `mkfs`, `mount`, writes into a FUSE mount, `sync`) from async code; on a
+/// shared runtime a blocked worker could delay the server's answer to a
+/// writer's lease renewal past the lease's slack (`lease_lost`).
+fn server_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("test-server")
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
 async fn world() -> World {
-    let srv = Server::start().await;
+    let srv = server_runtime().spawn(Server::start()).await.unwrap();
     let (admin, w) = (key(1), key(2));
     srv.claim(&admin, &[&w]).await;
     let a = srv.session(&admin).await;
