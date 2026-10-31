@@ -71,6 +71,14 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. update DESIGN-3 §6 item 8 (the scope and the link) and the README status ("Milestone 8: in progress")
     4. commit `docs: milestone 8 plan (large files, the rest)`
     5. push and open the PR
+  * Done: ee840a5, PR #64. CI green; PR #64 merged.
+* **Step 8.1** (spec, zen-core, wasm, vectors): planned below ("Step 8.1 in detail").
+  * **First:**
+    1. restart from main
+    2. `cp` this file to `docs/MILESTONE-8.md`
+    3. commit `docs: milestone 8 step 1 plan`
+    4. push and open the PR
+  * Then implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -162,6 +170,196 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * TECH_DEBT: TD-FS-LARGE-FILES fully resolved; TD-FUSE-INTEGRITY and TD-LORO-LARGE-SNAPSHOT resolved; new TD-FS-CDC-HUGE (two-level pages)
   * OPS pitfalls (sessions hold storage until they expire)
   * README, DESIGN-3 §6 item 8 done, and the Outcome
+
+## Step 8.1 in detail
+
+Step 8.1 specifies what 8.2–8.6 build on, and adds the zen-core codecs, the chunker and the vectors. It covers:
+* manifest version 3 (variable chunks)
+* page form 2
+* the keyed content-defined chunker
+* the policy's `chunking`
+* upload sessions
+
+The server is unchanged in this step: it keeps decoding pages with `decode_page`, form 1 only, and switches to form 2 in 8.2. No client behavior changes either: writers keep writing v2 until 8.3.
+
+**Survey:**
+* **zen-core `fs.rs`** (lines 136–380): `Manifest` (v1), `ManifestV2 {size, chunk_size, n, file_key, body: Inline | Paged {page_size, pages: (id, digest)}}`, `AnyManifest::{V1, V2}`, `page_len`, `page_capacity`, `encode_page`/`decode_page`, `page_digest`. They are sealed as kind 5 through `FsKeys` (`sealManifestV2`).
+* **The server** decodes pages only in `tree.rs` (`put_page`, :767, and the GC, :1942), with `zfs::decode_page`. It treats manifests as opaque.
+* **The key tree** (formats.md §2): NK is random and never rotated; MK_e is per epoch; `kdf(label, key, info)` gives 32 bytes (`kdf.rs`). File keys use `KDF("zen/v1/fs-file", file_key, u32(fs))`.
+* **The policy** (`header.rs` `FsPolicy`, CBOR keys 1 `file_keys` and 2 `rekey_after_rotate`):
+  * Unknown keys are kept.
+  * The default policy writes a version-1 header.
+  * wasm's `FsPolicy` TS type is `{fileKeys, rekeyAfterRotate}`.
+* **Vectors:** `fs.json` has `manifest`, `manifest_v2_{inline,fs_keys,paged}`, `pages`, `write_paged`, `purge`, … (`vectors.rs` `fs_vectors`, lines 269–410). They're read back by `crates/zen-core/tests/vectors.rs` and `packages/client/test/fsvectors.test.ts`.
+* **wasm (`crypto.rs`):**
+  * TS types by hand in `TS_TYPES` (`Manifest`, `PageRef`, `ManifestV2`, `AnyManifest`)
+  * the serde structs `JsManifestV2` etc. (:290–401)
+  * the sealing bindings (:522–582)
+  * `encodePage`/`decodePage`/`pageDigest`/`pageCapacity` (:1464–1489)
+  * the policy getter and setter (:968–990)
+
+### Spec (`spec:` commit)
+
+**formats.md §11.3, manifest version 3 (new; v1 and v2 unchanged and still read):**
+```
+u8 3 ‖ u64 size ‖ u64 n ‖ u32 min ‖ u8 avg_bits ‖ u32 max ‖ u8 key_mode ‖ keys ‖ u8 form ‖ body
+form 1, inline:  body = n × (chunk_id(16) ‖ u32 len)
+form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32) ‖ u32 bytes)
+```
+* **Fields:**
+  * `min`, `avg_bits` and `max` are the chunker's parameters (§11.7). Readers don't need them; a writer resyncs with a base only under the same ones.
+  * `key_mode` and `keys` are as in v2.
+  * `bytes` is the plaintext a page's chunks hold, so a reader finds an offset's page by prefix sums over the manifest, then its chunk by prefix sums over the page.
+* **A decoder refuses:**
+  * any `len` of 0 or above `max`
+  * lengths (inline) or page `bytes` (paged) whose sum isn't `size`
+  * `n = 0` with `size > 0`, or the reverse
+  * `m ≠ ceil(n / page_size)`, or `page_size = 0` with `n > 0`
+  * parameters with `min ≥ 2^avg_bits`, `2^avg_bits ≥ max`, `avg_bits ∉ 8..=24`, or `min < 64`
+  * another `form`, or trailing bytes
+* **A reader** checks each fetched page against its digest, its expected count and its `bytes`.
+* **Capacity at the defaults:** a page holds 4,499 chunks, and a version about 1,300 pages (68 B each: 52 in the manifest and 16 in the stored version), so about 5.8 million chunks. That is roughly 180 GiB at the measured average chunk length (STATS gives the figure in 8.7). A file past it uses `chunking: fixed`, and v2's 640 GiB.
+* **Changed from the milestone plan:** a page's `bytes` is `u32`, not `u64`, since a page holds at most 4,499 × 128 KiB < 4 GiB. That keeps 4 B per page.
+
+**formats.md §11.6, page form 2:**
+```
+page2 = u32 (0x8000_0000 | n) ‖ n × (chunk_id(16) ‖ u32 len)      1 ≤ n, 4 + 20n ≤ max_value_bytes
+```
+* Form 1's `n` is below 2^31, so the top bit tells the forms apart.
+* `page_digest` is unchanged, over all the bytes.
+* The server reads the ids for its reference counts, and the lengths are in the clear. That leaks nothing new: a sealed chunk's stored length is its plaintext length plus a constant.
+* Form 2 pages are listed only by v3 manifests, and form 1 only by v2.
+
+**formats.md §11.7, the chunker (new):**
+```
+K_cdc = KDF("zen/v1/fs-cdc", NK, u32(fs))                 key_mode 0 (stable across rotations, like the naming keys)
+K_cdc = KDF("zen/v1/fs-cdc-file", file_key, u32(fs))      key_mode 1
+G[i]  = u64le(BLAKE3.keyed_hash(K_cdc, u8(i))[0..8])      for i in 0..256
+```
+* **A chunk** starts with `h = 0`. For its byte at position `p` (0-based in the chunk), from `p = min` on:
+  1. `h = (h << 1) + G[b]` (mod 2^64)
+  2. With `len = p + 1`, cut after it when `len = max`, or when the top `avg_bits + 2` bits of `h` are zero while `len < 2^avg_bits`, or when the top `avg_bits − 2` bits are zero from `2^avg_bits` on (normalized chunking).
+* The rest of the input is the last chunk.
+* So cuts depend only on the bytes since the last cut and on the key: an insertion changes the chunks around it, and the cuts resync after it.
+* **Defaults:** `min` 8,192, `avg_bits` 15 (32 KiB), `max = min(131,072, max_value_bytes − 64)`, which is 89,936 at the defaults.
+* **Why keyed:** without `K_cdc` the server can't compute where a known plaintext would be cut.
+
+**formats.md §12, the policy:** key 3 `chunking`, 0 `cdc` (the default) or 1 `fixed`.
+* An absent key is `cdc`, so the default policy still writes a version-1 header.
+* With `cdc` writers write v3; with `fixed`, v2.
+* The rollback paragraph: a server serving another policy (unsigned header) changes only how new files are cut.
+
+**formats.md leakage (§11 and fs.md §10):**
+* **Under CDC** the server sees every chunk's length, not only the last one's. Two files with shared content in one fs show matching runs of lengths: the same key gives the same cuts.
+* **The key** keeps boundaries unpredictable to anyone without NK or the file key. A revoked member keeps NK, since it isn't rotated, so for files under the fs keys they can still predict cuts. Files under file keys don't have that exposure.
+* **Padding** of lengths is milestone 11's metadata padding.
+
+**fs.md:**
+* **§4:** versions list chunks with lengths (v3).
+* **§4.1:**
+  * chunks are 1 B to `max_value_bytes` sealed
+  * clients cut by content (formats.md §11.7) or at fixed sizes, by the policy
+  * **upload sessions:** a chunk or page put under a session is referenced by it until the session closes or expires, then released normally (grace)
+* **§6:** sessions in GC.
+
+**api.md:**
+* **§2:** the features `fs_cdc` (page form 2 accepted) and `upload_sessions`, and the limits `upload_ttl_secs` (604,800) and `upload_max_ttl_secs` (2,592,000).
+* **§6:** the commit field `upload?: {fs, session: bytes(16)}`, and a step-8 sentence on it.
+* **§12.1, upload sessions (new):**
+  ```
+  POST /v1/fs/upload/open  {fs, ttl_secs?}            → {session: bytes(16), expires_ms: u64}
+  POST /v1/fs/upload/renew {fs, session, ttl_secs?}   → {expires_ms}
+  POST /v1/fs/upload/close {fs, session}              → {}
+  ```
+  * **Open** needs fs `write`. `ttl_secs` defaults to `upload_ttl_secs` and is capped at `upload_max_ttl_secs`. At most 64 sessions per user and fs are open (429 `quota`).
+  * **A commit with `upload`:**
+    * The session must be the caller's user's and unexpired, else 412 `upload_gone`.
+    * Every chunk and page the commit puts for that fs gets one reference from the session, unless it has one already (`cr`/`pr` + 1).
+    * A put for another fs in such a commit is 400.
+  * **Renew** sets the expiry from now (412 `upload_gone` once expired). **Close** marks it, and is idempotent.
+  * **Releasing:** the sweeper releases a closed or expired session's references in bounded rounds. Each release is an ordinary one (a GC candidate whose grace restarts), so a write committed just before the close still holds its content.
+  * **Expiry** runs on the server's clock. Each reference counts as one key toward the fs quota.
+  * **Leakage:** which puts belong to one upload, which commit grouping and the device already show.
+
+**keyspace.md §3.6:**
+* `pack("us", fs, session)` → `user_fp(32) ‖ u64 expires_version ‖ u64 refs`
+* `pack("ur", fs, session, u8 kind, id)` → empty (kind 1 chunk, 2 page)
+* `pack("ux", fs, expires_version, session)` → empty: the expiry index, moved on renew and close
+* All three are data (`export` copies them).
+
+**labels.md and `labels.rs`:** `zen/v1/fs-cdc` and `zen/v1/fs-cdc-file`.
+
+### zen-core
+
+* **`fs.rs`:**
+  * `ManifestV3 {size, n, cdc: CdcParams {min, avg_bits, max}, file_key, body: BodyV3::{Inline(Vec<(Id, u32)>), Paged {page_size, pages: Vec<PageRefV3 {id, digest, bytes}>}}}`, with `encode` and a strict `decode`
+  * `AnyManifest::V3`
+  * `encode_page2(&[(Id, u32)])`, `decode_page2`, `decode_any_page` (→ ids and optional lengths), `page_capacity2(max_value_bytes)`
+  * `CdcParams::default_for(max_value_bytes)` and `CdcParams::check()`
+* **New `cdc.rs`:**
+  * `Chunker::new(key: &Key32, params)`, with the gear table computed once
+  * `push(&mut self, data: &[u8]) -> Vec<usize>`: cut positions within the stream so far, streaming across calls
+  * `finish()`
+  * `cdc_key_fs(&FsKeys)`, from NK through the existing `kdf`, and `cdc_key_file(&[u8; 32], fs)`
+* **`FsPolicy`** gains `chunking: Chunking::{Cdc, Fixed}`. Key 3 is decoded and encoded, an absent key is `Cdc`, and the default stays version 1.
+* **Vectors (`vectors.rs`, `fs.json`):**
+  * `manifest_v3_inline` and `manifest_v3_paged` (plaintext and sealed, as the v2 ones), and `pages_v2` (bytes and digests)
+  * `cdc`:
+    * the fixture fs's `K_cdc` and the first 4 `G` entries
+    * a 1 MiB `DetRng` input and its cuts
+    * the cuts after inserting 100 bytes at offset 300,000, showing at most 2 chunks differ before the cuts resync
+    * a file key's cuts over the same input
+  * Regenerating changes only these sections (and the description).
+* **Tests:**
+  * unit tests:
+    * v3 round trips
+    * every decode refusal above
+    * page form 2 round trip, and form 1 and form 2 told apart
+    * the chunker: cuts identical whether the input is pushed whole or in pieces of 1, 7 and 65,536 bytes; every chunk within `min..=max` but the last; resync after an insertion and a deletion
+    * a fixed-key distribution check: the mean chunk length over 64 MiB within 25–45 KiB
+    * the policy round trip, with key 3 and without it
+  * `tests/vectors.rs` reads the new sections back
+
+### zen-wasm (`crypto.rs`)
+
+* **TS types:**
+  * `ManifestV3 {version: 3; size; n; cdc: {min, avgBits, max}; keyEpoch?; fileKey?; chunks?: {id, len}[]; pageSize?; pages?: {id, digest, bytes}[]}`
+  * `AnyManifest` gains it
+  * `FsPolicy` gains `chunking: "cdc" | "fixed"`, optional on input, defaulting to `cdc`
+* **Bindings:**
+  * `FsKeys.sealManifestV3`; `openAnyManifest` decodes v3
+  * `encodePage2`, `decodeAnyPage` (→ `{ids, lens?}`), `pageCapacity2`, `cdcDefaults(maxValueBytes)`
+* **A `Chunker` class:** made by `FsKeys.chunker(params)` or `fileChunker(fileKey, fs, params)`, so K_cdc never reaches JS. It has `push(bytes) → Uint32Array` (cut offsets in the stream) and `finish()`.
+* Rebuild with `scripts/build-wasm.sh`.
+
+### TS
+
+* **`packages/client/test/fsvectors.test.ts`:** v3 open and seal against the vectors; page form 2; the chunker's cuts over the vector input (whole and in pieces); the insertion's cuts.
+* No other client change: `tree.ts` still writes v2, and v3 reading is 8.3.
+* The `FsPolicy` type change compiles through `fs.ts`'s `policy` and `setPolicy`, with the new field passed through.
+
+### Files
+
+* **Spec:** `spec/{formats,fs,api,keyspace,labels}.md`
+* **zen-core:** `crates/zen-core/src/{fs,cdc (new),header,labels,lib,vectors}.rs`, `crates/zen-core/tests/vectors.rs`, `spec/test-vectors/fs.json`
+* **zen-wasm:** `crates/zen-wasm/src/crypto.rs`
+* **TS:** `packages/client/test/fsvectors.test.ts`, `packages/client/src/fs.ts` (only if the policy type needs it)
+* **Docs:** `docs/MILESTONE-8.md` (the log)
+
+### Verification
+
+* `cargo fmt --check`
+* clippy `--all-targets -D warnings` on zen-core and zen-wasm (default, `--all-features`, `--no-default-features`, wasm32), and on the workspace once, since zen-server uses `FsPolicy` and `decode_page`
+* `cargo test -p zen-core --features test-utils`; regenerate the vectors (only `fs.json`'s new sections change); `cargo test -p zen-server --test fs` (unchanged behavior)
+* `scripts/build-wasm.sh`, `npm run check`, `fsvectors.test.ts` 3×; the client `large`, `tree` and `keyslots` tests once (policy and manifests unchanged for them)
+* **Negative controls:** with the chunker's normalization switched off (one mask), the distribution test fails; with the decode's sum check removed, the refusal test fails
+* CI green on both runs
+
+**Defaults chosen (overridable):**
+* **Gear key under the fs keys:** from NK, so cuts stay the same across rotations and chunks are reused across them, as under v2.
+* **Chunker:** `min` 8 KiB and an average of 32 KiB, capped by `max_value_bytes`.
+* **Lengths in page form 2 in the clear,** since sealed sizes already show them.
+* **Upload-session expiry on the server's clock,** shown to clients as `expires_ms`.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
