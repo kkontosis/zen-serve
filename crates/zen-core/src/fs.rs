@@ -331,13 +331,233 @@ impl ManifestV2 {
     }
 }
 
-/// A manifest of either version.
+/// The chunker's parameters (formats.md §11.7), recorded in a version-3 manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdcParams {
+    /// No cut before this many bytes.
+    pub min: u32,
+    /// The average chunk length is about `2^avg_bits`.
+    pub avg_bits: u8,
+    /// A cut at this many bytes at the latest.
+    pub max: u32,
+}
+
+impl CdcParams {
+    /// The defaults for a server's `max_value_bytes`: `min` 8,192, `avg_bits`
+    /// 15, `max = min(131,072, max_value_bytes − 64)`. `None` when the server's
+    /// values are too small for content-defined chunks.
+    pub fn default_for(max_value_bytes: u32) -> Option<Self> {
+        let p = CdcParams {
+            min: 8_192,
+            avg_bits: 15,
+            max: 131_072u32.min(max_value_bytes.saturating_sub(64)),
+        };
+        p.check().ok().map(|_| p)
+    }
+
+    /// `min ≥ 64`, `avg_bits` in 8..=24, `min < 2^avg_bits < max`.
+    pub fn check(&self) -> Result<()> {
+        if self.min < 64 || !(8..=24).contains(&self.avg_bits) {
+            return Err(Error::Format);
+        }
+        let avg = 1u32 << self.avg_bits;
+        if self.min >= avg || avg >= self.max {
+            return Err(Error::Format);
+        }
+        Ok(())
+    }
+}
+
+/// A page of a version-3 manifest: its id, digest and the plaintext bytes its chunks hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRefV3 {
+    /// The page id.
+    pub id: Id,
+    /// `page_digest` of its bytes.
+    pub digest: [u8; 32],
+    /// Plaintext bytes of its chunks.
+    pub bytes: u32,
+}
+
+/// The body of a version-3 manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyV3 {
+    /// `(chunk_id, len)` in file order (form 1).
+    Inline(Vec<(Id, u32)>),
+    /// Form-2 pages of `page_size` chunks each, the last possibly shorter (form 2).
+    Paged {
+        /// Chunks per page.
+        page_size: u32,
+        /// The pages in file order.
+        pages: Vec<PageRefV3>,
+    },
+}
+
+/// Plaintext of a version-3 manifest (formats.md §11.3): chunks of variable length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestV3 {
+    /// File size in bytes.
+    pub size: u64,
+    /// Number of chunks.
+    pub n: u64,
+    /// The chunker's parameters.
+    pub cdc: CdcParams,
+    /// As in version 2.
+    pub file_key: Option<FileKey>,
+    /// The chunks or their pages.
+    pub body: BodyV3,
+}
+
+impl ManifestV3 {
+    /// `0x03 ‖ u64 size ‖ u64 n ‖ u32 min ‖ u8 avg_bits ‖ u32 max ‖ u8 key_mode ‖
+    /// [u32 key_epoch ‖ file_key] ‖ u8 form ‖ body`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + 56 * self.n.min(1 << 16) as usize);
+        out.push(3);
+        out.extend_from_slice(&self.size.to_be_bytes());
+        out.extend_from_slice(&self.n.to_be_bytes());
+        out.extend_from_slice(&self.cdc.min.to_be_bytes());
+        out.push(self.cdc.avg_bits);
+        out.extend_from_slice(&self.cdc.max.to_be_bytes());
+        match &self.file_key {
+            None => out.push(0),
+            Some(k) => {
+                out.push(1);
+                out.extend_from_slice(&k.key_epoch.to_be_bytes());
+                out.extend_from_slice(&k.key);
+            }
+        }
+        match &self.body {
+            BodyV3::Inline(chunks) => {
+                out.push(1);
+                for (id, len) in chunks {
+                    out.extend_from_slice(id);
+                    out.extend_from_slice(&len.to_be_bytes());
+                }
+            }
+            BodyV3::Paged { page_size, pages } => {
+                out.push(2);
+                out.extend_from_slice(&page_size.to_be_bytes());
+                out.extend_from_slice(&(pages.len() as u32).to_be_bytes());
+                for p in pages {
+                    out.extend_from_slice(&p.id);
+                    out.extend_from_slice(&p.digest);
+                    out.extend_from_slice(&p.bytes.to_be_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode, refusing everything formats.md §11.3 lists.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != 3 {
+            return Err(Error::Format);
+        }
+        let size = r.u64()?;
+        let n = r.u64()?;
+        let cdc = CdcParams {
+            min: r.u32()?,
+            avg_bits: r.u8()?,
+            max: r.u32()?,
+        };
+        cdc.check()?;
+        if (n == 0) != (size == 0) {
+            return Err(Error::Format);
+        }
+        let file_key = match r.u8()? {
+            0 => None,
+            1 => Some(FileKey {
+                key_epoch: r.u32()?,
+                key: r.array()?,
+            }),
+            _ => return Err(Error::Format),
+        };
+        let body = match r.u8()? {
+            1 => {
+                if n > (bytes.len() / 20) as u64 {
+                    return Err(Error::Format);
+                }
+                let mut chunks = Vec::with_capacity(n as usize);
+                let mut sum = 0u64;
+                for _ in 0..n {
+                    let id = r.array()?;
+                    let len = r.u32()?;
+                    if len == 0 || len > cdc.max {
+                        return Err(Error::Format);
+                    }
+                    sum += len as u64;
+                    chunks.push((id, len));
+                }
+                if sum != size {
+                    return Err(Error::Format);
+                }
+                BodyV3::Inline(chunks)
+            }
+            2 => {
+                let page_size = r.u32()?;
+                let m = r.u32()? as u64;
+                let want = if n == 0 {
+                    0
+                } else if page_size == 0 {
+                    return Err(Error::Format);
+                } else {
+                    n.div_ceil(page_size as u64)
+                };
+                if m != want || m > (bytes.len() / 52) as u64 {
+                    return Err(Error::Format);
+                }
+                let mut pages = Vec::with_capacity(m as usize);
+                let mut sum = 0u64;
+                for _ in 0..m {
+                    let p = PageRefV3 {
+                        id: r.array()?,
+                        digest: r.array()?,
+                        bytes: r.u32()?,
+                    };
+                    sum += p.bytes as u64;
+                    pages.push(p);
+                }
+                if sum != size {
+                    return Err(Error::Format);
+                }
+                BodyV3::Paged { page_size, pages }
+            }
+            _ => return Err(Error::Format),
+        };
+        r.finish()?;
+        Ok(ManifestV3 {
+            size,
+            n,
+            cdc,
+            file_key,
+            body,
+        })
+    }
+
+    /// The number of chunks page `i` holds: `page_size`, the last fewer.
+    pub fn page_len(&self, i: usize) -> Option<u32> {
+        let BodyV3::Paged { page_size, pages } = &self.body else {
+            return None;
+        };
+        if i >= pages.len() {
+            return None;
+        }
+        let before = i as u64 * *page_size as u64;
+        Some((self.n - before).min(*page_size as u64) as u32)
+    }
+}
+
+/// A manifest of any version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnyManifest {
     /// Version 1: chunks under the fs keys.
     V1(Manifest),
     /// Version 2: inline or paged, chunks under the fs keys or a file key.
     V2(ManifestV2),
+    /// Version 3: chunks of variable length (content-defined chunking).
+    V3(ManifestV3),
 }
 
 impl AnyManifest {
@@ -346,6 +566,7 @@ impl AnyManifest {
         match self {
             AnyManifest::V1(m) => m.encode(),
             AnyManifest::V2(m) => m.encode(),
+            AnyManifest::V3(m) => m.encode(),
         }
     }
 
@@ -354,6 +575,7 @@ impl AnyManifest {
         match bytes.first() {
             Some(1) => Ok(AnyManifest::V1(Manifest::decode(bytes)?)),
             Some(2) => Ok(AnyManifest::V2(ManifestV2::decode(bytes)?)),
+            Some(3) => Ok(AnyManifest::V3(ManifestV3::decode(bytes)?)),
             _ => Err(Error::Format),
         }
     }
@@ -389,6 +611,77 @@ pub fn decode_page(bytes: &[u8]) -> Result<Vec<Id>> {
         .chunks(ID_LEN)
         .map(|c| c.try_into().expect("16"))
         .collect())
+}
+
+/// The top bit of a form-2 page's count (formats.md §11.6).
+pub const PAGE2_FLAG: u32 = 0x8000_0000;
+
+/// Most entries a form-2 page can hold within `max_value_bytes`.
+pub fn page_capacity2(max_value_bytes: u32) -> u32 {
+    (max_value_bytes.saturating_sub(4) / 20).max(1)
+}
+
+/// A form-2 page: `u32 (0x8000_0000 | n) ‖ n × (chunk_id ‖ u32 len)`.
+pub fn encode_page2(chunks: &[(Id, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 20 * chunks.len());
+    out.extend_from_slice(&(PAGE2_FLAG | chunks.len() as u32).to_be_bytes());
+    for (id, len) in chunks {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&len.to_be_bytes());
+    }
+    out
+}
+
+/// Decode a form-2 page: at least one entry, every length at least 1, nothing after.
+pub fn decode_page2(bytes: &[u8]) -> Result<Vec<(Id, u32)>> {
+    if bytes.len() < 4 {
+        return Err(Error::Format);
+    }
+    let head = u32::from_be_bytes(bytes[..4].try_into().expect("4"));
+    if head & PAGE2_FLAG == 0 {
+        return Err(Error::Format);
+    }
+    let n = (head & !PAGE2_FLAG) as usize;
+    if n == 0 || bytes.len() != 4 + 20 * n {
+        return Err(Error::Format);
+    }
+    bytes[4..]
+        .chunks(20)
+        .map(|c| {
+            let len = u32::from_be_bytes(c[16..].try_into().expect("4"));
+            if len == 0 {
+                return Err(Error::Format);
+            }
+            Ok((c[..16].try_into().expect("16"), len))
+        })
+        .collect()
+}
+
+/// A page of either form: its chunk ids, and their lengths for form 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnyPage {
+    /// The chunk ids, in order.
+    pub ids: Vec<Id>,
+    /// Each chunk's plaintext length (form 2 only).
+    pub lens: Option<Vec<u32>>,
+}
+
+/// Decode a page of either form, told apart by the top bit of its count.
+pub fn decode_any_page(bytes: &[u8]) -> Result<AnyPage> {
+    match bytes.first() {
+        Some(b) if b & 0x80 != 0 => {
+            let e = decode_page2(bytes)?;
+            Ok(AnyPage {
+                ids: e.iter().map(|(id, _)| *id).collect(),
+                lens: Some(e.iter().map(|(_, l)| *l).collect()),
+            })
+        }
+        Some(_) => Ok(AnyPage {
+            ids: decode_page(bytes)?,
+            lens: None,
+        }),
+        None => Err(Error::Format),
+    }
 }
 
 /// `page_digest = BLAKE3.derive_key("zen/v1/fs-page", page)`.

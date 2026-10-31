@@ -417,7 +417,11 @@ export class UnlockedFs {
     await this.editHeader((h) => {
       const cur = h.policy;
       const next = { ...cur, ...p };
-      if (next.fileKeys === cur.fileKeys && next.rekeyAfterRotate === cur.rekeyAfterRotate) {
+      if (
+        next.fileKeys === cur.fileKeys &&
+        next.rekeyAfterRotate === cur.rekeyAfterRotate &&
+        (next.chunking ?? 'cdc') === (cur.chunking ?? 'cdc')
+      ) {
         return false;
       }
       h.setPolicy(next);

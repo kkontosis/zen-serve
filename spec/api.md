@@ -39,7 +39,8 @@ No authentication. Returns:
   suites: [1],                       // supported suite ids (spec/suites.md)
   formats: [1],
   features: [text],                  // e.g. "kv", "log", "consume", "ephemeral", "static", "fs", "crdt_rows", "fs_pages", "svc",
-                                     //   "checkpoints", "signed_header", "lease", "devices" (§15, §16, §4.4)
+                                     //   "checkpoints", "signed_header", "lease", "devices" (§15, §16, §4.4),
+                                     //   "fs_cdc", "upload_sessions" (§6, §12.1)
   cross_origin_isolation: bool,      // DESIGN-3 §4.2
   claimed: bool,                     // an ACL exists
   time_ms: u64,                      // server clock, unix ms (HLC observation, fs.md §2)
@@ -49,7 +50,7 @@ No authentication. Returns:
             ephemeral_bytes_per_sec, ephemeral_burst_bytes,
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
-            chunk_grace_secs, checkpoint_keep },
+            chunk_grace_secs, checkpoint_keep, upload_ttl_secs, upload_max_ttl_secs },
   auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2); a dormant mtls is left out (auth.md §10)
            origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
            passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
@@ -58,7 +59,7 @@ No authentication. Returns:
            password_params?: { m_cost_kib: u32, t_cost: u32, p_cost: u32 } } }   // auth.md §11.2
 ```
 
-Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400; `checkpoint_keep` 1,024 (§15.1).
+Defaults: `max_key_bytes` 2,048; `max_value_bytes` and `max_envelope_bytes` 90,000; `max_commit_bytes` 8,000,000; `max_commit_ops` 10,000; `max_range_items` 10,000; `max_range_bytes` 8,000,000; `idempotency_ttl_secs` and `session_ttl_secs` 86,400; `claim_ttl_ms` 30,000; `ephemeral_ttl_secs` 60; `ephemeral_bytes_per_sec` 65,536 and `ephemeral_burst_bytes` 1,048,576 (§9.1; a server that doesn't send them has no ephemeral rate limit, which clients read as 0, "no limit"); `max_groups_per_topic` 64; `crdt_max_skew_ms` 60,000; `crdt_horizon_secs` 604,800; `crdt_max_redo` 1,000; `crdt_max_depth` 1,000; `chunk_grace_secs` 86,400; `checkpoint_keep` 1,024 (§15.1); `upload_ttl_secs` 604,800 and `upload_max_ttl_secs` 2,592,000 (§12.1).
 
 * **Range reads** (`/v1/kv/range`, `/v1/log/read`, `tree/children`, `tree/changes`, `dlq/list`, stream subscriptions) return at most `max_range_items` items **and** stop once the items returned hold about `max_range_bytes` of keys and values; either cut sets `more`. A range the server must read whole (`expect_ranges`, `clear_ranges`, a file's versions) returns 413 `too_large` past either cap.
 
@@ -386,6 +387,7 @@ POST /v1/commit
               from: bytes(12), to: bytes(12), token: u64}],
   chunks?: [{fs, id: bytes(16), data: bytes}],              // filesystem chunks (fs.md §4.1)
   pages?: [{fs, id: bytes(16), data: bytes}],               // chunk-list pages (fs.md §4.1, formats.md §11.6)
+  upload?: {fs, session: bytes(16)},                        // the upload session its chunks and pages go under (§12.1)
   crdt_ops?: [CrdtOp],                                      // filesystem operations (fs.md §3, §4), CRDT rows (§13)
   svc?: [SvcStep],                                          // relayed-service steps (§14.5)
   fence?: [{fs, name: bytes, token: u64}] }                 // fenced leases the commit depends on (§16)
@@ -418,7 +420,7 @@ The whole commit is **one storage transaction**: all of it applies, or none of i
 6. **Fences** (§16) are checked first, in order: each named lease is read normally, and must hold `token`, name the caller's device as holder, and not have expired or been released at the commit's read; otherwise 412 `claim_lost`, and nothing applies. A server without the feature `"lease"` refuses `fence` (400). **Consumes** (§8.3) are processed next, in order. Then the **`svc` steps** (§14.5), in order; each step and each of its output records count as one operation, and the records and state toward `max_commit_bytes`.
 7. **Appends.** Each append gets offset `versionstamp ‖ u16(i)`, with `i` its index in `append`. Appends become visible only when the commit commits, so events published inside an aborted transaction never exist.
 8. **Chunks** are stored (each needs fs `write`, at most `max_value_bytes`).
-9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` or `pages` (the stored version holds both, keyspace.md §3.6). That bounds an inline file at about `max_value_bytes / 32` chunks, and a paged one at about `max_value_bytes / 64` pages (fs.md §4). A `write` carries `chunks` or `pages`, never both (400). Chunks apply before pages, and pages before the operations, so a commit can upload a file's last chunks, its last page and its `write` together. Each page counts as one operation toward `max_commit_ops`, and its data plus 48 bytes per chunk it lists (the reference counts it adds) toward `max_commit_bytes`. A server without the feature `"fs_pages"` refuses `pages` (400). Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
+9. **CRDT operations** apply in list order (fs.md §3, §4); each needs fs `write`. `meta` is at most `max_value_bytes`; so is a `write`'s `manifest` plus 16 bytes per entry of `chunks` or `pages` (the stored version holds both, keyspace.md §3.6). That bounds an inline file at about `max_value_bytes / 32` chunks, and a paged one at about `max_value_bytes / 64` pages (fs.md §4). A `write` carries `chunks` or `pages`, never both (400). Chunks apply before pages, and pages before the operations, so a commit can upload a file's last chunks, its last page and its `write` together. Each page counts as one operation toward `max_commit_ops`, and its data plus 48 bytes per chunk it lists (the reference counts it adds) toward `max_commit_bytes`. A server without the feature `"fs_pages"` refuses `pages` (400), and one without `"fs_cdc"` refuses pages of form 2 (formats.md §11.6, 400). With `upload` (§12.1), every chunk and page the commit puts is also referenced by that session; a server without the feature `"upload_sessions"` refuses the field (400). Each `write` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's writes, returned in `dots`. A replayed commit returns the same `dots`. The CRDT-row operations `row`, `lww`, `ctr`, `add` and `rem` follow §13.2; each `add` gets the dot `versionstamp ‖ u16(i)`, where `i` is its index among the commit's `add`s, returned in `set_dots`, and a replayed commit returns the same `set_dots`. A server without the feature `"crdt_rows"` refuses them (400).
 
 ## 7. Log
 
@@ -620,6 +622,27 @@ NodeState = { node: bytes(16),
   * 409 `resync`: start again without `after`.
 * **Limits.** `limit` defaults to 1,000 (`children`, `changes`) and is capped at `max_range_items`; `max_range_bytes` of node records also sets `more` (§2). `nodes` and `ids` take at most 1,000 and 64 entries. `file/get` returns 413 when a node's versions exceed either cap.
 * **`read_version`** works as in KV reads (§5): several reads at one version see one snapshot.
+
+### 12.1 Upload sessions
+
+An upload session keeps the chunks and pages of a long upload past `chunk_grace_secs` (fs.md §4.1), so that it can resume days later. A server that implements it lists the feature `"upload_sessions"`.
+
+```
+POST /v1/fs/upload/open  {fs, ttl_secs?: u64}                   → {session: bytes(16), expires_ms: u64}
+POST /v1/fs/upload/renew {fs, session: bytes(16), ttl_secs?}   → {expires_ms: u64}
+POST /v1/fs/upload/close {fs, session: bytes(16)}              → {}
+```
+
+* **Open** needs fs `write`. The server picks the session id. `ttl_secs` defaults to `upload_ttl_secs` (7 days) and is capped at `upload_max_ttl_secs` (30 days). At most 64 sessions of one user may be open on one fs (429 `quota`).
+* **A commit with `upload: {fs, session}`** (§6):
+  * the session must be open, unexpired and the caller's user's, else 412 `upload_gone`, and nothing applies;
+  * every chunk and page the commit puts is referenced by the session, once: a put the session already references adds nothing (keyspace.md §3.6, `ur`). A commit with `upload` may put chunks and pages of that `fs` only (400 otherwise);
+  * the reference counts like a version's (`cr`/`pr` + 1), so the sweeper keeps the content while the session holds it;
+  * each reference counts as one key toward the fs quota (formats.md §9).
+* **Renew** (the session's user, fs `write`) sets the expiry to `ttl_secs` from now, with the same cap. An expired or closed session gets 412 `upload_gone`.
+* **Close** (the session's user) ends it; closing an ended or unknown session is a no-op. After a close or the expiry, the sweeper releases the session's references in bounded rounds (fs.md §6). Each release is an ordinary one, whose grace period starts then, so a `write` committed before the close still holds what it lists, and anything it doesn't list goes one grace period later.
+* `expires_ms` is the expiry on the server's clock, in unix milliseconds, for the client to renew in time. The server measures expiry in its own commit versions, as for leases (§8.2).
+* **Leakage:** the server learns which chunks and pages belong to one upload, which the device and the timing of its commits already show.
 
 ## 13. CRDT rows (zendb.md §19)
 

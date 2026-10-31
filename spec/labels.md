@@ -15,6 +15,8 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/topic-data` | MK_e | `u32(fs_id) ‖ u32(epoch)` | root of the topic data chain |
 | `zen/v1/fs-data` | MK_e | `u32(fs_id) ‖ u32(epoch)` | AEAD key for filesystem meta, manifests and chunks (formats.md §11) |
 | `zen/v1/fs-file` | a file key (32 B, formats.md §11.3) | `u32(fs_id)` | AEAD key for the chunks of a version-2 file (formats.md §11.4) |
+| `zen/v1/fs-cdc` | NK | `u32(fs_id)` | key of the chunker's gear table for files under the fs keys (formats.md §11.7) |
+| `zen/v1/fs-cdc-file` | a file key (32 B, formats.md §11.3) | `u32(fs_id)` | key of the chunker's gear table for a file with a key of its own (formats.md §11.7) |
 | `zen/v1/name-chain` | chain key N_{i-1} | `lp(element)` | next naming-chain key N_i |
 | `zen/v1/topic-data-chain` | topic data key D_{i-1} | `lp(segment)` | next topic data key D_i |
 | `zen/v1/event-key` | topic naming key N_topic | empty | key for event key tokens |

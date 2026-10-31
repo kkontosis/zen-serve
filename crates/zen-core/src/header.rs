@@ -39,6 +39,16 @@ pub enum RekeyAfterRotate {
     Keep = 2,
 }
 
+/// How writers cut new files into chunks (formats.md §12, §11.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Chunking {
+    /// By content: version-3 manifests.
+    #[default]
+    Cdc = 0,
+    /// At a fixed size: version-2 manifests.
+    Fixed = 1,
+}
+
 /// The fs policy (formats.md §12), kept in a version-2 header.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FsPolicy {
@@ -46,6 +56,8 @@ pub struct FsPolicy {
     pub file_keys: bool,
     /// When a file key is replaced after a rotation.
     pub rekey_after_rotate: RekeyAfterRotate,
+    /// How new files are cut into chunks.
+    pub chunking: Chunking,
     /// Entries this version doesn't know, as a CBOR map (empty when none);
     /// kept on re-encode.
     pub unknown: Vec<u8>,
@@ -57,7 +69,8 @@ impl FsPolicy {
         *self == FsPolicy::default()
     }
 
-    /// The CBOR map `{1: file_keys, 2: rekey_after_rotate, …unknown}`.
+    /// The CBOR map `{1: file_keys, 2: rekey_after_rotate, [3: chunking], …unknown}`;
+    /// key 3 only when it isn't the default, so older policies encode as before.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut items = match self.unknown.is_empty() {
             true => Vec::new(),
@@ -66,9 +79,12 @@ impl FsPolicy {
                 _ => return Err(Error::Param),
             },
         };
-        items.retain(|(k, _)| !matches!(k, Value::Int(1 | 2)));
+        items.retain(|(k, _)| !matches!(k, Value::Int(1..=3)));
         items.push((Value::Int(1), Value::Int(self.file_keys as i128)));
         items.push((Value::Int(2), Value::Int(self.rekey_after_rotate as i128)));
+        if self.chunking != Chunking::default() {
+            items.push((Value::Int(3), Value::Int(self.chunking as i128)));
+        }
         cbor::encode(&Value::Map(items))
     }
 
@@ -85,7 +101,9 @@ impl FsPolicy {
                 (Value::Int(2), Value::Int(0)) => p.rekey_after_rotate = RekeyAfterRotate::Rewrite,
                 (Value::Int(2), Value::Int(1)) => p.rekey_after_rotate = RekeyAfterRotate::Eager,
                 (Value::Int(2), Value::Int(2)) => p.rekey_after_rotate = RekeyAfterRotate::Keep,
-                (Value::Int(1 | 2), _) => return Err(Error::Format),
+                (Value::Int(3), Value::Int(0)) => p.chunking = Chunking::Cdc,
+                (Value::Int(3), Value::Int(1)) => p.chunking = Chunking::Fixed,
+                (Value::Int(1..=3), _) => return Err(Error::Format),
                 _ => rest.push((k, v)),
             }
         }
@@ -484,6 +502,29 @@ mod tests {
         let v2 = h.encode().unwrap();
         assert_eq!(v2[0], 2);
         assert_eq!(FsHeader::decode(&v2).unwrap(), h);
+
+        // Chunking: absent is cdc; fixed is written as key 3.
+        h.policy.chunking = Chunking::Fixed;
+        let v2f = h.encode().unwrap();
+        assert_eq!(FsHeader::decode(&v2f).unwrap(), h);
+        assert!(v2f.len() > v2.len());
+        h.policy.chunking = Chunking::Cdc;
+        assert_eq!(h.encode().unwrap(), v2);
+        let explicit = Value::map(vec![
+            (Value::Int(1), Value::Int(0)),
+            (Value::Int(2), Value::Int(0)),
+            (Value::Int(3), Value::Int(0)),
+        ]);
+        assert!(
+            FsPolicy::decode(&cbor::encode(&explicit).unwrap())
+                .unwrap()
+                .is_default()
+        );
+        let bad3 = Value::map(vec![(Value::Int(3), Value::Int(2))]);
+        assert_eq!(
+            FsPolicy::decode(&cbor::encode(&bad3).unwrap()),
+            Err(Error::Format)
+        );
 
         // Unknown keys are kept, and keep the header at version 2.
         let extra = Value::map(vec![(Value::Int(9), Value::text("later"))]);

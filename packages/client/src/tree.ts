@@ -1,7 +1,6 @@
 // The CRDT filesystem: tree operations, files, chunks and the change feed
 // (spec/fs.md, api.md §6 and §12, formats.md §11).
 import type {
-  AnyManifest,
   ChunkPut,
   CommitResult,
   CrdtOp,
@@ -15,8 +14,17 @@ import type {
   PageRef,
   StateNode,
   Versions,
+  AnyManifest as WasmAnyManifest,
 } from '@zen/wasm';
 import { compare, equal, hex, randomBytes } from './bytes.js';
+
+/**
+ * A manifest this client reads: version 1 or 2 (formats.md §11.3). A
+ * version-3 manifest (variable chunks, milestone 8) is refused until the
+ * client reads it.
+ */
+export type AnyManifest = Exclude<WasmAnyManifest, { version: 3 }>;
+
 import type { Client } from './client.js';
 import type { TreeClock } from './clock.js';
 import { isCode, ZenError } from './errors.js';
@@ -541,9 +549,11 @@ export class Tree {
   /** Open wire versions of `node` (from `fetchVersions`, or kept by a replica). */
   openVersions(node: Uint8Array, r: Versions): FileVersion[] {
     return r.versions.map((v) => {
-      const manifest = this.fs
-        .keysFor(v.manifest)
-        .openAnyManifest(this.id, node, v.manifest) as AnyManifest;
+      const opened = this.fs.keysFor(v.manifest).openAnyManifest(this.id, node, v.manifest);
+      if (opened.version === 3) {
+        throw new ZenError(0, 'format', 'a version-3 manifest: this client reads versions 1 and 2');
+      }
+      const manifest: AnyManifest = opened;
       const chunks = v.chunks ?? [];
       const pages = v.pages ?? [];
       const inline = manifest.chunks;

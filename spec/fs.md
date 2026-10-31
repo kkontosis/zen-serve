@@ -114,19 +114,20 @@ write {node, replaces: [dot], chunks: [chunk_id] | pages: [page_id], manifest}
   * **paged:** `pages`, the ids of the pages (§4.1) that hold the chunk ids, in file order. A large file uses it: the inline list must fit one value with the manifest.
 
   The server sees the ids (so it can garbage-collect chunks and pages), but not their order's meaning or the file size. A `write` with both `chunks` and `pages` is refused (400).
-* `manifest` is the sealed manifest (formats.md §11.3): the file size, chunk size, how its chunks are keyed (§4.2), and the same chunk list or page list, authenticated. Clients check that it matches `chunks` or `pages`, and check each page against its digest.
+* `manifest` is the sealed manifest (formats.md §11.3): the file size, the chunk size (version 2) or each chunk's length (version 3), how its chunks are keyed (§4.2), and the same chunk list or page list, authenticated. Clients check that it matches `chunks` or `pages`, and check each page against its digest.
 * `write` with neither writes an empty file. The server doesn't distinguish files from directories, so the client decides whether a directory has content.
 * Every chunk, or every page, must exist when the write commits: uploaded earlier, or in the same commit.
 * `node` must exist.
 
 ### 4.1 Chunks
 
-* A chunk is an immutable sealed blob (formats.md §11.4), at most `max_value_bytes`. Clients use 64 KiB of plaintext.
+* A chunk is an immutable sealed blob (formats.md §11.4), at most `max_value_bytes`. Clients cut a file into chunks by the fs policy (formats.md §12): by content (`chunking = cdc`, formats.md §11.7: 8 KiB to about 88 KiB, 32 KiB on average at the defaults), so that an insertion re-uploads only the chunks around it; or at a fixed 64 KiB (`fixed`).
 * Chunk ids are random 16-byte ids chosen by the client. They belong to the fs, not to a tree.
 * Chunks are uploaded through the commit field `chunks` (api.md §6). Large files are uploaded over several commits, then referenced by one `write`.
 * **Pages** (formats.md §11.6) are uploaded through the commit field `pages`, each `{fs, id, data}`. Every chunk a page lists must exist when the page is uploaded: uploaded earlier, or in the same commit (the commit's chunks apply before its pages). A page is immutable: re-uploading identical bytes stores nothing new but restarts its grace period, and different bytes under an existing id are refused (400). The first upload of a page counts one reference to each chunk it lists (once per occurrence), so a page shared by many versions holds its chunks once.
 * The server counts references to every page (one per paged version listing it, once per occurrence). A page no version references, and that hasn't been uploaded or released for `limits.chunk_grace_secs`, is deleted, which releases its chunk references (§6). Its grace is measured like a chunk's, from its newest upload or release (keyspace.md §3.6, `pc`).
 * Re-uploading an identical chunk stores nothing new but restarts its grace period (below). Uploading different bytes under an existing id is refused (400).
+* **Upload sessions** (api.md §12.1) keep a long upload's content past the grace period. A chunk or page put in a commit that names an open session is referenced by that session until it is closed or expires, and then released like any other reference, so its grace period starts then. A resume days later finds what it uploaded, and the `write` that finally references it needs no re-upload.
 * The server counts references to every chunk. A chunk that no version references, and hasn't been uploaded or referenced for `limits.chunk_grace_secs` (default 24 h), is deleted (§6). The grace period covers chunks uploaded in one commit and referenced by a later one. It is measured from the chunk's **newest** upload or release (keyspace.md §3.6, `cp`), so an earlier one that has aged past the grace period doesn't delete a chunk that was uploaded or released again since.
 
 ### 4.2 File keys
@@ -175,6 +176,7 @@ The sweeper (every node runs it) keeps the tree bounded. It visits only trees wi
   A purge can still contradict an operation that is inside the horizon but has not arrived yet: an offline device that moved a file out of a directory before the directory was trashed, and syncs after the purge. Its operation is refused with `stale_op` rather than applied to a node whose content is gone; the client shows the file as deleted.
 * **Pages:** unreferenced pages are deleted after the grace period (§4.1), and their chunk references are released. The sweeper collects pages before chunks; a chunk released by a page waits one more grace period.
 * **Chunks:** unreferenced chunks are deleted after the grace period (§4.1).
+* **Upload sessions:** a session that is closed or past its expiry has its references released in bounded rounds (keyspace.md §3.6, `ux`), each release an ordinary one: a GC candidate whose grace starts then. A session reference keeps a chunk or page alive like a version's.
 * **Lost and found.** Undo and redo after a purge can, in rare cases, leave a node whose parent no longer exists. Logged moves of a purged node itself (a skipped move can name one) are passed over by undo and redo. Such a node is an **orphan**. `tree/children` of the missing parent id still lists it, and clients show orphans in a "lost+found" folder. Moving it anywhere repairs it.
 
 ## 7. Transactions (G11)
@@ -236,7 +238,8 @@ Compared with the plain KV store, the server additionally sees, per tree:
 * **its shape:** which node is under which, children counts, depth
 * **timing:** when nodes are created, moved, renamed, deleted and written, and by which device
 * **content structure:** the number of chunks in each version, and which chunks versions share (dedup between versions of one file)
-* **sizes:** the size of each sealed metadata value and chunk, which approximates name lengths and file sizes to 64 KiB granularity unless the client pads
+* **sizes:** the size of each sealed metadata value and chunk, which approximates name lengths and file sizes to 64 KiB granularity under fixed-size chunks unless the client pads; under content-defined chunks every chunk's length, and runs of equal lengths where files share content (formats.md §11.7)
+* **uploads:** which chunks and pages were put under one upload session, which the device and commit timing already show
 
 It does not see names, types, modes, times, sizes inside the manifest, or contents. Clients may add padding nodes, padding chunks or padded metadata to blur the counts.
 

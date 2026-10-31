@@ -364,6 +364,28 @@ form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_d
 * A decoder refuses any other `form`, a paged `m` other than `ceil(n / page_size)`, `page_size = 0` with `n > 0`, and trailing bytes.
 * At the defaults (`max_value_bytes` 90,000) a paged version holds about 1,870 pages of 5,624 chunks, about 640 GiB at 64 KiB per chunk.
 
+Version 3 (milestone 8), with chunks of variable length, as the chunker of §11.7 cuts them:
+
+```
+u8 manifest_version = 3 ‖ u64 size ‖ u64 n ‖ u32 min ‖ u8 avg_bits ‖ u32 max ‖ u8 key_mode ‖ keys ‖ u8 form ‖ body
+key_mode, keys:  as in version 2
+form 1, inline:  body = n × (chunk_id(16) ‖ u32 len)
+form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32) ‖ u32 bytes)
+```
+
+* `len` is a chunk's plaintext length, and `bytes` the plaintext a page's chunks hold. A reader finds the chunk holding an offset by prefix sums: over the pages' `bytes`, then over the lengths in that page (§11.6, form 2).
+* `min`, `avg_bits` and `max` are the parameters the writer's chunker used (§11.7). A reader doesn't need them; a writer that builds on this version resyncs its cuts with these chunks only under the same parameters.
+* **Paged:** pages are of form 2 (§11.6), `page_size ≥ 1` entries each, every page full but the last, so `m = ceil(n / page_size)` (and `m = 0` when `n = 0`). The page ids must equal the `pages` of the `write`, in order. A reader checks each page against its `page_digest`, its expected count and its `bytes` when it fetches it.
+* A decoder refuses:
+  * a `len` of 0 or above `max`;
+  * lengths (inline) or page `bytes` (paged) that don't sum to `size`;
+  * `n = 0` with `size > 0`, or `n > 0` with `size = 0`;
+  * a paged `m` other than `ceil(n / page_size)`, or `page_size = 0` with `n > 0`;
+  * parameters with `min < 64`, `avg_bits` outside 8..=24, `min ≥ 2^avg_bits` or `2^avg_bits ≥ max`;
+  * any other `key_mode` or `form`, and trailing bytes.
+* At the defaults a form-2 page holds 4,499 chunks, and a paged version about 1,300 pages (52 bytes each in the manifest and 16 in the stored version, api.md §6), about 5.8 million chunks: roughly 180 GiB at an average chunk length near 32 KiB (docs/STATS.md). A larger file is written with fixed-size chunks (version 2, the policy's `chunking`, §12).
+* Which version a writer writes is the fs policy (§12): version 3 under `chunking = cdc`, version 2 under `fixed`. Readers read all three.
+
 ### 11.4 Chunk (kind 6)
 
 The plaintext is the chunk's bytes. A chunk is bound to its fs and id, so the server can't substitute one chunk for another.
@@ -419,6 +441,36 @@ page_digest = BLAKE3.derive_key("zen/v1/fs-page", page)
 * A page id is 16 random bytes chosen by the client. A page is immutable: an id never holds other bytes (fs.md §4.1).
 * At the defaults a page holds up to 5,624 chunk ids, about 351 MiB at 64 KiB per chunk.
 
+**Form 2** (milestone 8) also gives each chunk's plaintext length, for version-3 manifests (§11.3):
+
+```
+page2 = u32 (0x8000_0000 | n) ‖ n × (chunk_id(16) ‖ u32 len)      1 ≤ n, 4 + 20n ≤ max_value_bytes
+```
+
+* A form-1 page's `n` is below 2^31, so the top bit tells the forms apart. `page_digest` is computed the same way, over all the bytes.
+* Every `len` is at least 1. A version-3 manifest lists only form-2 pages, and a version-2 manifest only form-1 pages.
+* The server reads the chunk ids, for its reference counts (fs.md §4.1), and stores the page as it is. The lengths are in the clear; that shows the server nothing new, since a sealed chunk's stored length is its plaintext length plus a constant (§4).
+* At the defaults a form-2 page holds up to 4,499 chunks.
+
+### 11.7 Content-defined chunking
+
+Under the policy `chunking = cdc` (§12), writers cut a file's content where a keyed rolling hash says, not at fixed offsets, so an insertion or deletion changes only the chunks around it, and every later chunk is reused (fs.md §4.1).
+
+```
+K_cdc = KDF("zen/v1/fs-cdc", NK, u32(fs))                 chunks under the fs keys (key_mode 0)
+K_cdc = KDF("zen/v1/fs-cdc-file", file_key, u32(fs))      chunks under a file key (key_mode 1)
+G[i]  = u64le(first 8 bytes of BLAKE3.keyed_hash(K_cdc, u8(i)))      for i = 0 … 255
+```
+
+* **Cutting.** A chunk starts with `h = 0`. For each byte `b` at position `p` of the chunk (0-based), from `p = min` on:
+  1. `h = (h << 1) + G[b]`, modulo 2^64;
+  2. with `len = p + 1`, the chunk ends after this byte when `len = max`; or, while `len < 2^avg_bits`, when the top `avg_bits + 2` bits of `h` are zero; or, from `len = 2^avg_bits` on, when the top `avg_bits − 2` bits of `h` are zero.
+
+  The rest of the input after the last cut is the last chunk. So every chunk but the last is `min` to `max` bytes, and a cut depends only on the key and the bytes since the previous cut.
+* **Defaults:** `min = 8,192`, `avg_bits = 15` (32 KiB), `max = min(131,072, max_value_bytes − 64)`, so that a sealed chunk fits one value (89,936 at the defaults). A writer records them in the manifest (§11.3).
+* **Why it is keyed.** Without `K_cdc`, nobody can compute where a known plaintext would be cut, so the lengths the server sees can't be matched against known files. The fs-key form derives from NK, which isn't rotated, so cuts stay the same across rotations, and unchanged chunks are reused across them as under version 2.
+* **Leakage.** The server sees every chunk's length, not only the last one's. Two files of one fs with content in common show runs of equal lengths, since one key gives the same cuts. A revoked member keeps NK, so for files under the fs keys they can still compute the cuts of content they know; files under file keys don't have that exposure. Padding lengths is milestone 11's metadata padding.
+
 ## 12. fs header
 
 The fs header holds an fs's keyslots (§6) and its epoch chain (§2, §4 kind 3). The server stores it as opaque bytes, with a version for compare-and-set (api.md §4.4); only an admin may write it.
@@ -439,11 +491,12 @@ lp(policy)                         version 2 only
   |---|---|---|---|
   | 1 | `file_keys` | 0 off, 1 on: new files get a file key of their own (§11.3 `key_mode 1`) | 0 |
   | 2 | `rekey_after_rotate` | 0 `rewrite`, 1 `eager`, 2 `keep` (fs.md §4.2) | 0 |
+  | 3 | `chunking` | 0 `cdc`: chunks cut by content, version-3 manifests (§11.3, §11.7); 1 `fixed`: fixed-size chunks, version-2 manifests | 0 |
 
   * A version-1 header has the default policy.
   * A writer writes version 1 while the policy is the default and holds no unknown keys, so older clients still read it; otherwise version 2.
   * Unknown keys are kept on re-encode and otherwise ignored. A known key with a value the client doesn't know makes the header undecodable: a new value comes with a new header version.
-  * The policy is advice to writers. Readers never need it, since each manifest names its `key_mode`.
+  * The policy is advice to writers. Readers never need it, since each manifest names its `key_mode` and its form.
 
 * **The chain.** `chain[i]` is the record written when the fs rotated to epoch `i + 1`: the keys of epoch `i + 1` open it to the keys of epoch `i`. So `n_chain = current_epoch`, and the sealed header of `chain[i]` names `key_epoch = i + 1`. A client holding epoch `e` reads any epoch `≤ e` by walking the chain back.
 * **Slots.** Each slot starts with the §6 prefix (`format_version`, `suite`, `slot_type`, `reserved = 0`, `slot_id`). Clients keep slots of types they don't know, unchanged, and never try to open them. A client finds its slot by type and by what identifies it: `recipient_fp` (device), `credential_id` (passkey PRF, OPAQUE export key), or by trying each passphrase or recovery slot.
@@ -454,7 +507,7 @@ lp(policy)                         version 2 only
 **Leakage and rollback.** The server sees the number of slots, their types and ids, the credential ids and device fingerprints in their parameters, the Argon2id parameters, the number of epochs, and the policy. It can't open a slot or forge one that opens to real keys. Of an **unsigned** header it can:
 * drop slots or the whole header (denial of service; detectable only out of band),
 * serve an older header: a client then sees an older `current_epoch`, and notices when it meets data sealed under a newer `key_epoch` than its keys can reach. It refuses to write under an epoch older than one it has seen (clients remember the highest epoch per fs),
-* serve another policy. That changes only how new files are keyed: both key modes are end-to-end encrypted, and only sharing a single file depends on file keys,
+* serve another policy. That changes only how new files are keyed and cut: both key modes are end-to-end encrypted, only sharing a single file depends on file keys, and the chunking changes only which lengths the server sees and how much an edit re-uploads,
 * nothing else: a slot or chain record that was tampered with fails to open.
 
 A **signed** header (§12.1) leaves it only the first point and serving an older version, which a client that pinned a newer one, or that verified a device checkpoint naming one (§14), detects.

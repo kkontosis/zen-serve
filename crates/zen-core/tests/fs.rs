@@ -177,3 +177,157 @@ fn paged_write_bytes_differ_from_inline() {
     assert_eq!(b[0], 4);
     assert_eq!(a[1..], b[1..]);
 }
+
+// ------------------------------------------------------------------ version 3
+
+use zen_core::fs::{BodyV3, CdcParams, ManifestV3, PageRefV3};
+
+const CDC: CdcParams = CdcParams {
+    min: 64,
+    avg_bits: 8,
+    max: 1000,
+};
+
+fn v3_inline(lens: &[u32]) -> ManifestV3 {
+    ManifestV3 {
+        size: lens.iter().map(|&l| l as u64).sum(),
+        n: lens.len() as u64,
+        cdc: CDC,
+        file_key: None,
+        body: BodyV3::Inline(
+            lens.iter()
+                .enumerate()
+                .map(|(i, &l)| (id(i as u8), l))
+                .collect(),
+        ),
+    }
+}
+
+fn v3_paged(page_bytes: &[u32], n: u64, page_size: u32) -> ManifestV3 {
+    ManifestV3 {
+        size: page_bytes.iter().map(|&l| l as u64).sum(),
+        n,
+        cdc: CDC,
+        file_key: Some(FileKey {
+            key_epoch: 2,
+            key: [5; 32],
+        }),
+        body: BodyV3::Paged {
+            page_size,
+            pages: page_bytes
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| PageRefV3 {
+                    id: id(i as u8),
+                    digest: [i as u8; 32],
+                    bytes: b,
+                })
+                .collect(),
+        },
+    }
+}
+
+#[test]
+fn manifest_v3_round_trips() {
+    for m in [
+        v3_inline(&[100, 1000, 7]),
+        v3_inline(&[]),
+        v3_paged(&[3000, 400], 5, 4),
+        v3_paged(&[], 0, 4),
+    ] {
+        assert_eq!(ManifestV3::decode(&m.encode()).unwrap(), m);
+        let any = AnyManifest::V3(m.clone());
+        assert_eq!(AnyManifest::decode(&any.encode()).unwrap(), any);
+    }
+    assert_eq!(v3_paged(&[3000, 400], 5, 4).page_len(1), Some(1));
+    // Sealed and opened like the other versions.
+    let fsk = keys();
+    let m = AnyManifest::V3(v3_inline(&[10, 20]));
+    let sealed = fs::seal_any_manifest(&fsk, &id(1), &id(2), &m, &mut OsRng).unwrap();
+    assert_eq!(
+        fs::open_any_manifest(&fsk, &id(1), &id(2), &sealed).unwrap(),
+        m
+    );
+}
+
+#[test]
+fn manifest_v3_refusals() {
+    let bad = |m: &ManifestV3| ManifestV3::decode(&m.encode());
+    // A length of 0, or above max.
+    assert_eq!(bad(&v3_inline(&[10, 0])), Err(Error::Format));
+    assert_eq!(bad(&v3_inline(&[1001])), Err(Error::Format));
+    // Lengths or page bytes that don't sum to size.
+    let mut m = v3_inline(&[10, 20]);
+    m.size = 31;
+    assert_eq!(bad(&m), Err(Error::Format));
+    let mut m = v3_paged(&[3000, 400], 5, 4);
+    m.size += 1;
+    assert_eq!(bad(&m), Err(Error::Format));
+    // n = 0 with size > 0, and the reverse.
+    let mut m = v3_inline(&[]);
+    m.size = 5;
+    assert_eq!(bad(&m), Err(Error::Format));
+    let mut m = v3_paged(&[3000, 400], 5, 4);
+    m.n = 0;
+    assert_eq!(bad(&m), Err(Error::Format));
+    // m ≠ ceil(n / page_size), and page_size 0.
+    assert_eq!(bad(&v3_paged(&[3000, 400], 9, 4)), Err(Error::Format));
+    assert_eq!(bad(&v3_paged(&[3000, 400], 5, 0)), Err(Error::Format));
+    // Parameters.
+    for cdc in [
+        CdcParams { min: 63, ..CDC },
+        CdcParams { avg_bits: 7, ..CDC },
+        CdcParams {
+            avg_bits: 25,
+            max: u32::MAX,
+            ..CDC
+        },
+        CdcParams { min: 256, ..CDC },
+        CdcParams { max: 256, ..CDC },
+    ] {
+        let mut m = v3_inline(&[10]);
+        m.cdc = cdc;
+        assert_eq!(bad(&m), Err(Error::Format), "{cdc:?}");
+    }
+    // key_mode, form, trailing bytes, the version byte.
+    let enc = v3_inline(&[10]).encode();
+    let mut b = enc.clone();
+    b[26] = 2; // key_mode
+    assert_eq!(ManifestV3::decode(&b), Err(Error::Format));
+    let mut b = enc.clone();
+    b[27] = 3; // form
+    assert_eq!(ManifestV3::decode(&b), Err(Error::Format));
+    let mut b = enc.clone();
+    b.push(0);
+    assert_eq!(ManifestV3::decode(&b), Err(Error::Format));
+    let mut b = enc;
+    b[0] = 2;
+    assert!(ManifestV3::decode(&b).is_err());
+}
+
+#[test]
+fn page_forms() {
+    let e = vec![(id(1), 100u32), (id(2), 7)];
+    let p2 = fs::encode_page2(&e);
+    assert_eq!(p2.len(), 4 + 20 * 2);
+    assert_eq!(fs::decode_page2(&p2).unwrap(), e);
+    let any = fs::decode_any_page(&p2).unwrap();
+    assert_eq!(
+        (any.ids, any.lens),
+        (vec![id(1), id(2)], Some(vec![100, 7]))
+    );
+    // Form 1 is told apart, and each decoder refuses the other form.
+    let p1 = fs::encode_page(&[id(1), id(2)]);
+    assert_eq!(fs::decode_any_page(&p1).unwrap().lens, None);
+    assert!(fs::decode_page(&p2).is_err());
+    assert!(fs::decode_page2(&p1).is_err());
+    // Empty, a zero length, a wrong length.
+    assert!(fs::decode_page2(&fs::encode_page2(&[])).is_err());
+    assert!(fs::decode_page2(&fs::encode_page2(&[(id(1), 0)])).is_err());
+    let mut long = p2.clone();
+    long.push(0);
+    assert!(fs::decode_page2(&long).is_err());
+    assert!(fs::decode_any_page(&[]).is_err());
+    assert_eq!(fs::page_capacity2(90_000), 4_499);
+    assert_eq!(fs::page_capacity(90_000), 5_624);
+}

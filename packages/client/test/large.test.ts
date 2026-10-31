@@ -281,7 +281,7 @@ describe('the file-key policy (fs.md §4.2)', () => {
   };
 
   it('off by default: fs keys, and appends reuse chunks across a rotation', async () => {
-    expect(fs2.policy).toEqual({ fileKeys: false, rekeyAfterRotate: 'rewrite' });
+    expect(fs2.policy).toEqual({ fileKeys: false, rekeyAfterRotate: 'rewrite', chunking: 'cdc' });
     expect(fs2.header.encode()[0]).toBe(1);
     const f = await t.create(ROOT, 'plain');
     const data = random(3 * CS);
@@ -386,6 +386,19 @@ describe('the file-key policy (fs.md §4.2)', () => {
     }
   });
 
+  it('chunking: set to fixed and back, kept in the header (formats.md §12)', async () => {
+    await fs2.setPolicy({ fileKeys: false, rekeyAfterRotate: 'rewrite', chunking: 'cdc' });
+    await fs2.setPolicy({ chunking: 'fixed' });
+    expect(fs2.policy.chunking).toBe('fixed');
+    expect(fs2.header.encode()[0]).toBe(2);
+    const again = await w.session.fs(2).unlock({ device: w.admin.device });
+    expect(again.policy.chunking).toBe('fixed');
+    again.close();
+    await fs2.setPolicy({ chunking: 'cdc' });
+    // The default policy is written as a version-1 header again.
+    expect(fs2.header.encode()[0]).toBe(1);
+  });
+
   it('the policy survives an offline unlock (the kept header)', async () => {
     await fs2.setPolicy({ fileKeys: true, rekeyAfterRotate: 'keep' });
     const local = sealedStore(memoryLocalStore());
@@ -397,7 +410,7 @@ describe('the file-key policy (fs.md §4.2)', () => {
     }) as Session['call'];
     try {
       const u = await w.session.fs(2).unlock(how, { local });
-      expect(u.policy).toEqual({ fileKeys: true, rekeyAfterRotate: 'keep' });
+      expect(u.policy).toEqual({ fileKeys: true, rekeyAfterRotate: 'keep', chunking: 'cdc' });
       u.close();
     } finally {
       w.session.call = orig;
