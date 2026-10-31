@@ -83,6 +83,24 @@ Handlers on member clients serve TCP connections the server relays blind ([SVC.m
 | WS | `/v1/svc/connect` | a `tcp-auth` connection, as a member (§14.9) |
 | WS | `/v1/stream` | `svc_sub`: input and `svc_ready` pushed for a lease; `svc_reveal` (§14.10) |
 
+### Integrity (milestone 6)
+Device checkpoints, enrolled devices, signed fs headers and fenced leases ([INTEGRITY.md](INTEGRITY.md); normative: spec/api.md §4.4, §6, §15, §16; spec/formats.md §12.1, §14). The server stores checkpoints sealed and can't read them; it checks only who may put them and that each device's `seq` extends its head.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/checkpoint/put` | a device's next checkpoint (`seq` = head + 1; idempotent for the same bytes); counts toward the fs quota (§15.1) |
+| POST | `/v1/checkpoint/heads` | every device's head `seq`, or the named devices' (§15.1) |
+| POST | `/v1/checkpoint/get` | a device's checkpoints by `seq` range (§15.1) |
+| WS | `/v1/stream` | `cksub`: `ckh {device, seq}` pushed whenever a head moves (§9, §15.1) |
+| POST | `/v1/devices/register` | register a device cert issued by the caller's member identity; at most 64 per user (§15.2) |
+| POST | `/v1/devices/get` | registered devices' certs, for verifiers (§15.2) |
+| POST | `/v1/fs/header/put` | a signed header must be the admin-signed successor of the stored one (§4.4; formats.md §12.1) |
+| POST | `/v1/lease` | take, renew or release a named lease, with a token that grows on each new holder (§16) |
+| POST | `/v1/commit` (`fence`) | fail with `claim_lost` unless the caller still holds the lease at that token, atomically with the rest of the commit (§6, §16) |
+| POST | `/v1/fs/tree/changes` | `ops` and `chain` with a caught-up answer, so replicas tie their tree state to the op chain (§12) |
+
+`/v1/info` lists the features `checkpoints`, `signed_header`, `lease` and `devices`, and the limit `checkpoint_keep`.
+
 ---
 
 ## 2. Client library: `@zen/client` (TypeScript over the WASM core)

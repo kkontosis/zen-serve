@@ -364,6 +364,38 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * **Delete:** paged clears of the volume's keys (a clear over more than `max_range_items` keys is refused), and a tombstone root record that stays, so a server can't resurrect a deleted volume by serving its old root.
   * **Readers at a snapshot:** a read-only opener that keeps the values of its root, which needs the snapshots above, since the writer deletes and overwrites them.
 
+## TD-WITNESS
+
+* **Status:** open
+* **Context:** Integrity (formats.md §14, docs/INTEGRITY.md) detects rollbacks and forks up to **fork consistency** (DESIGN.md §2.6): a server that keeps two groups of devices apart forever, so that no checkpoint of one group ever reaches the other, isn't caught, unless users compare their pins out of band (formats.md §14.5). The server is the only channel between devices.
+* **Why deferred:** Closing it needs a second, independent channel, which is a deployment decision (who runs it, who trusts it), not a format change. Milestone 6 gives each device what it needs to be caught by one: signed, chained heads.
+* **What it would take:**
+  * **A witness:** a log outside the server, such as another zen-serve run by someone else, or a transparency log. After each checkpoint a client posts its device head `(fs, fp, seq, HC)` to it (signed: the checkpoint's signature covers the body, so the witness can store the signed head), and at each sync it reads the other devices' heads from it. A head the server doesn't show, or shows differently, is a fork.
+  * **Optionally, waiting for it:** the witness signs the set of heads it has seen, and a client treats a sync as complete only once the witness's set covers the server's answer. That bounds a fork to the time the witness takes to answer.
+  * **The fs setting** that names the witness and its key, in the signed header (formats.md §12.1), so the server can't change it.
+  * **Tests:** a forked server (`TestServer.fork()`) with an honest witness, where two groups that never share a checkpoint still alarm; and a witness that is down, where syncs continue and report it.
+
+## TD-FS-VERSIONS-INTEGRITY
+
+* **Status:** open
+* **Context:** The tree state (fs.md §9.1) commits each node's leaf to its sealed meta, parent, version **count** and change offset, but not to its version records (dots and sealed manifests). A replica fetches those separately by `(node, changed)` (`@zen/fs` `replica.ts` `versionsOf`, `@zen/client` `tree.ts` `versions`) and checks them against nothing. So a server could serve an older, still valid set of version records under a node's current change offset, and the replica would show older content. It can't forge content: every manifest and chunk is sealed.
+* **Why deferred:** Found while surveying for milestone 6 step 9. The fix changes the leaf, so the tree states of fs.md §9.1 and their vectors change with it: a format change, out of place in a docs step.
+* **What it would take:** a version digest in the leaf, a hash over the node's version records in dot order (each dot and the hash of its sealed manifest), as a leaf version 2 with new vectors (fs.md §9.1, `spec/test-vectors/fs.json`); the server's `NodeState` carrying what the client needs to compute it, or the replica computing it from the records it fetched; the replica checking fetched versions against the node's leaf, with a `tree` rollback alarm on a mismatch; and an adversary test that freezes a version record.
+
+## TD-FUSE-INTEGRITY
+
+* **Status:** open
+* **Context:** zen-mount (`packages/fuse`, docs/CLIENT.md §9) never attaches integrity, so its replica runs without tree checks and its writes add no checkpoints. Only the `apps/shared` workers (`ZEN_INTEGRITY=1`), the ledger and zen-ublk (always) attach it.
+* **Why deferred:** A feature, not a format: the replica's checks (milestone 6 step 4) work for any caller that attaches integrity.
+* **What it would take:** `zen-mount --integrity`, with the pins kept in the mount's store directory and the device key file as the signer; an alarm from the replica surfaced as `EIO` on the mount's files and a log line (the replica already stops its feed); `close` writing a last checkpoint on unmount; and a test with the adversary that a rolled-back tree makes reads fail.
+
+## TD-INTEGRITY-SYNC-COST
+
+* **Status:** open
+* **Context:** A `sync()` (TS `integrity.ts` `syncNow`, Rust `zen-client` `sync_now`) costs about two round trips per known device, whether that device's head moved or not: `advance` re-reads the ACL head for each device (`session.acl.head()`, one `/v1/acl/get`), and re-fetches each pinned checkpoint to check it is still the pinned one (formats.md §14.4 rule 2), before fetching a moved device's head. With ten devices that is about 50 ms on loopback (docs/STATS.md §6.1), and it grows with the number of devices, not with what changed.
+* **Why deferred:** Found while measuring for milestone 6 step 9, a docs step that changes no behavior. The checks are correct, only repeated.
+* **What it would take:** read the ACL head once per sync and pass it down; have `/v1/checkpoint/heads` return each head's checkpoint hash (HC is over the plaintext body, so the server would store it beside the head, given by the putting device), so a device whose head equals its pin is compared without a fetch, and fetched only when the hash differs (to verify the fork it shows); and a `/v1/checkpoint/get` over several devices in one request. A spec change (api.md §15.1). Not a skip of the comparison: a client moved to a forked server finds the fork exactly there (another checkpoint at the pinned seq). Both clients, with a test that counts the requests of a sync where one of ten devices moved, and the existing attack tests unchanged.
+
 ## TD-TEST-OPEN-FAILURES
 
 * **Status:** open

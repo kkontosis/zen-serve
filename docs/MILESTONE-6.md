@@ -365,7 +365,15 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * Fixed in f0b6bfb. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean. Pushed.
   * **CI green on both runs of 3d3eb3b** (push 444, pull_request 445): rust, pure-rust, fdb, client and devices all pass. In `devices`, the ublk tests ran over `/dev/ublkbN` for the first time: ext4 round trip, then a killed writer, its stale device deleted, `e2fsck`. Step 6.8 is done.
   * PR #61 merged.
-* **Step 6.9** (docs, bench, outcome): planned below ("Step 6.9 in detail"). Restarted from main; the log above is now in the repo copy too.
+* **Step 6.9** (docs, bench, outcome): planned below ("Step 6.9 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (4a60a3b), PR #62.
+  * PR #62 merged with the plan only. So the implementation goes in a new PR: restart from main first, then a log line here saying so.
+  * Restarted from main (9a83e73, PR #62 merged); the log above is now in the repo copy too. The implementation goes in a new PR.
+  * **Benches** (7b1b2bb): `packages/client/test/integritybench.test.ts` (`ZEN_BENCH=1`), `bench_fuse`/`bench_ublk` in `crates/zen-ublk/tests/devices.rs` (`#[ignore]`; the `World` gains `tuning`, so the benches run with the daemon's defaults and the tests keep their short lease and idle flush), and the `devices-bench` CI job (`workflow_dispatch` only, `--test-threads 1`).
+    * The untar source is a tarball of `crates`, `spec` and `docs` made with GNU tar's deterministic flags, not `git ls-files`: CI runs the test binary as root in a checkout owned by the runner user, where git refuses ("dubious ownership").
+    * **Found while measuring:** a TS `sync()` over ten devices costs ~50 ms whether one device moved or all ten. Traced (each call timed): `advance` re-reads the ACL head (`/v1/acl/get`) and re-fetches the pinned checkpoint for every known device, then fetches the moved heads: about two round trips per device. Correct but repeated; the Rust client does the same. Recorded as TD-INTEGRITY-SYNC-COST rather than changed in a docs step. Its fix keeps the comparison at the pinned seq (a client moved to a forked server finds the fork there, as the 6.3 fork test shows) and moves it to the heads answer, a spec change.
+    * The bench's first run failed at its own setup (one recovery key kept for two fs); fixed in the bench.
+  * **Docs:** new docs/INTEGRITY.md (the ten sections planned); docs/BLK.md §5–§9; STATS §1.1 (three rows) and §6; spec/TECH_DEBT.md TD-WITNESS, TD-FS-VERSIONS-INTEGRITY, TD-FUSE-INTEGRITY and TD-INTEGRITY-SYNC-COST; docs/API.md "Integrity (milestone 6)"; CLIENT.md §12 (the pointer, volumes); GAPS G26 done; DESIGN-3 §6 item 6 reworded and done; README (status, building blocks, docs row).
+    * **Changed from the plan:** the integrity pitfalls are a new spec/OPS.md §5, and the device tests and their benches a new §1.4: §4 is advice for developing, not operating. §1's table gains the integrity bench.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -2572,3 +2580,57 @@ It changes no formats and no behavior. The only new code is two opt-in benches a
 * **Checkpoint cost:** 3.4 KB and a signature per checkpoint, bounded by the cadence. Measured.
 * **ublk on hosted runners:** if `modprobe` fails there, the ublk job is dispatch-only, and the FUSE export carries the device tests (TD).
 * **Disk here:** 3.4 GB free; new crates add build output, so prune before each build.
+
+## Outcome
+
+Done. Milestone 6 makes the server's remaining lies detectable. It still can't read or forge anything; now it also can't serve older data, withhold the newest, or split clients into two histories without being caught, up to fork consistency (DESIGN.md §2.6). The one primitive is the **device checkpoint**: chained, hybrid-signed, sealed and cumulative, with `seen` links between devices, verified against client pins. Every object that matters carries a hash chain of its own inside its sealed values, and checkpoints vouch for the chain heads, so no write needs a signature. The milestone also built a native Rust client and a Linux block device over an fs.
+
+What was built:
+* **The spec** (6.1, then each step's `spec:` commit):
+  * formats.md §5.1 (event chains, body v2), §11.5 (purge records), §12.1 (the signed fs header), §14 (device checkpoints, kind 11; exported pins §14.5)
+  * fs.md §9 (tree state), zendb.md §14 (the authenticated tier), svc.md §12 (handler checkpoints)
+  * new spec/blk.md (block volumes)
+  * api.md §15 (checkpoints and devices), §16 (fenced leases), `Commit.fence`, `cksub`/`ckh`, `changes` `ops`/`chain`; keyspace.md §3.10
+  * vectors: `integrity.json` (new), `blk.json` (new), and new sections of `fs.json` and `zendb.json`
+* **zen-core:** `integrity` (checkpoints, exported pins), `header` (signed headers and their successor rule), event chains in `seal`, `TreeState` and purge records in `fs`, `db::auth` (the state tree entries, the NsRoot, PRF32 node ids), `blk` (leaves, nodes, the root record). Bound in zen-wasm.
+* **The server** (6.2): the checkpoint log (per-device CAS, ownership, pruning at `checkpoint_keep`, counted in the quota, idempotent resends), the device registry, signed header successors, named leases with fences checked inside the commit, `cksub`, and a test-only **adversary** that lies to readers (freeze a key, a header, a topic's tail, a tree, a device's checkpoints).
+* **`@zen/client`** (6.3): `fs.integrity` (cadence, cumulative bodies, the 409 merge between processes of one device, `sync`, `watch`, `exportPins`/`comparePins`, alarms), device enrollment, signed headers, event chains with gap and rewrite checks, topic-tail freshness, and the test harness (`spawnServer({adversary})`, `lie`, `TestServer.fork()`).
+* **Trees and relayed connections** (6.4): `@zen/fs` replicas keep the tree state and check it at each caught-up point; `@zen/svc` handlers note every step, checkpoint before a release, and refuse a claim below the floor. TD-SVC-STATE-ROLLBACK closed, but for the cadence window.
+* **The zen-db authenticated tier** (6.5): one state tree per namespace over every value, 32-byte node ids, the NsRoot chain, verified point and range reads, and the ledger app run authenticated in its tests.
+* **`crates/zen-client`** (6.6): a native Rust client (sign-in, the ACL walk, headers and device keyslots, KV transactions with fences, leases, integrity with a pins file) and the `zen-client` CLI, which syncs, checkpoints and compares pins out of band. It builds without C.
+* **`crates/zen-blk`** (6.7): the block engine (sealed 4 KiB blocks, a Merkle tree of fan-out 128, the root chain, fenced single-writer commits, the writer's root pin, settling lost answers).
+* **`crates/zen-ublk`** (6.8): the volume as a FUSE file for `losetup` (pure Rust) or as `/dev/ublkbN` (libublk), with a volatile write cache, transient retries and fail-closed `EIO`.
+* **The guides** (6.9): docs/INTEGRITY.md (new), docs/BLK.md, CLIENT.md §12–§13, DB.md §7.1, SVC.md §6, API.md's integrity section, OPS §1.4 and §5; **measurements** in STATS §1.1, §5.6, §5.7 and §6.
+
+Differences from the plan above:
+* **One state tree per namespace** (6.5), not a row tree per table plus index roots in the NsRoot: every value under the namespace, keyed by stored key, so every index kind is covered and range reads can be checked for completeness with one mechanism.
+* **The state-tree entry terminator is `0x00 0x00`,** not `0x00` (6.5): with one byte, the value hash that follows could start with `0xFF` and sort a key after its own extension.
+* **Purge records extend the tree's op chain** (6.4, formats.md §11.5): the server's trash purge removed nodes without advancing `ops`, so honest replicas at one `ops` could hold different node sets, which would have been a false fork on every purge.
+* **`observe` checks rollbacks against the floor from before the request** (`floorAt`, 6.4, used again in 6.5 and 6.7): a checkpoint arriving while a request is in flight can honestly name more than the answer.
+* **A missing state-tree node isn't a conflict loop** (6.5): it goes through the mismatch path (a conflict if the NsRoot moved, else a rollback).
+* **Durable handlers and consumers retry conflicts after a backoff** instead of stopping or nacking (6.5): with every writer of an authenticated namespace conflicting on its NsRoot, running out of attempts became likely.
+* **Exported pins are a fixed binary record** (6.3), moved into the spec as formats.md §14.5 (6.6) so both clients read each other's.
+* **An enrolled device signs checkpoints but doesn't sign in** (6.3): method 1 still needs the cert in the ACL.
+* **The engine's lease** (6.7): renewals are timed from the last request that held the lease, and a renewal that returns another token is a lost lease (the server re-grants a lapsed lease with the next token).
+* **Settling a lost answer** (6.8): an unknown commit outcome is resolved from the stored root before the next read or commit, so a volume never gets two root records at one seq. Found while implementing the frontends; spec/blk.md §4 says so.
+* **The engine orders writes and skips deletes of absent blocks** (6.8): two concurrent partial writes into one block could lose one, and `mkfs`'s whole-device discard would have cost a commit per MiB.
+* **libublk needed two fixes of ours** (6.8): its control ring is per thread (each thread that sends a control command makes one), and a queue thread wakes only on a ring completion, so a request's result is signalled through an eventfd read on the queue's ring.
+* **Fixed along the way, outside integrity:** in 6.3, a request's replies are kept from the ask, and the inbox is live before the commit (the "who's online" red); CRDT reads observe the registers' clocks; the first version expected of a key in a transaction stands (the ledger sum, a lost update through the row cache). In 6.1, `npm run check` now type-checks what CI does.
+* **OPS:** the integrity pitfalls are a new §5, and the device tests a new §1.4 (the plan said three bullets in §4, which is advice for developing).
+
+Tests (at step 9):
+* **Rust:**
+  * zen-core: unit tests for checkpoints (4), signed headers (5), the state tree and NsRoot (3), volumes (4), tree state; the vectors read back from `integrity.json`, `blk.json`, `fs.json` and `zendb.json`.
+  * zen-server: `tests/integrity.rs` 15 (the checkpoint log, ownership, quota, devices, `cksub`, signed headers, leases, fences, `changes` heads, the adversary); `tests/dump.rs` carries checkpoints, devices and leases; `tests/fs.rs` checks purge records. On both backends.
+  * zen-client: `tests/client.rs` 6, `tests/integrity.rs` 10 and a bench.
+  * zen-blk: `tests/volume.rs` 14 (2,000 random operations against a model and the reference tree, crashes, a second writer, a stale fence, four attacks) and a bench.
+  * zen-ublk: `tests/disk.rs` 5 and 2 unit tests; `tests/devices.rs` 5 as root (FUSE and ublk: ext4 round trips, a writer SIGKILLed, then `e2fsck`) and 2 benches.
+* **Node:** `packages/client` `integrity` 13, `integrityvectors` 5, `rustclient` 3 (interop with the Rust CLI, a fork across them); `packages/fs` `integrity` 5; `packages/db` `authenticated` 13; `apps/echo` `integrity` 4; `apps/ledger` both invariant suites, basic and authenticated. The full run: FULLRUN.
+* **Every attack test** first shows the attack works (the reader is served the stale or forked answer), then that it's caught. **Negative controls:** each detection was run once with its check disabled and its test failed; where another check caught it anyway, the log says which (6.3–6.8).
+* **CI:** the `client` job builds the server with `test-utils` and the Rust client; a new `devices` job runs the device tests as root with the ublk driver (`ZEN_TEST_REQUIRE_UBLK=1`); `devices-bench` runs the benches when started by hand.
+
+Measurements: MEASUREMENTS
+
+Tech debt:
+* **Resolved within the milestone:** TD-SVC-STATE-ROLLBACK (but for the cadence window, documented); TD-TEST-OPEN-FAILURES items 1 (the ledger sum) and 4 (who's online).
+* **New, open:** TD-BLK-SNAPSHOTS, TD-WITNESS, TD-FS-VERSIONS-INTEGRITY, TD-FUSE-INTEGRITY; TD-TEST-OPEN-FAILURES item 6.

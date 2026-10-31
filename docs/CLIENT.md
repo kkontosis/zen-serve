@@ -469,6 +469,8 @@ serve(db, {
 
 ## 12. Integrity
 
+What this catches and what it doesn't, how to turn it on everywhere, and what to do about an alarm: [INTEGRITY.md](INTEGRITY.md). This section is the TypeScript API.
+
 The server can't read or forge data, but it can serve an **older** valid answer, **withhold** the newest events, or show two groups of clients two histories (a **fork**). Integrity detects these up to fork consistency (spec/formats.md §14, DESIGN.md §2.6). It is opt-in per `Fs` object:
 
 ```ts
@@ -484,7 +486,7 @@ await integrity.sync();                 // verify every device's newest checkpoi
 const sub = await integrity.watch(await session.stream());   // or sync on every pushed head
 ```
 
-* **Checkpoints.** A device with a signer writes a hash-chained, signed, sealed **checkpoint** (§14.1) after `sigEvery` changes, `delayMs` after the last one, on `checkpoint()` and on `close()`. Each names the newest state of every object the device wrote or read through (topic heads and its event chains, trees, relayed connections, authenticated zen-db namespaces; volumes in a later step), the ACL and signed header it verified, and every other device's head it verified (`seen`). Processes of one device share one sequence: a put that loses the race merges the winner's entries and retries.
+* **Checkpoints.** A device with a signer writes a hash-chained, signed, sealed **checkpoint** (§14.1) after `sigEvery` changes, `delayMs` after the last one, on `checkpoint()` and on `close()`. Each names the newest state of every object the device wrote or read through (topic heads and its event chains, trees, relayed connections, authenticated zen-db namespaces, volumes (zen-blk)), the ACL and signed header it verified, and every other device's head it verified (`seen`). Processes of one device share one sequence: a put that loses the race merges the winner's entries and retries.
 * **Pins.** `sync()` verifies each device's head: its signature (the cert from the ACL, or the device registry checked against the ACL's member), its chain from the pinned one, its `seen` links, and that no object went back. It raises the **pins**: per device `(seq, hash, body)`, and per object the newest state any device vouched for. Pins persist on `local`, with the ACL version, so a new process continues where the last stopped.
 * **What is checked against the pins:** a topic read without `key` or `limit` that reaches the end must reach the pinned head and each pinned chain position; `topic.verifyHead()` checks the pinned head is still served; the ACL can't go below its pin; the header can't go below its pinned version (or change at it); this device's head can't go below what it wrote.
 * **Event chains** (§5.1). With integrity attached, appends write version-2 bodies: each writer's events on a topic form chains `(chain id, dseq, dprev)`, advanced only when a commit is known to have applied. Unfiltered readers (`read` without `key`, subscriptions) report a skipped `dseq` as a **gap** and another body at a seen position as a **rewrite**; filtered readers (keys, consumer groups) check against the pins only. `sender` is the signer's device.
