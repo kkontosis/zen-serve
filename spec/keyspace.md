@@ -118,16 +118,17 @@ Leases are never deleted: the stored token is what keeps fencing tokens increasi
 | `pack("tp", fs, tree, node)` | `cvs(12)` of the node's tombstone: a purged node by id, so operations naming it are refused (fs.md §3.4); dropped with the tombstone |
 | `pack("tf", fs, tree, node, dot)` | content version: `dev(32) ‖ u32 n ‖ n × chunk ‖ manifest` (inline), or `dev(32) ‖ u32 0xFFFFFFFF ‖ u32 m ‖ m × page ‖ manifest` (paged, fs.md §4) |
 | `pack("ck", fs, chunk)` | sealed chunk |
-| `pack("cr", fs, chunk)` | `i64` little-endian, atomic add: number of inline versions and pages referencing the chunk |
+| `pack("cr", fs, chunk)` | `i64` little-endian, atomic add: number of inline versions, pages and upload sessions referencing the chunk |
 | `pack("cz", fs, cvs, chunk)` | empty: chunk GC candidate, from upload or the release of a reference |
 | `pack("cp", fs, chunk)` | `cvs(12)` of the chunk's newest GC candidate: only that candidate can delete the chunk, so each upload or release restarts the grace period |
 | `pack("pg", fs, page)` | a page (formats.md §11.6), as uploaded |
-| `pack("pr", fs, page)` | `i64` little-endian, atomic add: number of paged versions referencing the page |
+| `pack("pr", fs, page)` | `i64` little-endian, atomic add: number of paged versions and upload sessions referencing the page |
 | `pack("pz", fs, cvs, page)` | empty: page GC candidate, from upload or the release of a reference |
 | `pack("pc", fs, page)` | `cvs(12)` of the page's newest GC candidate, as `cp` for chunks |
-| `pack("us", fs, session)` | upload session (api.md §12.1): `user_fp(32) ‖ u64 expires_version ‖ u64 refs`; `expires_version` 0 once closed |
+| `pack("us", fs, session)` | upload session (api.md §12.1): `user_fp(32) ‖ u64 expires_version`; `expires_version` 0 once closed. Commits under the session only read it, so several can be in flight without conflicting |
 | `pack("ur", fs, session, kind, id)` | empty: a reference the session holds; `kind` is the integer 1 (chunk) or 2 (page), and adds one to that `cr` or `pr` |
-| `pack("ux", fs, expires_version, session)` | empty: the expiry index of open sessions, moved on renew; the sweeper releases sessions whose entry is past, and closed ones, in bounded rounds |
+| `pack("ux", fs, expires_version, session)` | empty: the expiry index, moved on renew, and to `expires_version` 0 on close; the sweeper releases the sessions whose entry is at or before its read version (closed and expired ones) in bounded rounds, and clears `us`, `ux` and `uu` in the round that finds no `ur` left |
+| `pack("uu", fs, user_fp, session)` | `u64 expires_version`: the user's sessions, for the cap of 64 open per user and fs; cleared on close and on release |
 
 **Node record:**
 
@@ -145,7 +146,7 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * A node's old `tv` entry is cleared when it changes again, so the change index holds one entry per live node, plus tombstones.
 * `resync_before` in the tree header is the newest tombstone the sweeper has dropped. A `changes` cursor before it gets 409 `resync`.
 * A paged version's `u32 0xFFFFFFFF` can't be an inline chunk count, since an inline list must fit one value, so versions stored before pages existed read unchanged.
-* Upload-session keys (`us`, `ur`, `ux`) are data: `export` copies them, so a restored cluster keeps open sessions and their references.
+* Upload-session keys (`us`, `ur`, `ux`, `uu`) are data: `export` copies them, so a restored cluster keeps open sessions and their references.
 * The sweeper visits only the trees in `ts`. A move is the only operation that adds a move-log entry or a `TRASH` child, and tombstones only come from purging a tree that is listed, so a tree outside the index has nothing to sweep (chunk and page GC is per fs, through `cz` and `pz`).
 * The idempotency record (§3.4) is `versionstamp ‖ u16 appended_count ‖ device_fp(32) ‖ u16 write_count ‖ u16 add_count`. Records written before milestone 3.5 have no `write_count`, and records written before milestone 5 no `add_count` (§3.8); a missing count reads as 0.
 
