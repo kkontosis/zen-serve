@@ -219,6 +219,87 @@ fn fs_vectors_open_from_files() {
         fs::chain_next(&paged_chain, &purge, &fs::PURGE_DEVICE).to_vec(),
         hx(&v["purge"]["chain"])
     );
+    // Version 3: manifests with chunk lengths, form-2 pages, the chunker.
+    for (i, p) in v["pages_v2"].as_array().unwrap().iter().enumerate() {
+        let page = hx(&p["page"]);
+        assert_eq!(fs::page_digest(&page).to_vec(), hx(&p["digest"]));
+        let any = fs::decode_any_page(&page).unwrap();
+        assert_eq!(any.ids, vec![vectors::fixture_fs_ids().2[i]]);
+        assert_eq!(any.lens, Some(vec![[40_000, 30_000][i]]));
+        assert!(fs::decode_page(&page).is_err(), "form 1 refuses form 2");
+    }
+    for name in ["manifest_v3_inline", "manifest_v3_paged"] {
+        let m = fs::open_any_manifest(&fsk, &tree, &node, &hx(&v[name]["sealed"])).unwrap();
+        assert_eq!(m.encode(), hx(&v[name]["plaintext"]));
+        let fs::AnyManifest::V3(m) = m else {
+            panic!("version 3")
+        };
+        assert_eq!((m.size, m.n), (70_000, 2));
+    }
+    let c = &v["cdc"];
+    let params = fs::CdcParams {
+        min: c["params"]["min"].as_u64().unwrap() as u32,
+        avg_bits: c["params"]["avg_bits"].as_u64().unwrap() as u8,
+        max: c["params"]["max"].as_u64().unwrap() as u32,
+    };
+    assert_eq!(fs::CdcParams::default_for(90_000), Some(params));
+    let fs_key = zen_core::cdc::fs_cdc_key(&fsk);
+    assert_eq!(fs_key.to_vec(), hx(&c["fs_key"]));
+    let file_key = zen_core::cdc::file_cdc_key(fsk.fs_id, &fk);
+    assert_eq!(file_key.to_vec(), hx(&c["file_key"]));
+    let gear = zen_core::cdc::gear_table(&fs_key);
+    for (i, g) in c["gear_first"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(gear[i].to_string(), g.as_str().unwrap());
+    }
+    let stream = |x: &Value| {
+        vectors::xorshift_bytes(
+            x["xorshift32_seed"].as_u64().unwrap() as u32,
+            x["len"].as_u64().unwrap() as usize,
+        )
+    };
+    let input = stream(&c["input"]);
+    let ins = stream(&c["insert"]);
+    let at = c["insert"]["at"].as_u64().unwrap() as usize;
+    let mut edited = input.clone();
+    edited.splice(at..at, ins.iter().copied());
+    let lens = |key: &[u8; 32], d: &[u8]| -> Vec<u64> {
+        zen_core::cdc::Chunker::new(key, params)
+            .unwrap()
+            .lengths(d)
+            .into_iter()
+            .map(u64::from)
+            .collect()
+    };
+    let nums = |x: &Value| -> Vec<u64> {
+        x.as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_u64().unwrap())
+            .collect()
+    };
+    let before = nums(&c["lengths"]);
+    let after = nums(&c["lengths_after_insert"]);
+    assert_eq!(lens(&fs_key, &input), before);
+    assert_eq!(lens(&fs_key, &edited), after);
+    assert_eq!(lens(&file_key, &input), nums(&c["lengths_file_key"]));
+    // Only the chunks around the insertion differ: the rest are the same chunks.
+    let ends = |l: &[u64], shift_from: u64, by: u64| -> std::collections::HashSet<(u64, u64)> {
+        let mut out = std::collections::HashSet::new();
+        let mut off = 0;
+        for &x in l {
+            let start = if off >= shift_from { off - by } else { off };
+            out.insert((start, x));
+            off += x;
+        }
+        out
+    };
+    let a = ends(&before, u64::MAX, 0);
+    let b = ends(&after, at as u64 + ins.len() as u64, ins.len() as u64);
+    assert!(
+        b.difference(&a).count() <= 2,
+        "{} chunks changed",
+        b.difference(&a).count()
+    );
 }
 
 #[test]

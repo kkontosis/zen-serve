@@ -15,6 +15,10 @@ pub const TOPIC_DATA: &str = "zen/v1/topic-data";
 pub const FS_DATA: &str = "zen/v1/fs-data";
 /// KDF: AEAD key for the chunks of a version-2 file, from its file key.
 pub const FS_FILE: &str = "zen/v1/fs-file";
+/// KDF: key of the chunker's gear table for files under the fs keys (formats.md §11.7).
+pub const FS_CDC: &str = "zen/v1/fs-cdc";
+/// KDF: key of the chunker's gear table for a file with a key of its own (formats.md §11.7).
+pub const FS_CDC_FILE: &str = "zen/v1/fs-cdc-file";
 /// KDF: step of a naming chain (KV elements and topic segments).
 pub const NAME_CHAIN: &str = "zen/v1/name-chain";
 /// KDF: step of the topic data-key chain.
@@ -155,6 +159,8 @@ pub const ALL: &[&str] = &[
     TOPIC_DATA,
     FS_DATA,
     FS_FILE,
+    FS_CDC,
+    FS_CDC_FILE,
     NAME_CHAIN,
     TOPIC_DATA_CHAIN,
     EVENT_KEY,

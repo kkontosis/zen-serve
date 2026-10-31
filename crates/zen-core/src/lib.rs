@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 
 pub mod blk;
+pub mod cdc;
 pub mod db;
 mod encoding;
 pub mod error;

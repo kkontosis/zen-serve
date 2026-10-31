@@ -79,6 +79,44 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 1 plan`
     4. push and open the PR
   * Then implement on "go".
+  * Plan committed (0dd69c0), PR #65.
+  * `spec:` commit f95a431:
+    * formats.md §11.3 (version 3), §11.6 (page form 2), §11.7 (the chunker, new), §12 (`chunking`, key 3)
+    * fs.md §4, §4.1 (chunking, upload sessions), §6, §10
+    * api.md §2 (features `fs_cdc`, `upload_sessions`; limits `upload_ttl_secs`, `upload_max_ttl_secs`), §6 (`upload`), §12.1 (upload sessions, new)
+    * keyspace.md §3.6 (`us`, `ur`, `ux`)
+    * labels `fs-cdc` and `fs-cdc-file`
+  * **zen-core:**
+    * `fs.rs`: `CdcParams` (`default_for`, `check`), `ManifestV3`/`BodyV3`/`PageRefV3` with a strict decode, `AnyManifest::V3`, `encode_page2`/`decode_page2`/`decode_any_page`/`page_capacity2`
+    * new `cdc.rs`: `Chunker` (streaming `push` → cut offsets in the piece, `finish`, `lengths`), `gear_table`, `fs_cdc_key`/`file_cdc_key`
+    * `FsKeys::cdc_key`
+    * `FsPolicy.chunking` (`Chunking::{Cdc, Fixed}`, key 3 written only for `Fixed`, so existing policies encode byte for byte as before)
+  * **Vectors:** `fs.json` gains `manifest_v3_inline`, `manifest_v3_paged`, `pages_v2` and `cdc`. Regenerating changed only that file, by additions.
+  * **zen-wasm:**
+    * TS types `CdcParams`, `ChunkEntry`, `PageRefV3`, `ManifestV3`, `AnyPage`; `FsPolicy.chunking?`
+    * bindings: `sealManifestV3` (checked as a reader would), `openAnyManifest` v3, `FsKeys.chunker`, `fileChunker`, the `Chunker` class, `encodePage2`, `decodeAnyPage`, `pageCapacity2`, `cdcDefaults`
+  * **Client:** `tree.ts`'s `AnyManifest` is versions 1–2 until 8.3, and opening a version-3 manifest gives `format` ("this client reads versions 1 and 2").
+  * **Changes from the plan:**
+    * **Chunker inputs:** `Chunker.push` returns cut offsets within the piece pushed, not in the stream, so no 64-bit offsets cross into JS.
+    * **Vector inputs:** the chunker's vector inputs are xorshift32 streams (`vectors::xorshift_bytes`), not `DetRng`: the TS test regenerates them, and TS has no BLAKE3 XOF.
+    * **Negative control:** with one mask (normalization off) the mean stays near 40 KiB, inside the 25–45 KiB check, so that check alone doesn't catch it. What normalization changes is how often a chunk is cut at `max`, so the test now also requires fewer than 0.5 % of chunks cut there. With one mask, 149 of 1,763 were.
+  * **Found while testing:** `UnlockedFs.setPolicy` decided "nothing changed" from `fileKeys` and `rekeyAfterRotate` only, so `setPolicy({chunking: 'fixed'})` would have written nothing. It now compares `chunking` too. New test "chunking: set to fixed and back, kept in the header" (the header goes to version 2 and back to 1); with the old check it fails ("expected 'cdc' to be 'fixed'").
+  * **Measured:** the 1 MiB vector input gives 28 chunks, a mean of 37,449 B. A CDC version at the defaults then holds about 5.8 M × 37 KiB ≈ 200 GiB.
+  * **Tests:**
+    * zen-core units: `cdc` 6 (pieces of 1, 7 and 65,536 bytes give the same cuts; bounds; resync after an insertion and a deletion, ≤ 2 chunks changed; the mean and the forced cuts over 64 MiB; keys change the cuts; parameter checks) and the policy test with key 3
+    * `tests/fs.rs` 3 new (v3 round trips and sealing, every v3 decode refusal, page forms)
+    * `tests/vectors.rs`: the new sections read back, including ≤ 2 changed chunks after the insertion
+    * `fsvectors.test.ts` 2 new (v3 manifests and form-2 pages; the chunker over the vector input whole and in pieces, after the insertion, under the file key)
+  * **Negative controls** (each run once, then restored):
+    * one mask: the mean test fails ("149 of 1763 cut at max")
+    * the inline sum check removed: the refusal test fails
+    * the old `setPolicy` check: the chunking test fails
+  * **Checks (all clean):**
+    * `cargo fmt`; clippy `--all-targets -D warnings` on the workspace (default, `--no-default-features`, `--all-features`) and zen-core and zen-wasm on wasm32
+    * `cargo test -p zen-core --features test-utils`; `cargo test -p zen-server --test fs`
+    * `scripts/build-wasm.sh`, `npm run check`, biome
+    * `fsvectors` 3×; `large`, `tree`, `keyslots`
+    * the full vitest run (607 passed, 15 skipped: the opt-in benches)
 
 ## Steps (one PR each; each planned in detail before it starts)
 

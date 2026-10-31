@@ -266,6 +266,19 @@ pub fn fixture_meta() -> fs::NodeMeta {
     }
 }
 
+/// `n` bytes of a xorshift32 stream: after each step, its low byte.
+pub fn xorshift_bytes(seed: u32, n: usize) -> Vec<u8> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
 fn fs_vectors() -> Result<Value> {
     let fsk = fixture_fs();
     let (tree, node, chunk_ids, device) = fixture_fs_ids();
@@ -385,6 +398,68 @@ fn fs_vectors() -> Result<Value> {
         &sealed_paged_v2,
     );
     let paged_chain = fs::chain_next(&chain, &paged_op, &device);
+    // Version 3 (formats.md §11.3, §11.6, §11.7): chunks of variable length,
+    // form-2 pages, and the chunker's cuts.
+    let cdc = fs::CdcParams::default_for(90_000).expect("defaults");
+    let lens = [40_000u32, 30_000];
+    let entries: Vec<(fs::Id, u32)> = chunk_ids.iter().copied().zip(lens).collect();
+    let inline_v3 = fs::AnyManifest::V3(fs::ManifestV3 {
+        size: 70_000,
+        n: 2,
+        cdc,
+        file_key: None,
+        body: fs::BodyV3::Inline(entries.clone()),
+    });
+    let pages2 = [
+        fs::encode_page2(&entries[..1]),
+        fs::encode_page2(&entries[1..]),
+    ];
+    let paged_v3 = fs::AnyManifest::V3(fs::ManifestV3 {
+        size: 70_000,
+        n: 2,
+        cdc,
+        file_key: Some(fs::FileKey {
+            key_epoch: 0,
+            key: file_key,
+        }),
+        body: fs::BodyV3::Paged {
+            page_size: 1,
+            pages: page_ids
+                .iter()
+                .zip(&pages2)
+                .zip(lens)
+                .map(|((id, p), bytes)| fs::PageRefV3 {
+                    id: *id,
+                    digest: fs::page_digest(p),
+                    bytes,
+                })
+                .collect(),
+        },
+    });
+    let sealed_inline_v3 = fs::seal_any_manifest(
+        &fsk,
+        &tree,
+        &node,
+        &inline_v3,
+        &mut DetRng::new("fs-manifest-v3-inline"),
+    )?;
+    let sealed_paged_v3 = fs::seal_any_manifest(
+        &fsk,
+        &tree,
+        &node,
+        &paged_v3,
+        &mut DetRng::new("fs-manifest-v3-paged"),
+    )?;
+    let cdc_input = xorshift_bytes(0x2545_F491, 1 << 20);
+    let inserted = xorshift_bytes(0x9E37_79B9, 100);
+    let mut edited = cdc_input.clone();
+    edited.splice(300_000..300_000, inserted.iter().copied());
+    let fs_cdc_key = crate::cdc::fs_cdc_key(&fsk);
+    let file_cdc_key = crate::cdc::file_cdc_key(fsk.fs_id, &file_key);
+    let gear = crate::cdc::gear_table(&fs_cdc_key);
+    let cuts = |key: &[u8; 32], data: &[u8]| -> Result<Vec<u32>> {
+        Ok(crate::cdc::Chunker::new(key, cdc)?.lengths(data))
+    };
     let purge_op = fs::purge_bytes(fsk.fs_id, &tree, &[node, [0x77; 16]]);
     let purge_chain = fs::chain_next(&paged_chain, &purge_op, &fs::PURGE_DEVICE);
     Ok(json!({
@@ -408,6 +483,24 @@ fn fs_vectors() -> Result<Value> {
         "file_chunk": {"rng_seed": "fs-file-chunk", "id": h(&chunk_ids[0]), "plaintext": h(&chunk0), "sealed": h(&sealed_file_chunk)},
         "write_paged": {"op": h(&paged_op), "chain": h(&paged_chain),
                         "description": "a paged write after the op_chain steps"},
+        "manifest_v3_inline": {"rng_seed": "fs-manifest-v3-inline", "plaintext": h(&inline_v3.encode()), "sealed": h(&sealed_inline_v3),
+                               "description": "version 3, inline, key_mode 0: two chunks of 40,000 and 30,000 bytes"},
+        "manifest_v3_paged": {"rng_seed": "fs-manifest-v3-paged", "plaintext": h(&paged_v3.encode()), "sealed": h(&sealed_paged_v3),
+                              "description": "version 3, paged (one chunk a page), under the file key"},
+        "pages_v2": page_ids.iter().zip(&pages2).map(|(id, p)| json!({
+            "id": h(id), "page": h(p), "digest": h(&fs::page_digest(p)),
+        })).collect::<Vec<_>>(),
+        "cdc": {
+            "description": "the chunker (formats.md §11.7) with the defaults for max_value_bytes 90,000: lengths of the chunks of a 1 MiB input, of the same input with 100 bytes inserted at offset 300,000, and under the file key. Inputs are xorshift32 streams (x ^= x << 13; x ^= x >> 17; x ^= x << 5; each step's low byte) from the seeds given",
+            "params": {"min": cdc.min, "avg_bits": cdc.avg_bits, "max": cdc.max},
+            "fs_key": h(fs_cdc_key.as_ref()), "file_key": h(file_cdc_key.as_ref()),
+            "gear_first": gear[..4].iter().map(|g| g.to_string()).collect::<Vec<_>>(),
+            "input": {"xorshift32_seed": 0x2545_F491u32, "len": cdc_input.len()},
+            "insert": {"xorshift32_seed": 0x9E37_79B9u32, "len": inserted.len(), "at": 300_000},
+            "lengths": cuts(&fs_cdc_key, &cdc_input)?,
+            "lengths_after_insert": cuts(&fs_cdc_key, &edited)?,
+            "lengths_file_key": cuts(&file_cdc_key, &cdc_input)?,
+        },
         "purge": {"nodes": [h(&node), h(&[0x77; 16])], "op": h(&purge_op), "chain": h(&purge_chain),
                   "description": "a purge record (device: 32 zero bytes) after write_paged"},
     }))
@@ -472,6 +565,7 @@ fn header_vectors() -> Result<Value> {
     header.policy = FsPolicy {
         file_keys: true,
         rekey_after_rotate: RekeyAfterRotate::Eager,
+        chunking: Default::default(),
         unknown: Vec::new(),
     };
     let policy = header.policy.encode()?;

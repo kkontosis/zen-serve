@@ -87,6 +87,12 @@ impl FsKeys {
         kdf(labels::DB, &self.naming_key, &info)
     }
 
+    /// `KDF("zen/v1/fs-cdc", NK, u32(fs))`: the chunker's key for files under
+    /// the fs keys (spec/formats.md §11.7); stable across rotations.
+    pub fn cdc_key(&self) -> Key32 {
+        kdf(labels::FS_CDC, &self.naming_key, &self.fs_id.to_be_bytes())
+    }
+
     /// `KDF("zen/v1/topic-data", MK_e, u32(fs) || u32(e))`: root of the topic data chain.
     pub fn topic_data_root(&self) -> Key32 {
         kdf(labels::TOPIC_DATA, &self.epoch_key, &self.fs_epoch_info())

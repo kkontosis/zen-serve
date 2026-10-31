@@ -4,7 +4,7 @@ use crate::{core_err, js_err, serializer};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use zen_core::fs as zfs;
-use zen_core::header::{FsHeader as CoreHeader, RekeyAfterRotate};
+use zen_core::header::{Chunking, FsHeader as CoreHeader, RekeyAfterRotate};
 use zen_core::keys::FsKeys as CoreKeys;
 use zen_core::keyslot::{self, Argon2Params, Unlock};
 use zen_core::rng::OsRng;
@@ -54,10 +54,20 @@ export interface Manifest { size: number; chunkSize: number; chunks: Uint8Array[
 export interface PageRef { id: Uint8Array; digest: Uint8Array }
 /** Plaintext version-2 manifest (spec/formats.md §11.3): `chunks` (inline) or `pageSize` and `pages` (paged). With `fileKey` and `keyEpoch` (key_mode 1) the chunks are under the file key; without them (key_mode 0), under the fs keys. */
 export interface ManifestV2 { version: 2; size: number; chunkSize: number; n: number; keyEpoch?: number; fileKey?: Uint8Array; chunks?: Uint8Array[]; pageSize?: number; pages?: PageRef[] }
-/** The fs policy kept in the header (spec/formats.md §12). */
-export interface FsPolicy { fileKeys: boolean; rekeyAfterRotate: "rewrite" | "eager" | "keep" }
-/** A manifest of either version, as `openAnyManifest` returns it. */
-export type AnyManifest = (Manifest & { version: 1 }) | ManifestV2;
+/** The chunker's parameters (spec/formats.md §11.7). */
+export interface CdcParams { min: number; avgBits: number; max: number }
+/** A chunk of a version-3 manifest: its id and plaintext length. */
+export interface ChunkEntry { id: Uint8Array; len: number }
+/** A page of a version-3 manifest: id, digest and the plaintext bytes its chunks hold (spec/formats.md §11.3). */
+export interface PageRefV3 { id: Uint8Array; digest: Uint8Array; bytes: number }
+/** Plaintext version-3 manifest (spec/formats.md §11.3): chunks of variable length, `chunks` (inline) or `pageSize` and `pages` (paged, form-2 pages). Keys as in version 2. */
+export interface ManifestV3 { version: 3; size: number; n: number; cdc: CdcParams; keyEpoch?: number; fileKey?: Uint8Array; chunks?: ChunkEntry[]; pageSize?: number; pages?: PageRefV3[] }
+/** A page of either form (spec/formats.md §11.6): its chunk ids, and their lengths for form 2. */
+export interface AnyPage { ids: Uint8Array[]; lens?: number[] }
+/** The fs policy kept in the header (spec/formats.md §12). `chunking` defaults to "cdc" when set without it. */
+export interface FsPolicy { fileKeys: boolean; rekeyAfterRotate: "rewrite" | "eager" | "keep"; chunking?: "cdc" | "fixed" }
+/** A manifest of any version, as `openAnyManifest` returns it. */
+export type AnyManifest = (Manifest & { version: 1 }) | ManifestV2 | ManifestV3;
 /** Plaintext event body (spec/formats.md §5). With `chainId`, `dseq` and `dprev` (all three) it is a version-2 body, a link of its writer's chain (§5.1). */
 export interface EventBody { sender: Uint8Array; hlc: bigint; causation: Uint8Array; payload: Uint8Array; chainId?: Uint8Array; dseq?: bigint; dprev?: Uint8Array }
 /** The kind and key epoch in a sealed object's header. */
@@ -319,6 +329,161 @@ struct JsManifestV2 {
     pages: Option<Vec<JsPageRef>>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct JsCdc {
+    min: u32,
+    avg_bits: u8,
+    max: u32,
+}
+
+impl From<zfs::CdcParams> for JsCdc {
+    fn from(p: zfs::CdcParams) -> Self {
+        JsCdc {
+            min: p.min,
+            avg_bits: p.avg_bits,
+            max: p.max,
+        }
+    }
+}
+
+impl JsCdc {
+    fn core(self) -> zfs::CdcParams {
+        zfs::CdcParams {
+            min: self.min,
+            avg_bits: self.avg_bits,
+            max: self.max,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsChunkEntry {
+    id: serde_bytes::ByteBuf,
+    len: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsPageRefV3 {
+    id: serde_bytes::ByteBuf,
+    digest: serde_bytes::ByteBuf,
+    bytes: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsManifestV3 {
+    version: u8,
+    size: f64,
+    n: f64,
+    cdc: JsCdc,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_key: Option<serde_bytes::ByteBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunks: Option<Vec<JsChunkEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pages: Option<Vec<JsPageRefV3>>,
+}
+
+fn file_key_of(k: &Option<serde_bytes::ByteBuf>, e: Option<u32>) -> R<Option<zfs::FileKey>> {
+    match (k, e) {
+        (None, None) => Ok(None),
+        (Some(k), Some(key_epoch)) => Ok(Some(zfs::FileKey {
+            key_epoch,
+            key: arr(k)?,
+        })),
+        _ => Err(js_err("a file key comes with its keyEpoch")),
+    }
+}
+
+impl JsManifestV3 {
+    fn to_core(&self) -> R<zfs::ManifestV3> {
+        if self.version != 3 {
+            return Err(js_err("not a version-3 manifest"));
+        }
+        let body = match (&self.chunks, self.page_size, &self.pages) {
+            (Some(c), None, None) => zfs::BodyV3::Inline(
+                c.iter()
+                    .map(|c| Ok((arr(&c.id)?, c.len)))
+                    .collect::<R<_>>()?,
+            ),
+            (None, Some(page_size), Some(p)) => zfs::BodyV3::Paged {
+                page_size,
+                pages: p
+                    .iter()
+                    .map(|p| {
+                        Ok(zfs::PageRefV3 {
+                            id: arr(&p.id)?,
+                            digest: arr(&p.digest)?,
+                            bytes: p.bytes,
+                        })
+                    })
+                    .collect::<R<_>>()?,
+            },
+            _ => return Err(js_err("a manifest has chunks, or pageSize and pages")),
+        };
+        let m = zfs::ManifestV3 {
+            size: self.size as u64,
+            n: self.n as u64,
+            cdc: self.cdc.core(),
+            file_key: file_key_of(&self.file_key, self.key_epoch)?,
+            body,
+        };
+        // The same checks a reader applies.
+        zfs::ManifestV3::decode(&m.encode()).map_err(core_err)
+    }
+
+    fn from_core(m: zfs::ManifestV3) -> Self {
+        let (chunks, page_size, pages) = match m.body {
+            zfs::BodyV3::Inline(c) => (
+                Some(
+                    c.iter()
+                        .map(|(id, len)| JsChunkEntry {
+                            id: serde_bytes::ByteBuf::from(id.to_vec()),
+                            len: *len,
+                        })
+                        .collect(),
+                ),
+                None,
+                None,
+            ),
+            zfs::BodyV3::Paged { page_size, pages } => (
+                None,
+                Some(page_size),
+                Some(
+                    pages
+                        .iter()
+                        .map(|p| JsPageRefV3 {
+                            id: serde_bytes::ByteBuf::from(p.id.to_vec()),
+                            digest: serde_bytes::ByteBuf::from(p.digest.to_vec()),
+                            bytes: p.bytes,
+                        })
+                        .collect(),
+                ),
+            ),
+        };
+        JsManifestV3 {
+            version: 3,
+            size: m.size as f64,
+            n: m.n as f64,
+            cdc: m.cdc.into(),
+            key_epoch: m.file_key.map(|k| k.key_epoch),
+            file_key: m
+                .file_key
+                .map(|k| serde_bytes::ByteBuf::from(k.key.to_vec())),
+            chunks,
+            page_size,
+            pages,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsManifestV1 {
@@ -578,7 +743,34 @@ impl FsKeys {
                 chunks: byte_ids(&m.chunks),
             }),
             zfs::AnyManifest::V2(m) => to_js(&JsManifestV2::from_core(m)),
+            zfs::AnyManifest::V3(m) => to_js(&JsManifestV3::from_core(m)),
         }
+    }
+
+    /// Seal a version-3 manifest (spec/formats.md §11.3); it is checked as a reader would.
+    #[wasm_bindgen(js_name = sealManifestV3)]
+    pub fn seal_manifest_v3(
+        &self,
+        tree: &[u8],
+        node: &[u8],
+        #[wasm_bindgen(unchecked_param_type = "ManifestV3")] manifest: JsValue,
+    ) -> R<Vec<u8>> {
+        let m: JsManifestV3 = from_js(manifest)?;
+        let m = zfs::AnyManifest::V3(m.to_core()?);
+        zfs::seal_any_manifest(&self.0, &arr(tree)?, &arr(node)?, &m, &mut OsRng).map_err(core_err)
+    }
+
+    /// A chunker for content under the fs keys (spec/formats.md §11.7); its
+    /// key stays in WASM.
+    #[wasm_bindgen]
+    pub fn chunker(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "CdcParams")] params: JsValue,
+    ) -> R<Chunker> {
+        let p: JsCdc = from_js(params)?;
+        Ok(Chunker(
+            zen_core::cdc::Chunker::new(&self.0.cdc_key(), p.core()).map_err(core_err)?,
+        ))
     }
 
     /// Seal a chunk.
@@ -929,6 +1121,8 @@ pub fn open_opaque_slot(slot: &[u8], export_key: &[u8]) -> R<FsKeys> {
 struct JsPolicy {
     file_keys: bool,
     rekey_after_rotate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunking: Option<String>,
 }
 
 /// A decoded fs header (formats.md §12). Not secret.
@@ -977,6 +1171,13 @@ impl FsHeader {
                 RekeyAfterRotate::Keep => "keep",
             }
             .into(),
+            chunking: Some(
+                match p.chunking {
+                    Chunking::Cdc => "cdc",
+                    Chunking::Fixed => "fixed",
+                }
+                .into(),
+            ),
         })
     }
 
@@ -993,6 +1194,11 @@ impl FsHeader {
             "eager" => RekeyAfterRotate::Eager,
             "keep" => RekeyAfterRotate::Keep,
             _ => return Err(js_err("rekeyAfterRotate is rewrite, eager or keep")),
+        };
+        self.0.policy.chunking = match p.chunking.as_deref() {
+            None | Some("cdc") => Chunking::Cdc,
+            Some("fixed") => Chunking::Fixed,
+            _ => return Err(js_err("chunking is cdc or fixed")),
         };
         Ok(())
     }
@@ -1474,6 +1680,89 @@ pub fn decode_page(page: &[u8]) -> R<Vec<js_sys::Uint8Array>> {
         .iter()
         .map(|c| js_sys::Uint8Array::from(&c[..]))
         .collect())
+}
+
+/// A form-2 page: `u32 (0x8000_0000 | n) ‖ n × (chunk_id ‖ u32 len)` (spec/formats.md §11.6).
+#[wasm_bindgen(js_name = encodePage2)]
+pub fn encode_page2(
+    #[wasm_bindgen(unchecked_param_type = "ChunkEntry[]")] entries: JsValue,
+) -> R<Vec<u8>> {
+    let e: Vec<JsChunkEntry> = from_js(entries)?;
+    let e = e
+        .iter()
+        .map(|c| Ok((arr(&c.id)?, c.len)))
+        .collect::<R<Vec<_>>>()?;
+    Ok(zfs::encode_page2(&e))
+}
+
+/// A page of either form: its chunk ids, and their lengths for form 2.
+#[wasm_bindgen(js_name = decodeAnyPage, unchecked_return_type = "AnyPage")]
+pub fn decode_any_page(page: &[u8]) -> R<JsValue> {
+    #[derive(Serialize)]
+    struct Out {
+        ids: Vec<serde_bytes::ByteBuf>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lens: Option<Vec<u32>>,
+    }
+    let p = zfs::decode_any_page(page).map_err(core_err)?;
+    to_js(&Out {
+        ids: byte_ids(&p.ids),
+        lens: p.lens,
+    })
+}
+
+/// The most entries a form-2 page holds within `max_value_bytes`.
+#[wasm_bindgen(js_name = pageCapacity2)]
+pub fn page_capacity2(max_value_bytes: u32) -> u32 {
+    zfs::page_capacity2(max_value_bytes)
+}
+
+/// The chunker's default parameters for a server's `max_value_bytes`
+/// (spec/formats.md §11.7); undefined when it is too small for them.
+#[wasm_bindgen(js_name = cdcDefaults, unchecked_return_type = "CdcParams | undefined")]
+pub fn cdc_defaults(max_value_bytes: u32) -> R<JsValue> {
+    match zfs::CdcParams::default_for(max_value_bytes) {
+        Some(p) => to_js(&JsCdc::from(p)),
+        None => Ok(JsValue::UNDEFINED),
+    }
+}
+
+/// A chunker for content under a file key (spec/formats.md §11.7).
+#[wasm_bindgen(js_name = fileChunker)]
+pub fn file_chunker(
+    fs: u32,
+    file_key: &[u8],
+    #[wasm_bindgen(unchecked_param_type = "CdcParams")] params: JsValue,
+) -> R<Chunker> {
+    let p: JsCdc = from_js(params)?;
+    let key = zen_core::cdc::file_cdc_key(fs, &arr(file_key)?);
+    Ok(Chunker(
+        zen_core::cdc::Chunker::new(&key, p.core()).map_err(core_err)?,
+    ))
+}
+
+/// A streaming content-defined chunker (spec/formats.md §11.7).
+#[wasm_bindgen]
+pub struct Chunker(zen_core::cdc::Chunker);
+
+#[wasm_bindgen]
+impl Chunker {
+    /// Feed `data`; returns where chunks end, as offsets in `data` (exclusive).
+    pub fn push(&mut self, data: &[u8]) -> Vec<u32> {
+        self.0.push(data).into_iter().map(|c| c as u32).collect()
+    }
+
+    /// Bytes pushed since the last cut.
+    #[wasm_bindgen(getter)]
+    pub fn pending(&self) -> u32 {
+        self.0.pending()
+    }
+
+    /// The end of the content: the last chunk's length (0 when it ended at a
+    /// cut). The chunker starts afresh.
+    pub fn finish(&mut self) -> u32 {
+        self.0.finish()
+    }
 }
 
 /// `BLAKE3.derive_key("zen/v1/fs-page", page)`.
