@@ -14,6 +14,7 @@
 #![deny(missing_docs)]
 
 pub mod acl;
+pub mod cli;
 pub mod client;
 pub mod device;
 pub mod error;
