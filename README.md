@@ -20,6 +20,7 @@ Building blocks:
 | [`spec/`](spec/) | **Normative** specification: formats, labels, suites, glossary, test vectors |
 | [`crates/zen-client`](crates/zen-client) | A native client (Rust, no C): device sign-in, the ACL walk, fs headers and device keyslots, KV transactions with fences, named leases, device checkpoints and pins kept in a file; the `zen-client` CLI syncs, checkpoints and compares pins out of band ([`docs/CLIENT.md`](docs/CLIENT.md) §13) |
 | [`crates/zen-blk`](crates/zen-blk) | The block engine: fixed-size volumes of 4,096-byte sealed blocks in an fs, every read checked against a Merkle block tree and a hash-chained root carried in device checkpoints, one writer at a time under a fenced lease, writes buffered and committed in batches ([`spec/blk.md`](spec/blk.md)) |
+| [`crates/zen-ublk`](crates/zen-ublk) | Block devices: a zen-blk volume served as one FUSE file for `losetup` (pure Rust) or as `/dev/ublkbN` (feature `ublk`), with a volatile write cache that flushes commit, failing closed on an alarm or a lost lease ([`docs/BLK.md`](docs/BLK.md)) |
 | [`crates/zen-core`](crates/zen-core) | Client-side crypto core (Rust, native + `wasm32`) |
 | [`crates/zen-proto`](crates/zen-proto) | Wire types of the API (CBOR), shared by server and clients (native + `wasm32`) |
 | [`crates/zen-store`](crates/zen-store) | Storage trait with FoundationDB semantics, tuple encoding, embedded `redb` backend, FoundationDB backend (feature `fdb`) |

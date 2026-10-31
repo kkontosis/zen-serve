@@ -71,7 +71,8 @@ So each commit moves the volume from one verified state to the next, atomically.
 
 * **Flushing.** A flush returns once its commits applied. Writes not yet flushed may be lost in a crash, and when a flush needs several commits, a crash may leave a prefix of them applied, as with a disk's write cache.
 * **Checkpoints.** After a commit applies, the writer's next checkpoint carries `[4, vol id, seq, RH]`, counted toward the cadence (formats.md §14.3).
-* **A lost answer.** When a commit's outcome stays unknown after its replays (api.md §6), the writer re-reads the root record: its own next record means the commit applied, the previous one that it didn't.
+* **A lost answer.** When a commit's outcome stays unknown after its replays (api.md §6), the writer re-reads the root record: its own next record means the commit applied, the previous one that it didn't. Until it can tell, it neither reads nor commits: it doesn't know which tree to check against, and another commit at the same `seq` would make two records of one `seq`. Any other record means another writer (`lease_lost`).
+* **Nothing to change.** A delete of a block the tree already shows absent is left out, and a commit that would change no block isn't made: discarding blocks that were never written (as `mkfs` does to a whole device) costs nothing.
 
 ## 5. Reading
 

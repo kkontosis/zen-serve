@@ -9,31 +9,14 @@ use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use zen_client::{
-    Client, ClientOptions, DeviceKey, Error, IntegrityOptions, RangeOptions, TlsOptions, hex, unhex,
-};
+use zen_client::cli::{ConnectArgs, Connected, exit_code, print_error};
+use zen_client::{Error, IntegrityOptions, RangeOptions, hex, unhex};
 
 #[derive(Parser)]
 #[command(name = "zen-client", version, about = "A native zen-serve client")]
 struct Cli {
-    /// Server URL (http:// or https://).
-    #[arg(long)]
-    url: String,
-    /// Device key file: JSON {identity_seed, device_seed, cert} (hex), as zen-mount's.
-    #[arg(long)]
-    device_key: PathBuf,
-    /// The fs id.
-    #[arg(long)]
-    fs: u32,
-    /// The pins file (default: the device key file's path + `.pins-<fs>`).
-    #[arg(long)]
-    pins: Option<PathBuf>,
-    /// The origin to sign (default: the URL's).
-    #[arg(long)]
-    origin: Option<String>,
-    /// Trust only this CA (PEM) for the server's certificate.
-    #[arg(long)]
-    ca: Option<PathBuf>,
+    #[command(flatten)]
+    connect: ConnectArgs,
     #[command(subcommand)]
     command: Command,
 }
@@ -108,38 +91,9 @@ fn read_pins(file: &str) -> Result<Vec<u8>, Error> {
 }
 
 async fn run(cli: Cli) -> Result<u8, Error> {
-    let key = DeviceKey::load(&cli.device_key)?;
-    let tls = TlsOptions {
-        ca: match &cli.ca {
-            Some(p) => {
-                Some(std::fs::read(p).map_err(|e| Error::Io(format!("{}: {e}", p.display())))?)
-            }
-            None => None,
-        },
-    };
-    let client = Client::connect(
-        &cli.url,
-        ClientOptions {
-            origin: cli.origin.clone(),
-            tls,
-        },
-    )?;
-    let session = client.sign_in_device(&key).await?;
-    let fs = session.fs(cli.fs);
-    let pins = cli.pins.clone().unwrap_or_else(|| {
-        let mut p = cli.device_key.clone().into_os_string();
-        p.push(format!(".pins-{}", cli.fs));
-        p.into()
-    });
-    let integrity = fs
-        .integrity(IntegrityOptions {
-            signer: Some(key.clone()),
-            pins: Some(pins),
-            ..Default::default()
-        })
-        .await?;
-    let u = fs.unlock_device(&key.device).await?;
-    integrity.sync().await?;
+    let Connected {
+        integrity, fs: u, ..
+    } = cli.connect.connect(IntegrityOptions::default()).await?;
     let mut out = std::io::stdout().lock();
     let mut code = 0;
     match cli.command {
@@ -207,13 +161,9 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli).await {
         Ok(code) => ExitCode::from(code),
-        Err(Error::Integrity(a)) => {
-            eprintln!("{}", a.to_json());
-            ExitCode::from(3)
-        }
         Err(e) => {
-            eprintln!("zen-client: {e}");
-            ExitCode::from(1)
+            print_error("zen-client", &e);
+            ExitCode::from(exit_code(&e))
         }
     }
 }

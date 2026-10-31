@@ -67,6 +67,32 @@ jobs:
   # key exchange mlkem768x25519-sha256, which the runners' OpenSSH (9.6)
   # doesn't have, and the rest of the OpenSSH tests on a newer release.
   # Only when the workflow is started by hand (TD-SVC-SSH-PQ-CI).
+  # zen-ublk as a real block device: FUSE, loop devices, ext4 and ublk,
+  # as root (crates/zen-ublk/tests/devices.rs).
+  devices:
+    runs-on: ubuntu-latest
+    # A hung device fails in minutes, not after GitHub's 6 hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE, e2fsprogs, the ublk driver
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fuse3 e2fsprogs
+          sudo modprobe ublk_drv || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe ublk_drv; }
+          ls -l /dev/ublk-control /dev/fuse
+      - name: Clippy
+        run: cargo clippy -p zen-ublk --all-targets --features device-tests,ublk -- -D warnings
+      - name: Test (as root)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+          ZEN_TEST_REQUIRE_UBLK: "1"
+        run: cargo test -p zen-ublk --features device-tests,ublk
+
   openssh-pq:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

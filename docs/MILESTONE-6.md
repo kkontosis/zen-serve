@@ -286,6 +286,83 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * Fix: the sync runs before the lease is acquired (it needs none), so the lease covers only the root read, the checks and the create commit; renewals are due `ttl / 3` after the last lease request that held it was sent, not after the previous sleep; a renewal that returns another token marks the volume `lease_lost`; a transient renewal failure retries after `ttl / 12`, not a whole interval later.
     * Checked: with the same 600 ms delay, the open and its commits now succeed (the test then fails only at its own "busy while the lease lasts" check, since the injected delay outlasts its lease); with a 300 ms delay inside the leased part of the open, the test passes. The crash and stale-fence tests now use 1.5 s leases and 2 s waits, so a slow runner's round trips stay well inside them.
     * The zen-blk tests 3× green, and once with `--no-default-features` (the `pure-rust` configuration).
+  * **CI green on both runs of a41a906** (push 433, pull_request 434): rust, pure-rust, fdb and client all pass. Step 6.7 is done, waiting on review and merge of PR #60. This line reaches `docs/MILESTONE-6.md` at the restart from main.
+  * PR #60 merged.
+* **Step 6.8** (`crates/zen-ublk`, the FUSE export and ublk): planned below ("Step 6.8 in detail"). Restarted from main; the log above is now in the repo copy too. Plan committed (c0de3d3), PR #61.
+  * `spec:` commit 30154a2: blk.md §4, two new bullets. A lost answer is settled before the writer reads or commits again. A delete of a block the tree shows absent is left out, and a commit that would change nothing isn't made.
+  * **zen-blk:**
+    * Writes and discards hold a write lock from their edge reads until their blocks are buffered. A full batch flushes after the lock is released.
+    * `commit` drops deletes whose verified leaf is already zero (`Tree::leaf_in`), and a chunk left empty commits nothing.
+    * **Found while implementing:** the unknown-outcome path. When `send` couldn't read the root after its replays either, it gave the error back. The flush then put its blocks back, and the next commit wrote seq + 1 again, over a commit that may have applied: two root records at one seq. Now `State.unknown` keeps `(RH before, RH written)`, and the next read or commit first settles it from the stored root (`settle`):
+      * the old root: nothing applied
+      * its own root: the tree restarts from it, and the pin and the checkpoint entry follow
+      * anything else: `lease_lost`
+  * **zen-client:** new `cli.rs`. `ConnectArgs` (a clap `Args`: the six options, with `pins_path` and `beside_key`) and its `connect` (sign in, attach, unlock, sync), plus `exit_code` and `print_error`. `main.rs` uses them, with the same behavior.
+  * **zen-ublk** (new crate):
+    * `disk.rs`: the adapter. Errnos, transient retries up to `--io-timeout-ms`, fail-closed `Failure {code, message}`.
+    * `fuse.rs`: fuser 0.18 without libfuse, 4 threads, a task per request, `fsync`/`flush` → flush, `fallocate` → discard.
+    * `ublk.rs` (feature `ublk`): libublk 0.4.8. 4 KiB blocks, discard, `VOLATILE_CACHE|FUA`, smol queues awaiting tokio `JoinHandle`s, `clear_stale`.
+    * `main.rs`: `create`, `info`, `fuse DIR` and `ublk`, with `ready <path>`, SIGINT/SIGTERM, and exit codes 0/1/3.
+    * libublk builds here (bindgen with libclang 18), and clippy passes with every feature.
+  * **Changes from the plan:**
+    * `info` prints size and root, without whether a writer holds the lease (that would need a lease request).
+    * An unmount that fails (a loop device still on the file) keeps serving and says so.
+    * Without C: the crate adds none. Its only C is blake3's SIMD code, which zen-client already has, and blake3's `pure` feature (as the server's) turns it off.
+  * **Found while testing:** the FUSE serve loop polled the signal future again after it completed ("`async fn` resumed after completion"), so a SIGTERM exited 101. It's now polled only until the unmount succeeds.
+  * **Tests:**
+    * zen-blk `tests/volume.rs` adds 2: concurrent partial writes into one block all land; discarding absent blocks commits nothing. On an empty 1 GiB volume, the seq stays 1. Of 3 written blocks, one commit deletes exactly those, checked against the reference tree.
+    * zen-ublk `tests/disk.rs`, 5, in the default suite without root:
+      * requests and errnos: unaligned I/O, FUA, discard edges, `EINVAL`, `EROFS`
+      * a lost lease fails closed (exit 1); an alarm fails closed (exit 3)
+      * an outage, through a TCP proxy, is retried; with a 300 ms timeout it gives `EIO`, the disk isn't failed, and the next flush commits
+      * a commit whose answer was lost, while the server stayed away for 5 s, is settled: seq 3, one record per seq, and the reader and the reopen agree
+      * plus 2 unit tests: sizes, default paths
+    * zen-ublk `tests/devices.rs`, 5, feature `device-tests`, as root:
+      * `fuse_file`: size and mode; `pwrite` aligned and not; a short read at the end; `EPERM` on resize; `busy`; read-only `EROFS`
+      * `fuse_ext4_round_trip`: loop, `mkfs.ext4` (with its discard), files, `sync`, stop, restart, `e2fsck -fn`, compare; then read-only with `ro,noload`
+      * `fuse_writer_killed`: SIGKILL after a synced and an unsynced set; `busy` within the lease; then `e2fsck -fy` ≤ 1, `-fn` 0, and the synced set intact
+      * `ublk_ext4_round_trip`, `ublk_writer_killed`: compiled and run here, where they skip (no `/dev/ublk-control`); CI requires them
+  * **Negative controls** (each run once, then restored):
+    * the write lock off: `concurrent_partial_writes` fails ("before the flush")
+    * the skip of absent deletes off: `discarding_absent` fails (1,025 commits instead of 1)
+    * `settle` off: the lost-answer test fails (seq 2: the writer wrote seq 2 again)
+  * **CI:** a new job `devices`. It installs fuse3 and e2fsprogs, runs `modprobe ublk_drv` (falling back to `linux-modules-extra`), runs clippy with `device-tests,ublk`, then the tests as root (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=sudo -E`) with `ZEN_TEST_REQUIRE_UBLK=1`.
+  * **Docs:** new docs/BLK.md (running it, durability, integrity), the README row, CLIENT.md §13 ("Sharing it").
+  * **Checks (all clean):**
+    * `cargo fmt --check`; clippy on the workspace `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`)
+    * `cargo test -p zen-blk -p zen-ublk` 3×; `cargo test -p zen-client`; `cargo test -p zen-ublk -p zen-blk --no-default-features`
+    * `cargo test -p zen-ublk --features device-tests,ublk --test devices` 3× as root; nothing is left mounted or attached afterwards
+    * `rustclient.test.ts` (the CLI refactor)
+  * Pushed cf2db2b. **Both runs (push 438, pull_request 439) are red, in `devices` only**: `rust`, `pure-rust`, `fdb` (clippy `--all-features` builds libublk) and `client` are green.
+    * In `devices`, `modprobe ublk_drv` worked on the hosted runner, and the three FUSE tests passed as root.
+    * Both ublk tests fail at their first `zen-ublk ublk --id 4x`: the daemon exits 1 with "ublk: the control device: io_uring IO failure", after libublk prints "device reload json failed".
+    * **Cause:** `clear_stale(id)` calls `UblkCtrl::new_simple(id)` to look for a device a killed daemon left. `new_simple` for an id ≥ 0 doesn't only open the control device: it reloads that device's json and **reads its info from the driver** (`handle_device_lifecycle_async` → `read_dev_info_async`). That fails when there is no such device, which is the normal case. So `new_simple` returns an error, and `clear_stale` treated it as fatal. Read in libublk 0.4.8 `src/ctrl.rs` 1180–1191.
+    * **Fix (`ublk.rs` `clear_stale`):**
+      1. When `/dev/ublkc<id>` doesn't exist there is no device: return `Ok`.
+      2. Otherwise `new_simple(id)` (which has read the info already, so the separate `read_dev_info` call goes); a live daemon pid gives `busy`, a dead one gets `del_dev`.
+    * **Not yet exercised anywhere:** what comes after the device is added. That covers the I/O path, FLUSH/FUA, the read-only export without `--id`, `kill_dev`/`del_dev` on SIGTERM, and deleting a dead device after SIGKILL. This container has no ublk driver, so the next CI run is the first test of all of it. Each red gets pursued to its cause the same way.
+    * Fixed in e800684. fmt, clippy with `ublk,device-tests`, and the device tests here are clean (the FUSE ones pass; the ublk ones still skip here). Pushed; CI pending.
+  * **CI on 49e9acd (push 440, pull_request 441):** `rust`, `pure-rust`, `fdb` and `client` are green. `devices` is past `modprobe` and clippy, but "Test (as root)" has been running for 8+ minutes (the whole step took 2 on cf2db2b), and its log can't be read while it runs. So the device is now added, and the I/O hangs.
+    * **Cause, read in libublk 0.4.8 `src/uring_async.rs` (`wait_and_handle_io_events` → `run_uring_tasks` → `uring_poll_io_fn`):**
+      * A queue thread blocks in `io_uring_enter`, waiting for a completion on the queue's ring, for up to `idle_secs` (20 s). It ticks the smol executor only after a completion arrives.
+      * Our request tasks await a tokio `JoinHandle`. When the tokio task finishes, it wakes the smol task, but nothing completes on the ring, so the thread stays asleep.
+      * So each request waits for some other completion, or for the 20 s timeout: `mkfs` and the copies crawl.
+      * libublk's own targets never wait outside the ring: the loop target submits its I/O as SQEs on the queue's ring (`ublk_submit_sqe_async`).
+    * **Fix (`ublk.rs`), so the wake-up goes through the ring:**
+      * Each tag task makes an eventfd (`libc::eventfd(0, EFD_CLOEXEC)`, closed when the task ends).
+      * A request spawns its `Disk` work on tokio. The result goes into a `oneshot`, and then the task writes 1 to the eventfd.
+      * The smol task meanwhile awaits an `io_uring` READ of 8 bytes from that eventfd, through `q.ublk_submit_sqe(...)`. Its completion wakes the ring, and the result is then read from the `oneshot` with `try_recv`.
+      * New optional dependency `io-uring = "0.7"` (feature `ublk`; 0.7.15 is already in the lock through libublk).
+    * **CI guard:** the `devices` job gets `timeout-minutes: 20`, so a hang fails within 20 minutes instead of 6 hours. The test helper's `serve` also gives up after 60 s without a `ready` line.
+    * The hung run can't be cancelled from here (no tool for it). It stops at GitHub's 6-hour limit unless cancelled in the Actions UI.
+    * Fixed in 64e4771.
+  * **CI on ab1297c (push 442, pull_request 443):** `rust`, `pure-rust`, `fdb` and `client` are green. `devices` ran into its 20-minute timeout. The 3 FUSE tests passed; both ublk tests hung.
+    * **Cause, from the log:** each `zen-ublk ublk` daemon panicked within a second in a tokio blocking thread: libublk `ctrl.rs:1469`, "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor."
+      * libublk 0.4.8 keeps the control io_uring **per thread** (`thread_local! CTRL_URING`). Only the thread that ran the `UblkCtrl` constructor has one.
+      * The daemon built the control device in one `spawn_blocking` thread, then ran `run_target` (its ADD/START commands) in another, and `kill_dev`/`del_dev` in more. Every thread after the first had no ring.
+      * The daemon then never printed `ready`. After the 60 s watchdog's SIGKILL, the test still didn't finish: the process exit or its `wait()` never returned with the device added but not started. This is most likely in the kernel, which I can't see from the log.
+    * **Fix (`ublk.rs`):** `ensure_ring()` makes the calling thread's control ring if it has none. It goes through libublk's public `ublk_init_ctrl_task_ring`, building an `IoUring<squeue::Entry128>` of depth 16 as libublk's default does. It's called at the start of every function that sends a control command from a thread: `serve` (`run_target`), `stop` (`kill_dev`), `delete` (`del_dev`) and `clear_stale`.
+    * Fixed in f0b6bfb. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean. Pushed; CI pending. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean (the FUSE device tests pass; the ublk ones skip). Pushed; CI pending.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
@@ -2044,6 +2121,218 @@ impl Volume {
 * **Writes are blind** (no read set): the fence is what excludes other writers.
 * **An attached `Integrity` is required,** as for authenticated zen-db namespaces; the local pin file is per volume, next to the pins file.
 * **Read-only openers fail with `volume_changed`** when a writer moves the root under them, rather than pinning a snapshot (TD).
+
+## Step 6.8 in detail
+
+Step 6.8 builds `crates/zen-ublk`: a daemon that serves a zen-blk volume as a Linux block device, so `mkfs.ext4` on it gives a disk whose contents the server can't read, forge or roll back unnoticed. It has two frontends over one adapter:
+* **FUSE:** one file, `DIR/disk.img`, for `losetup`.
+* **ublk:** `/dev/ublkbN`. It's behind a cargo feature, and tested in a new CI job.
+
+**Survey (what this step builds on):**
+* **The engine** (`zen-blk` `Volume`):
+  * It's `Clone` (an `Arc`), and its `read`, `write`, `discard` and `flush` take `&self`, so requests can run concurrently.
+  * A failed flush puts its blocks back under newer writes, so the next flush retries them.
+  * After a lost lease, every write and flush gives `lease_lost`.
+  * `close(self)` flushes, checkpoints and releases the lease.
+* **Two engine gaps the frontends expose:**
+  * **Partial writes race.** An unaligned `write` reads its edge blocks, then buffers them. Two concurrent partial writes into one block can each read the old block, so one write is lost. Block devices may issue such writes (512-byte sectors, `dd`, the FUSE file written directly).
+  * **Discarding absent blocks costs commits.** `discard` buffers a delete for every block, and each one is committed even when the block was never written. `mkfs.ext4` discards the whole device by default: a 1 GiB volume would take 1,024 commits that change nothing.
+* **The zen-client CLI** (`crates/zen-client/src/main.rs`) has the connect sequence in `run`, not in the library:
+  1. sign in with the device key
+  2. attach integrity with the pins file (default: the key's path + `.pins-<fs>`)
+  3. unlock with the device keyslot
+  4. sync
+  
+  Its exit codes are 3 for an alarm (as JSON on stderr) and 1 for other errors.
+* **Test harness:** zen-client's `tests/common/mod.rs` provides `Server::start_with` (an HTTP URL on 127.0.0.1), `claim`, `fork`, `lie` and keys. zen-blk includes it with `#[path]`. Its tests set up fs 1 with `init_for(&devices, false)`.
+* **This container:** kernel 6.18, root, `/dev/fuse`, loop devices, `fusermount3`, `losetup`, `mkfs.ext4`, `e2fsck`, libclang 18. There's no ublk and no `/lib/modules`.
+* **GitHub runners:** non-root with `sudo`, clang and libclang installed. ublk may need `linux-modules-extra-$(uname -r)` before `modprobe ublk_drv`.
+* **Crates:**
+  * **fuser 0.18.0** (2026-07-22, MSRV 1.85). Without its `libfuse` feature it's pure Rust: it mounts through `fusermount3`. Its `Filesystem` methods take `&self`, a `Config` sets `n_threads`, and replies can be sent from another thread.
+  * **libublk 0.4.8** (2026-08-29, smol and io_uring per queue). Its `libublk-rs-sys` runs bindgen at build time, which needs libclang and kernel headers. So it can't be in the default build: the `pure-rust` job and builds without clang would break.
+* **CI:** `rust` and `pure-rust` run `cargo test --all` as a non-root user; root-only device tests can't run there. `fdb` runs clippy `--all-features`, which will build libublk (libclang is on the runner).
+
+### zen-blk (two small engine changes; tests in `tests/volume.rs`)
+
+* **Writes are ordered.**
+  * `write` and `discard` take an async write lock from the edge reads until their blocks are buffered.
+  * A full batch's flush runs after the lock is released, so a slow commit doesn't hold up other writes' buffering longer than it must.
+  * Reads stay concurrent.
+  * New test `concurrent_partial_writes`: 16 tasks write disjoint 256-byte pieces of one block at once; every piece reads back, before and after a flush. Without the lock, it fails: run once, logged.
+* **Deletes of absent blocks are dropped.**
+  * In `commit`, after the paths are resolved, a delete of a block whose verified leaf is already zero is left out.
+  * A chunk left with no changes commits nothing: no new root, no seq.
+  * New test `discard_absent_is_free`: discarding all of an empty 1 GiB volume leaves `seq` unchanged. After writing 3 blocks, discarding everything takes one commit, which deletes exactly those 3, and the stored tree matches the reference.
+  * The model test still passes.
+
+### zen-client: shared connect arguments
+
+* **New `cli.rs`** in the library:
+  * `#[derive(clap::Args)] pub struct ConnectArgs {url, device_key, fs, pins, origin, ca}`, the six options `zen-client` has today, with the same defaults.
+  * `ConnectArgs::connect(IntegrityOptions) -> Connected {key, session, integrity, fs: UnlockedFs}`: sign in, attach, unlock, sync.
+  * `pub fn exit_code(&Error) -> u8` (3 for an alarm, else 1), and `print_error`.
+* `zen-client`'s `main.rs` uses them, with `#[command(flatten)]`. Its behavior and tests are unchanged.
+
+### `crates/zen-ublk` (new: library and the `zen-ublk` binary)
+
+**Features:**
+* default: the FUSE frontend, pure Rust (fuser without `libfuse`)
+* `ublk`: the ublk frontend (libublk)
+* `device-tests`: compiles `tests/devices.rs`, the suite that needs root and the kernel's devices (as `fdb` gates FDB tests)
+
+**Dependencies:** zen-blk, zen-client, zen-core, tokio (`signal`), clap, fuser 0.18 (default features off), libc. Optional: libublk 0.4.8, smol (`ublk`).
+
+**The CLI:**
+```
+zen-ublk --url URL --device-key FILE --fs N [--pins FILE] [--origin O] [--ca FILE]     (ConnectArgs)
+         --vol NAME [--vol-pin FILE] [--read-only] [--lease-ttl-ms MS] [--batch-blocks N]
+         [--idle-flush-ms MS] [--io-timeout-ms MS] COMMAND
+  create SIZE        create the volume (SIZE: bytes, or with K/M/G/T; a multiple of 4,096), print its root, exit
+  info               size, seq, RH, whether a writer holds it
+  fuse DIR           serve DIR/disk.img until unmounted or signalled
+  ublk [--id N] [--queues Q] [--depth D]      serve /dev/ublkbN until signalled  (feature "ublk")
+```
+* **The volume pin** defaults to the device key's path + `.vol-<fs>-<hex(name)>`. It sits next to the pins file, which it shares with `zen-client`; the 409 merge covers two processes of one device.
+* **Readiness:** once serving, the daemon prints `ready <path>` on stdout (the file or the device). Scripts and the tests wait for that line.
+* **Stopping:**
+  * SIGINT or SIGTERM: the FUSE session unmounts, or the ublk device is stopped and deleted.
+  * An external `umount DIR` ends the FUSE session the same way.
+  * Then `Volume::close` (flush, checkpoint, release the lease) and `integrity.close()`.
+* **Exit codes:** 0 for a clean stop; 3 for an alarm, as JSON on stderr; 1 for other errors, including `busy` (another writer holds the volume) and a lost lease.
+
+**`disk.rs`, the adapter both frontends call** (`Disk`, `Clone`):
+* **Operations:**
+  * `read(off, len)` returns the bytes.
+  * `write(off, data, fua)`: a write with FUA is followed by a flush.
+  * `flush()`.
+  * `discard(off, len)`, also used for write-zeroes: discarded blocks read as zeros.
+* **Errors become an errno:**
+  * `range` → `EINVAL`
+  * `read_only` → `EROFS`
+  * `volume_changed` (a read-only export whose writer moved the root) → `EIO`, with a message to restart the export
+  * the rest → `EIO`
+* **Fail closed:** after an alarm or a lost lease, every request gets `EIO`. The first failure is printed once, and its exit code is kept for the end. The device stays until it's stopped: removing it under a mounted fs is worse.
+* **Transient errors retry:** network errors and 5xx answers are retried with backoff for up to `--io-timeout-ms` (default 60 s) before `EIO`. A network blip shouldn't make ext4 abort its journal, and a failed flush keeps its blocks.
+
+**`fuse.rs`, the FUSE frontend** (fuser 0.18, `n_threads` 4):
+* **The tree:** the root directory (ino 1) holds `disk.img` (ino 2), with size = the volume's, mode 0600 (0400 read-only), and the daemon's uid and gid. Mount options: `fsname=zen-ublk`, `default_permissions`. As root, `allow_other` too, so loop devices and other users can open it.
+* **Requests:**
+  * `lookup`, `getattr`, `readdir`, `open`, `statfs`
+  * `read`: a short read at the end, 0 past it
+  * `write`
+  * `fsync` and `flush` → `Disk::flush`. `fsync` is never `ENOSYS`: the kernel would take that as "no fsync needed".
+  * `fallocate`: `PUNCH_HOLE|KEEP_SIZE` and `ZERO_RANGE` → discard, which is how loop passes DISCARD and WRITE_ZEROES on; mode 0 inside the size → ok; anything else → `EOPNOTSUPP`
+  * `setattr`: a size change → `EPERM`, while times and mode are accepted and ignored
+  * the rest → `ENOSYS`
+* **Each request runs as a task** on the tokio runtime, which replies from the task. Writes are ordered by the engine. The kernel sends `fsync` only after the writes it covers were answered, so a flush includes them.
+* **No writeback cache:** FUSE writes are write-through, so a write is in the volume's buffer when the kernel sees it done.
+* **`losetup`:** docs and tests use `-b 4096`, so loop's I/O is block-aligned.
+
+**`ublk.rs`, the ublk frontend** (feature `ublk`):
+* **The control device:** `UblkCtrlBuilder`, with name `zen-ublk`, `--id` (default: the kernel picks), `--queues` (default 2), `--depth` (default 64), and 1 MiB I/O buffers.
+* **Parameters:**
+  * logical and physical block size 4,096; `io_min` and `io_opt` 4,096
+  * `dev_sectors` = size / 512; `max_sectors` 1 MiB
+  * discard: granularity 4,096, `max_discard_sectors` and `max_write_zeroes_sectors` 1 GiB, one segment
+  * attributes: `UBLK_ATTR_VOLATILE_CACHE` and `UBLK_ATTR_FUA`, plus `UBLK_ATTR_READ_ONLY` when read-only. Without `VOLATILE_CACHE`, the kernel would send no flushes and ext4 would treat buffered writes as durable.
+* **I/O:** each queue thread runs libublk's smol executor, with one task per tag.
+  * READ: `Disk::read` into the tag's buffer
+  * WRITE: copy out of the buffer, then `Disk::write`, with FUA from the request's flags
+  * FLUSH: `Disk::flush`
+  * DISCARD and WRITE_ZEROES: `Disk::discard`
+  * The result is the byte count, or `-errno`.
+  * The `Disk` futures run on the tokio runtime (`handle.spawn`). The queue awaits the `JoinHandle`, which works from any executor.
+* **A killed daemon's device:** after a SIGKILL, the device stays, dead, until deleted. With `--id N`, a device N whose daemon pid is gone is deleted before N is added again, so a restart, or systemd, can reuse the id. A live one gives `busy`.
+
+### Tests
+
+**`tests/disk.rs`, the default suite** (no root; the in-process server; runs in `rust` and `pure-rust`):
+* **The adapter:** read, write, discard and flush round trips, and unaligned edges.
+* **Errnos:** `EINVAL` past the end; `EROFS` on a read-only volume; FUA (the root's seq moves before the write returns).
+* **Fail closed:** after a stale fence (`pause_renewals`, another writer takes over), every request is `EIO` and the exit code is 1. After a rolled-back block (the adversary), it's `EIO` and exit code 3.
+* **Retries:** with the server stopped mid-flush and started again within `io-timeout`, the flush succeeds. With a 200 ms timeout, it gives `EIO`, and the blocks stay buffered: the next flush, after the server is back, commits them.
+* **The CLI:** sizes (`64M`, `1G`, `4096`, and refused: `100`, `0`, `1X`), and the default pin paths.
+
+**`tests/devices.rs`** (feature `device-tests`; root, FUSE and loop; the server in-process, `zen-ublk` run as a child process from `CARGO_BIN_EXE_zen-ublk`):
+* **Cleanup:** a guard kills the child and lazily unmounts the ext4 mount and the FUSE directory, and detaches the loop device, even when a test panics.
+* **The test volumes:** 64 MiB (a debug build seals slowly); the files are a few MiB of seeded random content in nested directories.
+* **`fuse_file`:**
+  * `create 64M`, then `fuse DIR`; `disk.img`'s size and mode are correct
+  * `pwrite`s aligned and unaligned, `fsync`, read back
+  * a truncate gives `EPERM`
+  * SIGTERM → exit 0, and a second run reads the same
+  * while one serves, a second `fuse` of the volume exits 1 with `busy`
+  * `--read-only`: opening for writing gives `EROFS`
+* **`fuse_ext4_round_trip`:**
+  1. `fuse`, then `losetup -b 4096 -f --show`, `mkfs.ext4 -q` (with its discard), and `mount`
+  2. write the files, `sync`, `umount`, `losetup -d`, SIGTERM (exit 0)
+  3. a new run: `e2fsck -fn` exits 0, then mount and compare every file
+  4. a `--read-only` run on a read-only loop, mounted `-o ro,noload`: compare again
+* **`fuse_writer_killed`** (`--lease-ttl-ms 2000`):
+  1. set A, `sync`; then set B without a sync; SIGKILL the daemon
+  2. cleanup: `umount -l`, `losetup -d`, `fusermount3 -uz`
+  3. a restart before the lease lapses exits with `busy`; after it lapses, it serves
+  4. `e2fsck -fy` exits 0 or 1 (it replays the journal), then `e2fsck -fn` exits 0
+  5. mount: set A is intact byte for byte. Set B may be partly there: no assertion
+* **`ublk_ext4_round_trip` and `ublk_writer_killed`** (also `ublk`): the same two scenarios over `/dev/ublkbN`, with mkfs directly on the device, and the restart after the kill using `--id N` (the stale device is deleted).
+  * Without `/dev/ublk-control`, each prints "skipped: no /dev/ublk-control (modprobe ublk_drv)" and returns. That's the kernel lacking the device. With `ZEN_TEST_REQUIRE_UBLK=1`, as in CI, it fails instead.
+* **Here:** the FUSE tests run (root, FUSE and loop are available). The ublk tests compile and clippy here, but run only in CI.
+
+**CI: a new job `devices`:**
+```yaml
+  devices:
+    runs-on: ubuntu-latest
+    steps:
+      - checkout; dtolnay/rust-toolchain@stable (clippy); Swatinem/rust-cache@v2
+      - name: FUSE, e2fsprogs, the ublk driver
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fuse3 e2fsprogs
+          sudo modprobe ublk_drv || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe ublk_drv; }
+          ls -l /dev/ublk-control /dev/fuse
+      - name: Clippy
+        run: cargo clippy -p zen-ublk --all-targets --features device-tests,ublk -- -D warnings
+      - name: Test (as root)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+          ZEN_TEST_REQUIRE_UBLK: "1"
+        run: cargo test -p zen-ublk --features device-tests,ublk
+```
+If `modprobe` fails on hosted runners even with the extra modules, the job keeps the FUSE tests. The ublk ones become `workflow_dispatch`-only, and that's recorded in TECH_DEBT (the risk named in this plan). The log says which happened.
+
+### Docs
+* **docs/BLK.md (new; 6.9 adds the design, threats and numbers):**
+  * running `zen-ublk`: create, the FUSE export with `losetup -b 4096`, ublk, read-only exports
+  * flags, stopping, exit codes
+  * durability: a write cache that flush empties; a crash loses only unflushed writes; one writer, with `busy`
+  * alarms and fail-closed `EIO`
+* **README:** the crate row.
+* **docs/CLIENT.md §13:** `zen-ublk` shares the connect options and pins files.
+* **docs/MILESTONE-6.md:** the log.
+
+### Files
+* **zen-blk:** `crates/zen-blk/src/volume.rs`, `tests/volume.rs`
+* **zen-client:** `crates/zen-client/src/{cli (new),lib,main}.rs`
+* **zen-ublk:** `crates/zen-ublk/{Cargo.toml, src/{lib,main,disk,fuse,ublk}.rs, tests/{disk,devices}.rs}`; root `Cargo.toml` (member), `Cargo.lock`
+* **CI:** `.github/workflows/ci.yml` (the `devices` job)
+* **Docs:** `docs/{BLK (new),CLIENT,MILESTONE-6}.md`, `README.md`
+
+### Verification
+* `cargo fmt --check`
+* clippy `--all-targets -D warnings` on the workspace: default, `--no-default-features`, `--all-features` (the last builds libublk here)
+* `cargo test -p zen-blk` 3×, `cargo test -p zen-client`, `cargo test -p zen-ublk` 3×
+* `cargo test -p zen-ublk --features device-tests` 3× here, as root; the ublk tests report their skip here
+* `cargo check -p zen-ublk --no-default-features` builds without C (`CC=false`)
+* the negative control: the write lock off makes `concurrent_partial_writes` fail
+* CI green on both runs, including `devices` with ublk running
+
+**Defaults chosen (overridable):**
+* **One crate, with ublk behind a feature:** libublk's bindgen needs libclang, which the default and pure-Rust builds must not need.
+* **Root-only device tests are a feature-gated suite** in their own CI job, as FDB's are, not `#[ignore]`d. The only runtime skip is a missing ublk driver, and CI turns that into a failure.
+* **fuser without libfuse:** pure Rust, mounting through `fusermount3`.
+* **A failed lease or an alarm fails closed with `EIO`,** and the device stays until it's stopped.
+* **Transient errors retry for 60 s** before `EIO`.
+* **`zen-ublk` shares zen-client's pins file** by default, and keeps a volume pin next to it.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once.

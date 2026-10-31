@@ -1,0 +1,45 @@
+[package]
+name = "zen-ublk"
+version = "0.1.0"
+description = "zen-serve block devices: a zen-blk volume served as one FUSE file (for losetup) or as /dev/ublkbN"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "zen-ublk"
+path = "src/main.rs"
+
+[features]
+# The ublk frontend (/dev/ublkbN). libublk's bindings are generated at
+# build time (bindgen): it needs libclang and the kernel headers.
+ublk = ["dep:libublk", "dep:smol", "dep:io-uring"]
+# The tests that need root and the kernel's devices (tests/devices.rs):
+# FUSE, loop devices, mkfs.ext4 and mount; the ublk ones also need `ublk`.
+device-tests = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# Pure Rust: no libfuse, mounts through fusermount3.
+fuser = { version = "0.18", default-features = false }
+io-uring = { version = "0.7", optional = true }
+libc = "0.2"
+libublk = { version = "0.4.8", optional = true }
+serde_json = "1"
+smol = { version = "2", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+zen-blk = { path = "../zen-blk" }
+zen-client = { path = "../zen-client" }
+zen-core = { path = "../zen-core" }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+zen-core = { path = "../zen-core", features = ["test-utils"] }
+zen-proto = { path = "../zen-proto" }
+# The server in-process, with the test adversary; as in zen-client's tests.
+zen-server = { path = "../zen-server", default-features = false, features = ["test-utils"] }
+
+[[test]]
+name = "devices"
+required-features = ["device-tests"]

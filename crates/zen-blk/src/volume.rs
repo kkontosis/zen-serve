@@ -70,6 +70,9 @@ struct State {
     renewals_paused: bool,
     /// When the last lease request that held it was sent.
     renewed: Instant,
+    /// A commit whose outcome stayed unknown: `(RH before, RH it wrote)`.
+    /// The next read or commit settles it from the stored root first.
+    unknown: Option<(Hash, Hash)>,
 }
 
 struct Inner {
@@ -83,6 +86,9 @@ struct Inner {
     tree: tokio::sync::RwLock<Tree>,
     st: Mutex<State>,
     flush_lock: tokio::sync::Mutex<()>,
+    /// Held by a write or discard from its edge reads until its blocks are
+    /// buffered, so two partial writes into one block can't lose each other.
+    write_lock: tokio::sync::Mutex<()>,
     lease: tokio::sync::Mutex<Option<Lease>>,
 }
 
@@ -231,11 +237,13 @@ impl Volume {
                         last_write: Instant::now(),
                         idle_armed: false,
                         renewals_paused: false,
+                        unknown: None,
                         renewed: acquired,
                     }),
                     tree: tokio::sync::RwLock::new(Tree::new(record, rh, o.cache_nodes)),
                     opts: o,
                     flush_lock: tokio::sync::Mutex::new(()),
+                    write_lock: tokio::sync::Mutex::new(()),
                     lease: tokio::sync::Mutex::new(lease),
                 }));
                 if writer {
@@ -488,6 +496,10 @@ impl Volume {
 
     /// The plaintexts of blocks (`None`: zeros), newest writes first.
     async fn read_blocks(&self, idx: &[u64]) -> Result<Vec<Data>> {
+        if self.st().unknown.is_some() {
+            let mut tree = self.0.tree.write().await;
+            self.settle(&mut tree).await?;
+        }
         let tree = self.0.tree.read().await;
         let mut out: Vec<Data> = vec![None; idx.len()];
         let mut need = Vec::new();
@@ -623,13 +635,23 @@ impl Volume {
 
     // -------------------------------------------------------------- writing
 
-    /// Write `data` at `offset` (buffered until a flush).
+    /// Write `data` at `offset` (buffered until a flush). Writes are
+    /// ordered: each one's blocks are buffered before the next one starts.
     pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.writable()?;
         self.check_range(offset, data.len() as u64)?;
         if data.is_empty() {
             return Ok(());
         }
+        let full = {
+            let _order = self.0.write_lock.lock().await;
+            self.write_locked(offset, data).await?
+        };
+        if full { self.flush().await } else { Ok(()) }
+    }
+
+    /// [`Volume::write`] under the write lock: whether the batch is full.
+    async fn write_locked(&self, offset: u64, data: &[u8]) -> Result<bool> {
         let bs = BLOCK_SIZE as u64;
         let first = offset / bs;
         let last = (offset + data.len() as u64 - 1) / bs;
@@ -655,8 +677,7 @@ impl Volume {
             b[(start - i * bs) as usize..(stop - i * bs) as usize]
                 .copy_from_slice(&data[(start - offset) as usize..(stop - offset) as usize]);
         }
-        self.buffer(blocks.into_iter().map(|(i, b)| (i, Some(Arc::new(b)))))
-            .await
+        Ok(self.buffer(blocks.into_iter().map(|(i, b)| (i, Some(Arc::new(b))))))
     }
 
     /// Discard `[offset, offset + len)`: whole blocks are deleted (they read
@@ -671,29 +692,35 @@ impl Volume {
         let end = offset + len;
         let whole_from = offset.div_ceil(bs);
         let whole_to = end / bs;
-        if whole_from >= whole_to {
-            return self.write(offset, &vec![0; len as usize]).await;
-        }
-        if offset < whole_from * bs {
-            self.write(offset, &vec![0; (whole_from * bs - offset) as usize])
-                .await?;
-        }
-        if end > whole_to * bs {
-            self.write(whole_to * bs, &vec![0; (end - whole_to * bs) as usize])
-                .await?;
-        }
-        self.buffer((whole_from..whole_to).map(|i| (i, None))).await
-    }
-
-    async fn buffer(&self, blocks: impl Iterator<Item = (u64, Data)>) -> Result<()> {
         let full = {
-            let mut st = self.st();
-            st.dirty.extend(blocks);
-            st.last_write = Instant::now();
-            self.arm_idle(&mut st);
-            st.dirty.len() >= self.0.opts.batch_blocks
+            let _order = self.0.write_lock.lock().await;
+            if whole_from >= whole_to {
+                self.write_locked(offset, &vec![0; len as usize]).await?
+            } else {
+                let mut full = false;
+                if offset < whole_from * bs {
+                    full |= self
+                        .write_locked(offset, &vec![0; (whole_from * bs - offset) as usize])
+                        .await?;
+                }
+                if end > whole_to * bs {
+                    full |= self
+                        .write_locked(whole_to * bs, &vec![0; (end - whole_to * bs) as usize])
+                        .await?;
+                }
+                full | self.buffer((whole_from..whole_to).map(|i| (i, None)))
+            }
         };
         if full { self.flush().await } else { Ok(()) }
+    }
+
+    /// Buffer blocks: whether the batch is full.
+    fn buffer(&self, blocks: impl Iterator<Item = (u64, Data)>) -> bool {
+        let mut st = self.st();
+        st.dirty.extend(blocks);
+        st.last_write = Instant::now();
+        self.arm_idle(&mut st);
+        st.dirty.len() >= self.0.opts.batch_blocks
     }
 
     fn arm_idle(&self, st: &mut State) {
@@ -766,6 +793,7 @@ impl Volume {
     /// One commit: the blocks, their changed nodes, the next root (spec/blk.md §4).
     async fn commit(&self, chunk: &[(u64, Data)]) -> Result<()> {
         let mut tree = self.0.tree.write().await;
+        self.settle(&mut tree).await?;
         let idx: Vec<u64> = chunk.iter().map(|(i, _)| *i).collect();
         let fetched = match self.resolve(&tree, &idx, false).await? {
             Ok(f) => f,
@@ -774,6 +802,21 @@ impl Volume {
                 return Err(self.mismatch(why).await);
             }
         };
+        // A delete of a block the tree shows absent changes nothing (mkfs
+        // discards a whole device): left out, and a chunk of nothing else
+        // commits nothing.
+        let chunk: Vec<&(u64, Data)> = chunk
+            .iter()
+            .filter(|(i, d)| d.is_some() || tree.leaf_in(*i, &fetched.nodes.have) != ZERO)
+            .collect();
+        if chunk.is_empty() {
+            drop(tree);
+            let mut st = self.st();
+            for i in &idx {
+                st.flushing.remove(i);
+            }
+            return Ok(());
+        }
         let fs = &self.0.fs;
         let keys = &self.0.keys;
         let seal_keys = fs.seal_keys()?;
@@ -868,8 +911,43 @@ impl Volume {
             .note(vol_entry(&self.0.vol_id, seq, rh), true)
     }
 
+    /// Settle a commit whose outcome stayed unknown, from the stored root:
+    /// the root before it means it didn't apply (its blocks are buffered
+    /// again); the root it wrote means it did, so the tree starts from that
+    /// root (the buffered blocks are written again on top); any other root
+    /// is another writer's. Without this, the next commit would write a
+    /// second root record at the same seq.
+    async fn settle(&self, tree: &mut Tree) -> Result<()> {
+        let Some((old, new)) = self.st().unknown else {
+            return Ok(());
+        };
+        match read_root(&self.0.fs, &self.0.keys).await? {
+            Some((_, rh)) if rh == old => {}
+            Some((record, rh)) if rh == new => {
+                let seq = record.seq;
+                *tree = Tree::new(record, rh, self.0.opts.cache_nodes);
+                self.st().root = (seq, rh);
+                if let Some(p) = &self.0.opts.pin {
+                    pin::save(p, &self.0.vol_id, &Pin { seq, hash: rh })?;
+                }
+                self.0
+                    .integrity
+                    .note(vol_entry(&self.0.vol_id, seq, rh), true)?;
+            }
+            _ => {
+                let mut st = self.st();
+                st.lost = true;
+                st.unknown = None;
+                return Err(err("lease_lost", "another writer moved the volume's root"));
+            }
+        }
+        self.st().unknown = None;
+        Ok(())
+    }
+
     /// Send a commit; on an unknown outcome, the root record says whether
-    /// it applied (spec/blk.md §4).
+    /// it applied (spec/blk.md §4), and when it can't be read either, the
+    /// next read or commit settles it ([`Volume::settle`]).
     async fn send(&self, c: &Commit, old: Hash, new: Hash) -> Result<()> {
         let mut last = match send_commit(&self.0.fs, c, 4).await {
             Ok(_) => return Ok(()),
@@ -899,6 +977,9 @@ impl Volume {
                 Ok(_) => return Ok(()),
                 Err(e) => e,
             };
+        }
+        if last.is("network") || last.is("commit_unknown") {
+            self.st().unknown = Some((old, new));
         }
         Err(last)
     }

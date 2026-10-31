@@ -528,6 +528,8 @@ Every command signs in, attaches integrity with the pins file (default: the key 
 
 **Comparing pins between a phone and a server.** The phone (TS) shows `integrity.exportPins()` as a QR code or sends it over chat; on the server, `zen-client … pins compare -` reads it. Exit 0: both views are one history so far. The other way, `zen-client … pins export` prints hex, which `integrity.comparePins(fromHex(…))` checks.
 
+**Sharing it.** The connect options and their defaults are `zen_client::cli::ConnectArgs` (a clap `Args`), with `connect` doing the sign-in, attach, unlock and sync above. `zen-ublk` ([BLK.md](BLK.md)) takes the same options and shares the pins file, so the two tools are two processes of one device: their checkpoint puts merge (formats.md §14.3).
+
 ## 14. Security notes
 
 * **Secrets stay in WASM memory** behind handles (`FsKeys`, `SigningIdentity`, `DeviceSecret`, `PasswordKey`, OPAQUE state); `free()` and `UnlockedFs.close()` zeroize them. Values passed in from JS (passwords, recovery keys) are copied; JS strings can't be wiped.
