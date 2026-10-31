@@ -342,6 +342,20 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       2. Otherwise `new_simple(id)` (which has read the info already, so the separate `read_dev_info` call goes); a live daemon pid gives `busy`, a dead one gets `del_dev`.
     * **Not yet exercised anywhere:** what comes after the device is added. That covers the I/O path, FLUSH/FUA, the read-only export without `--id`, `kill_dev`/`del_dev` on SIGTERM, and deleting a dead device after SIGKILL. This container has no ublk driver, so the next CI run is the first test of all of it. Each red gets pursued to its cause the same way.
     * Fixed in e800684. fmt, clippy with `ublk,device-tests`, and the device tests here are clean (the FUSE ones pass; the ublk ones still skip here). Pushed; CI pending.
+  * **CI on 49e9acd (push 440, pull_request 441):** `rust`, `pure-rust`, `fdb` and `client` are green. `devices` is past `modprobe` and clippy, but "Test (as root)" has been running for 8+ minutes (the whole step took 2 on cf2db2b), and its log can't be read while it runs. So the device is now added, and the I/O hangs.
+    * **Cause, read in libublk 0.4.8 `src/uring_async.rs` (`wait_and_handle_io_events` → `run_uring_tasks` → `uring_poll_io_fn`):**
+      * A queue thread blocks in `io_uring_enter`, waiting for a completion on the queue's ring, for up to `idle_secs` (20 s). It ticks the smol executor only after a completion arrives.
+      * Our request tasks await a tokio `JoinHandle`. When the tokio task finishes, it wakes the smol task, but nothing completes on the ring, so the thread stays asleep.
+      * So each request waits for some other completion, or for the 20 s timeout: `mkfs` and the copies crawl.
+      * libublk's own targets never wait outside the ring: the loop target submits its I/O as SQEs on the queue's ring (`ublk_submit_sqe_async`).
+    * **Fix (`ublk.rs`), so the wake-up goes through the ring:**
+      * Each tag task makes an eventfd (`libc::eventfd(0, EFD_CLOEXEC)`, closed when the task ends).
+      * A request spawns its `Disk` work on tokio. The result goes into a `oneshot`, and then the task writes 1 to the eventfd.
+      * The smol task meanwhile awaits an `io_uring` READ of 8 bytes from that eventfd, through `q.ublk_submit_sqe(...)`. Its completion wakes the ring, and the result is then read from the `oneshot` with `try_recv`.
+      * New optional dependency `io-uring = "0.7"` (feature `ublk`; 0.7.15 is already in the lock through libublk).
+    * **CI guard:** the `devices` job gets `timeout-minutes: 20`, so a hang fails within 20 minutes instead of 6 hours. The test helper's `serve` also gives up after 60 s without a `ready` line.
+    * The hung run can't be cancelled from here (no tool for it). It stops at GitHub's 6-hour limit unless cancelled in the Actions UI.
+    * Fixed in 64e4771. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean (the FUSE device tests pass; the ublk ones skip). Pushed; CI pending.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
