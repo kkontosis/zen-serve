@@ -35,10 +35,12 @@ fn ublk_err(what: &str, e: UblkError) -> zen_client::Error {
 /// Delete device `id` when a killed daemon left it (its daemon pid is
 /// gone), so a restart can add it again; a live one is `busy`.
 pub fn clear_stale(id: i32) -> zen_client::Result<()> {
-    let ctrl = UblkCtrl::new_simple(id).map_err(|e| ublk_err("the control device", e))?;
-    if ctrl.read_dev_info().is_err() {
-        return Ok(()); // no such device
+    // `new_simple` reads the device's info from the driver, so it fails
+    // when there is no such device: look for its char device first.
+    if !std::path::Path::new(&format!("/dev/ublkc{id}")).exists() {
+        return Ok(());
     }
+    let ctrl = UblkCtrl::new_simple(id).map_err(|e| ublk_err("the control device", e))?;
     let pid = ctrl.dev_info().ublksrv_pid;
     // SAFETY: kill with signal 0 only checks that the process exists.
     if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
