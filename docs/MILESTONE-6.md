@@ -275,6 +275,17 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * the pin's same-seq check off: the forked reader opens without an alarm.
   * **Bench** (STATS §5.7, release): sequential writes 49 MiB/s with a flush every 4 MiB; a random 4 KiB read 0.14 ms, cold or warm (a read's missing nodes come in the same request as its block); a one-block flush 1.6 ms.
   * **Docs:** README (the crate), STATS §5.7.
+  * Pushed 91228b4. **Both runs red (push 429, pull_request 430), in `rust`, `pure-rust` and `fdb`, at Clippy; `client` green.**
+    * Cause: CI's `stable` toolchain is Rust 1.99, this container's 1.97. Clippy 1.99 adds `chunks_exact_to_as_chunks`, which flags `b.chunks_exact(32)` in `zen-core/src/blk.rs` `node_from_bytes` (line 90). Clippy stopped at zen-core, so zen-blk wasn't linted under 1.99 at all.
+    * Fix (117a05b): `node_from_bytes` uses `as_chunks::<32>()` (stable since 1.88) and refuses a rest or a count other than 128. rustup updated the toolchain here to 1.99.1, the same as CI; clippy `--all-targets -D warnings` on the whole workspace is clean in all three feature sets CI uses, and the zen-core and zen-blk tests pass on it.
+  * **CI on 117a05b (push 431, pull_request 432): red in `pure-rust` only**, both runs at the same place: `a_crash_loses_only_unflushed_writes`, the first flush after `create` got `lease_lost`.
+    * Cause, two bugs in the engine's lease handling:
+      1. The lease was acquired before the integrity sync of the open, and renewals started only once the open finished, `ttl / 3` later. On the slower `pure-rust` runner the open outlasted the test's 500 ms lease: the fenced commit got `claim_lost`.
+      2. Renewing a lease that has lapsed doesn't fail: the server grants it again with the next token (api.md §16), and `Lease::renew` takes that token, while the volume kept fencing with the old one. Between the lapse and the renewal another writer may have written, so that is a lost lease.
+    * Reproduced here with a 600 ms delay after the sync of the open: the create commit got `claim_lost` (412).
+    * Fix: the sync runs before the lease is acquired (it needs none), so the lease covers only the root read, the checks and the create commit; renewals are due `ttl / 3` after the last lease request that held it was sent, not after the previous sleep; a renewal that returns another token marks the volume `lease_lost`; a transient renewal failure retries after `ttl / 12`, not a whole interval later.
+    * Checked: with the same 600 ms delay, the open and its commits now succeed (the test then fails only at its own "busy while the lease lasts" check, since the injected delay outlasts its lease); with a 300 ms delay inside the leased part of the open, the test passes. The crash and stale-fence tests now use 1.5 s leases and 2 s waits, so a slow runner's round trips stay well inside them.
+    * The zen-blk tests 3× green, and once with `--no-default-features` (the `pure-rust` configuration).
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 

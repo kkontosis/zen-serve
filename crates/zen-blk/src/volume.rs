@@ -68,6 +68,8 @@ struct State {
     last_write: Instant,
     idle_armed: bool,
     renewals_paused: bool,
+    /// When the last lease request that held it was sent.
+    renewed: Instant,
 }
 
 struct Inner {
@@ -193,6 +195,9 @@ impl Volume {
             return Err(err("integrity_needed", "a volume's writer needs a signer"));
         }
         let keys = VolumeKeys::new(&fs.keys(), name);
+        // The floors first: a sync can take long, and needs no lease.
+        integrity.sync().await?;
+        let acquired = Instant::now();
         let lease = if writer {
             let ttl = u32::try_from(o.lease_ttl.as_millis()).unwrap_or(u32::MAX);
             match Lease::acquire(fs.fs(), &keys.lease(), ttl).await {
@@ -226,6 +231,7 @@ impl Volume {
                         last_write: Instant::now(),
                         idle_armed: false,
                         renewals_paused: false,
+                        renewed: acquired,
                     }),
                     tree: tokio::sync::RwLock::new(Tree::new(record, rh, o.cache_nodes)),
                     opts: o,
@@ -265,7 +271,6 @@ impl Volume {
                 detail,
             })
         };
-        integrity.sync().await?;
         let floor_at = integrity.floor(&vol_entry(&vol, 0, ZERO));
         let floor = match &floor_at {
             Some(Entry::Vol { seq, hash, .. }) => Some((*seq, *hash)),
@@ -898,31 +903,56 @@ impl Volume {
         Err(last)
     }
 
+    /// Renew the lease every third of its ttl, counted from when the last
+    /// request that held it was sent (a renewal the server answers later
+    /// only holds it longer). A renewal that gets another token came after
+    /// the lease lapsed, when another writer may have written: lost.
     fn renewals(&self) {
         let weak: Weak<Inner> = Arc::downgrade(&self.0);
         let every = (self.0.opts.lease_ttl / 3).max(Duration::from_millis(30));
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(every).await;
-                let Some(inner) = weak.upgrade() else { return };
-                {
+                let due = {
+                    let Some(inner) = weak.upgrade() else { return };
                     let st = inner.st.lock().expect("volume state");
                     if st.closed || st.lost {
                         return;
                     }
-                    if st.renewals_paused {
-                        continue;
+                    (st.renewed + every).saturating_duration_since(Instant::now())
+                };
+                tokio::time::sleep(due).await;
+                let Some(inner) = weak.upgrade() else { return };
+                let token = {
+                    let st = inner.st.lock().expect("volume state");
+                    if st.closed || st.lost {
+                        return;
                     }
-                }
+                    (!st.renewals_paused).then_some(st.token)
+                };
+                let Some(token) = token else {
+                    tokio::time::sleep(every).await;
+                    continue;
+                };
                 let mut l = inner.lease.lock().await;
                 let Some(lease) = l.as_mut() else { return };
+                let sent = Instant::now();
                 match lease.renew().await {
-                    Ok(()) => {}
+                    Ok(()) if lease.token() == token => {
+                        inner.st.lock().expect("volume state").renewed = sent;
+                    }
+                    Ok(()) => {
+                        inner.st.lock().expect("volume state").lost = true;
+                        return;
+                    }
                     Err(e) if e.is("not_leader") => {
                         inner.st.lock().expect("volume state").lost = true;
                         return;
                     }
-                    Err(_) => {}
+                    // A transient failure: try again soon, within the ttl.
+                    Err(_) => {
+                        drop(l);
+                        tokio::time::sleep(every / 4).await;
+                    }
                 }
             }
         });

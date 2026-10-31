@@ -422,7 +422,7 @@ async fn a_crash_loses_only_unflushed_writes() {
     let w = dev(&srv, &kw).await;
     let pin = srv.dir.path().join("disk.pin");
     let o = VolumeOptions {
-        lease_ttl: Duration::from_millis(500),
+        lease_ttl: Duration::from_millis(1500),
         ..pinned(pin.clone())
     };
     let v = Volume::create(&w.u, b"disk", 64 * MIB, o.clone())
@@ -448,7 +448,7 @@ async fn a_crash_loses_only_unflushed_writes() {
             .unwrap()
             .is("busy")
     );
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     // The crash came after a commit and before its pin: the pin is one behind.
     std::fs::copy(&older, &pin).unwrap();
     let v = Volume::open(&w2.u, b"disk", o).await.unwrap();
@@ -491,7 +491,7 @@ async fn a_stale_fence_writes_nothing() {
     let (srv, _) = world(&[&ka, &kb]).await;
     let (a, b) = (dev(&srv, &ka).await, dev(&srv, &kb).await);
     let o = VolumeOptions {
-        lease_ttl: Duration::from_millis(600),
+        lease_ttl: Duration::from_millis(1500),
         ..opts()
     };
     let va = Volume::create(&a.u, b"disk", 64 * MIB, o.clone())
@@ -501,7 +501,7 @@ async fn a_stale_fence_writes_nothing() {
     va.flush().await.unwrap();
     // A stops renewing (a paused process) and its lease lapses.
     va.pause_renewals(true);
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     let vb = Volume::open(&b.u, b"disk", o).await.unwrap();
     vb.write(1000 * BS, &block_of("b")).await.unwrap();
     vb.flush().await.unwrap();
