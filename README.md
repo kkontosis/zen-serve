@@ -51,6 +51,7 @@ Building blocks:
 * Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
 * Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md), outcome at its end, [`docs/SVC.md`](docs/SVC.md)): done.
 * Milestone 6 (integrity: signed checkpoints, the authenticated tier, and `zen-ublk`, [`docs/MILESTONE-6.md`](docs/MILESTONE-6.md), outcome at its end, [`docs/INTEGRITY.md`](docs/INTEGRITY.md), [`docs/BLK.md`](docs/BLK.md)): done.
+* Milestone 8 (large files, the rest: content-defined chunking, upload sessions, multi-GiB writes and edits, [`docs/MILESTONE-8.md`](docs/MILESTONE-8.md)): in progress.
 
 ## Building
 
