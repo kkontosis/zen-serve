@@ -370,20 +370,21 @@ Version 3 (milestone 8), with chunks of variable length, as the chunker of §11.
 u8 manifest_version = 3 ‖ u64 size ‖ u64 n ‖ u32 min ‖ u8 avg_bits ‖ u32 max ‖ u8 key_mode ‖ keys ‖ u8 form ‖ body
 key_mode, keys:  as in version 2
 form 1, inline:  body = n × (chunk_id(16) ‖ u32 len)
-form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32) ‖ u32 bytes)
+form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_digest(32) ‖ u32 bytes ‖ u32 count)
 ```
 
-* `len` is a chunk's plaintext length, and `bytes` the plaintext a page's chunks hold. A reader finds the chunk holding an offset by prefix sums: over the pages' `bytes`, then over the lengths in that page (§11.6, form 2).
+* `len` is a chunk's plaintext length; `bytes` is the plaintext a page's chunks hold, and `count` how many chunks it lists. A reader finds the chunk holding an offset by prefix sums: over the pages' `bytes`, then over the lengths in that page (§11.6, form 2). Chunk `i`'s page is found by prefix sums over the counts.
 * `min`, `avg_bits` and `max` are the parameters the writer's chunker used (§11.7). A reader doesn't need them; a writer that builds on this version resyncs its cuts with these chunks only under the same parameters.
-* **Paged:** pages are of form 2 (§11.6), `page_size ≥ 1` entries each, every page full but the last, so `m = ceil(n / page_size)` (and `m = 0` when `n = 0`). The page ids must equal the `pages` of the `write`, in order. A reader checks each page against its `page_digest`, its expected count and its `bytes` when it fetches it.
+* **Paged:** pages are of form 2 (§11.6), each listing `count` chunks, 1 to `page_size ≥ 1`, and the counts sum to `n` (so `ceil(n / page_size) ≤ m ≤ n`). Pages need not be full: an edit re-encodes only the pages it touches, though it changes how many chunks they hold, and a writer can take a page of the version it edits over without fetching it. The page ids must equal the `pages` of the `write`, in order. A reader checks each page it fetches against its `page_digest`, its `count` and its `bytes`.
+* **Fill (writers):** a writer cuts a page short only where an edit ends, and merges a short page with the next when the two fit in one, so any two neighbouring pages list more than `page_size` chunks. When a version would need more pages than one manifest holds, the writer re-cuts its pages full.
 * A decoder refuses:
   * a `len` of 0 or above `max`;
   * lengths (inline) or page `bytes` (paged) that don't sum to `size`;
   * `n = 0` with `size > 0`, or `n > 0` with `size = 0`;
-  * a paged `m` other than `ceil(n / page_size)`, or `page_size = 0` with `n > 0`;
+  * a page `count` of 0 or above `page_size`, counts that don't sum to `n`, or a page's `bytes` below its `count` or above `count × max`;
   * parameters with `min < 64`, `avg_bits` outside 8..=24, `min ≥ 2^avg_bits` or `2^avg_bits ≥ max`;
   * any other `key_mode` or `form`, and trailing bytes.
-* At the defaults a form-2 page holds 4,499 chunks, and a paged version about 1,300 pages (52 bytes each in the manifest and 16 in the stored version, api.md §6), about 5.8 million chunks: roughly 180 GiB at an average chunk length near 32 KiB (docs/STATS.md). A larger file is written with fixed-size chunks (version 2, the policy's `chunking`, §12).
+* At the defaults a form-2 page holds 4,499 chunks, and a paged version about 1,250 pages (56 bytes each in the manifest and 16 in the stored version, api.md §6), about 5.6 million chunks when the pages are full and at least half that under the fill rule: roughly 170 GiB full at an average chunk length near 32 KiB (docs/STATS.md). A larger file is written with fixed-size chunks (version 2, the policy's `chunking`, §12).
 * Which version a writer writes is the fs policy (§12): version 3 under `chunking = cdc`, version 2 under `fixed`. Readers read all three.
 
 ### 11.4 Chunk (kind 6)

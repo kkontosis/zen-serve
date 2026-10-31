@@ -432,6 +432,7 @@ fn fs_vectors() -> Result<Value> {
                     id: *id,
                     digest: fs::page_digest(p),
                     bytes,
+                    count: 1,
                 })
                 .collect(),
         },

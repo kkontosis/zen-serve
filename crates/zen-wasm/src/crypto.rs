@@ -59,7 +59,7 @@ export interface CdcParams { min: number; avgBits: number; max: number }
 /** A chunk of a version-3 manifest: its id and plaintext length. */
 export interface ChunkEntry { id: Uint8Array; len: number }
 /** A page of a version-3 manifest: id, digest and the plaintext bytes its chunks hold (spec/formats.md §11.3). */
-export interface PageRefV3 { id: Uint8Array; digest: Uint8Array; bytes: number }
+export interface PageRefV3 { id: Uint8Array; digest: Uint8Array; bytes: number; count: number }
 /** Plaintext version-3 manifest (spec/formats.md §11.3): chunks of variable length, `chunks` (inline) or `pageSize` and `pages` (paged, form-2 pages). Keys as in version 2. */
 export interface ManifestV3 { version: 3; size: number; n: number; cdc: CdcParams; keyEpoch?: number; fileKey?: Uint8Array; chunks?: ChunkEntry[]; pageSize?: number; pages?: PageRefV3[] }
 /** A page of either form (spec/formats.md §11.6): its chunk ids, and their lengths for form 2. */
@@ -370,6 +370,7 @@ struct JsPageRefV3 {
     id: serde_bytes::ByteBuf,
     digest: serde_bytes::ByteBuf,
     bytes: u32,
+    count: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -422,6 +423,7 @@ impl JsManifestV3 {
                             id: arr(&p.id)?,
                             digest: arr(&p.digest)?,
                             bytes: p.bytes,
+                            count: p.count,
                         })
                     })
                     .collect::<R<_>>()?,
@@ -463,6 +465,7 @@ impl JsManifestV3 {
                             id: serde_bytes::ByteBuf::from(p.id.to_vec()),
                             digest: serde_bytes::ByteBuf::from(p.digest.to_vec()),
                             bytes: p.bytes,
+                            count: p.count,
                         })
                         .collect(),
                 ),
