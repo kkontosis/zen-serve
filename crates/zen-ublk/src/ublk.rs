@@ -76,6 +76,39 @@ where
     }
 }
 
+/// Give this thread a control ring if it has none. libublk keeps the
+/// control io_uring per thread, made by the thread that builds a
+/// `UblkCtrl`; every other thread that sends a control command (start,
+/// stop, delete) needs its own.
+fn ensure_ring() -> zen_client::Result<()> {
+    libublk::ctrl::ublk_init_ctrl_task_ring(|ring| {
+        if ring.is_none() {
+            let r = io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
+                .build(16)
+                .map_err(UblkError::IOError)?;
+            *ring = Some(r);
+        }
+        Ok(())
+    })
+    .map_err(|e| ublk_err("the control ring", e))
+}
+
+/// Stop the device (its queues end, so [`serve`] returns).
+pub fn stop(ctrl: &UblkCtrl) -> zen_client::Result<()> {
+    ensure_ring()?;
+    ctrl.kill_dev()
+        .map_err(|e| ublk_err("stopping the device", e))?;
+    Ok(())
+}
+
+/// Delete the device.
+pub fn delete(ctrl: &UblkCtrl) -> zen_client::Result<()> {
+    ensure_ring()?;
+    ctrl.del_dev()
+        .map_err(|e| ublk_err("deleting the device", e))?;
+    Ok(())
+}
+
 /// The device's shape.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -102,6 +135,7 @@ pub fn clear_stale(id: i32) -> zen_client::Result<()> {
     if !std::path::Path::new(&format!("/dev/ublkc{id}")).exists() {
         return Ok(());
     }
+    ensure_ring()?;
     let ctrl = UblkCtrl::new_simple(id).map_err(|e| ublk_err("the control device", e))?;
     let pid = ctrl.dev_info().ublksrv_pid;
     // SAFETY: kill with signal 0 only checks that the process exists.
@@ -272,6 +306,7 @@ pub fn serve(
     rt: Handle,
     ready: impl FnOnce(String) + Send + Sync + 'static,
 ) -> zen_client::Result<()> {
+    ensure_ring()?;
     let d = disk.clone();
     ctrl.run_target(
         |dev: &mut UblkDev| init(dev, &d),

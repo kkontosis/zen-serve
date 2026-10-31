@@ -200,12 +200,16 @@ async fn serve_ublk(disk: &Disk, o: zen_ublk::ublk::Options) -> Result<(), Error
         s = signalled() => {
             s?;
             let c = ctrl.clone();
-            let _ = tokio::task::spawn_blocking(move || c.kill_dev()).await;
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || ublk::stop(&c)).await {
+                eprintln!("zen-ublk: {e}");
+            }
             served.await
         }
     };
     let c = ctrl.clone();
-    let _ = tokio::task::spawn_blocking(move || c.del_dev()).await;
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || ublk::delete(&c)).await {
+        eprintln!("zen-ublk: {e}");
+    }
     r.map_err(|e| Error::Io(e.to_string()))?
 }
 
