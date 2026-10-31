@@ -11,12 +11,14 @@ Building blocks:
 * plaintext **`/unencrypted`** static serving for the app bootstrap
 * **zen-db and an in-app broker** in one client class, where rows, messages and files commit in one transaction, with CRDT tables the server merges, a local filesystem replica that works offline, and Loro documents ([`spec/zendb.md`](spec/zendb.md), [`docs/DB.md`](docs/DB.md))
 * **relayed services**: SSH, SMTP, IMAP and other TCP protocols served by handlers on member clients, through a server that relays the bytes blind; each protocol step commits with the handler's rows, and another handler takes over a live connection when one dies ([`docs/SVC.md`](docs/SVC.md))
+* **integrity**: signed, hash-chained device checkpoints and client pins, so a server that serves older data, withholds the newest, or forks clients into two histories is caught (up to fork consistency), for topics, filesystem trees, relayed connections, authenticated zen-db namespaces and volumes ([`docs/INTEGRITY.md`](docs/INTEGRITY.md))
+* **block devices**: an fs volume served as a Linux block device (ublk, or a FUSE file for `losetup`), so `mkfs.ext4` on it gives a disk the server can't read, change or roll back unnoticed ([`docs/BLK.md`](docs/BLK.md))
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| [`docs/`](docs/) | Design discussion and decisions (`DESIGN*.md`, `API.md`, `GAPS.md`, `EXAMPLES.md`), the client and service guides (`CLIENT.md`, `DB.md`, `SVC.md`) and measurements (`STATS.md`) |
+| [`docs/`](docs/) | Design discussion and decisions (`DESIGN*.md`, `API.md`, `GAPS.md`, `EXAMPLES.md`), the client and service guides (`CLIENT.md`, `DB.md`, `SVC.md`, `INTEGRITY.md`, `BLK.md`) and measurements (`STATS.md`) |
 | [`spec/`](spec/) | **Normative** specification: formats, labels, suites, glossary, test vectors |
 | [`crates/zen-client`](crates/zen-client) | A native client (Rust, no C): device sign-in, the ACL walk, fs headers and device keyslots, KV transactions with fences, named leases, device checkpoints and pins kept in a file; the `zen-client` CLI syncs, checkpoints and compares pins out of band ([`docs/CLIENT.md`](docs/CLIENT.md) §13) |
 | [`crates/zen-blk`](crates/zen-blk) | The block engine: fixed-size volumes of 4,096-byte sealed blocks in an fs, every read checked against a Merkle block tree and a hash-chained root carried in device checkpoints, one writer at a time under a fenced lease, writes buffered and committed in batches ([`spec/blk.md`](spec/blk.md)) |
@@ -48,7 +50,7 @@ Building blocks:
 * Milestone 4.5 (zen-db and the in-app broker, specs only, [`spec/zendb.md`](spec/zendb.md), [`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`docs/MILESTONE-4.5.md`](docs/MILESTONE-4.5.md)): done.
 * Milestone 5 (`@zen/db`, CRDT tables on the server, `@zen/fs` replica, `@zen/loro`, five example apps, [`docs/MILESTONE-5.md`](docs/MILESTONE-5.md), outcome at its end): done.
 * Milestone 5.5 (relayed services: a blind TCP relay with handlers on member clients and mid-connection takeover, [`docs/MILESTONE-5.5.md`](docs/MILESTONE-5.5.md), outcome at its end, [`docs/SVC.md`](docs/SVC.md)): done.
-* Milestone 6 (integrity: signed checkpoints, the authenticated tier, and `zen-ublk`, [`docs/MILESTONE-6.md`](docs/MILESTONE-6.md)): in progress.
+* Milestone 6 (integrity: signed checkpoints, the authenticated tier, and `zen-ublk`, [`docs/MILESTONE-6.md`](docs/MILESTONE-6.md), outcome at its end, [`docs/INTEGRITY.md`](docs/INTEGRITY.md), [`docs/BLK.md`](docs/BLK.md)): done.
 
 ## Building
 

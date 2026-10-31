@@ -5,6 +5,10 @@
 //!
 //! The ublk tests skip, saying so, only when the kernel has no
 //! `/dev/ublk-control`; with `ZEN_TEST_REQUIRE_UBLK=1` (CI) they fail.
+//!
+//! `bench_fuse` and `bench_ublk` are `#[ignore]`d benches (docs/STATS.md
+//! §6.3): `cargo test --release -p zen-ublk --features device-tests[,ublk]
+//! --test devices bench -- --ignored --nocapture --test-threads 1`, as root.
 
 #[path = "../../zen-client/tests/common/mod.rs"]
 mod common;
@@ -15,7 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_zen-ublk");
 
@@ -25,6 +29,9 @@ struct World {
     srv: Server,
     dir: tempfile::TempDir,
     key_file: PathBuf,
+    /// Options every command gets: short leases and idle flushes for the
+    /// tests, the defaults for the benches.
+    tuning: Vec<&'static str>,
 }
 
 async fn world() -> World {
@@ -39,7 +46,12 @@ async fn world() -> World {
     let dir = tempfile::tempdir().unwrap();
     let key_file = dir.path().join("dev.json");
     w.save(&key_file).unwrap();
-    World { srv, dir, key_file }
+    World {
+        srv,
+        dir,
+        key_file,
+        tuning: vec!["--lease-ttl-ms", "2000", "--idle-flush-ms", "1000"],
+    }
 }
 
 impl World {
@@ -48,7 +60,7 @@ impl World {
         c.args(["--url", &self.srv.url, "--fs", "1", "--vol", "disk"])
             .arg("--device-key")
             .arg(&self.key_file)
-            .args(["--lease-ttl-ms", "2000", "--idle-flush-ms", "1000"])
+            .args(&self.tuning)
             .args(extra);
         c
     }
@@ -502,4 +514,162 @@ async fn ublk_writer_killed() {
         umount(&mnt, &mut c);
         assert_eq!(d.stop().await, 0);
     }
+}
+
+// -------------------------------------------------------------------- benches
+
+/// A tarball of the repository's `crates`, `spec` and `docs` (many small
+/// files; the same bytes for the same tree): its path, files and bytes.
+fn source_tarball(at: &Path) -> (PathBuf, usize, u64) {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let out = at.join("src.tar");
+    ok(
+        "tar",
+        &[
+            "--sort=name",
+            "--mtime=@0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            "-cf",
+            p(&out),
+            "-C",
+            p(&repo),
+            "crates",
+            "spec",
+            "docs",
+        ],
+    );
+    let list = ok("tar", &["-tvf", p(&out)]);
+    let (mut n, mut bytes) = (0, 0u64);
+    for l in list.lines().filter(|l| l.starts_with('-')) {
+        n += 1;
+        bytes += l.split_whitespace().nth(2).unwrap().parse::<u64>().unwrap();
+    }
+    (out, n, bytes)
+}
+
+fn drop_caches() {
+    ok("sync", &[]);
+    std::fs::write("/proc/sys/vm/drop_caches", "3").unwrap();
+}
+
+fn timed(f: impl FnOnce()) -> f64 {
+    let t = Instant::now();
+    f();
+    t.elapsed().as_secs_f64()
+}
+
+/// ext4 on `dev` (an empty 1 GiB volume): mkfs, a sequential write and
+/// read, synchronous 4 KiB writes, and an untar. Prints a table.
+fn bench_device(name: &str, dev: &str, mnt: &Path, tarball: &(PathBuf, usize, u64)) {
+    let mut c = Cleanup::default();
+    const MIB: u64 = 256;
+    const SMALL: u64 = 256;
+    let mkfs_s = timed(|| mkfs(dev));
+    mount(dev, mnt, "rw", &mut c);
+    let big = mnt.join("big");
+    let write_s = timed(|| {
+        ok(
+            "dd",
+            &[
+                "if=/dev/urandom",
+                &format!("of={}", p(&big)),
+                "bs=1M",
+                &format!("count={MIB}"),
+                "conv=fsync",
+                "status=none",
+            ],
+        );
+    });
+    drop_caches();
+    let read_s = timed(|| {
+        ok(
+            "dd",
+            &[
+                &format!("if={}", p(&big)),
+                "of=/dev/null",
+                "bs=1M",
+                "status=none",
+            ],
+        );
+    });
+    let small = mnt.join("small");
+    let dsync_s = timed(|| {
+        ok(
+            "dd",
+            &[
+                "if=/dev/urandom",
+                &format!("of={}", p(&small)),
+                "bs=4k",
+                &format!("count={SMALL}"),
+                "oflag=dsync",
+                "status=none",
+            ],
+        );
+    });
+    let src = mnt.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let untar_s = timed(|| {
+        ok("tar", &["-xf", p(&tarball.0), "-C", p(&src)]);
+        ok("sync", &[]);
+    });
+    umount(mnt, &mut c);
+    println!("\n{name}, ext4 on a 1 GiB volume");
+    println!("  mkfs.ext4                        {mkfs_s:>8.2} s");
+    println!(
+        "  write {MIB} MiB, conv=fsync         {:>8.1} MiB/s",
+        MIB as f64 / write_s
+    );
+    println!(
+        "  read {MIB} MiB, after drop_caches    {:>8.1} MiB/s",
+        MIB as f64 / read_s
+    );
+    println!(
+        "  4 KiB writes, oflag=dsync        {:>8.2} ms each",
+        dsync_s * 1000.0 / SMALL as f64
+    );
+    println!(
+        "  untar {} files, {:.1} MiB, sync  {untar_s:>8.2} s",
+        tarball.1,
+        tarball.2 as f64 / (1 << 20) as f64
+    );
+}
+
+async fn bench_world() -> World {
+    let mut w = world().await;
+    // The daemon's defaults (30 s lease, 5 s idle flush, 256-block batches).
+    w.tuning = vec![];
+    w.create("1G").await;
+    w
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a bench: run with --ignored, in release, as root"]
+async fn bench_fuse() {
+    let w = bench_world().await;
+    let tarball = source_tarball(w.dir.path());
+    let (dir, mnt) = (w.mnt("fuse"), w.mnt("ext4"));
+    let mut c = Cleanup::default();
+    let d = w.serve(&["fuse", p(&dir)]).await;
+    let dev = losetup(&d.path, false, &mut c);
+    bench_device("FUSE + loop", &dev, &mnt, &tarball);
+    detach(&dev, &mut c);
+    assert_eq!(d.stop().await, 0);
+}
+
+#[cfg(feature = "ublk")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a bench: run with --ignored, in release, as root"]
+async fn bench_ublk() {
+    if !have_ublk() {
+        return;
+    }
+    let w = bench_world().await;
+    let tarball = source_tarball(w.dir.path());
+    let mnt = w.mnt("ext4");
+    let d = w.serve(&["ublk", "--id", "43"]).await;
+    let dev = p(&d.path).to_string();
+    bench_device("ublk", &dev, &mnt, &tarball);
+    assert_eq!(d.stop().await, 0);
 }

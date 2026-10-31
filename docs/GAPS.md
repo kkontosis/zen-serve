@@ -164,7 +164,7 @@ Optionally `on_poison: block` for groups where order matters more than progress.
 | G23 | **Testing strategy.** | Cross-language test vectors. Property tests for CRDT convergence (random op orders → same state). Run the server in FoundationDB's simulation where possible, plus fault injection in Jepsen style for leases, cursors and idempotency. |
 | G24 | **Terminology drift:** "volume", "filesystem" and "fs" are used for the same thing. | A glossary in `spec/`. **fs** = the encrypted namespace, with its own keys and ACL. "Volume" is retired. |
 | G25 | **Mobile Argon2 memory.** | Clients benchmark and choose parameters per keyslot. A floor of 64 MiB, and a warning below 256 MiB. |
-| G26 | **Withheld events / log freshness.** Checkpoints detect missing events from *one device*, but the server can hide a whole topic tail. | Topic heads are included in the signed per-device checkpoints, so clients gossip heads. Same fork-consistency limit as for blocks. |
+| G26 | **Withheld events / log freshness.** Checkpoints detect missing events from *one device*, but the server can hide a whole topic tail. | Topic heads are included in the signed per-device checkpoints, so clients gossip heads. Same fork-consistency limit as for blocks. **Done (milestone 6):** topic heads and event chains in device checkpoints (formats.md §5.1, §14; docs/INTEGRITY.md). |
 
 ---
 

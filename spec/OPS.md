@@ -42,6 +42,7 @@ Pitfalls:
 | One file | `npx vitest run packages/db/test/txn.test.ts` |
 | The browser tests | `npx playwright test` (builds the apps first); one project: `--project=apps` |
 | The measurements | `ZEN_BENCH=1 npx vitest run packages/db/test/bench.test.ts packages/loro/test/bench.test.ts` (docs/STATS.md §5.4); relayed services: `ZEN_BENCH=1 npx vitest run apps/echo/test/bench.test.ts apps/mail/test/bench.test.ts` (§5.5, measured with `ZEN_SERVE_BIN` set to a release build) |
+| Integrity's measurements | `ZEN_BENCH=1 ZEN_SERVE_BIN=target/release/zen-serve npx vitest run packages/client/test/integritybench.test.ts` (§6.1–§6.2; build it with `cargo build --release -p zen-server --features test-utils`) |
 
 Pitfalls:
 * **A server per test file.** Each file spawns its own zen-serve in `beforeAll`; tests in one file share it, so give each test its own database name or topic.
@@ -65,6 +66,20 @@ The relayed services' tests (`crates/zen-svc`, `apps/echo`, `apps/mail`, `packag
 * **OpenSSH 9.6** (Ubuntu 24.04) has no `mlkem768x25519-sha256`. `tests/openssh_pq.rs` is ignored unless `ZEN_TEST_SSH` names an OpenSSH 9.9 or later: `scripts/build-openssh.sh <prefix>` builds 10.6p1 from source in about 10 s. CI's `openssh-pq` job does this, on demand only (`workflow_dispatch`).
 * **Ports.** Each test world gives its services free ports on 127.0.0.1; nothing listens on a fixed port.
 * **Takeover tests** SIGKILL handler workers and wait out a 1 s lease. A loaded machine stretches them; their bounds leave room for that, so a failure there is worth reading, not re-running.
+
+### 1.4 Block-device tests
+
+`crates/zen-ublk/tests/devices.rs` runs `zen-ublk` as a real block device, so it is a suite of its own behind `--features device-tests` (as FDB's tests are behind `fdb`), and runs as root:
+
+```sh
+# cargo builds as you; only the test binary runs under sudo:
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test -p zen-ublk --features device-tests,ublk --test devices
+```
+
+* **Needs:** `/dev/fuse` and `fusermount3` (`fuse3`), loop devices, `mkfs.ext4` and `e2fsck` (`e2fsprogs`); for ublk, `modprobe ublk_drv` (Ubuntu: `linux-modules-extra-$(uname -r)`) and libclang at build time.
+* **Without `/dev/ublk-control`** the ublk tests say so and return; `ZEN_TEST_REQUIRE_UBLK=1` (CI's `devices` job) makes that a failure.
+* **A test that panics** unmounts and detaches what it set up (its `Cleanup` guard). After a SIGKILLed run, check `losetup -a` and `mount | grep zen-ublk`.
+* **The benches** (docs/STATS.md §6.3): `cargo test --release -p zen-ublk --features device-tests[,ublk] --test devices bench -- --ignored --nocapture --test-threads 1`, as root. CI's `devices-bench` job runs them when started by hand (`workflow_dispatch`).
 
 ## 2. What fills the disk
 
@@ -121,3 +136,13 @@ The milestones so far spent most wall-clock time on rebuilds, full test matrices
 9. **One working tree, one `target/`.** Parallel agents or worktrees each pay for a full build and ~8 GB of disk. If work must run in parallel, give it separate files and let one build verify both.
 10. **Check the environment first when something hangs:** free disk, then the FoundationDB cluster, then the code.
 11. **The client milestones (4–5) don't need FoundationDB at all.** Iterate with `npx vitest run packages/client/test/<file>`: one file spawns its own embedded server in milliseconds. Develop the client library against an embedded server. The server already behaves identically on both backends, which its tests prove.
+
+## 5. Integrity pitfalls
+
+Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are the ways to get it wrong in production.
+
+* **Keep the pins.** A device's pins (the TS client's `local` store, the Rust client's pins file, zen-ublk's volume pin) are what it verified. Lose them and the next run trusts whatever the server shows at its first sync, and a rollback to before that sync goes unnoticed. Back them up with the device key, keep them on persistent storage (not a container's ephemeral disk), and never delete them to silence an alarm: they are the evidence.
+* **An authenticated namespace serializes its writers.** Every commit rewrites its NsRoot, so concurrent writers of one authenticated namespace conflict and retry (zendb.md §14.5). Put balances, permissions and other state where freshness matters there, and keep high-rate, independent writes (logs, chat messages, telemetry) in a basic namespace.
+* **`sigEvery: 1` in a browser** signs a checkpoint after every change: 2.6 ms of WASM per change, plus a put of about 4.4 KB (docs/STATS.md §6). Natively it's 0.2 ms. Use it for handlers and volumes that need the window closed, and the default cadence elsewhere.
+* **Checkpoints count toward the fs quota:** up to `checkpoint_keep` (1,024) per device, about 4.5 MB per device that keeps writing. Lower `limits.checkpoint_keep` for fs with many devices and small quotas; a verifier needs only each device's newest.
+* **`adversary = true` is for tests only.** The server refuses it unless built with `test-utils`, and production builds shouldn't have that feature.

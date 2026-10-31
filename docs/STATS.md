@@ -16,6 +16,9 @@ Every sealed object costs **48 bytes** over its plaintext (formats.md §4: 8-byt
 | **Each file or directory** (node, meta, indexes, one version record) | ~650 B fixed: node record (~125 B + sealed meta ~70 B + name), children and change-feed index entries, a version record and a sealed manifest. A move also logs ~90 B for 7 days. |
 | **KV value** | 48 (seal) + 10 (versionstamp) + key (16 B per path element + ~8 B prefix) ≈ **+90 B** per entry for a 2-element key |
 | **Event** (log append) | 48 (seal) + log key (~40) + fs-wide index (~40) + per-key index (~60, keyed events only) ≈ **+150–190 B** per event |
+| **Chained event** (integrity attached, body version 2: formats.md §5.1) | **+52 B** per event over a version-1 body: the chain id (12), `dseq` (8) and `dprev` (32) |
+| **Device checkpoint** (formats.md §14) | ~4.4 KB sealed with a few entries (the hybrid signature is 3,375 B of it, §5.6), plus ~70–100 B per object entry and ~70 B per `seen` device, + 10 B versionstamp and ~60 B key. The server keeps the newest `checkpoint_keep` (1,024) per device: **at most ~4.5 MB per device**, counted in the fs quota (api.md §15.1) |
+| **Block volume** (spec/blk.md), per stored 4 KiB block | 48 (seal) + 10 (versionstamp) + key (~72 B: four path elements) ≈ 130 B, **~3.2 %**; plus one 4 KiB level-1 node per 128 written blocks, **~0.8 %**; the upper levels and the root record are negligible. **A fully written volume costs ~4 % over its size**; an empty one, only its root record. Discarded blocks and empty nodes aren't stored |
 | **Per sign-in credential** | a few hundred bytes (password key: public identity ~2 KB; passkey: COSE key ~100 B) |
 
 **Byte-for-byte conversion for files** (logical bytes zen-serve writes ÷ bytes in the file):
@@ -289,3 +292,62 @@ Reading it:
 * **A read is one round trip** either way: the nodes a block's path lacks are fetched in the same `get` as the block, so a cold reader costs about what a warm one does. Only the bytes differ (up to `depth` nodes of 4 KiB more, until the level-1 node is cached).
 * **A flush is one commit per 256 blocks:** the blocks, about one level-1 node per touched region, the nodes above, and the root record. Sequential writes touch one level-1 node per 128 blocks, so a 1 MiB commit carries about 1.04 MiB of blocks and nodes.
 * **Every commit replaces the top node and the root record,** so commits of one volume are serial; one writer per volume is the model anyway.
+
+## 6. Integrity: what it costs
+
+Integrity (docs/INTEGRITY.md) costs signatures, round trips and bytes. Where each is measured:
+
+| What | Where |
+|---|---|
+| Signing and verifying a checkpoint: WASM 2.6 ms and 0.7 ms; native 0.2 ms and 0.14 ms | §5.2, §5.6 |
+| Keeping a replica's tree state: 100,000 nodes from scratch ~0.6 s, then ~55–95 µs per change | §5.2 |
+| An authenticated zen-db namespace vs a basic one: reads the same; an insert 1 → 6 ops and 0.6 → 9 KB | §5.4 |
+| The block engine in process: 49 MiB/s written, a 4 KiB read 0.14 ms, a one-block flush 1.6 ms | §5.7 |
+| Stored bytes: a checkpoint ~4.4 KB (at most ~4.5 MB per device); +52 B per chained event; ~4 % per volume | §1.1 |
+| A TS checkpoint end to end, syncs, chained appends and reads | §6.1, §6.2 below |
+| ext4 over FUSE + loop and over ublk | §6.3 below |
+
+### 6.1 Checkpoints in the TS client (measured)
+
+`ZEN_BENCH=1 ZEN_SERVE_BIN=target/release/zen-serve npx vitest run packages/client/test/integritybench.test.ts` (opt-in, not in CI): a release zen-serve (embedded backend) and release WASM, on the 4-core development machine, in one Node process; medians of 20 runs, two runs of the bench. Ten writer devices of one user (one in the ACL, nine enrolled) and a verify-only reader.
+
+| Operation | ms (median) | Sealed bytes |
+|---|---|---|
+| `checkpoint()` carrying 10 entries (sign, seal, put) | 6.4–7.2 | 4,477 |
+| `checkpoint()` carrying 100 entries | 8.9–13.3 | 12,680 |
+| `sync()`, 1 of 10 devices moved | 46–51 | |
+| `sync()`, 10 of 10 devices moved | 68–83 | |
+| `exportPins()`, 10 devices | < 0.01 | 809 |
+
+### 6.2 Event chains (measured)
+
+The same bench: 50 appends of a short payload, and five reads of 1,000 events, on one fs without integrity attached and one with it.
+
+| Operation | Without integrity (v1 bodies) | With integrity (v2 bodies, chained) |
+|---|---|---|
+| `append`, ms (median) | 2.5–3.0 | 2.5–2.7 |
+| `append`, request bytes | 197 | 249 |
+| An unfiltered read of 1,000 events, ms | 13 | 25–34 |
+
+### 6.3 ext4 on the devices (measured)
+
+`cargo test --release -p zen-ublk --features device-tests[,ublk] --test devices bench -- --ignored --nocapture --test-threads 1`, as root: the server in the test's process (embedded backend), `zen-ublk` as a child process with its defaults (`--batch-blocks` 256, a 5 s idle flush), an empty 1 GiB volume (depth 3), ext4 with 4 KiB blocks. The untar is the repository's `crates`, `spec` and `docs` at this step (241 files, 4.3 MiB). The FUSE figures are from the development machine (4 cores, two runs). The CI figures are from the `devices-bench` job (run 451, on 7b1b2bb), on a GitHub-hosted `ubuntu-latest` runner, a different machine: compare the columns of one machine, not across them. This container has no ublk driver, so ublk is measured only there.
+
+| ext4 on a 1 GiB volume | FUSE + loop, development machine | FUSE + loop, CI runner | ublk, CI runner |
+|---|---|---|---|
+| `mkfs.ext4` (with its whole-device discard) | 0.13 s | 0.10 s | 0.10 s |
+| Write 256 MiB, `conv=fsync` | 18–25 MiB/s | 48 MiB/s | 52 MiB/s |
+| Read 256 MiB after `drop_caches` | 113–140 MiB/s | 253 MiB/s | 315 MiB/s |
+| 4 KiB writes, `oflag=dsync` | 11.7 ms each | 4.5 ms each | 4.3 ms each |
+| Untar ~240 files (4.3 MiB), then `sync` | 0.23 s | 0.18 s | 0.12 s |
+
+### 6.4 Reading it
+
+* **Round trips, not crypto,** are where the time goes. A TS checkpoint is 2.6 ms of signing and one put; 100 entries add about 8 KB and a few milliseconds of encoding. Natively, signing is 0.2 ms (§5.6).
+* **A sync costs about two round trips per known device, whether it moved or not.** The client re-reads the ACL head and re-fetches each pinned checkpoint to check it's still the one it pinned (formats.md §14.4 rule 2), then fetches a moved device's head and verifies it (0.7 ms in WASM). So ten devices cost about 50 ms on loopback whatever moved, and a moved device adds a get and a verify. That's more than it needs to be: TD-INTEGRITY-SYNC-COST. Prefer `watch()` (a sync per pushed head) to polling `sync()` in a loop.
+* **An event chain** adds 52 bytes to each append and no round trip: the chain's position is kept in memory. Appends measured the same with and without it, within noise. Checking chains on a read (a hash per event, opening the v2 fields) doubles the client's time for a 1,000-event read, which is still under 35 ms.
+* **Choosing `sigEvery`:**
+  * The default (64 changes, or 5 s after the last one) costs at most one checkpoint per 64 writes: well under 1 % of the time of the writes themselves.
+  * `sigEvery: 1` costs a checkpoint per change: about 7 ms more per change in a browser, and 4.5 KB stored. A handler step (§5.5) takes 16–20 ms, so a checkpoint per step adds about a third.
+* **ext4 over a volume** is bounded by commits. A write that fills a batch flushes before it returns, so sequential writes wait for one commit per MiB. A synchronous 4 KiB write (`O_DSYNC`, as a database's `fsync` does) costs ext4 a data write and a journal commit with its cache flushes, which is several engine commits: 4–12 ms depending on the machine. Reads that miss the page cache are one request per block the kernel asks for, with readahead making them large.
+* **ublk and FUSE + loop are close** on one machine (the CI columns): ublk is about 10 % faster for writes and 25 % for reads, since it skips the loop device and FUSE's copies, but both are bounded by the engine's round trips. `mkfs` costs almost nothing on an empty volume: discarding blocks that were never written commits nothing (spec/blk.md §4).

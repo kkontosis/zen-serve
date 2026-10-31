@@ -72,3 +72,110 @@ So a crash, including the daemon being killed, loses only writes no flush covere
 * **An alarm stops the disk:** a rollback, a fork, or a checkpoint that doesn't verify (formats.md §14). The alarm is printed once, and every request gets `EIO` from then on: the disk **fails closed**. The device stays until the daemon is stopped, since removing it under a mounted fs is worse. Then it exits 3.
 * **A lost lease fails closed the same way** (exit 1).
 * **The window:** a server can serve a root one checkpoint old to another device, between a write and its writer's next checkpoint (spec/blk.md §6). The writer itself catches any rollback of its own writes on its next open, through its root pin.
+
+## 5. How it works
+
+A summary of [spec/blk.md](../spec/blk.md), which is normative.
+
+* **Keys.** A volume's values live under the stored key of `("blk", name)`: the root record, the blocks, the tree nodes and the lease name. Stored keys are PRF tokens (formats.md §3.1), so the server sees neither the name nor a block's index, and neighbouring blocks don't sort together. Every value is sealed with its stored key in the AAD, so a block can't be moved to another index, volume or fs; it can only be replaced by an older value of the same key.
+* **Leaves.** A block's leaf hashes its index and its whole sealed value; an absent block (which reads as zeros) has a zero leaf. Any older value of a block is therefore another leaf, with no write counter needed.
+* **The tree.** Fan-out 128: a node is the 4,096 bytes of its 128 child hashes. A 1 GiB volume has depth 3, a 1 TiB one depth 4. A node whose children are all zero isn't stored, so an empty volume stores only its root record, and storage follows what was written.
+* **The root record** `{seq, prev, blocks, root, writer, hlc}` is hash-chained: `prev` is the hash (RH) of the previous record.
+* **A commit** carries the blocks written or deleted, every node on their paths whose hash changed, the next root record and the lease's fence. It reads nothing; the fence keeps other writers out. So each commit moves the volume from one verified state to the next, atomically.
+* **A read** fetches the block together with any nodes of its path the daemon doesn't hold, in one request, and checks them top-down from the verified root: each node against its parent's slot, the block against its leaf. The writer keeps every node above level 1 and a cache of level-1 nodes (4,096, 16 MiB).
+* **A lost answer** (the server applied a commit, or didn't, and the reply was lost) is settled from the stored root before the daemon reads or writes again, so a volume never gets two root records at one `seq`.
+
+## 6. What the server sees and can do
+
+**It sees:**
+* how many blocks and nodes are stored, which of them each commit touches, and when
+* how often the writer flushes, and how large each commit is
+* discards, as deletes
+
+It doesn't see the name, a block's index or the contents. The fixed block size hides write lengths. (spec/blk.md §7.)
+
+**It can't** read a block, forge one, or move one to another index or volume: each is sealed under the fs key, bound to its stored key, and checked against the tree.
+
+**What it can try, and what catches it:**
+
+| The server … | Caught by |
+|---|---|
+| serves an older block, node or root to the writer | the writer's root pin, on its next open (even with no checkpoint yet); a block or node that doesn't match the root at once |
+| serves an older root to another device | that device's floor, once it has synced a checkpoint of the writer that carries a newer root |
+| shows two devices two histories (a fork) | the same `seq` with another RH, once checkpoints cross between them, or when pins are compared out of band ([INTEGRITY.md](INTEGRITY.md) §7) |
+| withholds the writer's newest checkpoints | the writer's own sync (its head below its pin) |
+
+**The window:** a read-only export on another device, opened between a commit and the writer's next checkpoint, can be shown the older volume. The cadence bounds it (by default, 64 changes or 5 s after the last one); a daemon's close always writes a checkpoint.
+
+## 7. Numbers
+
+The engine in process (docs/STATS.md §5.7) writes 49 MiB/s sequentially, reads a random block in 0.14 ms, and flushes one block in 1.6 ms. Through ext4 (STATS.md §6.3):
+
+| ext4 on a 1 GiB volume (CI runner) | FUSE + loop | ublk |
+|---|---|---|
+| Write 256 MiB, `conv=fsync` | 48 MiB/s | 52 MiB/s |
+| Read 256 MiB, cold | 253 MiB/s | 315 MiB/s |
+| A synchronous 4 KiB write (`oflag=dsync`) | 4.5 ms | 4.3 ms |
+| Untar ~240 files, then `sync` | 0.18 s | 0.12 s |
+
+On the 4-core development machine, FUSE + loop measured 18–25 MiB/s, 113–140 MiB/s and 11.7 ms. So ublk is a little faster than FUSE + loop, and both are bounded by the server's round trips: a disk for a filesystem that syncs a few times a second, not for a database that fsyncs every write.
+
+**Tuning:**
+* **`--batch-blocks`** (default 256, 1 MiB) is a commit's size and the buffered blocks that force a flush. Larger batches commit less often (each commit rewrites the top of the tree and the root record), but a flush then waits for a larger commit, and the daemon holds more unflushed data. A commit's blocks are also capped by the server's limits, budgeting a full path of new nodes per block: with the default `max_commit_bytes` (8 MB), about 420 blocks at depth 3 (volumes up to 8 GiB) and 340 at depth 4.
+* **`--idle-flush-ms`** (default 5,000) bounds how long written data waits in the daemon when nothing flushes it. ext4 flushes on its own every 5 s (`commit=5`) and on every `fsync`, so this matters mostly for direct writes to the FUSE file. Lower it for a disk that's written rarely and must lose little; `0` leaves flushing to the filesystem.
+
+## 8. Limits
+
+* **One writer per volume.** Others can export it read-only.
+* **A fixed size,** set at creation. No snapshots, clones or deletion yet (TD-BLK-SNAPSHOTS).
+* **Read-only exports read one root.** When the writer moves it, reads that need the new root fail with `EIO` (`volume_changed`); restart the export (pinned snapshots: TD-BLK-SNAPSHOTS).
+* **ublk** needs a `zen-ublk` built with `--features ublk` (libclang at build time, for libublk's bindings) and the `ublk_drv` module at run time. The FUSE frontend needs neither: only `/dev/fuse`, `fusermount3` and a loop device.
+* **Throughput** is bounded by round trips, not by crypto: a flush is a commit, and reads that miss the page cache are a request each. It's a disk for a filesystem that syncs a few times a second, not for a database that fsyncs every write (STATS.md §6.3).
+
+## 9. Running it under systemd
+
+A unit for the ublk frontend, and a mount that needs it:
+
+```ini
+# /etc/systemd/system/zen-disk.service
+[Unit]
+Description=zen-ublk volume "disk"
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStartPre=/sbin/modprobe ublk_drv
+ExecStart=/usr/local/bin/zen-ublk --url https://zen.example.org --device-key /etc/zen/disk-key.json \
+          --fs 1 --vol disk ublk --id 0
+ExecStartPost=/bin/sh -c 'until [ -b /dev/ublkb0 ]; do sleep 0.2; done'
+KillSignal=SIGTERM
+# Above the flush and its retries (--io-timeout-ms, 60 s by default).
+TimeoutStopSec=90
+Restart=on-failure
+# After a crash the lease (30 s) must lapse before a restart can write.
+RestartSec=35
+# An integrity alarm (exit 3) isn't fixed by restarting: leave it stopped.
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/mnt-disk.mount
+[Unit]
+BindsTo=zen-disk.service
+After=zen-disk.service
+
+[Mount]
+What=/dev/ublkb0
+Where=/mnt/disk
+Type=ext4
+
+[Install]
+WantedBy=multi-user.target
+```
+
+* **`--id`** keeps the device name stable, so the mount unit can name it. After a SIGKILL or a crash, the dead device stays until it is deleted; the next start with the same `--id` deletes it first.
+* **`KillSignal=SIGTERM`**: the daemon stops the device, flushes, checkpoints and releases the lease. `BindsTo` and `After` make systemd unmount the filesystem first.
+* **The pins** (`--pins`, `--vol-pin`) default to files next to the device key, so `/etc/zen` must be writable by the service, or point them elsewhere (`/var/lib/zen`). Losing them means the next start trusts what it is first shown ([INTEGRITY.md](INTEGRITY.md) §7).
