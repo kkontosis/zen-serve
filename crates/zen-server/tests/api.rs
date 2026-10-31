@@ -23,6 +23,13 @@ async fn claim_acl_chain_and_cas() {
 
     let info: Info = h.get("/v1/info").await;
     assert!(!info.claimed);
+    for f in ["fs_pages", "fs_cdc", "upload_sessions"] {
+        assert!(info.features.iter().any(|x| x == f), "{f}");
+    }
+    assert_eq!(
+        (info.limits.upload_ttl_secs, info.limits.upload_max_ttl_secs),
+        (604_800, 2_592_000)
+    );
 
     let (v1, doc1) = signed_acl(
         &admin,

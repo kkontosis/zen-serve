@@ -1809,3 +1809,533 @@ async fn paged_gc_matches_reference() {
         }
     }
 }
+
+// ------------------------------------------------------- page form 2, uploads
+
+/// The `i64` count at `key`, read from the store.
+async fn count_at(h: &Harness, key: &[u8]) -> i64 {
+    let mut t = h.server.state.store.begin(None).await.unwrap();
+    t.get(key)
+        .await
+        .unwrap()
+        .map_or(0, |v| i64::from_le_bytes(v.try_into().unwrap()))
+}
+
+async fn chunk_refs(h: &Harness, c: [u8; 16]) -> i64 {
+    count_at(h, &zen_server::keys::chunk_refs(1, &c)).await
+}
+
+async fn quota_keys(h: &Harness) -> i64 {
+    count_at(h, &zen_server::keys::quota(1, "keys")).await
+}
+
+/// Keys under `pfx`.
+async fn keys_under(h: &Harness, pfx: Vec<u8>) -> usize {
+    let mut t = h.server.state.store.begin(None).await.unwrap();
+    t.get_range(&pfx, &zen_server::keys::end_of(&pfx), 1_000_000, false)
+        .await
+        .unwrap()
+        .len()
+}
+
+async fn open_upload(h: &Harness, d: &Dev, ttl_secs: Option<u64>) -> Result<UploadSession, ApiErr> {
+    h.call(
+        "/v1/fs/upload/open",
+        Some(&d.tok),
+        &UploadOpen { fs: 1, ttl_secs },
+    )
+    .await
+}
+
+async fn renew_upload(
+    h: &Harness,
+    d: &Dev,
+    s: &[u8],
+    ttl_secs: Option<u64>,
+) -> Result<UploadExpiry, ApiErr> {
+    h.call(
+        "/v1/fs/upload/renew",
+        Some(&d.tok),
+        &UploadRenew {
+            fs: 1,
+            session: s.to_vec(),
+            ttl_secs,
+        },
+    )
+    .await
+}
+
+async fn close_upload(h: &Harness, d: &Dev, s: &[u8]) {
+    let _: Empty = h
+        .call(
+            "/v1/fs/upload/close",
+            Some(&d.tok),
+            &UploadClose {
+                fs: 1,
+                session: s.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn list_uploads(h: &Harness, d: &Dev) -> Vec<Vec<u8>> {
+    let r: UploadSessions = h
+        .call("/v1/fs/upload/list", Some(&d.tok), &UploadList { fs: 1 })
+        .await
+        .unwrap();
+    r.sessions.into_iter().map(|s| s.session).collect()
+}
+
+/// A commit under upload session `s`.
+async fn under(
+    h: &Harness,
+    d: &Dev,
+    s: &[u8],
+    chunks: Vec<ChunkPut>,
+    pages: Vec<PagePut>,
+    ops: Vec<CrdtOp>,
+) -> Result<CommitResult, ApiErr> {
+    let c = Commit {
+        commit_id: rcid(),
+        chunks,
+        pages,
+        upload: Some(UploadRef {
+            fs: 1,
+            session: s.to_vec(),
+        }),
+        crdt_ops: ops,
+        ..Default::default()
+    };
+    h.call("/v1/commit", Some(&d.tok), &c).await
+}
+
+/// Sweep until `gone` are collected, checking `kept` stay.
+async fn sweep_until_gone(h: &Harness, d: &Dev, gone: &[[u8; 16]], kept: &[[u8; 16]]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        zen_server::sweep_once(&h.server.state).await.unwrap();
+        for c in kept {
+            assert!(chunk_exists(h, d, *c).await, "kept {c:02x?}");
+        }
+        let mut done = true;
+        for c in gone {
+            done &= !chunk_exists(h, d, *c).await;
+        }
+        if done {
+            return;
+        }
+        assert!(Instant::now() < deadline, "collected {gone:02x?}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Page form 2 (formats.md §11.6): stored and served as uploaded, one
+/// chunk reference per entry (a repeated id twice), released per entry,
+/// alongside form 1; malformed form-2 pages are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn page_form_2_counts_and_releases() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 0;
+        c.limits.sweep_interval_secs = 3600;
+    })
+    .await;
+    let (n1, n2) = (id(1), id(2));
+    let (c1, c2) = (id(0xC1), id(0xC2));
+    let (p2, p1) = (id(0xE2), id(0xE1));
+    let t = zfs::hlc(now_ms(), 0);
+    ops(
+        &h,
+        &a,
+        vec![mv(n1, ROOT, t, Some(b"a")), mv(n2, ROOT, t + 1, Some(b"b"))],
+    )
+    .await
+    .unwrap();
+    let form2 = zfs::encode_page2(&[(c1, 40), (c2, 40), (c1, 40)]);
+    let r = upload(
+        &h,
+        &a,
+        vec![chunk_put(c1), chunk_put(c2)],
+        vec![
+            PagePut {
+                fs: 1,
+                id: p2.to_vec(),
+                data: form2.clone(),
+            },
+            page_put(p1, &[c2]),
+        ],
+        vec![
+            write_paged(n1, &[], &[p2], b"m2"),
+            write_paged(n2, &[], &[p1], b"m1"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(page_data(&h, &a, p2).await.as_deref(), Some(&form2[..]));
+    assert_eq!(chunk_refs(&h, c1).await, 2, "one per entry");
+    assert_eq!(chunk_refs(&h, c2).await, 2, "form 2 and form 1");
+    assert_eq!(ids(&file(&h, &a, n1).await.versions[0].pages), vec![p2]);
+    // Malformed form 2: short, n = 0, a length of 0.
+    let mut zero_len = zfs::encode_page2(&[(c1, 40)]);
+    zero_len[20..24].copy_from_slice(&0u32.to_be_bytes());
+    for (i, bad) in [
+        vec![0x80, 0, 0, 1],
+        vec![0x80, 0, 0, 0],
+        zero_len,
+        form2[..form2.len() - 1].to_vec(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let page = PagePut {
+            fs: 1,
+            id: id(0xF0 + i as u8).to_vec(),
+            data: bad,
+        };
+        let e = upload(&h, &a, vec![], vec![page], vec![])
+            .await
+            .unwrap_err();
+        assert_eq!((e.0, e.1.code.as_str()), (400, "bad_request"), "case {i}");
+    }
+    // Replacing n1's version releases p2, then its entries: c1 goes, c2
+    // stays (p1 lists it).
+    let d1 = r.dots[0].to_vec();
+    ops(&h, &a, vec![write(n1, &[d1], &[], b"empty")])
+        .await
+        .unwrap();
+    sweep_until(
+        &h,
+        &a,
+        &[(p2, vec![c1, c2]), (p1, vec![c2])],
+        &[c1, c2],
+        &[p1],
+        &[c2],
+    )
+    .await;
+    assert_eq!(chunk_refs(&h, c2).await, 1);
+}
+
+/// A session's chunks and pages outlive the grace period while it's open
+/// (a resume days later); after the close, what a write lists stays and
+/// the rest goes one grace period later. Without a session, chunks go.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_keeps_content_past_grace() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 1;
+        c.limits.sweep_interval_secs = 3600;
+    })
+    .await;
+    let s = open_upload(&h, &a, None).await.unwrap().session;
+    let (c1, c2, cx, cy, c3) = (id(0xA1), id(0xA2), id(0xAE), id(0xAF), id(0xA3));
+    under(
+        &h,
+        &a,
+        &s,
+        vec![chunk_put(c1), chunk_put(c2), chunk_put(cx)],
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+    put_chunk(&h, &a, cy).await; // no session
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    sweep_until_gone(&h, &a, &[cy], &[c1, c2, cx]).await;
+    // The resume: more chunks, a page and the write.
+    let n = id(1);
+    let p = id(0xE1);
+    under(
+        &h,
+        &a,
+        &s,
+        vec![chunk_put(c3)],
+        vec![page_put(p, &[c1, c2, c3])],
+        vec![
+            mv(n, ROOT, zfs::hlc(now_ms(), 0), Some(b"big")),
+            write_paged(n, &[], &[p], b"m"),
+        ],
+    )
+    .await
+    .unwrap();
+    close_upload(&h, &a, &s).await;
+    // The release starts cx's grace period: not collected at once.
+    zen_server::sweep_once(&h.server.state).await.unwrap();
+    assert!(chunk_exists(&h, &a, cx).await, "grace restarts on release");
+    assert_eq!(
+        keys_under(&h, zen_server::keys::upload_refs(1, &s).finish()).await,
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sweep_until_gone(&h, &a, &[cx], &[c1, c2, c3]).await;
+    assert!(page_data(&h, &a, p).await.is_some());
+}
+
+/// A session expires on its ttl, extended by renew; once it's gone, a
+/// commit naming it is 412 `upload_gone` with nothing applied, renew is
+/// 412 and close a no-op; the sweeper then releases it.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_expiry_and_renew() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 1;
+        c.limits.sweep_interval_secs = 3600;
+    })
+    .await;
+    let s = open_upload(&h, &a, Some(2)).await.unwrap().session;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let r = renew_upload(&h, &a, &s, Some(4)).await.unwrap();
+    assert!(r.expires_ms >= now_ms() + 3000);
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let c1 = id(0xB1);
+    under(&h, &a, &s, vec![chunk_put(c1)], vec![], vec![])
+        .await
+        .unwrap(); // at 3 s: renewed past the first ttl
+    // Expiry is measured in commit versions, which on FoundationDB can
+    // trail the clock: wait for it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match under(&h, &a, &s, vec![], vec![], vec![]).await {
+            Ok(_) => {}
+            Err(e) => {
+                assert_eq!((e.0, e.1.code.as_str()), (412, "upload_gone"));
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "expired");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let cz = id(0xBF);
+    let e = under(&h, &a, &s, vec![chunk_put(cz)], vec![], vec![])
+        .await
+        .unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (412, "upload_gone"));
+    assert!(!chunk_exists(&h, &a, cz).await, "nothing applied");
+    let e = renew_upload(&h, &a, &s, None).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (412, "upload_gone"));
+    close_upload(&h, &a, &s).await; // a no-op
+    assert!(list_uploads(&h, &a).await.is_empty());
+    assert_eq!(chunk_refs(&h, c1).await, 1, "held until the release");
+    sweep_until_gone(&h, &a, &[c1], &[]).await;
+    assert_eq!(
+        keys_under(&h, zen_server::keys::upload_session(1, &s)).await,
+        0
+    );
+}
+
+/// Sessions are their user's: another user's commit and renew are 412
+/// and their close a no-op; a read-only member can't open; an `upload`
+/// commit puts content of its fs only; ttl rules; `list` is per user.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_rights() {
+    let h = Harness::start().await;
+    let (ua, ub, uc) = (User::new(1), User::new(2), User::new(3));
+    let mut grants = Vec::new();
+    for u in [&ua, &ub] {
+        grants.push(fs_grant(u, 1, &["read", "write"]));
+        grants.push(fs_grant(u, 2, &["read", "write"]));
+    }
+    grants.push(fs_grant(&uc, 1, &["read"]));
+    let (signed, _) = signed_acl(&ua, 1, None, &[&ua], &[&ua, &ub, &uc], grants, vec![]);
+    h.put_acl(signed, h.server.claim_token.clone())
+        .await
+        .unwrap();
+    let (a, b, c) = (
+        Dev::new(&h, &ua).await,
+        Dev::new(&h, &ub).await,
+        Dev::new(&h, &uc).await,
+    );
+    let s = open_upload(&h, &a, None).await.unwrap().session;
+    let e = under(&h, &b, &s, vec![chunk_put(id(0xD1))], vec![], vec![])
+        .await
+        .unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (412, "upload_gone"));
+    let e = renew_upload(&h, &b, &s, None).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (412, "upload_gone"));
+    close_upload(&h, &b, &s).await; // a no-op for another user
+    under(&h, &a, &s, vec![chunk_put(id(0xD2))], vec![], vec![])
+        .await
+        .unwrap();
+    // A read-only member.
+    let e = open_upload(&h, &c, None).await.unwrap_err();
+    assert_eq!(e.0, 403);
+    // Content of another fs in an upload commit.
+    let other = ChunkPut {
+        fs: 2,
+        id: id(0xD3).to_vec(),
+        data: vec![1; 8],
+    };
+    let e = under(&h, &a, &s, vec![other], vec![], vec![])
+        .await
+        .unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (400, "bad_request"));
+    // ttl: 0 is refused, a long one is capped at 30 days.
+    let e = open_upload(&h, &a, Some(0)).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (400, "bad_request"));
+    let long = open_upload(&h, &a, Some(10 * 365 * 86_400)).await.unwrap();
+    let max_ms = 30 * 86_400 * 1000;
+    assert!(long.expires_ms <= now_ms() + max_ms + 5_000);
+    assert!(long.expires_ms >= now_ms() + max_ms - 60_000);
+    // `list` is the caller's open sessions.
+    let sb = open_upload(&h, &b, None).await.unwrap().session;
+    let mut mine = list_uploads(&h, &a).await;
+    mine.sort();
+    let mut want = vec![s.clone(), long.session.clone()];
+    want.sort();
+    assert_eq!(mine, want);
+    assert_eq!(list_uploads(&h, &b).await, vec![sb]);
+    close_upload(&h, &a, &s).await;
+    assert_eq!(list_uploads(&h, &a).await, vec![long.session]);
+    let e = under(&h, &a, &s, vec![], vec![], vec![]).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (412, "upload_gone"));
+}
+
+/// At most 64 open sessions per user and fs; closed and expired ones don't
+/// count. Each reference is one quota key (once per id), returned on the
+/// release, and a `max_keys` limit refuses references past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_cap_and_quota() {
+    let (h, a, _) = two_devices(|c| c.limits.sweep_interval_secs = 3600).await;
+    let mut open = Vec::new();
+    for _ in 0..64 {
+        open.push(open_upload(&h, &a, None).await.unwrap().session);
+    }
+    let e = open_upload(&h, &a, None).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (429, "quota"));
+    close_upload(&h, &a, &open.pop().unwrap()).await;
+    open_upload(&h, &a, Some(1)).await.unwrap(); // 64 again, one short-lived
+    assert_eq!(open_upload(&h, &a, None).await.unwrap_err().0, 429);
+    // Once the short one expires it doesn't count, swept or not.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while open_upload(&h, &a, None).await.is_err() {
+        assert!(Instant::now() < deadline, "expired sessions don't count");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Quota keys: one per reference.
+    let s = open[0].clone();
+    let k0 = quota_keys(&h).await;
+    let (c1, c2, c3) = (id(0x71), id(0x72), id(0x73));
+    under(
+        &h,
+        &a,
+        &s,
+        vec![chunk_put(c1), chunk_put(c2)],
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+    under(
+        &h,
+        &a,
+        &s,
+        vec![chunk_put(c1), chunk_put(c3)],
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(quota_keys(&h).await, k0 + 3);
+    assert_eq!(chunk_refs(&h, c1).await, 1, "once per id");
+    close_upload(&h, &a, &s).await;
+    zen_server::sweep_once(&h.server.state).await.unwrap();
+    assert_eq!(quota_keys(&h).await, k0);
+
+    // A `max_keys` limit.
+    let h = Harness::start().await;
+    let u = User::new(1);
+    let grants = vec![fs_grant(&u, 1, &["read", "write"])];
+    let limits = vec![acl::FsLimit {
+        fs: 1,
+        max_keys: Some(2),
+        max_bytes: None,
+    }];
+    let (signed, _) = signed_acl(&u, 1, None, &[&u], &[&u], grants, limits);
+    h.put_acl(signed, h.server.claim_token.clone())
+        .await
+        .unwrap();
+    let a = Dev::new(&h, &u).await;
+    let s = open_upload(&h, &a, None).await.unwrap().session;
+    let three = vec![chunk_put(id(1)), chunk_put(id(2)), chunk_put(id(3))];
+    let e = under(&h, &a, &s, three, vec![], vec![]).await.unwrap_err();
+    assert_eq!((e.0, e.1.code.as_str()), (429, "quota"));
+    under(
+        &h,
+        &a,
+        &s,
+        vec![chunk_put(id(1)), chunk_put(id(2))],
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
+}
+
+/// Commits in flight together under one session that put the same chunk
+/// count it once: the `ur` key is read with a conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_parallel_puts_count_once() {
+    let (h, a, _) = two_devices(|c| {
+        c.limits.chunk_grace_secs = 0;
+        c.limits.sweep_interval_secs = 3600;
+    })
+    .await;
+    let s = open_upload(&h, &a, None).await.unwrap().session;
+    let c1 = id(0x61);
+    let tries = (0..8).map(|_| async {
+        loop {
+            match under(&h, &a, &s, vec![chunk_put(c1)], vec![], vec![]).await {
+                Ok(_) => return,
+                Err((409, e)) if e.code == "conflict" => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    });
+    futures::future::join_all(tries).await;
+    assert_eq!(chunk_refs(&h, c1).await, 1);
+    assert_eq!(
+        keys_under(&h, zen_server::keys::upload_refs(1, &s).finish()).await,
+        1
+    );
+    close_upload(&h, &a, &s).await;
+    sweep_until_gone(&h, &a, &[c1], &[]).await;
+}
+
+/// A session with more references than one release transaction is
+/// released over several in one sweep, leaving no session keys behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_big_release() {
+    let (h, a, _) = two_devices(|c| c.limits.sweep_interval_secs = 3600).await;
+    let s = open_upload(&h, &a, None).await.unwrap().session;
+    let k0 = quota_keys(&h).await;
+    let tagged = |i: u16| {
+        let mut b = [0x5A; 16];
+        b[..2].copy_from_slice(&i.to_be_bytes());
+        b
+    };
+    for part in 0..3u16 {
+        let chunks = (part * 4000..(part + 1) * 4000)
+            .map(|i| ChunkPut {
+                fs: 1,
+                id: tagged(i).to_vec(),
+                data: vec![1],
+            })
+            .collect();
+        under(&h, &a, &s, chunks, vec![], vec![]).await.unwrap();
+    }
+    assert_eq!(quota_keys(&h).await, k0 + 12_000);
+    close_upload(&h, &a, &s).await;
+    zen_server::sweep_once(&h.server.state).await.unwrap();
+    use zen_server::keys;
+    assert_eq!(keys_under(&h, keys::upload_refs(1, &s).finish()).await, 0);
+    assert_eq!(keys_under(&h, keys::upload_session(1, &s)).await, 0);
+    assert_eq!(keys_under(&h, keys::upload_expiry(1).finish()).await, 0);
+    assert_eq!(
+        keys_under(&h, keys::upload_user(1, &a_user()).finish()).await,
+        0
+    );
+    assert_eq!(quota_keys(&h).await, k0);
+    assert_eq!(chunk_refs(&h, tagged(11_999)).await, 0);
+}
+
+/// User 1's fingerprint (the `uu` index key).
+fn a_user() -> Vec<u8> {
+    User::new(1).fp()
+}

@@ -40,6 +40,7 @@ pub mod tls;
 pub mod token;
 pub mod tree;
 mod txn;
+pub mod upload;
 pub mod webauthn;
 
 /// The RSA key policy (zen-tls-rustcrypto's), for passkeys and TLS keys.
@@ -82,6 +83,8 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             "fs",
             "crdt_rows",
             "fs_pages",
+            "fs_cdc",
+            "upload_sessions",
             "svc",
             "checkpoints",
             "signed_header",
@@ -117,6 +120,8 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             ephemeral_bytes_per_sec: l.ephemeral_bytes_per_sec,
             ephemeral_burst_bytes: l.ephemeral_burst_bytes,
             checkpoint_keep: l.checkpoint_keep,
+            upload_ttl_secs: l.upload_ttl_secs,
+            upload_max_ttl_secs: l.upload_max_ttl_secs,
         },
         auth: Some(auth::info(&st).await),
     })
@@ -295,6 +300,10 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/fs/file/get", post(tree::file_get))
         .route("/v1/fs/chunks/get", post(tree::chunks_get))
         .route("/v1/fs/pages/get", post(tree::pages_get))
+        .route("/v1/fs/upload/open", post(upload::open))
+        .route("/v1/fs/upload/renew", post(upload::renew))
+        .route("/v1/fs/upload/close", post(upload::close))
+        .route("/v1/fs/upload/list", post(upload::list))
         .route("/v1/crdt/get", post(crdt::get))
         .route("/v1/crdt/range", post(crdt::range))
         .route("/v1/crdt/versions", post(crdt::versions))
@@ -394,6 +403,10 @@ pub async fn sweep_once(st: &Shared) -> error::ApiResult<()> {
     let n = token::sweep(st).await?;
     if n > 0 {
         tracing::debug!(removed = n, "expired API tokens");
+    }
+    let n = upload::sweep(st, now).await?;
+    if n > 0 {
+        tracing::debug!(released = n, "upload-session references");
     }
     tree::sweep(st, now).await?;
     let n = crdt::sweep(st, now).await?;

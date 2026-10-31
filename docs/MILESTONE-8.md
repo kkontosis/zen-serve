@@ -126,6 +126,37 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 2 plan`
     4. push and open the PR
   * Then implement on "go".
+  * Plan committed (9323508), PR #66.
+  * `spec:` commit d3fffff:
+    * keyspace.md §3.6: `us` without `refs`; new `uu`; close moves `ux` to 0; `cr`/`pr` count sessions too
+    * api.md §12.1: `list`; another user's session reads as unknown; close needs no fs right; `ttl_secs` 0 is 400; `upload` with no puts only checks
+    * api.md §1: `upload_gone` in the error table
+  * **zen-proto:** `UploadRef`, `UploadOpen`, `UploadSession`, `UploadRenew`, `UploadExpiry`, `UploadClose`, `UploadList`, `UploadSessions`; `Commit.upload`; `Limits.upload_ttl_secs`/`upload_max_ttl_secs`.
+  * **Server:**
+    * new `upload.rs`: `open`, `renew`, `close`, `list`, `check`, `reference`, `sweep` (release rounds of 5,000, at most 100 per fs and pass)
+    * `tree.rs`: `decode_any_page` in `put_page` and `collect_pages`; the engine's session, referencing each chunk and page once per commit (and once per session through `ur`); `release_page`; `release_chunk` and `add_quota` `pub(crate)`
+    * `commit.rs`: the `upload` checks (16 bytes, fs `write`, puts of that fs only, 64 B per put toward `max_commit_bytes`) and `upload::check` before the puts
+    * `config.rs`: the two limits, checked; `error.rs`: `upload_gone`; `keys.rs`: the four key families; `lib.rs`: routes, features `fs_cdc` and `upload_sessions`, the limits in `Info`, `upload::sweep` before `tree::sweep`
+  * **Changes from the plan:**
+    * **Every non-final release round rewrites `us`.** Planning had only the final round touch it, but then a renew or commit that read `us` before the expiry and committed after a middle round would still succeed and keep referencing while the release ran. Rewriting the record makes those conflict, and their retries (at a read version past the expiry) get 412.
+    * **The final round is the one whose `ur` read comes back short** (fewer than the budget, so the conflicting read covered the whole range), not a separate empty read.
+    * **`list` needs fs `read`.**
+    * **Tests went in `tests/fs.rs`, not a new binary,** to save disk.
+  * **Tests:**
+    * `upload.rs` unit: 30 references released 7 per round, and only the last round clears the record and indexes
+    * `config.rs` unit: the ttl checks
+    * `tests/fs.rs` 7 new: `page_form_2_counts_and_releases`, `upload_session_keeps_content_past_grace`, `upload_session_expiry_and_renew`, `upload_session_rights`, `upload_session_cap_and_quota`, `upload_session_parallel_puts_count_once`, `upload_session_big_release` (12,000 references)
+    * `tests/dump.rs`: an open session with a chunk survives export and import, still accepts a commit on the copy, and its reference holds after a sweep
+    * `tests/api.rs`: the features and limits in `/v1/info`
+  * **Negative controls** (each run once, then restored):
+    * without the `ur` check: the parallel test fails (`cr` 8, not 1)
+    * without `reference`: the keeps-content test fails (`kept a1…`)
+    * without the user check: the rights test fails
+    * clearing the record after any round: the unit test fails
+    * `decode_page` in `put_page`: the form-2 test fails
+  * **Checks:**
+    * `cargo fmt`; clippy `--all-targets -D warnings` on the workspace (default, `--no-default-features`, `--all-features`)
+    * `cargo test -p zen-server` on embedded: all suites pass
 
 ## Steps (one PR each; each planned in detail before it starts)
 

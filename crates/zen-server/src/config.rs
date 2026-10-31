@@ -466,6 +466,10 @@ pub struct LimitsConfig {
     pub crdt_max_depth: u32,
     /// Device checkpoints kept per device and fs (api.md §15.1).
     pub checkpoint_keep: u32,
+    /// Default upload-session lifetime (api.md §12.1).
+    pub upload_ttl_secs: u64,
+    /// Longest upload-session lifetime (api.md §12.1).
+    pub upload_max_ttl_secs: u64,
 }
 
 impl Default for LimitsConfig {
@@ -492,6 +496,8 @@ impl Default for LimitsConfig {
             max_groups_per_topic: 64,
             crdt_max_depth: 1000,
             checkpoint_keep: 1024,
+            upload_ttl_secs: 7 * 86_400,
+            upload_max_ttl_secs: 30 * 86_400,
         }
     }
 }
@@ -589,6 +595,13 @@ impl Config {
             return Err(
                 "limits.crdt_max_depth, max_range_items and checkpoint_keep must be at least 1"
                     .into(),
+            );
+        }
+        if self.limits.upload_ttl_secs == 0
+            || self.limits.upload_ttl_secs > self.limits.upload_max_ttl_secs
+        {
+            return Err(
+                "limits.upload_ttl_secs must be at least 1 and at most upload_max_ttl_secs".into(),
             );
         }
         if self.adversary && !cfg!(feature = "test-utils") {
@@ -739,6 +752,24 @@ mod tests {
             assert!(Config::from_toml(&t).is_err(), "{bad}");
         }
         let t = "data_dir = \"/tmp/x\"\npublic_origins = [\"https://a.example:8443\"]";
+        assert!(Config::from_toml(t).is_ok());
+    }
+
+    #[test]
+    fn upload_ttls_are_checked() {
+        let c = Config::from_toml("data_dir = \"/tmp/x\"").unwrap();
+        assert_eq!(
+            (c.limits.upload_ttl_secs, c.limits.upload_max_ttl_secs),
+            (604_800, 2_592_000)
+        );
+        for bad in [
+            "upload_ttl_secs = 0",
+            "upload_ttl_secs = 100\nupload_max_ttl_secs = 99",
+        ] {
+            let t = format!("data_dir = \"/tmp/x\"\n[limits]\n{bad}");
+            assert!(Config::from_toml(&t).is_err(), "{bad}");
+        }
+        let t = "data_dir = \"/tmp/x\"\n[limits]\nupload_ttl_secs = 60\nupload_max_ttl_secs = 60";
         assert!(Config::from_toml(t).is_ok());
     }
 

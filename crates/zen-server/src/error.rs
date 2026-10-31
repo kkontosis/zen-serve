@@ -57,6 +57,7 @@ ctor!(cursor_moved, PRECONDITION_FAILED, "cursor_moved");
 ctor!(not_leader, PRECONDITION_FAILED, "not_leader");
 ctor!(claim_lost, PRECONDITION_FAILED, "claim_lost");
 ctor!(conn_closed, PRECONDITION_FAILED, "conn_closed");
+ctor!(upload_gone, PRECONDITION_FAILED, "upload_gone");
 ctor!(too_large, PAYLOAD_TOO_LARGE, "too_large");
 ctor!(quota, TOO_MANY_REQUESTS, "quota");
 ctor!(window, TOO_MANY_REQUESTS, "window");

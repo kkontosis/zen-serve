@@ -101,6 +101,19 @@ Device checkpoints, enrolled devices, signed fs headers and fenced leases ([INTE
 
 `/v1/info` lists the features `checkpoints`, `signed_header`, `lease` and `devices`, and the limit `checkpoint_keep`.
 
+### Large files (milestone 8)
+Page form 2 and upload sessions ([MILESTONE-8.md](MILESTONE-8.md); normative: spec/api.md §6, §12.1; spec/formats.md §11.6; spec/keyspace.md §3.6). Pages of form 2 carry each chunk's length, for content-defined chunks. The server counts one chunk reference per entry, as for form 1. An upload session keeps a long upload's chunks and pages past `chunk_grace_secs`, so the upload can resume days later.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/fs/upload/open` | a new session of the caller's, `ttl_secs` default `upload_ttl_secs` (7 days), capped at `upload_max_ttl_secs` (30 days); at most 64 open per user and fs (§12.1) |
+| POST | `/v1/commit` (`upload`) | every chunk and page the commit puts is referenced by the session, once per id; 412 `upload_gone` if it is closed, expired or not the caller's (§6, §12.1) |
+| POST | `/v1/fs/upload/renew` | the expiry set to `ttl_secs` from now (§12.1) |
+| POST | `/v1/fs/upload/close` | end it; the sweeper then releases its references in bounded rounds, each starting a grace period (§12.1) |
+| POST | `/v1/fs/upload/list` | the caller's open sessions, to close the ones a lost client left behind (§12.1) |
+
+Each session reference counts as one key toward the fs quota. `/v1/info` lists the features `fs_cdc` and `upload_sessions`, and the limits `upload_ttl_secs` and `upload_max_ttl_secs`.
+
 ---
 
 ## 2. Client library: `@zen/client` (TypeScript over the WASM core)

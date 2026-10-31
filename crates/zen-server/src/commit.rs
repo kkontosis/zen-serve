@@ -164,6 +164,19 @@ fn validate(st: &Shared, caller: &Caller, req: &Commit) -> ApiResult<()> {
         // The page's data, plus a reference-count add per chunk it lists.
         bytes += p.data.len() + p.id.len() + 48 * (p.data.len() / 16);
     }
+    if let Some(u) = &req.upload {
+        fs_ok(u.fs, R_WRITE)?;
+        if u.session.len() != 16 {
+            return Err(bad_request("session must be 16 bytes"));
+        }
+        if req.chunks.iter().any(|c| c.fs != u.fs) || req.pages.iter().any(|p| p.fs != u.fs) {
+            return Err(bad_request(
+                "a commit with upload puts chunks and pages of that fs only",
+            ));
+        }
+        // Each put's `ur` key and reference count.
+        bytes += 64 * (req.chunks.len() + req.pages.len());
+    }
     let mut written = HashSet::new();
     for op in &req.crdt_ops {
         fs_ok(op.fs(), R_WRITE)?;
@@ -405,6 +418,10 @@ pub async fn execute(
             }
         }
         let mut eng = crate::tree::Engine::new(st, caller.device);
+        if let Some(u) = &req.upload {
+            let s = crate::upload::check(&mut t, caller, u).await?;
+            eng.set_session(u.fs, s);
+        }
         for c in &req.chunks {
             eng.put_chunk(&mut t, c).await?;
         }

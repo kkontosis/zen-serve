@@ -322,7 +322,7 @@ fn gc_candidate(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
 }
 
 /// Release one reference to a chunk and make it a GC candidate.
-fn release_chunk(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
+pub(crate) fn release_chunk(t: &mut Box<dyn Txn>, fs: u32, chunk: &Id) {
     t.atomic_add(&keys::chunk_refs(fs, chunk), -1);
     gc_candidate(t, fs, chunk);
 }
@@ -337,6 +337,12 @@ fn page_gc_candidate(t: &mut Box<dyn Txn>, fs: u32, page: &Id) {
     t.set_versionstamped_value(&keys::page_gc_ptr(fs, page), &[], &[0, 0]);
 }
 
+/// Release one reference to a page and make it a GC candidate.
+pub(crate) fn release_page(t: &mut Box<dyn Txn>, fs: u32, page: &Id) {
+    t.atomic_add(&keys::page_refs(fs, page), -1);
+    page_gc_candidate(t, fs, page);
+}
+
 /// Release a version's references: to its chunks, or to its pages.
 fn release_content(t: &mut Box<dyn Txn>, fs: u32, content: &Content) {
     match content {
@@ -347,8 +353,7 @@ fn release_content(t: &mut Box<dyn Txn>, fs: u32, content: &Content) {
         }
         Content::Pages(pages) => {
             for p in pages {
-                t.atomic_add(&keys::page_refs(fs, p), -1);
-                page_gc_candidate(t, fs, p);
+                release_page(t, fs, p);
             }
         }
     }
@@ -371,6 +376,10 @@ pub struct Engine<'a> {
     moved: BTreeSet<(u32, Id)>,
     new_chunks: HashSet<(u32, Id)>,
     new_pages: HashSet<(u32, Id)>,
+    /// The commit's upload session (api.md §12.1), and what it referenced
+    /// in this commit.
+    session: Option<(u32, crate::upload::Session)>,
+    referenced: HashSet<(u8, Id)>,
     /// Writes so far (the next write's dot index).
     pub writes: u16,
     /// Quota deltas per fs: (bytes, keys).
@@ -392,6 +401,8 @@ impl<'a> Engine<'a> {
             moved: BTreeSet::new(),
             new_chunks: HashSet::new(),
             new_pages: HashSet::new(),
+            session: None,
+            referenced: HashSet::new(),
             writes: 0,
             delta: HashMap::new(),
         }
@@ -742,6 +753,31 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Put the commit's chunks and pages under an upload session.
+    pub fn set_session(&mut self, fs: u32, session: crate::upload::Session) {
+        self.session = Some((fs, session));
+    }
+
+    /// Reference `id` from the commit's upload session, once.
+    async fn reference(
+        &mut self,
+        t: &mut Box<dyn Txn>,
+        fs: u32,
+        kind: u8,
+        id: &Id,
+    ) -> ApiResult<()> {
+        let Some((sfs, s)) = self.session else {
+            return Ok(());
+        };
+        if sfs != fs || !self.referenced.insert((kind, *id)) {
+            return Ok(());
+        }
+        if crate::upload::reference(t, fs, &s, kind, id).await? {
+            self.delta.entry(fs).or_default().1 += 1;
+        }
+        Ok(())
+    }
+
     /// Store an uploaded chunk (idempotent for identical bytes).
     pub async fn put_chunk(&mut self, t: &mut Box<dyn Txn>, c: &ChunkPut) -> ApiResult<()> {
         let id = id16(&c.id, "chunk id")?;
@@ -757,14 +793,19 @@ impl<'a> Engine<'a> {
         // A (re-)upload starts the grace period (again).
         gc_candidate(t, c.fs, &id);
         self.new_chunks.insert((c.fs, id));
-        Ok(())
+        self.reference(t, c.fs, crate::upload::KIND_CHUNK, &id)
+            .await
     }
 
     /// Store an uploaded page (idempotent for identical bytes). Its first
     /// upload counts one reference to each chunk it lists (fs.md §4.1).
     pub async fn put_page(&mut self, t: &mut Box<dyn Txn>, p: &PagePut) -> ApiResult<()> {
         let id = id16(&p.id, "page id")?;
-        let chunks = zfs::decode_page(&p.data).map_err(|_| bad_request("malformed page"))?;
+        // Form 1 or form 2 (formats.md §11.6, feature `fs_cdc`): either
+        // way one reference per entry.
+        let chunks = zfs::decode_any_page(&p.data)
+            .map_err(|_| bad_request("malformed page"))?
+            .ids;
         let key = keys::page(p.fs, &id);
         match t.get(&key).await? {
             Some(v) if v == p.data => {}
@@ -786,7 +827,7 @@ impl<'a> Engine<'a> {
         }
         page_gc_candidate(t, p.fs, &id);
         self.new_pages.insert((p.fs, id));
-        Ok(())
+        self.reference(t, p.fs, crate::upload::KIND_PAGE, &id).await
     }
 
     /// Apply one operation and extend its tree's chain.
@@ -1425,7 +1466,7 @@ async fn trim_log(st: &Shared, fs: u32, tree: &Id, cutoff_ms: u64) -> ApiResult<
     Ok(())
 }
 
-fn add_quota(t: &mut Box<dyn Txn>, fs: u32, bytes: i64, nkeys: i64) {
+pub(crate) fn add_quota(t: &mut Box<dyn Txn>, fs: u32, bytes: i64, nkeys: i64) {
     if bytes != 0 {
         t.atomic_add(&keys::quota(fs, "bytes"), bytes);
     }
@@ -1939,7 +1980,9 @@ async fn collect_pages(st: &Shared, fs: u32, before: &[u8; 12]) -> ApiResult<usi
                 if let Some(v) = t.get(&keys::page(fs, p)).await? {
                     bytes -= v.len() as i64;
                     t.clear(&keys::page(fs, p));
-                    let chunks = zfs::decode_page(&v).map_err(|_| internal("bad stored page"))?;
+                    let chunks = zfs::decode_any_page(&v)
+                        .map_err(|_| internal("bad stored page"))?
+                        .ids;
                     released += chunks.len();
                     for c in &chunks {
                         release_chunk(&mut t, fs, c);
