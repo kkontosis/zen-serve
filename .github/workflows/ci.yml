@@ -93,6 +93,27 @@ jobs:
           ZEN_TEST_REQUIRE_UBLK: "1"
         run: cargo test -p zen-ublk --features device-tests,ublk
 
+  # ext4 over both frontends, in release (docs/STATS.md §6.3). By hand only.
+  devices-bench:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE, e2fsprogs, the ublk driver
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fuse3 e2fsprogs
+          sudo modprobe ublk_drv || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe ublk_drv; }
+          nproc; free -m
+      - name: Bench (as root)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+          ZEN_TEST_REQUIRE_UBLK: "1"
+        run: cargo test --release -p zen-ublk --features device-tests,ublk --test devices bench -- --ignored --nocapture --test-threads 1
+
   openssh-pq:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
