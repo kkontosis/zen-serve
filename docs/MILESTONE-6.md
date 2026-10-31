@@ -355,7 +355,14 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * New optional dependency `io-uring = "0.7"` (feature `ublk`; 0.7.15 is already in the lock through libublk).
     * **CI guard:** the `devices` job gets `timeout-minutes: 20`, so a hang fails within 20 minutes instead of 6 hours. The test helper's `serve` also gives up after 60 s without a `ready` line.
     * The hung run can't be cancelled from here (no tool for it). It stops at GitHub's 6-hour limit unless cancelled in the Actions UI.
-    * Fixed in 64e4771. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean (the FUSE device tests pass; the ublk ones skip). Pushed; CI pending.
+    * Fixed in 64e4771.
+  * **CI on ab1297c (push 442, pull_request 443):** `rust`, `pure-rust`, `fdb` and `client` are green. `devices` ran into its 20-minute timeout. The 3 FUSE tests passed; both ublk tests hung.
+    * **Cause, from the log:** each `zen-ublk ublk` daemon panicked within a second in a tokio blocking thread: libublk `ctrl.rs:1469`, "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor."
+      * libublk 0.4.8 keeps the control io_uring **per thread** (`thread_local! CTRL_URING`). Only the thread that ran the `UblkCtrl` constructor has one.
+      * The daemon built the control device in one `spawn_blocking` thread, then ran `run_target` (its ADD/START commands) in another, and `kill_dev`/`del_dev` in more. Every thread after the first had no ring.
+      * The daemon then never printed `ready`. After the 60 s watchdog's SIGKILL, the test still didn't finish: the process exit or its `wait()` never returned with the device added but not started. This is most likely in the kernel, which I can't see from the log.
+    * **Fix (`ublk.rs`):** `ensure_ring()` makes the calling thread's control ring if it has none. It goes through libublk's public `ublk_init_ctrl_task_ring`, building an `IoUring<squeue::Entry128>` of depth 16 as libublk's default does. It's called at the start of every function that sends a control command from a thread: `serve` (`run_target`), `stop` (`kill_dev`), `delete` (`del_dev`) and `clear_stale`.
+    * Fixed in f0b6bfb. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean. Pushed; CI pending. fmt, clippy with `ublk,device-tests` and the zen-ublk tests here are clean (the FUSE device tests pass; the ublk ones skip). Pushed; CI pending.
 
 ## Step 6.3: the red on run 396 (`apps/chat` "who's online")
 
