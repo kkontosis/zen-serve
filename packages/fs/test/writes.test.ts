@@ -229,6 +229,35 @@ describe('offline', () => {
 });
 
 describe('changed chunks only', () => {
+  it('a file of variable chunks (version 3) reads, and its edits flush in fixed chunks', async () => {
+    const { id, r, seen } = await setup();
+    const cdc = admin.tree(id, { cdc: { min: 64, avgBits: 8, max: 1984 } });
+    const data = blob(150_000, 3);
+    const f = await cdc.create(ROOT, 'cdc.bin');
+    expect((await cdc.writeFile(f, data)).manifest.version).toBe(3);
+    await r.sync();
+    expect(await r.read('/cdc.bin', 70_000, 3000)).toEqual(data.slice(70_000, 73_000));
+    expect(await r.readFile('/cdc.bin')).toEqual(data);
+    const h = await r.open('/cdc.bin', 'r+');
+    await h.write(text('edited'), 1000);
+    await h.write(text('!'), data.length);
+    await h.close();
+    await r.flush();
+    const next = bytes.concat(data, text('!'));
+    next.set(text('edited'), 1000);
+    const view = await seen();
+    expect(await view.readFile('/cdc.bin')).toEqual(next);
+    const [v] = await admin.tree(id).versions(f);
+    expect(v!.manifest.version).toBe(2);
+    // A second edit reuses the first one's chunks.
+    const h2 = await r.open('/cdc.bin', 'r+');
+    await h2.write(text('E'), 1000);
+    await h2.close();
+    await r.flush();
+    next.set(text('E'), 1000);
+    expect(await (await seen()).readFile('/cdc.bin')).toEqual(next);
+  });
+
   it('a 1-byte write in a 300-chunk paged file sends one chunk and one page', async () => {
     const { t, r, net, seen } = await setup();
     const data = blob(300 * CS, 7);

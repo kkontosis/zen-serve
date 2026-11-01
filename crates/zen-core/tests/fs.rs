@@ -203,10 +203,10 @@ fn v3_inline(lens: &[u32]) -> ManifestV3 {
     }
 }
 
-fn v3_paged(page_bytes: &[u32], n: u64, page_size: u32) -> ManifestV3 {
+fn v3_paged(pages: &[(u32, u32)], page_size: u32) -> ManifestV3 {
     ManifestV3 {
-        size: page_bytes.iter().map(|&l| l as u64).sum(),
-        n,
+        size: pages.iter().map(|&(b, _)| b as u64).sum(),
+        n: pages.iter().map(|&(_, c)| c as u64).sum(),
         cdc: CDC,
         file_key: Some(FileKey {
             key_epoch: 2,
@@ -214,13 +214,14 @@ fn v3_paged(page_bytes: &[u32], n: u64, page_size: u32) -> ManifestV3 {
         }),
         body: BodyV3::Paged {
             page_size,
-            pages: page_bytes
+            pages: pages
                 .iter()
                 .enumerate()
-                .map(|(i, &b)| PageRefV3 {
+                .map(|(i, &(bytes, count))| PageRefV3 {
                     id: id(i as u8),
                     digest: [i as u8; 32],
-                    bytes: b,
+                    bytes,
+                    count,
                 })
                 .collect(),
         },
@@ -232,14 +233,13 @@ fn manifest_v3_round_trips() {
     for m in [
         v3_inline(&[100, 1000, 7]),
         v3_inline(&[]),
-        v3_paged(&[3000, 400], 5, 4),
-        v3_paged(&[], 0, 4),
+        v3_paged(&[(3000, 4), (400, 1)], 4),
+        v3_paged(&[], 4),
     ] {
         assert_eq!(ManifestV3::decode(&m.encode()).unwrap(), m);
         let any = AnyManifest::V3(m.clone());
         assert_eq!(AnyManifest::decode(&any.encode()).unwrap(), any);
     }
-    assert_eq!(v3_paged(&[3000, 400], 5, 4).page_len(1), Some(1));
     // Sealed and opened like the other versions.
     let fsk = keys();
     let m = AnyManifest::V3(v3_inline(&[10, 20]));
@@ -260,19 +260,46 @@ fn manifest_v3_refusals() {
     let mut m = v3_inline(&[10, 20]);
     m.size = 31;
     assert_eq!(bad(&m), Err(Error::Format));
-    let mut m = v3_paged(&[3000, 400], 5, 4);
+    let mut m = v3_paged(&[(3000, 4), (400, 1)], 4);
     m.size += 1;
     assert_eq!(bad(&m), Err(Error::Format));
     // n = 0 with size > 0, and the reverse.
     let mut m = v3_inline(&[]);
     m.size = 5;
     assert_eq!(bad(&m), Err(Error::Format));
-    let mut m = v3_paged(&[3000, 400], 5, 4);
+    let mut m = v3_paged(&[(3000, 4), (400, 1)], 4);
     m.n = 0;
     assert_eq!(bad(&m), Err(Error::Format));
-    // m ≠ ceil(n / page_size), and page_size 0.
-    assert_eq!(bad(&v3_paged(&[3000, 400], 9, 4)), Err(Error::Format));
-    assert_eq!(bad(&v3_paged(&[3000, 400], 5, 0)), Err(Error::Format));
+    // Page counts: 0, above page_size, not summing to n, or with bytes a
+    // count of chunks can't hold; pages need not be full.
+    assert_eq!(
+        bad(&v3_paged(&[(3000, 4), (400, 0)], 4)),
+        Err(Error::Format)
+    );
+    assert_eq!(
+        bad(&v3_paged(&[(3000, 5), (400, 1)], 4)),
+        Err(Error::Format)
+    );
+    assert_eq!(
+        bad(&v3_paged(&[(3000, 4), (400, 1)], 0)),
+        Err(Error::Format)
+    );
+    assert_eq!(bad(&v3_paged(&[(3, 4), (400, 1)], 4)), Err(Error::Format));
+    assert_eq!(
+        bad(&v3_paged(&[(4001, 4), (400, 1)], 4)),
+        Err(Error::Format)
+    );
+    let mut m = v3_paged(&[(3000, 4), (400, 1)], 4);
+    m.n = 6;
+    assert_eq!(bad(&m), Err(Error::Format));
+    for pages in [
+        &[(3000, 3), (400, 1)][..],
+        &[(10, 1), (20, 2), (30, 4)],
+        &[(5, 1)],
+    ] {
+        let m = v3_paged(pages, 4);
+        assert_eq!(ManifestV3::decode(&m.encode()), Ok(m), "{pages:?}");
+    }
     // Parameters.
     for cdc in [
         CdcParams { min: 63, ..CDC },

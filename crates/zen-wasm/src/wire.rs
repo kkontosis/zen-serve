@@ -116,6 +116,13 @@ wire_fns! {
     zen_proto::PagesGet => "PagesGet", encode_pages_get, decode_pages_get, "encodePagesGet", "decodePagesGet";
     zen_proto::PageData => "PageData", encode_page_data, decode_page_data, "encodePageData", "decodePageData";
     zen_proto::Pages => "Pages", encode_pages, decode_pages, "encodePages", "decodePages";
+    zen_proto::UploadOpen => "UploadOpen", encode_upload_open, decode_upload_open, "encodeUploadOpen", "decodeUploadOpen";
+    zen_proto::UploadSession => "UploadSession", encode_upload_session, decode_upload_session, "encodeUploadSession", "decodeUploadSession";
+    zen_proto::UploadRenew => "UploadRenew", encode_upload_renew, decode_upload_renew, "encodeUploadRenew", "decodeUploadRenew";
+    zen_proto::UploadExpiry => "UploadExpiry", encode_upload_expiry, decode_upload_expiry, "encodeUploadExpiry", "decodeUploadExpiry";
+    zen_proto::UploadClose => "UploadClose", encode_upload_close, decode_upload_close, "encodeUploadClose", "decodeUploadClose";
+    zen_proto::UploadList => "UploadList", encode_upload_list, decode_upload_list, "encodeUploadList", "decodeUploadList";
+    zen_proto::UploadSessions => "UploadSessions", encode_upload_sessions, decode_upload_sessions, "encodeUploadSessions", "decodeUploadSessions";
     zen_proto::ClusterStatus => "ClusterStatus", encode_cluster_status, decode_cluster_status, "encodeClusterStatus", "decodeClusterStatus";
     zen_proto::SvcInfoRequest => "SvcInfoRequest", encode_svc_info_request, decode_svc_info_request, "encodeSvcInfoRequest", "decodeSvcInfoRequest";
     zen_proto::SvcInfo => "SvcInfo", encode_svc_info, decode_svc_info, "encodeSvcInfo", "decodeSvcInfo";

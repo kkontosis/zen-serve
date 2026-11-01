@@ -368,7 +368,8 @@ impl CdcParams {
     }
 }
 
-/// A page of a version-3 manifest: its id, digest and the plaintext bytes its chunks hold.
+/// A page of a version-3 manifest: its id, digest, the plaintext bytes its
+/// chunks hold and how many chunks it lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRefV3 {
     /// The page id.
@@ -377,6 +378,8 @@ pub struct PageRefV3 {
     pub digest: [u8; 32],
     /// Plaintext bytes of its chunks.
     pub bytes: u32,
+    /// Its chunks: 1 to `page_size`.
+    pub count: u32,
 }
 
 /// The body of a version-3 manifest.
@@ -384,9 +387,9 @@ pub struct PageRefV3 {
 pub enum BodyV3 {
     /// `(chunk_id, len)` in file order (form 1).
     Inline(Vec<(Id, u32)>),
-    /// Form-2 pages of `page_size` chunks each, the last possibly shorter (form 2).
+    /// Form-2 pages of 1 to `page_size` chunks each (form 2).
     Paged {
-        /// Chunks per page.
+        /// The most chunks a page holds.
         page_size: u32,
         /// The pages in file order.
         pages: Vec<PageRefV3>,
@@ -443,6 +446,7 @@ impl ManifestV3 {
                     out.extend_from_slice(&p.id);
                     out.extend_from_slice(&p.digest);
                     out.extend_from_slice(&p.bytes.to_be_bytes());
+                    out.extend_from_slice(&p.count.to_be_bytes());
                 }
             }
         }
@@ -498,28 +502,31 @@ impl ManifestV3 {
             2 => {
                 let page_size = r.u32()?;
                 let m = r.u32()? as u64;
-                let want = if n == 0 {
-                    0
-                } else if page_size == 0 {
-                    return Err(Error::Format);
-                } else {
-                    n.div_ceil(page_size as u64)
-                };
-                if m != want || m > (bytes.len() / 52) as u64 {
+                if m > n || m > (bytes.len() / 56) as u64 {
                     return Err(Error::Format);
                 }
                 let mut pages = Vec::with_capacity(m as usize);
-                let mut sum = 0u64;
+                let (mut sum, mut count) = (0u64, 0u64);
                 for _ in 0..m {
                     let p = PageRefV3 {
                         id: r.array()?,
                         digest: r.array()?,
                         bytes: r.u32()?,
+                        count: r.u32()?,
                     };
+                    // 1..=page_size chunks (formats.md §11.3), each 1..=max bytes.
+                    if p.count == 0
+                        || p.count > page_size
+                        || (p.bytes as u64) < p.count as u64
+                        || p.bytes as u64 > p.count as u64 * cdc.max as u64
+                    {
+                        return Err(Error::Format);
+                    }
                     sum += p.bytes as u64;
+                    count += p.count as u64;
                     pages.push(p);
                 }
-                if sum != size {
+                if sum != size || count != n {
                     return Err(Error::Format);
                 }
                 BodyV3::Paged { page_size, pages }
@@ -534,18 +541,6 @@ impl ManifestV3 {
             file_key,
             body,
         })
-    }
-
-    /// The number of chunks page `i` holds: `page_size`, the last fewer.
-    pub fn page_len(&self, i: usize) -> Option<u32> {
-        let BodyV3::Paged { page_size, pages } = &self.body else {
-            return None;
-        };
-        if i >= pages.len() {
-            return None;
-        }
-        let before = i as u64 * *page_size as u64;
-        Some((self.n - before).min(*page_size as u64) as u32)
     }
 }
 
