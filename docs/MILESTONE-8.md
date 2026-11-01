@@ -258,6 +258,29 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 4 plan`
     4. push and open the PR
   * Then implement on "go".
+  * Plan committed (879eca6), PR #68.
+  * **CI on 879eca6:** the pull_request run was green. The push run's `fdb` job failed 3 of 5 zen-server `dump` tests (`export_import_round_trip`, `a_started_server_counts_as_empty`, `a_lagging_store_is_read_again`), all at `dump.rs:94`: the upload-session commit in `populated_on` got 412 `upload_gone`.
+    * **The cause is in the test (8.2's), not the code:**
+      * Session expiry is counted in commit versions (`read_version + ttl × VERSIONS_PER_SEC`).
+      * Embedded versions are unix microseconds (about 1.8e15). The shared FDB test cluster's versions are small.
+      * `migrate_copies_into_another_store` copies an embedded store into that cluster and calls `advance_version` (`dump.rs:362`), which jumps the cluster about 56 years ahead, far past a 7-day ttl (6e11 versions).
+      * The tests in this binary run at once. A session another test opened just before the jump has expired by its next commit. Whether the jump lands in that gap is down to timing, which is why the pull_request run passed.
+      * The binary's other helpers already retry `too_old` and `commit_unknown` for the same jump.
+    * **The fix** (`crates/zen-server/tests/dump.rs` only, its own commit `test(server): dump tests survive a concurrent version jump`):
+      1. In `populated_on`, open the session and commit under it in a bounded loop (50 tries, 200 ms apart, as `call` does). On 412 `upload_gone`, a concurrent jump expired the session, so open a new one and commit again.
+      2. `session_of` takes the session with the highest expiry (the last `ux` entry, since the index sorts by expiry), not the first, so an expired earlier one isn't picked.
+    * **Verification:**
+      1. **Reproduce first:** with a temporary line in `populated_on` that advances the harness's own store by 1e15 versions between the open and the commit (embedded), `cargo test -p zen-server --test dump` fails at `dump.rs:94` with `upload_gone`, as on CI.
+      2. **With the fix:** the same hacked run passes, and the old session is skipped by `session_of`.
+      3. Remove the hack. `cargo test -p zen-server --test dump` passes on embedded, and on local FDB if its cluster starts (disk permitting). `cargo fmt --check`; clippy `--all-targets -D warnings` on zen-server.
+    * Push; CI green on both runs.
+    * **Done:**
+      * **Reproduced:** with the jump forced on embedded (1e15 versions between the open and the commit), 4 of 5 dump tests failed at `dump.rs:94` with `upload_gone`, as on CI.
+      * **The fix:** with the jump still forced, all 5 pass.
+      * **The `session_of` control:** with `find` in place of `rfind` and the jump, `export_import_round_trip` fails at `dump.rs:266`, picking the expired session.
+      * **After removing the hack:** the 5 dump tests pass on embedded; `cargo fmt --check` and clippy `-p zen-server --all-targets -D warnings` are clean.
+      * **Not run:** local FDB, given about 2.7 GB of disk free; CI's `fdb` job runs it.
+    * **A note for 8.7's OPS pitfalls** (no code change): a cross-backend `migrate` or `import` changes the version scale, so upload sessions (like leases) may read as expired on the target, and their uploads start over.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
