@@ -155,39 +155,58 @@ async fn populated_on(h: Harness) -> (Harness, Vec<u8>, CommitResult) {
             Err(e) => panic!("/v1/lease: {e:?}"),
         }
     }
-    // An upload session holding a chunk (keyspace.md §3.6).
-    let up: UploadSession = call(
-        &h,
-        "/v1/fs/upload/open",
-        &tok,
-        &UploadOpen {
-            fs: 1,
-            ttl_secs: None,
-        },
-    )
-    .await;
-    let c = Commit {
-        commit_id: cid(3),
-        chunks: vec![ChunkPut {
-            fs: 1,
-            id: vec![0xAB; 16],
-            data: vec![1; 40],
-        }],
-        upload: Some(UploadRef {
-            fs: 1,
-            session: up.session,
-        }),
-        ..Default::default()
-    };
-    let _: CommitResult = call(&h, "/v1/commit", &tok, &c).await;
-    (h, tok, r)
+    // An upload session holding a chunk (keyspace.md §3.6). Its expiry is
+    // counted in versions, and a migrate into the shared FoundationDB
+    // cluster jumps its version far past it: a session that reads as gone
+    // was expired by such a jump, and a new one is opened.
+    for attempt in 0..50u8 {
+        let up: UploadSession = call(
+            &h,
+            "/v1/fs/upload/open",
+            &tok,
+            &UploadOpen {
+                fs: 1,
+                ttl_secs: None,
+            },
+        )
+        .await;
+        let c = Commit {
+            commit_id: cid(100 + attempt),
+            chunks: vec![ChunkPut {
+                fs: 1,
+                id: vec![0xAB; 16],
+                data: vec![1; 40],
+            }],
+            upload: Some(UploadRef {
+                fs: 1,
+                session: up.session,
+            }),
+            ..Default::default()
+        };
+        match h
+            .call::<_, CommitResult>("/v1/commit", Some(&tok), &c)
+            .await
+        {
+            Ok(_) => return (h, tok, r),
+            Err((412, e)) if e.code == "upload_gone" => {}
+            // Unknown or too old: the same commit again, under the same session.
+            Err((409, e)) if e.code == "too_old" || e.code == "commit_unknown" => {
+                let _: CommitResult = call(&h, "/v1/commit", &tok, &c).await;
+                return (h, tok, r);
+            }
+            Err(e) => panic!("/v1/commit: {e:?}"),
+        }
+    }
+    panic!("/v1/commit: every upload session expired at once");
 }
 
-/// The one upload session of [`populated`].
+/// The upload session of [`populated`] that holds its chunk: the one
+/// expiring last (`ux` sorts by expiry), since an earlier one may have
+/// expired at a version jump.
 async fn session_of(s: &dyn Storage) -> Vec<u8> {
     let pfx = zen_server::keys::upload_expiry(1).finish();
     let all = everything(s).await;
-    let (k, _) = all.iter().find(|(k, _)| k.starts_with(&pfx)).expect("ux");
+    let (k, _) = all.iter().rfind(|(k, _)| k.starts_with(&pfx)).expect("ux");
     let (elems, _) = zen_store::tuple::unpack_prefix(&k[pfx.len()..], 2).unwrap();
     match &elems[1] {
         zen_store::tuple::Elem::Bytes(s) => s.clone(),
