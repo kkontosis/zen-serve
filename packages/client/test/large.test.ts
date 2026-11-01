@@ -2,7 +2,7 @@
 // the fs file-key policy (formats.md §11.3–11.6, §12; fs.md §4.1–4.2). The
 // server's max_value_bytes is 2,048, so chunks are 1,984 bytes, a page
 // holds 127 ids and an inline manifest about 60.
-import type { ChunkPut, PagePut } from '@zen/wasm';
+import type { ChunkPut, ManifestV2, PagePut } from '@zen/wasm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   bytes,
@@ -82,7 +82,7 @@ describe('paged files', () => {
     for (const src of [data, gen(), stream]) {
       const f = await t.create(ROOT, `f${Math.random()}`);
       const r = await t.writeFile(f, src);
-      expect(r.manifest.chunkSize).toBe(CS);
+      expect(r.manifest.version === 2 && r.manifest.chunkSize).toBe(CS);
       expect(r.manifest.pages?.length).toBe(4);
       expect(r.pagesUploaded).toBe(4);
       const [v] = await t.versions(f);
@@ -288,7 +288,7 @@ describe('the file-key policy (fs.md §4.2)', () => {
     const w1 = await t.writeFile(f, data);
     expect(w1.manifest.fileKey).toBeUndefined();
     const [v] = await t.versions(f);
-    const id = v!.manifest.chunks![0]!;
+    const id = (v!.manifest as ManifestV2).chunks![0]!;
     const sealed = (
       await w.session.call('/v1/fs/chunks/get', zw.encodeChunksGet, zw.decodeChunks, {
         fs: 2,
@@ -314,7 +314,7 @@ describe('the file-key policy (fs.md §4.2)', () => {
     expect(w1.manifest.fileKey).toBeDefined();
     expect(equal(w1.manifest.fileKey!, w2.manifest.fileKey!)).toBe(false);
     // f's chunks don't open under g's key.
-    const id = w1.index.chunks[0]!;
+    const id = w1.index!.chunks[0]!;
     const sealed = (
       await w.session.call('/v1/fs/chunks/get', zw.encodeChunksGet, zw.decodeChunks, {
         fs: 2,
@@ -338,7 +338,7 @@ describe('the file-key policy (fs.md §4.2)', () => {
       const node = await t.create(ROOT, name);
       const data = random(3 * CS);
       const r = await t.writeFile(node, data);
-      files.set(name, { node, data, key: r.manifest.fileKey!, index: r.index });
+      files.set(name, { node, data, key: r.manifest.fileKey!, index: r.index! });
     };
     for (const n of ['rw-prev', 'rw-whole', 'eager', 'keep']) await setup(n);
     await rotate();
@@ -451,14 +451,14 @@ describe('sealing without sending (Tree.seal), known chunks', () => {
     const data = random(300 * CS);
     const w1 = await t.writeFile(f, data);
     expect(w1.manifest.pages!.length).toBe(3);
-    const ix = w1.index;
+    const ix = w1.index!;
     const at = 150 * CS + 10; // chunk 150, page 1
     const next = data.slice();
     next[at]! ^= 0xff;
     async function* src() {
       for (let i = 0; i < ix.chunks.length; i++) {
         if (i === 150) yield next.subarray(i * CS, (i + 1) * CS);
-        else yield { id: ix.chunks[i]!, hash: ix.hashes[i]!, size: CS };
+        else yield { id: ix.chunks[i]!, hash: ix.hashes![i]!, size: CS };
       }
     }
     const w2 = await t.writeFile(f, src(), { previous: ix, replaces: [w1.dot] });
@@ -473,12 +473,15 @@ describe('sealing without sending (Tree.seal), known chunks', () => {
     await expect(t.writeFile(f, bad(), { previous: w2.index })).rejects.toMatchObject({
       code: 'bad_value',
     });
+    // A known chunk off a block boundary is fetched and cut again.
     const mid = async function* () {
       yield new Uint8Array(10);
-      yield { id: ix.chunks[1]!, hash: ix.hashes[1]!, size: CS };
+      yield { id: ix.chunks[1]!, hash: ix.hashes![1]!, size: CS };
     };
-    await expect(t.writeFile(f, mid(), { previous: ix })).rejects.toMatchObject({
-      code: 'bad_value',
-    });
+    const r = await calls(w.session, () => t.writeFile(f, mid(), { previous: ix }));
+    expect(r.count.get('/v1/fs/chunks/get')).toBe(1);
+    expect(
+      equal(await t.readFile(f), bytes.concat(new Uint8Array(10), data.subarray(CS, 2 * CS))),
+    ).toBe(true);
   });
 });

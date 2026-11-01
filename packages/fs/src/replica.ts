@@ -1362,6 +1362,7 @@ export class Replica {
     const chunks: Uint8Array[] = [];
     const pages: Uint8Array[] = [];
     const u = await this.tree.seal(node, data, {
+      chunking: 'fixed',
       ...(previous ? { previous } : {}),
       sink: async (cs, ps) => {
         for (const c of cs) {
@@ -1661,7 +1662,10 @@ export class Replica {
         node.id,
         base,
         flags,
-        base?.manifest.chunkSize ?? (await this.chunkSize()),
+        // Fixed chunks until the replica cuts by content (milestone 8 step 4):
+        // a base of variable chunks is rewritten whole on its first flush.
+        (base && base.manifest.version !== 3 ? base.manifest.chunkSize : undefined) ??
+          (await this.chunkSize()),
       );
       if (flags === 'w') await h.truncate(0);
       return h;

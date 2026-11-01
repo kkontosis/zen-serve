@@ -175,6 +175,61 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 3 plan`
     4. push and open the PR
   * Then implement on "go".
+  * Plan committed (4432212), PR #67.
+  * `spec:` commit 2da7ba3 (formats.md §11.3; zen-core; wasm; `fs.json`'s v3 paged vector, 2 lines):
+    * v3 pages hold 1 to `page_size` chunks, and each page reference carries its `count` (56 B a page)
+    * the decoder refuses a count of 0 or above `page_size`, counts not summing to `n`, and a page's `bytes` below its count or above `count × max`
+    * the fill rule for writers, and the repack
+  * The devices fix: 16d1c67 (`world()` starts the server on a runtime of its own); the FUSE device tests pass locally.
+  * **wasm:** encoders for the seven upload-session types (`wire.rs`).
+  * **Client:**
+    * `tree.ts`:
+      * reading v1–v3 (`layout`, `spans`, `entries`, `pagesOf` with per-form checks, `readStream` in 4 MiB windows with `readAhead`)
+      * `writeFile`/`upload`/`seal` through the new stager
+      * `edit`, `editUpload`, `append`, `uploads`, `closeUpload`
+      * `send(…, upload)`
+      * the types: `Chunking`, `FileManifest`, `KnownPage`, `Edit`, `TailEntry`, `UploadCommit`, `UploadSessionInfo`, `EditOptions`, the compact `UploadState`, and optional `ChunkIndex.hashes`/`WrittenFile.index`
+    * new `writer.ts`:
+      * the fixed and CDC cutters
+      * known chunks and pages, aligned or fetched from the base
+      * pages with the fill rule and the realigning of pages with `previous`'s
+      * pipelined commits reported in order
+      * sessions
+      * `editSource`
+  * **Callers:**
+    * `@zen/fs`: `sealWrite` writes `chunking: 'fixed'`; a v3 base gets the default chunk size; optional hashes in the handle
+    * kanban's worker prints `onProgress`'s second argument
+  * **Changes from the plan:**
+    * **Page references carry a `count`.** Without it a writer taking a page over unread doesn't know `n`, and a page wholly inside a removed range would have to be fetched to count it.
+    * **The form follows `base` or `previous`** (unless `chunking` or `chunkSize` is given), so a write with a fixed index under the CDC default keeps reusing its chunks; the policy applies to writes with neither.
+    * **A commit carrying pages waits for the commits before it:** the server refuses a page whose chunks it hasn't applied (`unknown chunk in page`).
+    * **Progress is reported through a promise chain,** so a commit is reported as soon as it and every earlier one are done, not when the pipeline next fills.
+    * **A known chunk off a cut is fetched and cut again** (it was `bad_value`), also with only `previous` (its key opens it). `large.test.ts`'s mid-block case now checks that.
+    * **`KnownChunk.last`** marks the base's last chunk, so the writer doesn't fetch the last page to recognise it.
+    * **The writeFile path closes a page where a page of `previous` ends** (under the fill rule), so an insertion re-uploads at most 2 pages.
+    * **`WriteOptions.size`** takes precedence over a `Uint8Array`'s length for the capacity check.
+  * **Tests:**
+    * new `cdc.test.ts`, 12:
+      * round trips
+      * an insertion (≤ 3 chunks, ≤ 2 pages, at 3 places)
+      * an append (1 page and 1 chunk read, v3 and v2)
+      * edits (touched pages only; random multi-edit rounds keep the fill property; truncation; refusals)
+      * the fill rule's merge (deterministic, chunk-aligned cuts)
+      * random reads and streams over v1, v2, v3 and after a repack
+      * refusals (page bytes or count off, a swapped page, foreign known items)
+      * pipelining (order, a failure at commit 4, resume)
+      * the policy and its fallbacks (capacity, `size`, no parameters, no `fs_cdc`)
+      * sessions (a resume past the grace with one and without one, an expired one is 412, `writeFile` closes its own)
+    * `tree.test.ts` pins its chunk-counting tests to `chunking: 'fixed'`
+    * `large.test.ts` (typing, the mid-block case)
+    * a new `@zen/fs` writes test: a v3 file read and edited through the replica, flushed as v2, then reused
+  * **Negative controls** (each run once, then restored):
+    * pages located by division: the random-reads test fails
+    * known chunks taken over off a cut: the edit test reads back wrong
+    * the fill rule's merge off: the fill-rule test fails (5 pages, not 4); with random edits alone it was caught only sometimes, hence the deterministic test
+    * `upload` left out of commits: the session test fails (`unknown chunk in page` on resume)
+    * progress reported as commits finish: the pipelining test fails (`[2, 3, 1, 5, 6]`)
+  * **Checks:** `cargo fmt`; clippy on zen-core, zen-wasm (wasm32) and zen-ublk (`device-tests`); `cargo test -p zen-core --features test-utils`; vectors regenerated; `scripts/build-wasm.sh`; `npm run check` (biome and every tsc project); `cdc`, `large`, `tree`, `fsvectors` and `stream` suites.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

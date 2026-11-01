@@ -263,7 +263,8 @@ describe('large files and limits', () => {
     const t = a.tree(Tree.newId());
     const f = await t.create(ROOT, 'big.bin');
     const data = random(10 * 65536 + 1000); // 11 chunks, 4 per commit
-    const w1 = await t.writeFile(f, data);
+    const fixed = { chunking: 'fixed' } as const;
+    const w1 = await t.writeFile(f, data, fixed);
     expect(w1.uploaded).toBe(11);
     expect(w1.commits).toBe(3);
     expect(w1.manifest.size).toBe(data.length);
@@ -280,10 +281,10 @@ describe('large files and limits', () => {
     // Change one byte in chunk 3: only that chunk is uploaded again.
     const next = data.slice();
     next[3 * 65536 + 7]! ^= 1;
-    const w2 = await t.writeFile(f, next, { previous: w1.index, replaces: [w1.dot] });
+    const w2 = await t.writeFile(f, next, { ...fixed, previous: w1.index, replaces: [w1.dot] });
     expect(w2.uploaded).toBe(1);
     expect(w2.commits).toBe(1);
-    expect(w2.index.chunks.filter((c, i) => equal(c, w1.index.chunks[i]!)).length).toBe(10);
+    expect(w2.index!.chunks.filter((c, i) => equal(c, w1.index!.chunks[i]!)).length).toBe(10);
     expect(equal(await b.tree(t.id).readFile(f), next)).toBe(true);
 
     // An index built from a version read back reuses as well.
@@ -291,7 +292,7 @@ describe('large files and limits', () => {
     const idx = await t.chunkIndex(f, v2);
     const appended = new Uint8Array(next.length + 70000);
     appended.set(next);
-    const w3 = await t.writeFile(f, appended, { previous: idx });
+    const w3 = await t.writeFile(f, appended, { ...fixed, previous: idx });
     // The old last chunk (1000 bytes) is now full; it and the new tail upload.
     expect(w3.uploaded).toBe(2);
     expect(equal(await t.readFile(f), appended)).toBe(true);
@@ -304,7 +305,7 @@ describe('large files and limits', () => {
     async function* pieces() {
       for (let i = 0; i < data.length; i += 7777) yield data.subarray(i, i + 7777);
     }
-    const r = await t.writeFile(f, pieces());
+    const r = await t.writeFile(f, pieces(), { chunking: 'fixed' });
     expect(r.manifest.chunks!.length).toBe(5);
     expect(equal(await t.readFile(f), data)).toBe(true);
     // An empty file.
@@ -423,14 +424,14 @@ describe('tree operations in transactions', () => {
     const t = a.tree(Tree.newId());
     const f = await t.create(ROOT, 'f');
     const data = random(150_000);
-    const up = await t.upload(f, data);
+    const up = await t.upload(f, data, { chunking: 'fixed' });
     expect(up.uploaded).toBe(3);
     expect(up.commits).toBeGreaterThanOrEqual(1);
     // Not written yet.
     expect((await t.versions(f)).length).toBe(0);
     await a.transaction(async (tx) => {
       await t.writeIn(tx, [await t.writeOp(up)]);
-      tx.set(['file-index'], up.index.hashes[0]!);
+      tx.set(['file-index'], up.index!.hashes![0]!);
     });
     expect(equal(await t.readFile(f), data)).toBe(true);
     // The next write reuses unchanged chunks through `previous`.

@@ -176,7 +176,7 @@ export class FileHandle {
         baseLen === this.expected(i) &&
         i * cs + baseLen <= this.baseLimit
       ) {
-        yield { id: ix.chunks[i]!, hash: ix.hashes[i]!, size: baseLen };
+        yield { id: ix.chunks[i]!, ...(ix.hashes ? { hash: ix.hashes[i]! } : {}), size: baseLen };
       } else {
         yield await this.chunk(i);
       }

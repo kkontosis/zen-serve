@@ -1,29 +1,33 @@
 // The CRDT filesystem: tree operations, files, chunks and the change feed
 // (spec/fs.md, api.md §6 and §12, formats.md §11).
 import type {
+  AnyPage,
+  CdcParams,
   ChunkPut,
   CommitResult,
   CrdtOp,
-  FsPolicy,
   Info,
   Limits,
   ManifestV2,
+  ManifestV3,
   NodeMeta,
   NodeState,
   PagePut,
   PageRef,
+  PageRefV3,
   StateNode,
+  UploadRef,
   Versions,
   AnyManifest as WasmAnyManifest,
 } from '@zen/wasm';
-import { compare, equal, hex, randomBytes } from './bytes.js';
+import { compare, concat, equal, hex, randomBytes } from './bytes.js';
 
-/**
- * A manifest this client reads: version 1 or 2 (formats.md §11.3). A
- * version-3 manifest (variable chunks, milestone 8) is refused until the
- * client reads it.
- */
-export type AnyManifest = Exclude<WasmAnyManifest, { version: 3 }>;
+/** A manifest of any version (formats.md §11.3): 1, 2 (fixed chunks) or 3 (content-defined). */
+export type AnyManifest = WasmAnyManifest;
+/** A manifest this client writes: version 2 (fixed chunks) or 3 (content-defined). */
+export type FileManifest = ManifestV2 | ManifestV3;
+/** How a file's content is cut into chunks (formats.md §11.7, §12). */
+export type Chunking = 'fixed' | 'cdc';
 
 import type { Client } from './client.js';
 import type { TreeClock } from './clock.js';
@@ -32,6 +36,16 @@ import type { UnlockedFs } from './fs.js';
 import { sendCommit, type Transaction } from './kv.js';
 import type { Session } from './session.js';
 import { zw } from './wasm.js';
+import {
+  editSource,
+  locate,
+  OP_OVERHEAD,
+  overflows,
+  type Staged,
+  sha256,
+  splitBy,
+  stage,
+} from './writer.js';
 
 /** The root of every tree (formats.md §11). */
 export const ROOT: Uint8Array = new Uint8Array(16);
@@ -41,13 +55,14 @@ export const TRASH: Uint8Array = new Uint8Array(16).fill(0xff);
 /** The plaintext chunk size clients use (fs.md §4.1). */
 export const CHUNK_SIZE = 65536;
 
-const OP_OVERHEAD = 512; // per commit operation, as the server counts (api.md §6)
 const MAX_GET_NODES = 1000;
 const MAX_GET_CHUNKS = 64;
 const MAX_GET_PAGES = 64;
 const FETCH_PARALLEL = 4;
-/** Chunks a `readStream` pull fetches at once. */
-const STREAM_WINDOW = 64;
+/** Plaintext bytes a `readStream` window covers (rounded out to whole chunks). */
+const STREAM_WINDOW = 4 << 20;
+/** Windows `readStream` fetches ahead by default. */
+const READ_AHEAD = 3;
 /** Decoded pages kept per tree. */
 const PAGE_MEMO = 256;
 
@@ -90,14 +105,17 @@ export interface NodeStat extends TreeNode {
 
 /**
  * One content version of a file, its manifest opened and checked. The
- * manifest is version 1 (old writers) or 2 (formats.md §11.3): inline or
- * paged, its chunks under the fs keys or a file key of its own.
+ * manifest is version 1 (old writers), 2 (fixed chunks) or 3 (chunks cut
+ * by content), formats.md §11.3: inline or paged, its chunks under the fs
+ * keys or a file key of its own.
  */
 export interface FileVersion {
   dot: Uint8Array;
   /** The writing device's fingerprint. */
   device: Uint8Array;
   manifest: AnyManifest;
+  /** `fixed` (versions 1 and 2) or `cdc` (version 3). */
+  chunking: Chunking;
   /** Chunk ids in file order when inline (equal to the manifest's); empty when paged. */
   chunks: Uint8Array[];
   /** Page ids in file order when paged (equal to the manifest's); empty when inline. */
@@ -111,43 +129,86 @@ export interface FileVersion {
 }
 
 /**
- * What a writer knows of a version's plaintext, for chunk reuse: a SHA-256
- * per chunk, kept in memory only (never sent). `writeFile` returns one for
- * what it wrote; `chunkIndex` builds one from a version's bytes.
+ * What a writer knows of a version's content, for reuse: its chunk ids and
+ * lengths, and a SHA-256 per chunk when its plaintext was seen, kept in
+ * memory only (never sent). `writeFile` returns one for what it wrote;
+ * `chunkIndex` builds one from a version (its bytes, or only its pages).
  */
 export interface ChunkIndex {
-  chunkSize: number;
+  /** Fixed chunks: plaintext bytes per chunk. Absent under CDC. */
+  chunkSize?: number;
+  /** CDC: the chunker's parameters. */
+  cdc?: CdcParams;
   chunks: Uint8Array[];
-  hashes: Uint8Array[];
+  /** Plaintext lengths (CDC). */
+  lens?: number[];
+  /** Plaintext SHA-256s; absent when not every chunk's plaintext was seen. */
+  hashes?: Uint8Array[];
   /** The file key the chunks are sealed under; absent: under the fs keys. */
   fileKey?: Uint8Array;
   /** The file key's epoch. */
   keyEpoch?: number;
-  /** Ids per page, when the version is paged: pages whose ids didn't change are reused. */
+  /** The most ids per page, when the version is paged: pages whose ids didn't change are reused. */
   pageSize?: number;
-  pages?: PageRef[];
+  pages?: (PageRef | PageRefV3)[];
 }
 
 /**
- * A chunk of the `previous` version taken over as is, without its
- * plaintext (its id, SHA-256 and size, from that version's index). It
- * must start at a chunk boundary and be whole, unless it is the last.
+ * A chunk of the base version (`previous`, or `base`) taken over without
+ * its plaintext. Where it doesn't fall on a cut of the new content, the
+ * writer fetches its plaintext and cuts it again (resyncing with the base).
  */
 export interface KnownChunk {
   id: Uint8Array;
-  hash: Uint8Array;
+  /** Its plaintext SHA-256, when known (from an index). */
+  hash?: Uint8Array;
   size: number;
+  /**
+   * Whether it is the base's last chunk (cut by the end of the file, not
+   * its content, so taken over only if it stays last); default looked up.
+   */
+  last?: boolean;
+}
+
+/**
+ * A whole page of the base version (`WriteOptions.base`) taken over
+ * without fetching it, when it falls on a cut; otherwise the writer
+ * fetches it and takes its chunks over one by one.
+ */
+export interface KnownPage {
+  page: PageRef | PageRefV3;
 }
 
 /**
  * A file's content: bytes, or a stream of byte arrays of any sizes, which
- * may hold known chunks of the previous version.
+ * may hold known chunks and pages of the base version.
  */
 export type FileSource =
   | Uint8Array
-  | AsyncIterable<Uint8Array | KnownChunk>
-  | Iterable<Uint8Array | KnownChunk>
+  | AsyncIterable<Uint8Array | KnownChunk | KnownPage>
+  | Iterable<Uint8Array | KnownChunk | KnownPage>
   | ReadableStream<Uint8Array>;
+
+/** A change of `Tree.edit`: `remove` bytes at `offset` of the base, then `insert` there. */
+export interface Edit {
+  offset: number;
+  remove?: number;
+  insert?: Uint8Array;
+}
+
+/** An entry of an upload's tail (`UploadState.tail`). */
+export interface TailEntry {
+  id: Uint8Array;
+  len: number;
+  hash?: Uint8Array;
+}
+
+/** An open upload session (api.md §12.1). */
+export interface UploadSessionInfo {
+  session: Uint8Array;
+  /** Its expiry on the server's clock (unix ms). */
+  expiresMs: number;
+}
 
 /** Options of `writeFile`. */
 export interface WriteOptions {
@@ -160,42 +221,82 @@ export interface WriteOptions {
   replaces?: Uint8Array[] | 'current';
   /** The previous version's chunk index: chunks whose bytes didn't change keep their ids. */
   previous?: ChunkIndex;
-  /** Plaintext bytes per chunk (default 64 KiB, or less on a server with a small `max_value_bytes`). */
+  /**
+   * The version the source's known pages (and known chunks) are of; their
+   * plaintext is fetched from it where they don't fall on a cut.
+   */
+  base?: FileVersion;
+  /**
+   * `fixed` or `cdc` (default: `fixed` when `chunkSize` is given, else the
+   * form of `base` or `previous`, so their chunks are reused, else the fs
+   * policy). `cdc` falls back to `fixed` on a server without `fs_cdc`,
+   * with no chunker parameters for its `max_value_bytes`, or for a known
+   * size past what a CDC version holds.
+   */
+  chunking?: Chunking;
+  /** Fixed: plaintext bytes per chunk (default 64 KiB, or less on a server with a small `max_value_bytes`). */
   chunkSize?: number;
+  /** CDC: the chunker's parameters (default those of `base` or `previous`, else `TreeOptions.cdc`, else `cdcDefaults`). */
+  cdc?: CdcParams;
+  /** The content's size, when known ahead (a `Uint8Array` is): picks `fixed` past the CDC capacity. */
+  size?: number;
+  /** Upload commits in flight at once (default 3, 1–8). */
+  parallel?: number;
+  /**
+   * Upload under an upload session (api.md §12.1), so the content is kept
+   * past `chunk_grace_secs` until the write: `writeFile` closes it after
+   * the write; `upload` leaves it open (`Upload.session`, `closeUpload`).
+   */
+  session?: boolean;
+  /** The session's lifetime (default the server's `upload_ttl_secs`); renewed as the upload goes. */
+  sessionTtlSecs?: number;
 }
 
 /**
  * Where an `upload` stands after a commit: plain data to keep (it holds the
  * file key, so keep it sealed, e.g. on a `SealedStore`) and to pass as
  * `resume` with the rest of the source. Everything in it is on the server.
+ * Its size is the pages done plus at most one page of chunks.
  */
 export interface UploadState {
   node: Uint8Array;
-  chunkSize: number;
-  /** Bytes uploaded so far: whole chunks, until the end of the file. */
+  chunking: Chunking;
+  /** Fixed: bytes per chunk. */
+  chunkSize?: number;
+  /** CDC: the chunker's parameters. */
+  cdc?: CdcParams;
+  /** Bytes uploaded so far: up to a cut (a chunk's end). */
   size: number;
-  /** Chunk ids so far, in file order. */
-  chunks: Uint8Array[];
-  /** Their SHA-256s. */
-  hashes: Uint8Array[];
-  /** The full pages uploaded or reused so far (paged files). */
-  pages: PageRef[];
+  /** The pages done (paged files). */
+  pages: (PageRef | PageRefV3)[];
+  /** The chunks since the last page (all of them while the file is inline). */
+  tail: TailEntry[];
+  /** Whether the file is paged. */
+  paged: boolean;
   /** The file key and its epoch; absent: chunks under the fs keys. */
   fileKey?: Uint8Array;
   keyEpoch?: number;
+  /** The upload session, when the upload has one. */
+  session?: Uint8Array;
   uploaded: number;
   pagesUploaded: number;
   commits: number;
 }
 
+/** What one upload commit put (the second argument of `onProgress`). */
+export interface UploadCommit {
+  chunks: Uint8Array[];
+  pages: Uint8Array[];
+}
+
 /** Options of `upload`. */
 export interface UploadOptions extends Omit<WriteOptions, 'replaces'> {
-  /** Called after each commit of the upload. */
-  onProgress?: (state: UploadState) => void | Promise<void>;
+  /** Called after each commit of the upload, in commit order. */
+  onProgress?: (state: UploadState, commit: UploadCommit) => void | Promise<void>;
   /**
    * Continue an upload from its last `onProgress` state; the source is then
    * the rest of the file, from `state.size`. Works while the uploaded chunks
-   * are within `chunk_grace_secs`.
+   * are within `chunk_grace_secs`, or while its session is open.
    */
   resume?: UploadState;
   /**
@@ -209,9 +310,12 @@ export interface UploadOptions extends Omit<WriteOptions, 'replaces'> {
 export interface WrittenFile {
   /** The new version's dot. */
   dot: Uint8Array;
-  manifest: ManifestV2;
-  /** The new content's index, for the next write's `previous`. */
-  index: ChunkIndex;
+  manifest: FileManifest;
+  /**
+   * The new content's index, for the next write's `previous`; absent when
+   * the write took pages over unread (`edit`), or resumed past a page.
+   */
+  index?: ChunkIndex;
   /** Chunks uploaded (the rest were reused). */
   uploaded: number;
   /** Pages uploaded (the rest were reused); 0 when inline. */
@@ -223,19 +327,29 @@ export interface WrittenFile {
 /** A file's content uploaded by `Tree.upload`, not yet written to its node. */
 export interface Upload {
   node: Uint8Array;
-  manifest: ManifestV2;
+  manifest: FileManifest;
   /** The manifest sealed for this tree and node. */
   sealedManifest: Uint8Array;
-  /** The content's index, for the next write's `previous`. */
-  index: ChunkIndex;
+  /** The content's index, for the next write's `previous` (absent as in `WrittenFile`). */
+  index?: ChunkIndex;
   /** Page ids when paged (the write lists these, not the chunks); empty when inline. */
   pages: Uint8Array[];
   /** Chunks uploaded (the rest were reused). */
   uploaded: number;
   /** Pages uploaded (the rest were reused). */
   pagesUploaded: number;
+  /** Chunk ids when inline (the write lists these); empty when paged. */
+  chunks: Uint8Array[];
   /** Commits the upload took. */
   commits: number;
+  /** The upload session it was uploaded under, still open (close it after the write). */
+  session?: Uint8Array;
+}
+
+/** Options of `edit` and `append`. */
+export interface EditOptions extends WriteOptions {
+  /** Re-cut every page full (the writer does this itself when a version would overflow). */
+  repack?: boolean;
 }
 
 /** Options of `readStream`. */
@@ -246,6 +360,8 @@ export interface ReadStreamOptions {
   offset?: number;
   /** Bytes to read (default to the end). */
   length?: number;
+  /** Windows (of about 4 MiB) fetched ahead (default 3). */
+  readAhead?: number;
 }
 
 /** Operations with their timestamps assigned (`Tree.prepare`). */
@@ -326,6 +442,8 @@ export interface TreeOptions {
   pageCache?: ChunkCache;
   /** Where the server's `/v1/info` comes from (e.g. kept for offline use); default read once per client. */
   info?: () => Promise<Info>;
+  /** The chunker's parameters for new content under CDC (default `cdcDefaults(max_value_bytes)`). */
+  cdc?: CdcParams;
 }
 
 /** Metadata given to `mkdir` / `create`. */
@@ -549,19 +667,16 @@ export class Tree {
   /** Open wire versions of `node` (from `fetchVersions`, or kept by a replica). */
   openVersions(node: Uint8Array, r: Versions): FileVersion[] {
     return r.versions.map((v) => {
-      const opened = this.fs.keysFor(v.manifest).openAnyManifest(this.id, node, v.manifest);
-      if (opened.version === 3) {
-        throw new ZenError(0, 'format', 'a version-3 manifest: this client reads versions 1 and 2');
-      }
-      const manifest: AnyManifest = opened;
+      const manifest = this.fs.keysFor(v.manifest).openAnyManifest(this.id, node, v.manifest);
       const chunks = v.chunks ?? [];
       const pages = v.pages ?? [];
-      const inline = manifest.chunks;
+      const inline = inlineIds(manifest);
+      const refs = pageRefsOf(manifest);
       const same = inline
         ? !pages.length && sameIds(inline, chunks)
         : !chunks.length &&
           sameIds(
-            (manifest as ManifestV2).pages!.map((p) => p.id),
+            refs!.map((p) => p.id),
             pages,
           );
       if (!same)
@@ -570,6 +685,7 @@ export class Tree {
         dot: v.dot,
         device: v.device,
         manifest,
+        chunking: manifest.version === 3 ? 'cdc' : 'fixed',
         chunks,
         pages,
         size: manifest.size,
@@ -589,6 +705,11 @@ export class Tree {
     const v = all.find((x) => equal(x.dot, version));
     if (!v) throw new ZenError(404, 'not_found', 'no such version');
     return v;
+  }
+
+  /** The newest version of `node` (or the one given by its dot); undefined when it has no content. */
+  version(node: Uint8Array, version?: FileVersion | Uint8Array): Promise<FileVersion | undefined> {
+    return this.pickVersion(node, version);
   }
 
   /**
@@ -618,98 +739,240 @@ export class Tree {
   ): Promise<Uint8Array> {
     const v = await this.pickVersion(node, version);
     if (!v) return new Uint8Array(0);
-    const { size, chunkSize } = v.manifest;
-    const end = Math.min(size, offset + length);
+    const end = Math.min(v.size, offset + length);
     if (offset >= end) return new Uint8Array(0);
-    const first = Math.floor(offset / chunkSize);
-    const last = Math.floor((end - 1) / chunkSize);
-    const ids = await this.chunkIds(v, first, last);
-    const data = await this.fetchChunks(ids, v);
+    return this.readSpans(v, await this.spans(v, offset, end), offset, end);
+  }
+
+  /** Bytes `offset..end` from the chunks `spans` (which cover them). */
+  private async readSpans(
+    v: FileVersion,
+    spans: Span[],
+    offset: number,
+    end: number,
+  ): Promise<Uint8Array> {
+    const data = await this.fetchChunks(
+      spans.map((s) => s.id),
+      v,
+    );
     const out = new Uint8Array(end - offset);
-    for (let i = first; i <= last; i++) {
-      const plain = data.get(hex(ids[i - first]!))!;
-      const want = i === v.chunkCount - 1 ? size - i * chunkSize : chunkSize;
-      if (plain.length !== want) throw new ZenError(0, 'format', `chunk ${i} has the wrong size`);
-      const start = i * chunkSize;
-      const from = Math.max(offset, start) - start;
-      const to = Math.min(end, start + want) - start;
-      out.set(plain.subarray(from, to), start + from - offset);
+    for (const s of spans) {
+      const plain = data.get(hex(s.id))!;
+      if (plain.length !== s.len) {
+        throw new ZenError(0, 'format', `the chunk at byte ${s.start} has the wrong size`);
+      }
+      const from = Math.max(offset, s.start) - s.start;
+      const to = Math.min(end, s.start + s.len) - s.start;
+      out.set(plain.subarray(from, to), s.start + from - offset);
     }
     return out;
   }
 
   /**
-   * A version's bytes as a stream, fetched lazily a window of chunks at a
-   * time (and their pages as they are reached), so memory stays at one
-   * window. Cancel it to stop fetching.
+   * A version's bytes as a stream, fetched lazily in windows of about
+   * 4 MiB (whole chunks), `readAhead` windows ahead (default 3), so memory
+   * stays at a few windows. Cancel it to stop fetching.
    */
   readStream(node: Uint8Array, opts: ReadStreamOptions = {}): ReadableStream<Uint8Array> {
     let v: FileVersion | undefined;
-    let pos = opts.offset ?? 0;
     let end = 0;
+    let next = opts.offset ?? 0;
     let started = false;
+    let cancelled = false;
+    const ahead = Math.max(0, opts.readAhead ?? READ_AHEAD);
+    const queue: Promise<Uint8Array>[] = [];
+    const plan = async () => {
+      while (!cancelled && next < end && queue.length <= ahead) {
+        const a = next;
+        const spans = await this.spans(v!, a, Math.min(end, a + STREAM_WINDOW));
+        const last = spans.at(-1)!;
+        const b = Math.min(end, last.start + last.len);
+        next = b;
+        const p = this.readSpans(v!, spans, a, b);
+        p.catch(() => {});
+        queue.push(p);
+      }
+    };
     return new ReadableStream<Uint8Array>({
       pull: async (ctl) => {
         if (!started) {
           started = true;
           v = await this.pickVersion(node, opts.version);
-          end = v ? Math.min(v.size, opts.length === undefined ? v.size : pos + opts.length) : 0;
+          end = v ? Math.min(v.size, opts.length === undefined ? v.size : next + opts.length) : 0;
         }
-        if (!v || pos >= end) {
+        if (v) await plan();
+        const p = queue.shift();
+        if (!p) {
           ctl.close();
           return;
         }
-        const cs = v.manifest.chunkSize;
-        const upto = Math.min(end, (Math.floor(pos / cs) + STREAM_WINDOW) * cs);
-        const part = await this.read(node, v, pos, upto - pos);
-        pos += part.length;
-        ctl.enqueue(part);
+        ctl.enqueue(await p);
+      },
+      cancel: () => {
+        cancelled = true;
+        queue.length = 0;
       },
     });
   }
 
-  /** The chunk ids `first..=last` of a version, through its pages when paged. */
-  async chunkIds(v: FileVersion, first: number, last: number): Promise<Uint8Array[]> {
+  private readonly layouts = new WeakMap<object, Layout>();
+
+  /**
+   * Where each page of a paged version starts, in bytes and in chunks
+   * (one more entry than pages, for the end); for an inline version of
+   * variable chunks, where each chunk starts. Computed once per manifest.
+   */
+  layout(v: FileVersion): Layout {
     const m = v.manifest;
-    if (m.version === 1) return m.chunks.slice(first, last + 1);
-    if (m.chunks) return m.chunks.slice(first, last + 1);
-    const ps = m.pageSize!;
-    const p0 = Math.floor(first / ps);
-    const p1 = Math.floor(last / ps);
-    const pages = await this.fetchPages(m, p0, p1);
-    const ids: Uint8Array[] = [];
-    for (let p = p0; p <= p1; p++) ids.push(...pages[p - p0]!);
-    return ids.slice(first - p0 * ps, last - p0 * ps + 1);
+    let l = this.layouts.get(m);
+    if (l) return l;
+    const bytes: number[] = [0];
+    const chunks: number[] = [0];
+    if (m.version === 3) {
+      if (m.pages) {
+        for (const p of m.pages) {
+          bytes.push(bytes.at(-1)! + p.bytes);
+          chunks.push(chunks.at(-1)! + p.count);
+        }
+      } else {
+        for (const c of m.chunks!) {
+          bytes.push(bytes.at(-1)! + c.len);
+          chunks.push(chunks.length);
+        }
+      }
+    } else if (m.version === 2 && m.pages) {
+      const ps = m.pageSize!;
+      for (let p = 1; p <= m.pages.length; p++) {
+        chunks.push(Math.min(m.n, p * ps));
+        bytes.push(Math.min(m.size, p * ps * m.chunkSize));
+      }
+    }
+    l = { bytes, chunks };
+    this.layouts.set(m, l);
+    return l;
   }
 
-  private readonly pageMemo = new Map<string, Uint8Array[]>();
+  /** The chunks bytes `offset..end` of a version fall in, fetching only their pages. */
+  async spans(v: FileVersion, offset: number, end: number): Promise<Span[]> {
+    const m = v.manifest;
+    if (offset >= end) return [];
+    if (m.version !== 3) {
+      const cs = m.chunkSize;
+      const first = Math.floor(offset / cs);
+      const last = Math.floor((end - 1) / cs);
+      const ids = await this.chunkIds(v, first, last);
+      return ids.map((id, j) => {
+        const i = first + j;
+        return { id, start: i * cs, len: i === v.chunkCount - 1 ? m.size - i * cs : cs };
+      });
+    }
+    const out: Span[] = [];
+    const lay = this.layout(v);
+    const take = (ids: Uint8Array[], lens: number[], start: number) => {
+      for (let i = 0; i < ids.length && start < end; i++) {
+        if (start + lens[i]! > offset) out.push({ id: ids[i]!, start, len: lens[i]! });
+        start += lens[i]!;
+      }
+    };
+    if (!m.pages) {
+      const i = locate(lay.bytes, offset);
+      const entries = m.chunks!;
+      for (let j = i, start = lay.bytes[i]!; j < entries.length && start < end; j++) {
+        out.push({ id: entries[j]!.id, start, len: entries[j]!.len });
+        start += entries[j]!.len;
+      }
+      return out;
+    }
+    const p0 = locate(lay.bytes, offset);
+    const p1 = locate(lay.bytes, end - 1);
+    const pages = await this.pagesOf(v, p0, p1);
+    for (let p = p0; p <= p1; p++) take(pages[p - p0]!.ids, pages[p - p0]!.lens, lay.bytes[p]!);
+    return out;
+  }
 
-  /** Pages `p0..=p1` of a paged manifest, each checked against its digest and count. */
-  private async fetchPages(m: ManifestV2, p0: number, p1: number): Promise<Uint8Array[][]> {
-    const refs = m.pages!;
-    const ps = m.pageSize!;
-    const count = (p: number) => Math.min(ps, m.n - p * ps);
-    const out: (Uint8Array[] | undefined)[] = [];
+  /** The chunk ids `first..=last` of a version, through its pages when paged. */
+  async chunkIds(v: FileVersion, first: number, last: number): Promise<Uint8Array[]> {
+    return (await this.entries(v, first, last)).ids;
+  }
+
+  /** The chunks `first..=last` of a version, ids and plaintext lengths, through its pages when paged. */
+  async entries(v: FileVersion, first: number, last: number): Promise<PageEntries> {
+    const m = v.manifest;
+    if (last < first) return { ids: [], lens: [] };
+    const fixedLen = (i: number) =>
+      m.version === 3 ? 0 : i === v.chunkCount - 1 ? m.size - i * m.chunkSize : m.chunkSize;
+    const range = (from: number, to: number) => {
+      const lens: number[] = [];
+      for (let i = from; i <= to; i++) lens.push(fixedLen(i));
+      return lens;
+    };
+    if (m.version === 1 || (m.version === 2 && m.chunks)) {
+      const ids = (m.chunks as Uint8Array[]).slice(first, last + 1);
+      return { ids, lens: range(first, first + ids.length - 1) };
+    }
+    if (m.version === 3 && m.chunks) {
+      const e = m.chunks.slice(first, last + 1);
+      return { ids: e.map((c) => c.id), lens: e.map((c) => c.len) };
+    }
+    const lay = this.layout(v);
+    const p0 = locate(lay.chunks, first);
+    const p1 = locate(lay.chunks, last);
+    const ids: Uint8Array[] = [];
+    const lens: number[] = [];
+    for (const pg of await this.pagesOf(v, p0, p1)) {
+      ids.push(...pg.ids);
+      lens.push(...pg.lens);
+    }
+    const from = first - lay.chunks[p0]!;
+    return {
+      ids: ids.slice(from, from + last - first + 1),
+      lens: lens.slice(from, from + last - first + 1),
+    };
+  }
+
+  private readonly pageMemo = new Map<string, AnyPage>();
+
+  /**
+   * Pages `p0..=p1` of a paged version, each checked against its digest,
+   * its count and (version 3) its bytes: their chunk ids and lengths.
+   */
+  async pagesOf(v: FileVersion, p0: number, p1: number): Promise<PageEntries[]> {
+    const refs = pageRefsOf(v.manifest)!;
+    const out: (PageEntries | undefined)[] = [];
     const todo: number[] = [];
     const cache = this.opts.pageCache;
-    const check = (p: number, bytes: Uint8Array): Uint8Array[] | undefined => {
+    const decode = (bytes: Uint8Array): AnyPage | undefined => {
+      try {
+        return zw.decodeAnyPage(bytes);
+      } catch {
+        return undefined;
+      }
+    };
+    const check = (p: number, bytes: Uint8Array): [AnyPage, PageEntries] | undefined => {
       if (!equal(zw.pageDigest(bytes), refs[p]!.digest)) return undefined;
-      const ids = zw.decodePage(bytes);
-      return ids.length === count(p) ? ids : undefined;
+      const d = decode(bytes);
+      const e = d && this.pageEntries(v, p, d);
+      return e && [d, e];
     };
     for (let p = p0; p <= p1; p++) {
       const key = hex(refs[p]!.digest);
-      let ids = this.pageMemo.get(key);
-      if (ids) {
+      let e: PageEntries | undefined;
+      const memo = this.pageMemo.get(key);
+      if (memo) {
         // Most recently used last.
         this.pageMemo.delete(key);
-        this.pageMemo.set(key, ids);
+        this.pageMemo.set(key, memo);
+        e = this.pageEntries(v, p, memo);
       } else if (cache) {
         const bytes = await cache.get(refs[p]!.id);
-        ids = bytes && check(p, bytes);
+        const c = bytes && check(p, bytes);
+        if (c) {
+          this.pageMemo.set(key, c[0]);
+          e = c[1];
+        }
       }
-      out.push(ids);
-      if (!ids) todo.push(p);
+      out.push(e);
+      if (!e) todo.push(p);
     }
     for (let i = 0; i < todo.length; i += MAX_GET_PAGES) {
       const batch = todo.slice(i, i + MAX_GET_PAGES);
@@ -720,26 +983,51 @@ export class Tree {
       for (const [j, p] of batch.entries()) {
         const d = r.pages[j];
         if (!d?.data) throw new ZenError(404, 'not_found', `page ${hex(refs[p]!.id)} is missing`);
-        const ids = check(p, d.data);
-        if (!ids) throw new ZenError(0, 'format', `page ${p} doesn't match its manifest`);
+        const c = check(p, d.data);
+        if (!c) throw new ZenError(0, 'format', `page ${p} doesn't match its manifest`);
         await cache?.put(refs[p]!.id, d.data);
-        out[p - p0] = ids;
+        this.pageMemo.set(hex(refs[p]!.digest), c[0]);
+        out[p - p0] = c[1];
       }
-    }
-    for (const [i, ids] of out.entries()) {
-      this.pageMemo.set(hex(refs[p0 + i]!.digest), ids!);
     }
     while (this.pageMemo.size > PAGE_MEMO) {
       this.pageMemo.delete(this.pageMemo.keys().next().value!);
     }
-    return out as Uint8Array[][];
+    return out as PageEntries[];
+  }
+
+  /** A decoded page as page `p` of `v`: its entries, or undefined when it doesn't fit there. */
+  private pageEntries(v: FileVersion, p: number, d: AnyPage): PageEntries | undefined {
+    const m = v.manifest;
+    const lay = this.layout(v);
+    if (m.version === 3) {
+      const ref = m.pages![p]!;
+      if (!d.lens || d.ids.length !== ref.count) return undefined;
+      let sum = 0;
+      for (const l of d.lens) {
+        if (l < 1 || l > m.cdc.max) return undefined;
+        sum += l;
+      }
+      return sum === ref.bytes ? { ids: d.ids, lens: d.lens } : undefined;
+    }
+    if (m.version !== 2 || d.lens) return undefined;
+    const first = lay.chunks[p]!;
+    if (d.ids.length !== lay.chunks[p + 1]! - first) return undefined;
+    const lens = d.ids.map((_, j) =>
+      first + j === m.n - 1 ? m.size - (m.n - 1) * m.chunkSize : m.chunkSize,
+    );
+    return { ids: d.ids, lens };
   }
 
   /**
    * Fetch and open chunks (64 per request, a few requests at a time), by hex
-   * id. `version` says how they are sealed (default: under the fs keys).
+   * id. `version` (or a file key) says how they are sealed (default: under
+   * the fs keys).
    */
-  async fetchChunks(ids: Uint8Array[], version?: FileVersion): Promise<Map<string, Uint8Array>> {
+  async fetchChunks(
+    ids: Uint8Array[],
+    version?: FileVersion | ChunkKey,
+  ): Promise<Map<string, Uint8Array>> {
     const open = this.opener(version);
     const out = new Map<string, Uint8Array>();
     const todo: Uint8Array[] = [];
@@ -782,34 +1070,43 @@ export class Tree {
   }
 
   /** How a version's chunks open: under its file key, or the fs keys of their epoch. */
-  private opener(v?: FileVersion): (id: Uint8Array, sealed: Uint8Array) => Uint8Array {
-    const m = v?.manifest;
-    if (m?.version === 2 && m.fileKey) {
-      const { fileKey, keyEpoch } = m;
+  private opener(v?: FileVersion | ChunkKey): (id: Uint8Array, sealed: Uint8Array) => Uint8Array {
+    const k = v && 'manifest' in v ? chunkKeyOf(v.manifest) : v;
+    if (k?.fileKey) {
+      const { fileKey, keyEpoch } = k;
       return (id, sealed) => zw.openFileChunk(this.fs.id, fileKey, keyEpoch!, id, sealed);
     }
     return (id, sealed) => this.fs.keysFor(sealed).openChunk(id, sealed);
   }
 
   /**
-   * A version's chunk index, from its bytes: `data` if given, else read as
-   * a stream, so the file is never held whole.
+   * A version's chunk index: its ids and lengths (from the manifest and
+   * pages), and with `hashes` (default) a SHA-256 per chunk from its bytes,
+   * `data` if given, else read as a stream, so the file is never held whole.
    */
-  async chunkIndex(node: Uint8Array, version: FileVersion, data?: Uint8Array): Promise<ChunkIndex> {
+  async chunkIndex(
+    node: Uint8Array,
+    version: FileVersion,
+    data?: Uint8Array,
+    opts: { hashes?: boolean } = {},
+  ): Promise<ChunkIndex> {
     const m = version.manifest;
-    const cs = m.chunkSize;
-    const hashes: Uint8Array[] = [];
-    const src = data ?? this.readStream(node, { version });
-    for await (const block of blocks(src, cs)) hashes.push(await sha256(block as Uint8Array));
-    if (hashes.length !== version.chunkCount) {
-      throw new ZenError(0, 'format', 'a version has the wrong number of chunks');
+    const n = version.chunkCount;
+    const all = await this.entries(version, 0, n - 1);
+    const index: ChunkIndex =
+      m.version === 3
+        ? { cdc: m.cdc, chunks: all.ids, lens: all.lens }
+        : { chunkSize: m.chunkSize, chunks: all.ids };
+    if (opts.hashes !== false) {
+      const hashes: Uint8Array[] = [];
+      const src = data ?? this.readStream(node, { version });
+      for await (const block of splitBy(src, all.lens)) hashes.push(await sha256(block));
+      if (hashes.length !== n) {
+        throw new ZenError(0, 'format', 'a version has the wrong number of chunks');
+      }
+      index.hashes = hashes;
     }
-    const index: ChunkIndex = {
-      chunkSize: cs,
-      chunks: version.chunkCount ? await this.chunkIds(version, 0, version.chunkCount - 1) : [],
-      hashes,
-    };
-    if (m.version === 2) {
+    if (m.version !== 1) {
       if (m.fileKey) Object.assign(index, { fileKey: m.fileKey, keyEpoch: m.keyEpoch });
       if (m.pages) Object.assign(index, { pageSize: m.pageSize, pages: m.pages });
     }
@@ -817,22 +1114,32 @@ export class Tree {
   }
 
   /**
-   * Write a file's content (fs.md §4): `chunkSize` chunks with random ids,
-   * uploaded over as many commits as `max_commit_bytes` needs, then the
-   * `write` op (with the last chunks). A file too long for one inline
-   * manifest is paged (formats.md §11.6). With `previous`, a chunk whose
-   * bytes equal one of the previous version's keeps that chunk's id and
-   * isn't uploaded (when both are under the same key), and so does a page
-   * whose ids didn't change; that version should still exist (or have been
-   * replaced within `chunk_grace_secs`), else the write fails with 400.
+   * Write a file's content (fs.md §4.1): cut by content (version 3, the fs
+   * policy's default `chunking: cdc`) or into fixed-size chunks (version
+   * 2), with random ids, uploaded in commits of `max_commit_bytes` (a few
+   * in flight), then the `write` op with the last chunks. A file too long
+   * for one inline manifest is paged (formats.md §11.6). With `previous`, a
+   * chunk whose bytes equal one of the previous version's keeps that
+   * chunk's id and isn't uploaded (when both are under the same key), and
+   * so does a page whose ids didn't change; that version should still
+   * exist (or have been replaced within `chunk_grace_secs`), else the write
+   * fails with 400. With `session`, the upload runs under an upload session,
+   * closed after the write.
    */
   async writeFile(
     node: Uint8Array,
     data: FileSource,
     opts: WriteOptions = {},
   ): Promise<WrittenFile> {
-    const st = await this.stage(node, data, opts);
-    const op = await this.writeOp(st.upload, opts.replaces);
+    return this.finish(await stage(this, node, data, opts), opts.replaces);
+  }
+
+  /** The write commit of a staged upload (with its last puts), then its session closed. */
+  private async finish(
+    st: Staged,
+    replaces: Uint8Array[] | 'current' | undefined,
+  ): Promise<WrittenFile> {
+    const op = await this.writeOp(st.upload, replaces);
     const limits = await this.limits();
     const writeCost =
       OP_OVERHEAD +
@@ -846,12 +1153,17 @@ export class Tree {
     ) {
       await st.flush();
     }
-    const r = await this.send([op], st.pending(), st.pendingPages());
+    await st.drain();
+    const r = await this.send([op], st.pending(), st.pendingPages(), st.ref);
     const u = st.upload;
+    if (u.session) {
+      // The version holds the content now; a session left open expires.
+      await this.closeUpload(u.session).catch(() => {});
+    }
     return {
       dot: r.dots![0]!,
       manifest: u.manifest,
-      index: u.index,
+      ...(u.index ? { index: u.index } : {}),
       uploaded: u.uploaded,
       pagesUploaded: u.pagesUploaded,
       commits: u.commits + 1,
@@ -862,12 +1174,14 @@ export class Tree {
    * Upload a file's content without writing it (as `writeFile`, every
    * chunk and page in commits of its own). Write it later with `writeOp`,
    * alone (`send`) or in a transaction (`writeIn`). Chunks never written
-   * are collected after `chunk_grace_secs`. `onProgress` and `resume` make
-   * it resumable.
+   * are collected after `chunk_grace_secs`, or after the upload session
+   * (`session`) is closed or expires: close it (`closeUpload`) once
+   * written. `onProgress` and `resume` make it resumable.
    */
   async upload(node: Uint8Array, data: FileSource, opts: UploadOptions = {}): Promise<Upload> {
-    const st = await this.stage(node, data, opts);
+    const st = await stage(this, node, data, opts);
     await st.flush();
+    await st.drain();
     return st.upload;
   }
 
@@ -884,13 +1198,99 @@ export class Tree {
     return this.upload(node, data, opts);
   }
 
+  /**
+   * Edit a version (default the newest) and write the result: each edit
+   * removes bytes at an offset and inserts others there. Only the pages
+   * the edits touch are fetched and uploaded, and the chunks around each
+   * edit, until the cuts resync with the base's; untouched pages are taken
+   * over unread. The base keeps its form (`fixed` or `cdc`) unless
+   * `chunking` says otherwise. Under fixed chunks an insertion or deletion
+   * of other than whole chunks shifts every later chunk, so the rest of
+   * the file is read and uploaded again.
+   */
+  async edit(
+    node: Uint8Array,
+    version: FileVersion | Uint8Array | undefined,
+    edits: Edit[],
+    opts: EditOptions = {},
+  ): Promise<WrittenFile> {
+    const v = await this.pickVersion(node, version);
+    return repacking(opts.repack, async (repack) =>
+      this.finish(await this.stageEdit(node, v, edits, opts, repack), opts.replaces),
+    );
+  }
+
+  /** `edit` without the write: the content uploaded (or sealed into `sink`), as `upload`. */
+  async editUpload(
+    node: Uint8Array,
+    version: FileVersion | Uint8Array | undefined,
+    edits: Edit[],
+    opts: UploadOptions & { repack?: boolean } = {},
+  ): Promise<Upload> {
+    const v = await this.pickVersion(node, version);
+    return repacking(opts.repack, async (repack) => {
+      const st = await this.stageEdit(node, v, edits, opts, repack);
+      await st.flush();
+      await st.drain();
+      return st.upload;
+    });
+  }
+
+  /** Append bytes to the newest version (an `edit` at its end; a new file's content when it has none). */
+  async append(node: Uint8Array, data: Uint8Array, opts: EditOptions = {}): Promise<WrittenFile> {
+    const v = await this.pickVersion(node);
+    return this.edit(node, v, [{ offset: v?.size ?? 0, insert: data }], opts);
+  }
+
+  private stageEdit(
+    node: Uint8Array,
+    v: FileVersion | undefined,
+    edits: Edit[],
+    opts: UploadOptions,
+    repack: boolean,
+  ): Promise<Staged> {
+    if (!v) {
+      if (edits.some((e) => e.offset !== 0 || (e.remove ?? 0) !== 0)) {
+        throw new ZenError(0, 'bad_value', 'edits must be within the file');
+      }
+      return stage(this, node, concat(...edits.map((e) => e.insert ?? new Uint8Array(0))), opts);
+    }
+    const size = edits.reduce((a, e) => a - (e.remove ?? 0) + (e.insert?.length ?? 0), v.size);
+    return stage(this, node, editSource(this, v, edits), {
+      ...opts,
+      base: v,
+      chunking: opts.chunking ?? v.chunking,
+      size,
+      repack,
+    });
+  }
+
+  /** The caller's open upload sessions on this fs (api.md §12.1). */
+  async uploads(): Promise<UploadSessionInfo[]> {
+    const r = await this.session.call(
+      '/v1/fs/upload/list',
+      zw.encodeUploadList,
+      zw.decodeUploadSessions,
+      { fs: this.fs.id },
+    );
+    return r.sessions.map((s) => ({ session: s.session, expiresMs: Number(s.expires_ms) }));
+  }
+
+  /** Close an upload session: what it holds is released (and collected after `chunk_grace_secs` unless written). */
+  async closeUpload(session: Uint8Array): Promise<void> {
+    await this.session.call('/v1/fs/upload/close', zw.encodeUploadClose, zw.decodeEmpty, {
+      fs: this.fs.id,
+      session,
+    });
+  }
+
   /** The `write` operation of an upload, replacing exactly `replaces` (no read). */
   writeOpOf(u: Upload, replaces: Uint8Array[]): Extract<PendingOp, { op: 'write' }> {
     return {
       op: 'write',
       node: u.node,
       replaces,
-      chunks: u.pages.length ? [] : u.index.chunks,
+      chunks: u.pages.length ? [] : u.chunks,
       ...(u.pages.length ? { pages: u.pages } : {}),
       manifest: u.sealedManifest,
     };
@@ -908,241 +1308,6 @@ export class Tree {
       u,
       replaces === 'current' ? (await this.versions(u.node)).map((v) => v.dot) : replaces,
     );
-  }
-
-  /**
-   * The file key a write of `node` uses under a `file_keys: on` policy
-   * (fs.md §4.2): the key of `previous`, or else of the node's newest
-   * version, unless the policy replaces it after a rotation; a fresh one
-   * when there is none.
-   */
-  private async fileKeyFor(
-    node: Uint8Array,
-    previous: ChunkIndex | undefined,
-    policy: FsPolicy,
-    epoch: number,
-  ): Promise<{ key: Uint8Array; epoch: number }> {
-    let base: { key: Uint8Array; epoch: number } | undefined;
-    if (previous) {
-      if (previous.fileKey) base = { key: previous.fileKey, epoch: previous.keyEpoch! };
-    } else {
-      try {
-        const m = (await this.versions(node)).at(-1)?.manifest;
-        if (m?.version === 2 && m.fileKey) base = { key: m.fileKey, epoch: m.keyEpoch! };
-      } catch (e) {
-        // Offline (e.g. a replica sealing a write to send later): a fresh key.
-        if (!isCode(e, 'network')) throw e;
-      }
-    }
-    const fresh = () => ({ key: zw.newFileKey(), epoch });
-    if (!base) return fresh();
-    if (base.epoch < epoch) {
-      if (policy.rekeyAfterRotate === 'eager') return fresh();
-      if (policy.rekeyAfterRotate === 'rewrite' && !previous) return fresh();
-    }
-    return base;
-  }
-
-  /**
-   * Seal and upload chunks (and pages); the last ones stay pending for the
-   * caller's commit.
-   */
-  private async stage(node: Uint8Array, data: FileSource, opts: UploadOptions) {
-    const keys = this.fs.sealKeys();
-    const limits = await this.limits();
-    const resume = opts.resume;
-    if (resume && !equal(resume.node, node)) {
-      throw new ZenError(0, 'bad_value', 'resume: the state is of another node');
-    }
-    const chunkSize =
-      resume?.chunkSize ?? opts.chunkSize ?? Math.min(CHUNK_SIZE, limits.max_value_bytes - 64);
-    const fk: { key: Uint8Array; epoch: number } | undefined = resume
-      ? resume.fileKey && { key: resume.fileKey, epoch: resume.keyEpoch! }
-      : this.fs.policy.fileKeys
-        ? await this.fileKeyFor(node, opts.previous, this.fs.policy, keys.epoch)
-        : undefined;
-    const keyOf = fk ? { fileKey: fk.key, keyEpoch: fk.epoch } : {};
-
-    // Reuse only what is sealed under the same key.
-    const prev = opts.previous;
-    const sameKey =
-      !!prev &&
-      prev.chunkSize === chunkSize &&
-      (fk ? !!prev.fileKey && equal(prev.fileKey, fk.key) : !prev.fileKey);
-    const reuse = new Map<string, Uint8Array[]>();
-    if (sameKey) {
-      prev!.hashes.forEach((h, i) => {
-        const list = reuse.get(hex(h)) ?? [];
-        list.push(prev!.chunks[i]!);
-        reuse.set(hex(h), list);
-      });
-    }
-
-    // Forms: inline up to what one value holds, then paged.
-    const empty: ManifestV2 = { version: 2, size: 0, chunkSize, n: 0, ...keyOf, chunks: [] };
-    const inlineMax = Math.floor(
-      (limits.max_value_bytes - keys.sealManifestV2(this.id, node, empty).length) / 32,
-    );
-    const pageSize = zw.pageCapacity(limits.max_value_bytes);
-    const prevPages = sameKey && prev!.pageSize === pageSize ? (prev!.pages ?? []) : [];
-
-    const ids: Uint8Array[] = resume ? [...resume.chunks] : [];
-    const hashes: Uint8Array[] = resume ? [...resume.hashes] : [];
-    const pages: PageRef[] = resume ? [...resume.pages] : [];
-    let pending: ChunkPut[] = [];
-    let pendingPages: PagePut[] = [];
-    let pendingBytes = 0;
-    let size = resume?.size ?? 0;
-    const upload = {
-      uploaded: resume?.uploaded ?? 0,
-      pagesUploaded: resume?.pagesUploaded ?? 0,
-      commits: resume?.commits ?? 0,
-    } as Upload;
-    const state = (): UploadState => ({
-      node,
-      chunkSize,
-      size,
-      chunks: [...ids],
-      hashes: [...hashes],
-      pages: [...pages],
-      ...keyOf,
-      uploaded: upload.uploaded,
-      pagesUploaded: upload.pagesUploaded,
-      commits: upload.commits,
-    });
-    const flush = async () => {
-      if (!pending.length && !pendingPages.length) return;
-      if (opts.sink) await opts.sink(pending, pendingPages);
-      else {
-        await sendCommit(this.session, {
-          commit_id: randomBytes(16),
-          ...(pending.length ? { chunks: pending } : {}),
-          ...(pendingPages.length ? { pages: pendingPages } : {}),
-        });
-      }
-      upload.commits++;
-      pending = [];
-      pendingPages = [];
-      pendingBytes = 0;
-      await opts.onProgress?.(state());
-    };
-    const add = async (cost: number) => {
-      if (
-        pendingBytes + cost > limits.max_commit_bytes ||
-        pending.length + pendingPages.length + 1 > limits.max_commit_ops
-      ) {
-        await flush();
-      }
-      pendingBytes += cost;
-    };
-    // The pages of `ids` from `pages.length` on: full ones, or every one at the end.
-    const cutPages = async (end: boolean) => {
-      while (ids.length - pages.length * pageSize >= (end ? 1 : pageSize)) {
-        const i = pages.length;
-        const slice = ids.slice(i * pageSize, (i + 1) * pageSize);
-        const old = prevPages[i];
-        if (old && sameIds(slice, prev!.chunks.slice(i * pageSize, (i + 1) * pageSize))) {
-          pages.push(old);
-          continue;
-        }
-        const bytes = zw.encodePage(slice);
-        const id = randomBytes(16);
-        await add(OP_OVERHEAD + bytes.length + 16 + 48 * slice.length);
-        pendingPages.push({ fs: this.fs.id, id, data: bytes });
-        pages.push({ id, digest: zw.pageDigest(bytes) });
-        upload.pagesUploaded++;
-      }
-    };
-    const paged = () => ids.length > inlineMax;
-
-    const known = sameKey ? new Set(prev!.chunks.map(hex)) : undefined;
-    for await (const block of blocks(data, chunkSize)) {
-      if (size % chunkSize !== 0) {
-        throw new ZenError(0, 'bad_value', 'a short chunk before the end of the file');
-      }
-      if (!(block instanceof Uint8Array)) {
-        // A known chunk: taken over as is.
-        if (!known?.has(hex(block.id))) {
-          throw new ZenError(0, 'bad_value', 'a known chunk not of `previous` (or another key)');
-        }
-        if (block.size < 1 || block.size > chunkSize) {
-          throw new ZenError(0, 'bad_value', 'a known chunk of the wrong size');
-        }
-        ids.push(block.id);
-        hashes.push(block.hash);
-        size += block.size;
-        if (paged()) await cutPages(false);
-        continue;
-      }
-      const h = await sha256(block);
-      // Each previous id is used once: a version shouldn't list a chunk twice.
-      const old = reuse.get(hex(h))?.shift();
-      if (old) {
-        ids.push(old);
-      } else {
-        const id = randomBytes(16);
-        const sealed = fk
-          ? zw.sealFileChunk(this.fs.id, fk.key, fk.epoch, id, block)
-          : keys.sealChunk(id, block);
-        if (sealed.length > limits.max_value_bytes) {
-          throw new ZenError(
-            413,
-            'too_large',
-            `a sealed chunk exceeds max_value_bytes; lower chunkSize`,
-          );
-        }
-        // A flush here reports a state without this chunk.
-        await add(sealed.length + 16 + OP_OVERHEAD);
-        pending.push({ fs: this.fs.id, id, data: sealed });
-        ids.push(id);
-        upload.uploaded++;
-      }
-      hashes.push(h);
-      size += block.length;
-      if (paged()) await cutPages(false);
-    }
-
-    let manifest: ManifestV2;
-    if (paged()) {
-      const info = await this.info();
-      if (!info.features.includes('fs_pages')) {
-        throw new ZenError(
-          413,
-          'too_large',
-          `a file of ${ids.length} chunks needs paged versions, which this server lacks`,
-        );
-      }
-      await cutPages(true);
-      manifest = { version: 2, size, chunkSize, n: ids.length, ...keyOf, pageSize, pages };
-    } else {
-      manifest = { version: 2, size, chunkSize, n: ids.length, ...keyOf, chunks: ids };
-    }
-    const sealedManifest = keys.sealManifestV2(this.id, node, manifest);
-    const listed = paged() ? pages.length : ids.length;
-    if (sealedManifest.length + 16 * listed > limits.max_value_bytes) {
-      throw new ZenError(
-        413,
-        'too_large',
-        `a file of ${ids.length} chunks exceeds what one manifest holds`,
-      );
-    }
-    const index: ChunkIndex = { chunkSize, chunks: ids, hashes, ...keyOf };
-    if (paged()) Object.assign(index, { pageSize, pages });
-    Object.assign(upload, {
-      node,
-      manifest,
-      sealedManifest,
-      index,
-      pages: paged() ? pages.map((p) => p.id) : [],
-    });
-    return {
-      upload,
-      flush,
-      pending: () => pending,
-      pendingPages: () => pendingPages,
-      pendingOps: () => pending.length + pendingPages.length,
-      pendingBytes: () => pendingBytes,
-    };
   }
 
   /**
@@ -1251,6 +1416,7 @@ export class Tree {
     ops: PendingOp[],
     chunks: ChunkPut[] = [],
     pages: PagePut[] = [],
+    upload?: UploadRef,
   ): Promise<CommitResult> {
     for (let attempt = 1; ; attempt++) {
       const p = await this.prepare(ops);
@@ -1259,6 +1425,7 @@ export class Tree {
           commit_id: randomBytes(16),
           ...(chunks.length ? { chunks } : {}),
           ...(pages.length ? { pages } : {}),
+          ...(upload ? { upload } : {}),
           crdt_ops: p.ops,
         });
         this.accept(p);
@@ -1534,63 +1701,57 @@ export function displayNames(children: TreeNode[]): Map<string, string> {
   return out;
 }
 
-async function sha256(b: Uint8Array): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest('SHA-256', b as Uint8Array<ArrayBuffer>));
-}
-
 function sameIds(a: Uint8Array[], b: Uint8Array[]): boolean {
   return a.length === b.length && a.every((x, i) => equal(x, b[i]!));
 }
 
-/** A web stream as an async iterable (not every browser makes it one). */
-async function* streamParts(s: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
-  const reader = s.getReader();
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      yield value;
-    }
-  } finally {
-    reader.releaseLock();
-  }
+/** A chunk a byte range falls in: its id, where it starts and its length. */
+export interface Span {
+  id: Uint8Array;
+  start: number;
+  len: number;
 }
 
-/**
- * Split bytes or a stream of byte arrays into `size`-byte blocks (the last
- * shorter). Known chunks pass through, at a block boundary.
- */
-async function* blocks(data: FileSource, size: number): AsyncGenerator<Uint8Array | KnownChunk> {
-  if (data instanceof Uint8Array) {
-    for (let i = 0; i < data.length; i += size) yield data.subarray(i, i + size);
-    return;
+/** Chunk ids and their plaintext lengths (a page's, or a run of a version's). */
+export interface PageEntries {
+  ids: Uint8Array[];
+  lens: number[];
+}
+
+/** Where each page (or, inline under CDC, each chunk) of a version starts: in bytes and in chunks. */
+export interface Layout {
+  bytes: number[];
+  chunks: number[];
+}
+
+/** A file key and its epoch, for opening chunks. */
+export interface ChunkKey {
+  fileKey?: Uint8Array;
+  keyEpoch?: number;
+}
+
+function inlineIds(m: AnyManifest): Uint8Array[] | undefined {
+  if (m.version === 3) return m.chunks?.map((c) => c.id);
+  return m.chunks;
+}
+
+function pageRefsOf(m: AnyManifest): (PageRef | PageRefV3)[] | undefined {
+  return m.version === 1 ? undefined : m.pages;
+}
+
+function chunkKeyOf(m: AnyManifest): ChunkKey | undefined {
+  return m.version !== 1 && m.fileKey ? { fileKey: m.fileKey, keyEpoch: m.keyEpoch } : undefined;
+}
+
+async function repacking<T>(
+  repack: boolean | undefined,
+  f: (repack: boolean) => Promise<T>,
+): Promise<T> {
+  try {
+    return await f(!!repack);
+  } catch (e) {
+    // Pages left short by edits overflowed one manifest: write them again full.
+    if (repack || !overflows(e)) throw e;
+    return f(true);
   }
-  const parts =
-    typeof (data as ReadableStream).getReader === 'function'
-      ? streamParts(data as ReadableStream<Uint8Array>)
-      : (data as AsyncIterable<Uint8Array | KnownChunk> | Iterable<Uint8Array | KnownChunk>);
-  let buf = new Uint8Array(size);
-  let fill = 0;
-  for await (const part of parts) {
-    if (!(part instanceof Uint8Array)) {
-      if (fill > 0) {
-        throw new ZenError(0, 'bad_value', 'a known chunk must start at a chunk boundary');
-      }
-      yield part;
-      continue;
-    }
-    let p = 0;
-    while (p < part.length) {
-      const n = Math.min(size - fill, part.length - p);
-      buf.set(part.subarray(p, p + n), fill);
-      fill += n;
-      p += n;
-      if (fill === size) {
-        yield buf;
-        buf = new Uint8Array(size);
-        fill = 0;
-      }
-    }
-  }
-  if (fill > 0) yield buf.subarray(0, fill);
 }

@@ -24,8 +24,8 @@ setInterval(() => {}, 1000);
 console.log('uploading');
 await attachFile(db, tree, process.env.KANBAN_CARD!, 'endless.bin', endless(), {
   upload: {
-    onProgress: (s) => {
-      console.log(`uploaded ${s.chunks.map((c) => bytes.hex(c)).join(',')}`);
+    onProgress: (_state, commit) => {
+      console.log(`uploaded ${commit.chunks.map((c) => bytes.hex(c)).join(',')}`);
       stalled = true;
     },
   },
