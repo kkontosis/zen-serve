@@ -247,6 +247,17 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * The cause is a clock race in `deleteCard`: the move is stamped by a session that never read the directory, so it isn't ordered after the directory's creation (by the other session, in `addCard`). If that session's clock estimate trails the other's by more than the time between them, which can happen under CI load, the move sorts before the `mkdir` and loses.
       * Fix: `deleteCard` reads the directory first (`tree.getOne`), which observes its timestamps.
       * No test change: the race needs the clocks skewed.
+  * Pushed cf82ad1 and ccfca39. **CI green on both runs of each** (push and pull_request), every job. PR #67 merged. Step 8.3 is done.
+  * The scheduled CI check-in for ccfca39 fired and was handled.
+  * These two lines are only in this file; they reach `docs/MILESTONE-8.md` at the next restart from main.
+* **Step 8.4** (the replica and zen-mount): planned below ("Step 8.4 in detail").
+  * **Decided at planning:** past the dirty bound a handle queues a write of its own (the user's choice), rather than sealing into the store unqueued.
+  * **First:**
+    1. restart from main
+    2. `cp` this file to `docs/MILESTONE-8.md`
+    3. commit `docs: milestone 8 step 4 plan`
+    4. push and open the PR
+  * Then implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -920,6 +931,208 @@ The fix: `world()` starts the server on its own thread with its own multi-thread
 * **Small servers fall back to fixed** rather than scaling CDC parameters down on their own. Tests pass parameters explicitly.
 * **Up to 3 upload commits and 3 read windows in flight.**
 * **The replica stays fixed until 8.4,** and the devices fix rides in this PR as its own commit.
+
+## Step 8.4 in detail
+
+Step 8.4 makes the `@zen/fs` replica write large files in bounded memory and edit them by page (under CDC by default), fixes `FileHandle.close({wait})`, and adds `zen-mount --integrity` (TD-FUSE-INTEGRITY). No Rust or wasm change.
+
+**Survey:**
+* **`handle.ts` (218 lines):**
+  * A `FileHandle` keeps dirty data as whole fixed chunks (`Map<index, bytes>`), with no bound: a file written through a handle stays whole in memory until the flush (810 MiB peak RSS for 256 MiB).
+  * `flush` streams every chunk, the clean ones as `KnownChunk`s from the base's `ChunkIndex` (`replica.indexOf`), into `replica.queueFlush` → `sealWrite` (`tree.seal`, `chunking: 'fixed'`, a sink into the content store) → one queue entry.
+  * A v3 base gets the default chunk size, so its first flush re-seals the whole file.
+* **`replica.ts`:**
+  * **`queueFlush` (:1676)** returns `this.ov.files.get(node)!.local` after `enqueue`. With `wait`, `enqueue` awaits the send, and by then the entry has left the overlay, so `close({wait: true})` throws. That's the bug.
+  * **`indexOf` (:1307)** reads a JSON `ChunkIndex` record (`index`, key `node ‖ dot`, every id and hash), or builds one with a full read (`tree.chunkIndex`) and stores it.
+  * **`done` (:1132)** writes the JSON index of every write it sends, from `QWrite.index`.
+  * **`open` (:1636)** creates the handle with a chunk size (`chunkSize()`, the only user of that method).
+  * The tree is made with `chunkCache`/`pageCache` on the content store, so the client reads a local version's chunks and pages from there.
+* **`queue.ts`:**
+  * Entries are JSON `{v: 1, key, ops, chunks, pages}`.
+  * `QWrite.index` embeds the whole index, so a queued write of a 100 GiB file carries about 100 MB of JSON.
+  * Eviction (`evict`, :995) keeps queued entries' `chunks`/`pages` and `protect`.
+* **The client (8.3):**
+  * `editUpload(node, base, edits, {sink})` builds the source from known pages and known chunks, and fetches only touched pages and the chunks around each edit.
+  * `Edit.insert` is a `Uint8Array`. The no-base branch of `stageEdit` concatenates the inserts.
+  * Several edits at one offset are already allowed (each needs `offset ≥` the previous one's end).
+* **zen-mount:**
+  * `cli.ts` signs in, unlocks (through `session.fs(id)`, which returns a new `Fs` each call), opens the replica, syncs, mounts, and on a signal unmounts, drains, closes.
+  * `mount.ts` maps `ZenError` codes to errno (`EIO` otherwise).
+  * Integrity is attached by `fs.integrity({device, local, onAlarm})` before unlocking; `integrity.trusted` turns false at the first alarm, and `integrity.close()` writes a last checkpoint.
+  * The workers (`apps/shared/node.ts`) attach it with the vault store as `local`; `vault.signer()` gives the signer.
+* **Tests:**
+  * `packages/fs/test/{replica,writes,integrity}.test.ts`; the fork adversary is `TestServer.fork()` → `{self, copy}`; `restart()` and `kill()` exist.
+  * `packages/fuse/test/mount.test.ts` mounts in-process (`canMount`) and runs `dist/cli.js` with a vault and a cache dir.
+
+### Spec (`spec:` commit)
+
+**fs.md §11.1, "Content" and a new "File handles" bullet:**
+* Only the chunks around what changed are sealed: under CDC, until the cuts resync with the base's (§4.1). Untouched pages are taken over.
+* **File handles:** a handle keeps its writes in memory up to a bound (the client's, 64 MiB by default).
+  * Past it, the handle queues what it has as a write, as a flush does.
+  * So a file being written may show partial content to other devices before the handle closes, as a local reader of a file being written sees, and a restart keeps what was queued.
+  * Each flush is one entry and one version.
+
+### Client (`@zen/client`)
+
+**`Edit.zeros?: number`:**
+* The bytes inserted after `insert` are zeros, streamed in 1 MiB pieces and never allocated whole.
+* Counted in the edit's size.
+* `stageEdit`'s no-base branch yields the parts in turn rather than concatenating them.
+* Lets a handle that was extended (`truncate` up, or a write past the end) flush without allocating the gap.
+
+### `@zen/fs`
+
+**`FileHandle`, rewritten over extents:**
+* **Extents:**
+  * The content is a sorted list of extents `[start, end)`, each one of:
+    * the base's bytes at the same offsets (a base extent, never moved: POSIX writes overwrite in place)
+    * bytes in memory
+    * zeros
+  * `write`, `truncate` and growing split and replace extents by binary search.
+  * Writes that continue a memory extent append to it (a buffer that doubles, up to 4 MiB per extent), so the kernel's 128 KiB writes don't make thousands of extents.
+  * `dirtyBytes` (a getter) is the bytes held in memory.
+* **`read`** walks the extents: base ranges through `replica.readVersion` (byte offsets, so any form), memory copied, zeros filled.
+* **The bound:**
+  * After a `write` or `truncate`, when `dirtyBytes` exceeds `ReplicaOptions.dirtyBytes` (default 64 MiB), the handle flushes.
+  * The new local version is its base from then on, and the extents become one base extent.
+* **`flush`:**
+  * Nothing changed: nothing is queued.
+  * **No base, or no base extent left** (a new file, or a whole rewrite such as `w` or `truncate(0)`): the content streams into `sealWrite` as today, with `previous = indexOf(base)` when there is a base, so unchanged chunks are reused by hash.
+  * **Otherwise an edit:**
+    * The edits come from the gaps between base extents: each gap removes the base range it covers and inserts its memory and zero extents. Each part is its own edit at the gap's end (`insert` or `zeros`), since edits at one offset are allowed.
+    * The new replica method `sealEdit(node, base, edits)` calls `tree.editUpload(node, base, edits, {sink})` with the same sink and op building as `sealWrite`.
+    * So a flush fetches and seals only the touched pages and the chunks around each edit (8.3).
+  * **The form:** the base's form is kept (`editUpload` and `sealWrite`'s `previous`); a new file takes the fs policy (CDC by default). `sealWrite` no longer passes `chunking: 'fixed'`.
+* **The handle drops `chunkSize` and `index`.** `Replica.chunkSize()` goes too, since `open` was its only caller.
+
+**`queueFlush` and the `close({wait})` fix:**
+* `enqueue` returns once the entry is stored and shown, with a promise for its send.
+* `queueFlush` takes the local version from the overlay before it awaits that promise.
+* `flush({wait})` and `close({wait})` then resolve once the server has the write, and the handle stays usable after a `flush({wait})`.
+
+**Index records: binary, per page, content-addressed** (store `index`):
+* **The records:**
+  * `0x70 ‖ page_id` → `u8 1 ‖ n × (chunk_id ‖ u32 len ‖ sha256)`, one per page.
+  * `0x6d ‖ sha256(sealed manifest)[0..16]` → `u8 1 ‖ n × sha256`, for an inline version (ids and lengths are in its manifest).
+  * Neither depends on the dot, so they're written when the content is sealed, valid for the local version and the sent one alike, and nothing is rewritten on `done`. An edit writes records only for the pages it made.
+* **Written** from `Upload.index` when it has hashes (writes from bytes: `writeFile`, whole rewrites, new files), split by the manifest's pages (v3 `count`; v2 `pageSize`, the last page short). An edit's upload has no hashes (pages taken over unread), so it writes none.
+* **`indexOf(node, v)`:**
+  1. A legacy JSON record (`node ‖ dot`), or a legacy local version's `index`, as before.
+  2. Else the per-page or inline records, when every page has one: ids, lengths and hashes, with the form, keys and `pages` from the manifest.
+  3. Else, as today, one full read (`tree.chunkIndex`), whose records are then written; offline, undefined.
+* **`done`** writes no index records.
+
+**Queue entries:**
+* New entries no longer carry `QWrite.index` (the records hold it). Entries with it still load, and their index is used as before.
+* Content arrays stay in entries: a handle's entry holds at most the dirty bound of new content, plus what its edit re-cut.
+* Old JSON index records and v1 entries load unchanged.
+
+**`ReplicaOptions`:**
+* `dirtyBytes` (default 64 MiB)
+* `cdc` (passed to the tree as `TreeOptions.cdc`, so small-`max_value_bytes` tests and servers can cut by content)
+
+### zen-mount `--integrity` (TD-FUSE-INTEGRITY)
+
+* **Setup:**
+  * **Pins:** `--integrity` needs `--vault` or `--cache-dir`, else it exits 1 ("pins kept in memory would trust whatever the server shows at each mount"). The pins go in the vault's store when there is one (with the device key, as INTEGRITY.md §7 advises), else in the cache dir's.
+  * **Signer:** `--device-key` (its device seed and cert), else `vault.signer()`. Without either, it verifies only, with a line saying so.
+  * **Attaching:** on the one `Fs` object that `unlock` then unlocks (`session.fs()` makes a new object each call). `onAlarm` writes `zen-mount: integrity alarm: <kind> (<object>): <detail>; every operation now fails with EIO` to stderr.
+* **Failing closed:**
+  * **`MountOptions.integrity?: Integrity`:** every FUSE operation first checks `integrity.trusted`; once it's false, the operation answers `EIO`. Unmounting still works.
+  * **At startup:** an alarm while attaching, unlocking or in the first sync prints the alarm and exits 3. No mount is made, as the Rust CLI does.
+  * **Mounted:** the replica's feed raises the alarm, the mount fails closed, and `stop` exits 3.
+* **Stopping:** unmount, drain, `replica.close()`, then `integrity.close()` (the last checkpoint; none once untrusted), then `ufs.close()`.
+* **`HELP`** gains the flag.
+
+### Docs
+
+* **CLIENT.md:**
+  * §8: the replica's handles (the bound, flushes by edit, CDC by default, `dirtyBytes`, partial versions while writing)
+  * §9: `zen-mount --integrity`
+* **INTEGRITY.md:** §5 (zen-mount turned on) and §8 (zen-mount fails closed: EIO, exit 3)
+* **TECH_DEBT:** TD-FUSE-INTEGRITY resolved
+* **The plan log,** in both copies
+
+### Tests
+
+**`@zen/fs`, new `test/handles.test.ts`:**
+1. **The memory bound:**
+   * The setup: a disk store in a temp dir, `cacheBytes` 16 MiB, `dirtyBytes` 4 MiB, and the server's default `max_value_bytes` (CDC).
+   * 128 MiB written through one handle in 128 KiB writes.
+   * `dirtyBytes` never passes 4 MiB plus one write.
+   * The peak RSS growth stays under 96 MiB, sampled at each write after a `gc()` where exposed.
+   * Several entries were queued.
+   * A fresh replica reads it back (SHA-256 compared).
+2. **Random operations against a model, CDC and fixed:**
+   * The setup: `max_value_bytes` 8,192, `cdc` `{256, 10, 8,128}` (8.3's parameters), `dirtyBytes` 64 KiB, so files of about 2 MB are paged and spill.
+   * 300 random writes, truncates (down and up), appends, reads and flushes, over handles reopened at random.
+   * After each flush, the file reads back through a second replica and `tree.read`.
+   * Run once under the default policy and once with `setPolicy({chunking: 'fixed'})`.
+3. **An edit costs the pages it touches:**
+   * The setup: a paged v3 file.
+   * A 1-byte overwrite mid-file through a handle queues at most 2 pages. Its new chunks are exactly those whose bytes changed as the fs's chunker cuts them (as `cdc.test.ts`).
+   * A 1-byte append queues 1 page and the re-cut tail.
+   * No `chunks/get` beyond the touched chunks (calls counted).
+4. **The queue survives a restart mid-way:**
+   * The server is killed.
+   * A write of 3 × the bound through a handle queues 3 entries offline.
+   * The replica is closed without closing the handle (a crash: the in-memory tail is lost).
+   * The server restarts and the replica reopens: the entries are sent, and the file is exactly the bytes up to the last spill.
+5. **`close({wait: true})`:**
+   * It resolves with the write on the server. Before the fix it threw reading `local` of undefined.
+   * After a `flush({wait: true})`, the same handle writes and flushes again.
+6. **Records:**
+   * A `writeFile` after a `writeFile` of a paged file reuses its chunks from the per-page records, with no content read (no `chunks/get`).
+   * After an edit, a `writeFile` reads once (incomplete records), then reuses.
+   * An old JSON index record and a v1 queue entry with `index`, written raw into the store, still load and are used.
+7. **Zeros:** a handle extended from 0 to 64 MiB by `truncate` and flushed holds no zero buffer (`dirtyBytes` 0), and reads back zeros.
+
+**Updated:**
+* `writes.test.ts`'s 8.3 case: a v3 file edited through the replica now stays v3, with only touched pages queued.
+* The replica suite runs unchanged otherwise.
+
+**zen-mount (`mount.test.ts`):**
+* **In-process, "a rolled-back tree fails the mount closed":**
+  * The fork setup of `integrity.test.ts`: a write and checkpoint on `self`, verified there.
+  * Bob's replica on the copy is mounted with `integrity`. Its `sync` raises the rollback.
+  * `readFile`, `readdir`, `stat` and a write then give `EIO`, where they gave the stale content before the alarm; unmount works.
+* **The CLI (a world of its own):**
+  * `--integrity` without `--vault` or `--cache-dir` exits 1 with the message.
+  * With `--vault`, after a fork: a mount on `self` writes a file and stops (exit 0), and the device's checkpoint head is on the server (written at close).
+  * A mount on the copy, with the same vault and cache, exits 3 and prints a `rollback` alarm.
+* **"A 1-byte write through the kernel sends one chunk and one page"** keeps its exact count with its fs set to `fixed`. The CDC count is test 3 above.
+
+**Negative controls** (each run once, then restored):
+* the bound off (`dirtyBytes` Infinity): test 1 fails (`dirtyBytes` and RSS)
+* every flush a whole rewrite (no edits): test 3 fails (all pages queued)
+* the `trusted` check off in `mount.ts`: the in-process fuse test fails (stale reads succeed)
+* the old `queueFlush`: test 5 fails
+* the per-page lookup off: test 6 fails (a `chunks/get`)
+
+### Files
+
+* **Spec:** `spec/fs.md` (§11.1)
+* **Client:** `packages/client/src/{tree,writer}.ts` (`Edit.zeros`) and a case in `cdc.test.ts`
+* **`@zen/fs`:**
+  * `packages/fs/src/{handle,replica,queue,index}.ts`
+  * `packages/fs/test/{handles (new),writes}.test.ts`
+* **zen-mount:** `packages/fuse/src/{cli,mount}.ts`, `packages/fuse/test/mount.test.ts`
+* **Docs:** `docs/CLIENT.md`, `docs/INTEGRITY.md`, `spec/TECH_DEBT.md`, `docs/MILESTONE-8.md`
+
+### Verification
+
+* `npm run check` (biome and every tsc project); `npm run build` (the CLI tests run `dist/`)
+* **Suites:** `handles` 3× and `writes`/`replica`/`integrity` once; `mount` (FUSE, in-process and CLI); client `cdc`, `tree` and `large` once; then the full `npx vitest run`
+* **Negative controls:** the five above
+* **CI:** green on both runs
+
+**Defaults chosen (overridable):**
+* **The bound:** 64 MiB per handle (`dirtyBytes`). Past it the handle queues a write (decided).
+* **A whole rewrite reuses by hash** and reads the base once when it has no complete records, as `writeFile` does today; an edit never reads beyond its pages.
+* **Content arrays stay in queue entries,** since the bound limits them, rather than new content-list records (a change from the milestone plan's "entries name content lists").
+* **zen-mount:** an alarm at startup exits 3 without mounting; pins are kept in the vault, else the cache dir, and one of them is required.
+* **TD-FUSE-INTEGRITY is resolved in this step,** with the code, not in 8.7.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
