@@ -134,19 +134,38 @@ describe('content-defined chunks (version 3)', () => {
     expect(d.lens!.reduce((a, b) => a + b, 0)).toBe(ref.bytes);
   });
 
-  it('an insertion re-uploads at most 3 chunks and 2 pages', async () => {
+  it('an insertion re-uploads only the chunks it changes, and at most 2 pages', async () => {
     const t = tree();
     const f = await t.create(ROOT, name());
     const data = random(1_200_000);
     await t.writeFile(f, data);
+    // The chunks of some content, as the chunker cuts them (by their bytes).
+    const cuts = (d: Uint8Array) => {
+      const ch = ufs.sealKeys().chunker(CDC);
+      const out: string[] = [];
+      let p = 0;
+      for (const c of ch.push(d)) {
+        out.push(bytes.hex(d.subarray(p, c)));
+        p = c;
+      }
+      ch.finish();
+      ch.free();
+      if (p < d.length) out.push(bytes.hex(d.subarray(p)));
+      return out;
+    };
     for (const at of [600_000, 10, 1_199_000]) {
       const prev = await t.versions(f);
       const v = prev[0]!;
       const idx = await t.chunkIndex(f, v);
       const before = await t.readFile(f);
       const next = concat(before.subarray(0, at), random(100), before.subarray(at));
+      const old = new Set(cuts(before));
+      const changed = cuts(next).filter((c) => !old.has(c)).length;
+      // The cuts resync within a few chunks (one in most cases).
+      expect(changed).toBeGreaterThanOrEqual(1);
+      expect(changed).toBeLessThanOrEqual(12);
       const w2 = await t.writeFile(f, next, { previous: idx, replaces: [v.dot] });
-      expect(w2.uploaded).toBeLessThanOrEqual(3);
+      expect(w2.uploaded).toBe(changed);
       expect(w2.pagesUploaded).toBeLessThanOrEqual(2);
       expect(equal(await tree(t.id).readFile(f), next)).toBe(true);
     }
@@ -165,7 +184,7 @@ describe('content-defined chunks (version 3)', () => {
       expect(r.count.get('/v1/fs/pages/get')).toBe(1);
       expect(r.count.get('/v1/fs/chunks/get')).toBe(1);
       expect(r.result.manifest.version).toBe(chunking === 'cdc' ? 3 : 2);
-      expect(r.result.uploaded).toBeLessThanOrEqual(chunking === 'cdc' ? 8 : 2);
+      expect(r.result.uploaded).toBeLessThanOrEqual(chunking === 'cdc' ? 1 + 5_000 / CDC.min : 2);
       expect(r.result.pagesUploaded).toBe(1);
       expect(r.result.index).toBeUndefined();
       expect(equal(await tree(t.id).readFile(f), concat(data, more))).toBe(true);
@@ -190,10 +209,12 @@ describe('content-defined chunks (version 3)', () => {
         fresh.edit(f, undefined, [{ offset, remove, insert }]),
       );
       apply(offset, remove, insert);
+      // The touched page, and the chunks until the cuts resync (a few, at
+      // most about 12 in a probe of 300 insertions): never the whole file.
       expect(r.count.get('/v1/fs/pages/get')).toBeLessThanOrEqual(2);
-      expect(r.count.get('/v1/fs/chunks/get') ?? 0).toBeLessThanOrEqual(6);
+      expect(r.count.get('/v1/fs/chunks/get') ?? 0).toBeLessThanOrEqual(14);
       expect(r.result.pagesUploaded).toBeLessThanOrEqual(2);
-      expect(r.result.uploaded).toBeLessThanOrEqual(4 + Math.ceil(insert.length / CDC.min));
+      expect(r.result.uploaded).toBeLessThanOrEqual(14 + Math.ceil(insert.length / CDC.min));
       expect(equal(await tree(t.id).readFile(f), model)).toBe(true);
     }
     const m = v3((await t.versions(f))[0]!.manifest);

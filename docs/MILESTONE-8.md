@@ -230,6 +230,13 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * `upload` left out of commits: the session test fails (`unknown chunk in page` on resume)
     * progress reported as commits finish: the pipelining test fails (`[2, 3, 1, 5, 6]`)
   * **Checks:** `cargo fmt`; clippy on zen-core, zen-wasm (wasm32) and zen-ublk (`device-tests`); `cargo test -p zen-core --features test-utils`; vectors regenerated; `scripts/build-wasm.sh`; `npm run check` (biome and every tsc project); `cdc`, `large`, `tree`, `fsvectors` and `stream` suites.
+  * **Full vitest run:** 619 passed, 15 skipped, 1 failed. The failure was zen-mount's vault test (EIO on a read): the CLI runs `packages/fuse/dist/cli.js`, and this checkout's `dist/` builds dated from Oct 25, so an old client read a v3 file. After `npm run build` the mount suite passes (11/11). CI builds fresh.
+  * **The insertion test was flaky (1 in 3 runs: 4 or 5 chunks re-uploaded, bound 3).**
+    * The writer isn't at fault: in a probe of 30 writes it uploaded exactly the chunks the chunker changed.
+    * The chunker's own resync over 300 random 100-byte insertions (avg 1 KiB, min 256) changed 1 chunk 64 % of the time, 2 21 %, 3 7 %, 4 4 %, 5 2.7 %, 6 1 %, 7 0.3 %. Normalized cutting depends on the position within a chunk, so an insertion can move a cut, and a few chunks follow before the cuts line up again.
+    * The test now requires the uploads to equal the chunks whose bytes changed (cut with the same chunker), which is exact; the edit and append bounds allow that tail.
+    * Then `cdc` passed 3× in full, and its randomized tests 10× more.
+    * The plan's "≤ 2 chunks" (from 8.1's single vector input) holds for most insertions, not all; STATS gets the distribution in 8.7.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
