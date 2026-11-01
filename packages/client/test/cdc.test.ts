@@ -251,7 +251,7 @@ describe('content-defined chunks (version 3)', () => {
 
   it('the fill rule merges a short page with a short neighbour', async () => {
     const t = tree();
-    const f = await t.create(ROOT, name());
+    let f = await t.create(ROOT, name());
     let model = random(2_000_000);
     await t.writeFile(f, model);
     const starts = async () => {
@@ -284,6 +284,20 @@ describe('content-defined chunks (version 3)', () => {
     expect(m.pages!.length).toBe(once.pages!.length - 1);
     expect(m.pages![0]!.count).toBeGreaterThanOrEqual(PS / 2);
     filled(m);
+    expect(equal(await tree(t.id).readFile(f), model)).toBe(true);
+
+    // A short page of the base whose next page an edit shrinks: the two
+    // become one, though the short one isn't touched.
+    f = await t.create(ROOT, name());
+    model = random(2_000_000);
+    await t.writeFile(f, model);
+    await cut(1);
+    const first = (await starts()).m;
+    expect(first.pages![1]!.count).toBeLessThan(PS / 2);
+    await cut(2);
+    const again = (await starts()).m;
+    expect(again.pages!.length).toBe(first.pages!.length - 1);
+    filled(again);
     expect(equal(await tree(t.id).readFile(f), model)).toBe(true);
   });
 

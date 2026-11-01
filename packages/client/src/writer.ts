@@ -633,7 +633,7 @@ export async function stage(
     chunking,
     ...(chunking === 'cdc' ? { cdc: cdc! } : { chunkSize }),
     size: s.size,
-    pages: pages.slice(0, s.pages),
+    pages: s.pages,
     tail: s.tail,
     paged: s.paged,
     ...keyOf,
@@ -671,7 +671,7 @@ export async function stage(
     upload.commits++;
     const snap: Snapshot = {
       size,
-      pages: pages.length,
+      pages: pages.slice(),
       tail: open.slice(),
       paged,
       uploaded: upload.uploaded,
@@ -714,7 +714,26 @@ export async function stage(
   };
 
   // ---- pages
+  // Pages this write made (not the base's).
+  const own = new Set<string>();
   const closePage = async (count: number) => {
+    // A short page after a short page of the base taken over unread (whose
+    // neighbour an edit shrank): one page, if the two fit (the fill rule).
+    const before = pages.at(-1);
+    if (chunking === 'cdc' && count < pageSize && before && 'count' in before && base) {
+      const bp = basePages.get(hex(before.id));
+      if (
+        bp !== undefined &&
+        !own.has(hex(before.id)) &&
+        2 * before.count < pageSize &&
+        before.count + count <= pageSize
+      ) {
+        const pg = (await tree.pagesOf(base, bp, bp))[0]!;
+        pages.pop();
+        open.unshift(...pg.ids.map((id, i) => ({ id, len: pg.lens[i]! })));
+        count += before.count;
+      }
+    }
     const entries = open.slice(0, count);
     const ids = entries.map((e) => e.id);
     await prevPagesOf();
@@ -735,6 +754,7 @@ export async function stage(
       await add(OP_OVERHEAD + data.length + 16 + 48 * Math.floor(data.length / 16) + putCost);
       open.splice(0, count);
       pendingPages.push({ fs: fs.id, id, data });
+      own.add(hex(id));
       const digest = zw.pageDigest(data);
       pages.push(chunking === 'cdc' ? { id, digest, bytes, count } : { id, digest });
       upload.pagesUploaded++;
@@ -1005,7 +1025,7 @@ export async function stage(
 /** What a progress report covers: the content up to a commit. */
 interface Snapshot {
   size: number;
-  pages: number;
+  pages: (PageRef | PageRefV3)[];
   tail: TailEntry[];
   paged: boolean;
   uploaded: number;

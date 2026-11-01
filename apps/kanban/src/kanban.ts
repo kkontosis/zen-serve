@@ -271,6 +271,9 @@ export function deleteCard(db: Db, tree: Tree, id: string): Promise<boolean> {
     if (!card) return false;
     await cards.delete(id);
     if (card.dir) {
+      // Read it first: that observes its timestamps, so this move orders
+      // after its creation even when another device's clock runs ahead.
+      await tree.getOne(bytes.fromHex(card.dir));
       await tx.fs(tree).ops([{ op: 'move', node: bytes.fromHex(card.dir), parent: TRASH }]);
     }
     return true;

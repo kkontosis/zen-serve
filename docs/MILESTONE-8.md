@@ -237,6 +237,16 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * The test now requires the uploads to equal the chunks whose bytes changed (cut with the same chunker), which is exact; the edit and append bounds allow that tail.
     * Then `cdc` passed 3× in full, and its randomized tests 10× more.
     * The plan's "≤ 2 chunks" (from 8.1's single vector input) holds for most insertions, not all; STATS gets the distribution in 8.7.
+  * **CI on 9f0fba8: red on both runs, two different tests.**
+    * **The pull_request run** failed `filled()` after the three edits: a short page and its neighbour held 408 entries, not over 409. The writer is at fault: a short page of the base was taken over unread while an edit shrank the page after it, and nothing re-examined the pair.
+      * Fix: when the writer closes a short page right after a short base page taken over unread, it fetches that page and makes the two one page, if they fit.
+      * Progress snapshots now copy the page list, since a page can be taken back.
+      * The fill-rule test gained a deterministic case (a short base page whose next page an edit shrinks); with the merge disabled it fails (5 pages, not 4).
+    * **The push run** failed kanban's "deleting a card moves its attachment directory to TRASH": the directory's parent read back as ROOT.
+      * It didn't reproduce locally (6 of 6 passed).
+      * The cause is a clock race in `deleteCard`: the move is stamped by a session that never read the directory, so it isn't ordered after the directory's creation (by the other session, in `addCard`). If that session's clock estimate trails the other's by more than the time between them, which can happen under CI load, the move sorts before the `mkdir` and loses.
+      * Fix: `deleteCard` reads the directory first (`tree.getOne`), which observes its timestamps.
+      * No test change: the race needs the clocks skewed.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
