@@ -237,7 +237,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-LORO-LARGE-SNAPSHOT
 
-* **Status:** open
+* **Status:** resolved, by the commits "spec: Loro snapshots in zen-fs files past half a commit (zendb.md §20)" and "loro: snapshots larger than half a commit go to zen-fs files (milestone 8 step 5)": a snapshot past half of `max_commit_bytes` is a file in a tree of the document's own, and the `$loro` row names its version by the hash of its sealed manifest (zendb.md §20.1, §20.2, §20.5); tests in `packages/loro/test/loro.test.ts`.
 * **Context:** A Loro document's snapshot is a row of the `$loro` system table (spec/zendb.md §20.5). A row is split into parts, but it must fit one commit (`max_commit_bytes`, 8 MB by default). A larger snapshot keeps the old one, and the client stops compacting that document, so loads read ever more of the log.
 * **Why deferred:** Documents of the milestone 5 apps (card texts) stay far below the limit, and a file-backed snapshot needs the replica's write path, which landed only in step 8.
 * **What it would take:** Store a large snapshot as a zen-fs file (paged versions, uploaded in commits of its own), with the `$loro` row holding the file's node and version instead of the bytes; compaction then replaces the file's version; loads stream it.

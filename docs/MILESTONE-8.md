@@ -336,6 +336,48 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 5 plan`
     4. push and open the PR
   * Then implement on "go", in a new PR.
+  * Plan committed (2953c99), PR #70.
+  * **Decided at "go":** PR #70 wasn't merged yet, so the implementation goes on the same branch, on top of the plan commit. PR #70 is retitled to cover the plan and the implementation.
+  * **On "go":**
+    1. Set up the container if needed: `npm ci`, `scripts/build-wasm.sh`, `npm run build`, and a zen-server build for the tests.
+    2. The `spec:` commit (zendb.md §20).
+    3. Implement and test "Step 8.5 in detail", then the docs.
+    4. Log the step in both copies.
+    5. Push, retitle PR #70, and confirm CI is green on both runs.
+  * **Implementation** (on "go"):
+    * **Setup:** this container had `node_modules`, the wasm package and the builds; only `zen-serve` was rebuilt.
+    * **`spec:` commit** 86114a3 (zendb.md §20.1, §20.2, §20.5, §20.6).
+    * **`@zen/loro` (`loro.ts`):**
+      * `LoroOptions.fileBytes`
+      * the row helpers `rowOffset` and `fileOf`, which checks a file row's shape (ids of 16 bytes, a hash of 32, a safe integer size)
+      * `writeInline`, which removes a file row's node
+      * `writeFile`: upload, then one transaction. It starts over, up to 3 times, when the row no longer names the node it uploaded to.
+      * `removeIn`: reads the node first, so the move sorts after its creation (the kanban clock race of 8.3)
+      * `snapshotOf` and `readFile` for loading. A version whose size differs from the row's is refused (`poisoned`).
+    * **Changes from the plan:**
+      * **`writeFile` starts over when its node is stale.** That covers a node taken from the row before the upload that the row no longer names by the transaction: the file went back inline (the node is in `TRASH`), or another client replaced it. Writing there would put the snapshot in a removed node, so the attempt starts over with the row read again. After 3 attempts nothing is written (the next compaction tries again).
+      * **Test 3 was split in two.** A real race of two owners mostly ends with equal offsets, so the loser writes nothing. A second, deterministic test therefore commits another client's first file (at an earlier offset) between our transaction's row read and its commit, and checks that the transaction's re-run removes that node and writes its own.
+    * **Tests:** the "too large" describe became "a snapshot larger than a commit goes to a file", with 9 cases:
+      * on the small world (64 KiB commits, 16 KiB values), with the snapshot uploaded in several session commits:
+        1. the compaction to a file
+        2. the load (exactly the 5 tail events), then the next compaction replacing the version
+      * on the main world, with `fileBytes: 0`:
+        3. two owners at once
+        4. another client's new file removed
+        5. a version replaced between the reads (0 events read)
+        6. a row naming no version (one warning, the whole log read)
+        7. the hash picking the row's version over a newer sibling
+        8. back to inline (the node in `TRASH`)
+        9. no upload sessions (no `/v1/fs/upload/` call)
+    * **Negative controls** (each run once, then restored):
+      * the newest version instead of the hash match: test 7 fails (the document reads back empty)
+        * The first form of this control compared objects from two `versions()` calls, so it never matched and the loader fell back to the log, and the test passed. The fixed control takes the last version.
+      * `replaces: []` on every write: test 2 fails (2 versions)
+      * no reread: test 5 fails (2 events read, not 0)
+      * the session left open: test 1 fails
+      * no remove of the other node: test 4 fails
+    * **Docs:** DB.md (Loro limits); TECH_DEBT TD-LORO-LARGE-SNAPSHOT resolved.
+    * **Checks:** `npm run check` and `npm run build` clean; `loro` 3× (17 passed).
 
 ## Steps (one PR each; each planned in detail before it starts)
 
