@@ -15,6 +15,10 @@ import {
   type CredentialVault,
   connect,
   credentialVault,
+  type Fs,
+  type Integrity,
+  type IntegrityAlarm,
+  type IntegrityOptions,
   isCode,
   memoryLocalStore,
   type SealedStore,
@@ -60,6 +64,12 @@ Mount:
                          repeatable, and remembered in --cache-dir
   --offline-ok           mount from --cache-dir when the server can't be reached
                          (needs --vault)
+  --integrity            check what the server shows against this device's pins
+                         and checkpoints (fs.md §9): pins kept in --vault, else
+                         --cache-dir (one is needed); signed by --device-key or
+                         the vault's device. An alarm stops the mount: at start,
+                         exit 3; mounted, every operation fails with EIO, and
+                         the exit is 3
   -h, --help
 `;
 
@@ -84,6 +94,7 @@ export interface Args {
   pins: string[];
   vault?: string;
   offlineOk: boolean;
+  integrity: boolean;
 }
 
 export function parse(argv: string[]): Args {
@@ -108,6 +119,7 @@ export function parse(argv: string[]): Args {
       pin: { type: 'string', multiple: true, default: [] },
       vault: { type: 'string' },
       'offline-ok': { type: 'boolean', default: false },
+      integrity: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -122,6 +134,10 @@ export function parse(argv: string[]): Args {
     throw new Error('--cache-size takes a number of bytes');
   if (values['offline-ok'] && (!values['cache-dir'] || !values.vault))
     throw new Error('--offline-ok needs --cache-dir and --vault');
+  if (values.integrity && !values['cache-dir'] && !values.vault)
+    throw new Error(
+      '--integrity needs --vault or --cache-dir: pins kept in memory would trust whatever the server shows at each mount',
+    );
   return {
     url: positionals[0]!,
     mountpoint: positionals[1]!,
@@ -142,6 +158,7 @@ export function parse(argv: string[]): Args {
     pins: values.pin as string[],
     ...(values.vault ? { vault: values.vault } : {}),
     offlineOk: values['offline-ok']!,
+    integrity: values.integrity!,
   };
 }
 
@@ -215,13 +232,13 @@ async function signIn(
 }
 
 async function unlock(
+  fs: Fs,
   session: Session,
   a: Args,
   local: SealedStore | undefined,
   device?: DeviceFile,
   vault?: CredentialVault,
 ): Promise<UnlockedFs> {
-  const fs = session.fs(a.fs);
   const opts = local ? { local } : {};
   let how: Unlock | undefined;
   if (a.passphrase || process.env.ZEN_PASSPHRASE) {
@@ -241,6 +258,23 @@ async function hasDevice(vault: CredentialVault): Promise<boolean> {
   d?.device.free();
   return !!d;
 }
+
+/** The device that signs checkpoints: the device key file's, else the vault's (none: verify only). */
+async function signer(
+  device: DeviceFile | undefined,
+  vault: CredentialVault | undefined,
+): Promise<IntegrityOptions['device']> {
+  if (device) {
+    return {
+      device: zw.DeviceSecret.fromSeed(bytes.fromHex(device.device_seed)),
+      cert: bytes.fromHex(device.cert),
+    };
+  }
+  const d = await vault?.signer();
+  return d ? { device: d.device, cert: d.cert } : undefined;
+}
+
+const alarmLine = (a: IntegrityAlarm) => `integrity alarm: ${a.kind} (${a.object}): ${a.detail}`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -274,10 +308,40 @@ async function main(): Promise<void> {
     online = false;
     process.stderr.write("zen-mount: the server can't be reached; mounting from the cache\n");
   }
-  const vault = a.vault ? credentialVault(sealedStore(nodeDiskLocalStore(a.vault))) : undefined;
+  const vaultStore = a.vault ? sealedStore(nodeDiskLocalStore(a.vault)) : undefined;
+  const vault = vaultStore ? credentialVault(vaultStore) : undefined;
   const local = a.cacheDir ? sealedStore(nodeDiskLocalStore(a.cacheDir)) : undefined;
   const { session, device } = await signIn(client, a, vault);
-  const ufs = await unlock(session, a, local, device, vault);
+  // Integrity is attached to the fs object that is then unlocked.
+  const fs = session.fs(a.fs);
+  let integrity: Integrity | undefined;
+  let mounted = false;
+  /** An alarm before the mount: no mount is made. */
+  const refuse = (e: unknown): never => {
+    const alarm = integrity?.alarms[0];
+    if (!alarm && !(integrity && !integrity.trusted)) throw e;
+    process.stderr.write('zen-mount: not mounting a tree the server rolled back or forked\n');
+    process.exit(3);
+  };
+  if (a.integrity) {
+    const dev = await signer(device, vault);
+    if (!dev) {
+      process.stderr.write(
+        'zen-mount: --integrity without a device key: checking only, no checkpoints written\n',
+      );
+    }
+    integrity = await fs
+      .integrity({
+        local: (vaultStore ?? local)!,
+        ...(dev ? { device: dev } : {}),
+        onAlarm: (al) =>
+          process.stderr.write(
+            `zen-mount: ${alarmLine(al)}${mounted ? '; every operation now fails with EIO' : ''}\n`,
+          ),
+      })
+      .catch(refuse);
+  }
+  const ufs = await unlock(fs, session, a, local, device, vault).catch(refuse);
   const treeId = a.tree ? bytes.fromHex(a.tree) : bytes.randomBytes(16);
   if (a.newTree) process.stdout.write(`tree ${bytes.hex(treeId)}\n`);
   const replica = await openReplica(ufs, treeId, {
@@ -287,13 +351,18 @@ async function main(): Promise<void> {
     channel: null,
   });
   // Mount a complete table: catch up first (offline, the kept one).
-  if (online) await replica.sync();
+  if (online) await replica.sync().catch(refuse);
+  if (integrity && !integrity.trusted) refuse(undefined);
   for (const p of a.pins) {
     await replica.pin(p).catch((e: unknown) => {
       process.stderr.write(`zen-mount: --pin ${p}: ${(e as Error).message}\n`);
     });
   }
-  const m = await mount(replica, a.mountpoint, { readOnly: a.readOnly });
+  const m = await mount(replica, a.mountpoint, {
+    readOnly: a.readOnly,
+    ...(integrity ? { integrity } : {}),
+  });
+  mounted = true;
   process.send?.('mounted');
   process.stderr.write(`mounted fs ${a.fs} tree ${bytes.hex(treeId)} on ${a.mountpoint}\n`);
   let stopping = false;
@@ -301,7 +370,9 @@ async function main(): Promise<void> {
     if (stopping) process.exit(1); // a second signal: stop at once
     stopping = true;
     await m.unmount();
-    if (!(await drain(replica, 10_000))) {
+    const untrusted = !!integrity && !integrity.trusted;
+    // Untrusted, nothing more is sent to that server.
+    if (!untrusted && !(await drain(replica, 10_000))) {
       const { queued } = await replica.status();
       if (local) {
         process.stderr.write(
@@ -318,8 +389,12 @@ async function main(): Promise<void> {
       }
     }
     await replica.close();
+    // The last checkpoint (none once untrusted).
+    await integrity?.close().catch((e: unknown) => {
+      process.stderr.write(`zen-mount: the last checkpoint: ${(e as Error).message}\n`);
+    });
     ufs.close();
-    process.exit(0);
+    process.exit(untrusted || (integrity && !integrity.trusted) ? 3 : 0);
   };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);

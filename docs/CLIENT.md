@@ -170,7 +170,7 @@ for await (const batch of tree.changes(cursor, { waitMs: 25_000 })) { … }
 ```ts
 import { openReplica } from '@zen/fs';
 
-const r = await openReplica(ufs, treeId, { local, cacheBytes: 512 << 20 });
+const r = await openReplica(ufs, treeId, { local, cacheBytes: 512 << 20, dirtyBytes: 64 << 20 });
 await r.sync();                                   // optional: catch up now (it follows the feed anyway)
 await r.readdir('/docs', { withTypes: true });    // [{name, type}], display names and conflict copies
 await r.stat('/docs/a.txt');                      // {type, mode, size, mtimeMs, node, versions, conflict}
@@ -201,17 +201,20 @@ await r.chmod(p, 0o600); await r.utimes(p, ms); await r.setxattr(p, 'user.k', v)
 await r.writeFile('/x', data, { wait: true });    // resolve once the server has it, not once queued
 
 const h = await r.open('/big.bin', 'r+');          // 'r', 'r+', 'w' (truncates), 'a'; {create, exclusive, mode}
-await h.write(patch, offset); await h.read(n, offset);
-await h.close();                                  // flush: one write, sealing only the chunks written
+await h.write(patch, offset); await h.read(n, offset); await h.truncate(n);
+h.dirtyBytes;                                     // bytes written and held in memory, not yet queued
+await h.flush({ wait: true });                    // one write (an edit of the version opened); the handle goes on
+await h.close({ wait: true });                    // flush and close; with wait, once the server has it
 await r.flush();                                  // resolves once every queued write is sent; offline: rejects
 r.onError((e, entries) => …);                     // writes the server refused (they are dropped)
 ```
 
 * **A call returns once it is queued** (in the store, so it survives a restart), offline too; `{wait: true}` waits for the server. `status()` gives `queued` and `sending`.
-* **Changed chunks only.** A handle keeps the chunks it writes in memory; on flush the others are taken over from the version it opened by id (`KnownChunk`), with no plaintext read, and only pages whose ids changed are new. `writeFile` reuses unchanged chunks by hash. Both need the version's chunk index, built once with a streamed read and kept; offline it can be built from pinned content, else the whole file is sealed.
+* **Handles, in bounded memory.** A handle keeps the file as extents over the version it opened: that version's bytes where nothing was written, the bytes written in memory, and zeros where it was extended (`truncate` up, or a write past the end; zeros take no memory). Past `dirtyBytes` (default 64 MiB) of written bytes it queues them as a write of its own, as a flush does, and goes on from the new version; so a large file written through a handle is queued in pieces, and other devices may see its partial content before the handle closes (spec/fs.md §11.1).
+* **Changed chunks only.** A handle's flush is an edit of the version it opened (`Tree.editUpload`): only the pages it touches are fetched and sealed again, and only the chunks around each change, until the cuts resync with the version's. Untouched pages are taken over unread. A whole rewrite (`w`, or `truncate(0)` then writes) and `writeFile` reuse unchanged chunks by hash, through the version's chunk index: kept in binary records per page (written when content is sealed from bytes), else built once with a streamed read and kept; offline it can be built from pinned content, else the whole file is sealed.
+* **Chunks:** new files are cut by content (version 3) under the fs policy's default (`chunking: cdc`), with `fixed` where the policy says so or the server has no chunker parameters for its `max_value_bytes`; an edit keeps its file's form. `ReplicaOptions.cdc` sets the chunker's parameters (`TreeOptions.cdc`).
 * **Conflicts.** A write replaces the version shown (and this replica's earlier writes of the file), so a write made elsewhere meanwhile stays as a conflict copy, on every replica. Deleting the copy resolves it, keeping the version shown.
 * **Writing offline over a file whose versions aren't kept fails with `offline`**: read, stat or pin it first. Versions this replica wrote are kept.
-* **Chunks:** the replica writes fixed-size chunks for now (milestone 8 step 4 makes it cut by content). It reads files of either kind; the first flush of an edit to a file of variable chunks rewrites the file whole.
 * **Sending.** Entries go in order, as few commits as the limits allow; a batch's commit is stored first and sent again with its `commit_id` after a crash. A refused entry (rights, a node purged meanwhile) is dropped and reported to `onError`; `stale_op` and `clock_skew` are rebased.
 * **Tabs.** Any tab writes; the owner sends, and the others hear when their writes are sent or refused.
 * The `zen.` xattr names are reserved (`zen.content_type` holds the media type, `stat().contentType`).
@@ -237,7 +240,8 @@ node packages/fuse/dist/cli.js https://zen.example.org ~/zen --tree <hex> \
 * **`--cache-dir DIR`:** the replica (node table, content, pins, writes not yet sent) and the kept fs header, in a sealed disk store. One mount per directory (a lock file). Without it, everything is in memory. `--cache-size` bounds the content kept (default 1 GiB; pins don't count), and `--pin PATH` (repeatable, remembered) keeps a file or a folder offline.
 * **`--offline-ok`** (needs `--cache-dir` and `--vault`): when the server can't be reached at start, mount from the cache. Without it the CLI exits with status 1. Offline, the node table lists, kept content reads, and a file whose content isn't kept lists with size 0 and fails to read (`EIO`).
 * Without `--foreground` it detaches once mounted. SIGINT or SIGTERM unmounts (open files queue their writes) and waits up to 10 s for the queue to be sent. With `--cache-dir`, what is left is sent at the next mount; in memory it would be lost, so it waits for the server (a second signal stops at once).
-* **How it maps:** listings, `stat`, symlinks and xattrs come from the replica's node table, kept current through the change feed; the kernel caches them for `attrTimeout` (1 s). Reads go through the replica's content cache. A file open for writing keeps only the chunks written; `flush`, `fsync` and `close` queue one write with only those chunks sealed. **`fsync` makes a write durable on this device** (with `--cache-dir`), not on the server: it is sent as soon as the server can be reached.
+* **How it maps:** listings, `stat`, symlinks and xattrs come from the replica's node table, kept current through the change feed; the kernel caches them for `attrTimeout` (1 s). Reads go through the replica's content cache. A file open for writing is a replica handle (§8): at most 64 MiB of what is written stays in memory before it is queued, and `flush`, `fsync` and `close` queue one write that seals only the pages and chunks around what changed. **`fsync` makes a write durable on this device** (with `--cache-dir`), not on the server: it is sent as soon as the server can be reached.
+* **`--integrity`:** the fs's integrity (§12, spec/fs.md §9) is attached before unlocking. The pins go in the vault's store (with `--vault`), else in the cache dir's, and one of them is required: pins kept in memory would trust whatever the server shows at each mount (exit 1). Checkpoints are signed by `--device-key`, else the vault's signer or device; with neither, the mount checks only. An alarm while attaching, unlocking or in the first sync prints it and exits 3, with no mount made. Once mounted, an alarm (from the change feed) is logged as `zen-mount: integrity alarm: <kind> (<object>): <detail>; every operation now fails with EIO`, and every operation answers `EIO` (unmounting still works, and open files are dropped unflushed); the CLI then exits 3 when stopped. A clean stop writes a last checkpoint after the queue is sent.
 * **Symlinks** are `symlink` nodes. **xattrs:** the kernel's `user.<x>` is the stored `<x>` (`user.zen.content_type` is the media type); other namespaces give `ENOTSUP`.
 * **Conflicts:** two devices writing the same file concurrently leave siblings. The newest is shown as the file and the others as read-only `name (conflict <device>-<n>).ext`; deleting the copy resolves the conflict in favour of the file.
 * **Limits:** no hard links (`EPERM`), no `mmap` coherence across devices, inode numbers from the kernel (fuse-native has no `use_ino`), and no cache invalidation pushed to the kernel (changes from elsewhere show within `attrTimeout`).

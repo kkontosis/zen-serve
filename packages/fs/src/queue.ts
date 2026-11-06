@@ -9,7 +9,10 @@ import type { Commit } from '@zen/wasm';
 export type QWrite = Extract<PendingOp, { op: 'write' }> & {
   /** Earlier entries (hex keys) writing the node: their dots, once known, are replaced too. */
   after?: string[];
-  /** The new content's index (for later writes' chunk reuse). */
+  /**
+   * The new content's whole index: only in entries queued before the index
+   * records (`records.ts`), still read; new entries leave it out.
+   */
   index?: ChunkIndex;
 };
 

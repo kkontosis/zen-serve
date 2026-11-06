@@ -20,7 +20,7 @@ import type {
   Versions,
   AnyManifest as WasmAnyManifest,
 } from '@zen/wasm';
-import { compare, concat, equal, hex, randomBytes } from './bytes.js';
+import { compare, equal, hex, randomBytes } from './bytes.js';
 
 /** A manifest of any version (formats.md §11.3): 1, 2 (fixed chunks) or 3 (content-defined). */
 export type AnyManifest = WasmAnyManifest;
@@ -37,7 +37,9 @@ import { sendCommit, type Transaction } from './kv.js';
 import type { Session } from './session.js';
 import { zw } from './wasm.js';
 import {
+  editBytes,
   editSource,
+  inserted,
   locate,
   OP_OVERHEAD,
   overflows,
@@ -189,11 +191,15 @@ export type FileSource =
   | Iterable<Uint8Array | KnownChunk | KnownPage>
   | ReadableStream<Uint8Array>;
 
-/** A change of `Tree.edit`: `remove` bytes at `offset` of the base, then `insert` there. */
+/**
+ * A change of `Tree.edit`: `remove` bytes at `offset` of the base, then
+ * `insert` there, then `zeros` zero bytes (streamed, never allocated whole).
+ */
 export interface Edit {
   offset: number;
   remove?: number;
   insert?: Uint8Array;
+  zeros?: number;
 }
 
 /** An entry of an upload's tail (`UploadState.tail`). */
@@ -1253,9 +1259,10 @@ export class Tree {
       if (edits.some((e) => e.offset !== 0 || (e.remove ?? 0) !== 0)) {
         throw new ZenError(0, 'bad_value', 'edits must be within the file');
       }
-      return stage(this, node, concat(...edits.map((e) => e.insert ?? new Uint8Array(0))), opts);
+      const size = edits.reduce((a, e) => a + editBytes(e), 0);
+      return stage(this, node, inserted(edits), { ...opts, size });
     }
-    const size = edits.reduce((a, e) => a - (e.remove ?? 0) + (e.insert?.length ?? 0), v.size);
+    const size = edits.reduce((a, e) => a - (e.remove ?? 0) + editBytes(e), v.size);
     return stage(this, node, editSource(this, v, edits), {
       ...opts,
       base: v,

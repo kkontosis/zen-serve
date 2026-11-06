@@ -249,6 +249,38 @@ describe('content-defined chunks (version 3)', () => {
     ).rejects.toMatchObject({ code: 'bad_value' });
   });
 
+  it('zeros in an edit are streamed: into a base, and as a file with no base', async () => {
+    const t = tree();
+    const f = await t.create(ROOT, name());
+    const data = random(600_000);
+    await t.writeFile(f, data);
+    const z = 3 * (1 << 20) + 5;
+    // Bytes and zeros at one place, and zeros alone at the end.
+    await t.edit(f, undefined, [
+      { offset: 1000, remove: 10, insert: bytes.utf8('abc'), zeros: z },
+      { offset: data.length, zeros: 7 },
+    ]);
+    const want = concat(
+      data.subarray(0, 1000),
+      bytes.utf8('abc'),
+      new Uint8Array(z),
+      data.subarray(1010),
+      new Uint8Array(7),
+    );
+    expect(equal(await tree(t.id).readFile(f), want)).toBe(true);
+    // No base: the edits' bytes in turn.
+    const g = await t.create(ROOT, name());
+    const w2 = await t.edit(g, undefined, [
+      { offset: 0, insert: bytes.utf8('x') },
+      { offset: 0, zeros: 100_000 },
+    ]);
+    expect(w2.manifest.size).toBe(100_001);
+    expect(equal(await t.readFile(g), concat(bytes.utf8('x'), new Uint8Array(100_000)))).toBe(true);
+    await expect(t.edit(g, undefined, [{ offset: 0, zeros: -1 }])).rejects.toMatchObject({
+      code: 'bad_value',
+    });
+  });
+
   it('the fill rule merges a short page with a short neighbour', async () => {
     const t = tree();
     let f = await t.create(ROOT, name());

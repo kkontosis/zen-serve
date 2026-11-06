@@ -90,7 +90,7 @@ Integrity is opt-in per fs object, and attached **before unlocking**, so the hea
 * **zen-db:** `Db.open(fs, ns, {integrity: 'authenticated'})` creates the namespace authenticated, and needs integrity attached to the fs. A namespace created authenticated stays so, and opens verified without the option.
 * **`@zen/fs` replicas** and **`@zen/svc` handlers** use the integrity attached to their fs: nothing else to set.
 * **zen-ublk:** always on. A volume can't be opened without it.
-* **zen-mount:** not yet (TD-FUSE-INTEGRITY).
+* **zen-mount:** `--integrity`, with the pins in `--vault` (else `--cache-dir`; one is required) and checkpoints signed by `--device-key` or the vault's device. A clean stop writes a last checkpoint. CLIENT.md §9.
 
 ## 6. Signers and enrollment
 
@@ -136,6 +136,7 @@ A device writes checkpoints only with a **signing key**: a device key certified 
 * **A handler** (`@zen/svc`) aborts the connection whose claim failed, and gives up a batch of claims it can't verify.
 * **An authenticated namespace:** the transaction fails with the alarm.
 * **zen-ublk** fails closed: every request gets `EIO`, the device stays until the daemon is stopped, and it exits 3.
+* **zen-mount** (`--integrity`) fails closed too: an alarm at start (attaching, unlocking, the first sync) exits 3 with no mount made; once mounted, every operation answers `EIO` (unmounting still works, open files are dropped unflushed, and nothing more is sent), a log line names the alarm, and the CLI exits 3 when stopped.
 * **The Rust CLI** prints the alarm as JSON on stderr and exits 3.
 
 **A suggested app policy:**
