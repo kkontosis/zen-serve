@@ -24,6 +24,15 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_zen-ublk");
 
+/// The tests' lease (the default is 30 s). It is renewed every third of it,
+/// so a renewal has two thirds of it to land. That covers a renewal waiting
+/// behind the writer's own 1 MiB commits on a debug server with several
+/// tests at once: with 2 s (1.33 s of slack) a FUSE test lost its lease on
+/// CI twice.
+const LEASE_MS: &str = "6000";
+/// Longer than the lease: a killed writer's lease has lapsed.
+const LAPSE: Duration = Duration::from_millis(6500);
+
 /// A server claimed by key 1, fs 1 with slots for key 1 and the writer,
 /// and the writer's device key file.
 struct World {
@@ -67,7 +76,7 @@ async fn world() -> World {
         srv,
         dir,
         key_file,
-        tuning: vec!["--lease-ttl-ms", "2000", "--idle-flush-ms", "1000"],
+        tuning: vec!["--lease-ttl-ms", LEASE_MS, "--idle-flush-ms", "1000"],
     }
 }
 
@@ -417,11 +426,11 @@ async fn fuse_writer_killed() {
         c.loops.clear();
         let _ = sh("umount", &["-l", p(&dir)]);
     }
-    // The lease lasts 2 s: a restart at once is refused.
+    // The lease is still held: a restart at once is refused.
     let o = w.run(&["fuse", p(&dir)]).await;
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("busy"));
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(LAPSE).await;
     {
         let mut c = Cleanup::default();
         let d = w.serve(&["fuse", p(&dir)]).await;
@@ -518,8 +527,8 @@ async fn ublk_writer_killed() {
         let _ = sh("umount", &["-l", p(&mnt)]);
         c.mounts.clear();
     }
-    // The lease (2 s) lapses.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // The lease lapses.
+    tokio::time::sleep(LAPSE).await;
     {
         // The same id: the dead device is deleted first.
         let mut c = Cleanup::default();
