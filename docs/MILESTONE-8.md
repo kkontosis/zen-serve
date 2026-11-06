@@ -450,7 +450,25 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * CLIENT.md §8 (sending under sessions) and §9 (no per-operation timeout; zeros written)
       * TECH_DEBT: TD-BLK-SNAPSHOT-FILES and TD-FS-SPARSE
       * README
-    * Pushed 4fa20a5.
+    * Pushed 4fa20a5, then the docs (8c874c6). CI green on both runs; **PR #71 merged.** The figures follow in a new PR.
+  * **The benches, from main (566cfe2), PR #72:**
+    * **The disk filled during a CDC run.** The bench's server store and zen-mount cache take several GB, and two earlier runs had left 4.8 GB of temp dirs. Those three dirs were deleted (a broader sweep was refused, rightly).
+    * **The fixed-chunk run lost data:** queued writes were refused (`queued content … is missing`, then `unknown page`), and the file read EIO.
+      * **The cause:** `Replica.evict` built its keep set before awaiting the store's flush and listing. What was sealed and queued meanwhile wasn't in it. Once queued content outgrows `cacheBytes`, eviction removes all it may, the newest included.
+      * **The fix, commit 63e4d66:** `Content.evict` takes `keep` as a function, asked once the content is listed, with nothing awaited from there to the deletes.
+      * **Test** (`writes.test.ts`): offline, a 1,000-byte cache, a handle spilling while another file is rewritten. It failed 6 runs of 6 on main and 0 of 6 with the fix; with only the snapshot restored, 5 of 6.
+      * **Not changed:** `store()`'s global `protect.clear()`. Every seal and its queueing run in `serial()`, so none overlaps. A test of overlapping seals deadlocked on that, and the per-call variant was reverted.
+    * **The file bench reports unsent writes** (commit 9505ee5). zen-mount's stop waits 10 s for its queue and leaves the rest in the cache dir.
+    * **CI on 9505ee5:** the pull_request run's `client` job failed `handles.test.ts`'s memory bound (34.4 MiB past the middle, the bound 32); the push run passed.
+      * The test took the largest gap between any one sample and the one sample at the middle, so a single noisy sample could fail it. Locally: 5.5–12.1 MiB.
+      * **Commit 7dd7ac6:** it now compares the medians of the last quarter and the second quarter: 14.8 and 18.1 MiB, and 64.1 MiB (failing) with the bound off.
+    * **The figures** (release, this container, one run each), in BLK.md §8 "Files or volumes":
+      * **volume:** 25.6 MiB/s write, 149 MiB/s read, 8.3 ms dsync, untar 0.21 s; 62 MiB RSS; 279 MiB stored
+      * **file, fixed:** 9.6 MiB/s, 45 MiB/s, 126 ms, 0.96 s; 1,822 MiB RSS; 1,333 MiB stored; 447 writes unsent at stop
+      * **file, CDC:** 0.7 MiB/s, 10.5 MiB/s, 2,172 ms, 30 s; 1,544 MiB RSS; 8,182 MiB stored; 402 unsent
+      * **import:** 37 MiB/s of data; **export:** 108 MiB/s; a 294 MiB-allocated 1 GiB image exports to 262 MiB allocated
+    * **Not resolved:** zen-mount's 1.5–1.8 GB peak RSS under this load, against the handle's 64 MiB bound. Not investigated; BLK.md says so.
+    * **Not run:** `bench_ublk` (no `/dev/ublk-control` here).
 
 ## Steps (one PR each; each planned in detail before it starts)
 
