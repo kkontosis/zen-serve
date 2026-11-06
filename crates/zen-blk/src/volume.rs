@@ -780,7 +780,17 @@ impl Volume {
     }
 
     /// Blocks per commit: `batch_blocks`, within the server's commit limits
-    /// for a block and a full path of new nodes each.
+    /// for a block and a full path of new nodes each. A flush of at most
+    /// this many buffered blocks is one commit.
+    pub fn blocks_per_commit(&self) -> usize {
+        self.per_commit()
+    }
+
+    /// The root record this volume holds (its `seq`, `prev` and `writer`).
+    pub async fn root_record(&self) -> RootRecord {
+        self.0.tree.read().await.record.clone()
+    }
+
     fn per_commit(&self) -> usize {
         let l = &self.0.fs.session().info().limits;
         let d = blk::depth(self.0.blocks) as usize;

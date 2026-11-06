@@ -6,9 +6,13 @@
 //! The ublk tests skip, saying so, only when the kernel has no
 //! `/dev/ublk-control`; with `ZEN_TEST_REQUIRE_UBLK=1` (CI) they fail.
 //!
-//! `bench_fuse` and `bench_ublk` are `#[ignore]`d benches (docs/STATS.md
-//! §6.3): `cargo test --release -p zen-ublk --features device-tests[,ublk]
-//! --test devices bench -- --ignored --nocapture --test-threads 1`, as root.
+//! The benches are `#[ignore]`d (docs/BLK.md §7–§8, docs/STATS.md §6.3):
+//! `bench_fuse` and `bench_ublk` (ext4 on a volume), `bench_file_cdc` and
+//! `bench_file_fixed` (ext4 on an image kept as a zen-fs file, through
+//! zen-mount and a loop device: `npm run build` first, or `$ZEN_MOUNT` for
+//! its `cli.js`), and `bench_image` (import and export). Run them with
+//! `cargo test --release -p zen-ublk --features device-tests[,ublk] --test
+//! devices bench -- --ignored --nocapture --test-threads 1`, as root.
 
 #[path = "../../zen-client/tests/common/mod.rs"]
 mod common;
@@ -444,6 +448,60 @@ async fn fuse_writer_killed() {
     }
 }
 
+/// An ext4 image made without mounting it (`mkfs.ext4 -d`) is imported,
+/// served, mounted and changed, then exported and checked offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn image_import_serve_export() {
+    let w = world().await;
+    let src = w.mnt("src");
+    let data = files(7, 40);
+    write_files(&src, &data);
+    let img = w.dir.path().join("in.img");
+    ok(
+        "mkfs.ext4",
+        &["-q", "-F", "-b", "4096", "-d", p(&src), p(&img), "64M"],
+    );
+    let o = w.run(&["import", "--create", p(&img)]).await;
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let (dir, mnt) = (w.mnt("fuse"), w.mnt("ext4"));
+    let added: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut c = Cleanup::default();
+        let d = w.serve(&["fuse", p(&dir)]).await;
+        let dev = losetup(&d.path, false, &mut c);
+        mount(&dev, &mnt, "rw", &mut c);
+        check_files(&mnt, &data);
+        std::fs::write(mnt.join("added"), &added).unwrap();
+        ok("sync", &[]);
+        umount(&mnt, &mut c);
+        detach(&dev, &mut c);
+        assert_eq!(d.stop().await, 0);
+    }
+    let out = w.dir.path().join("out.img");
+    let o = w.run(&["export", p(&out)]).await;
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    ok("e2fsck", &["-fn", p(&out)]);
+    let dump = w.dir.path().join("added.out");
+    ok(
+        "debugfs",
+        &["-R", &format!("dump /added {}", p(&dump)), p(&out)],
+    );
+    assert!(std::fs::read(&dump).unwrap() == added, "the added file");
+    let first = data.keys().next().unwrap();
+    ok(
+        "debugfs",
+        &[
+            "-R",
+            &format!("dump /{} {}", first.display(), p(&dump)),
+            p(&out),
+        ],
+    );
+    assert!(
+        std::fs::read(&dump).unwrap() == data[first],
+        "an imported file"
+    );
+}
+
 // -------------------------------------------------------------------- ublk
 
 /// Whether the kernel has ublk; without it, a test says so and skips,
@@ -666,14 +724,54 @@ async fn bench_world() -> World {
     let mut w = world().await;
     // The daemon's defaults (30 s lease, 5 s idle flush, 256-block batches).
     w.tuning = vec![];
-    w.create("1G").await;
     w
+}
+
+/// The peak RSS of a process, in MiB (`VmHWM`).
+fn peak_rss_mib(pid: u32) -> f64 {
+    let st = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let kb: f64 = st
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap();
+    kb / 1024.0
+}
+
+/// What fs 1 stores, in MiB (its quota's bytes). Content that superseded
+/// versions or an import's discards released is still counted until the
+/// grace (a day by default) has passed.
+async fn stored_mib(w: &World) -> f64 {
+    let st = &w.srv.server.state;
+    let mut t = st.store.begin(None).await.unwrap();
+    let bytes = t
+        .get(&zen_server::keys::quota(1, "bytes"))
+        .await
+        .unwrap()
+        .map_or(0, |v| i64::from_le_bytes(v.try_into().unwrap()));
+    bytes as f64 / (1 << 20) as f64
+}
+
+/// After a bench: the serving process's peak RSS, the time from SIGTERM to
+/// its exit (for zen-mount, the drain: everything sent), and what the fs
+/// stores then.
+async fn report(w: &World, name: &str, d: Daemon) {
+    let pid = d.child.as_ref().unwrap().id();
+    let rss = peak_rss_mib(pid);
+    let t = Instant::now();
+    assert_eq!(d.stop().await, 0);
+    let stop_s = t.elapsed().as_secs_f64();
+    let stored = stored_mib(w).await;
+    println!("  {name}: stop (flush or drain)    {stop_s:>8.2} s");
+    println!("  {name}: peak RSS                 {rss:>8.1} MiB");
+    println!("  {name}: stored, superseded incl. {stored:>8.1} MiB");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a bench: run with --ignored, in release, as root"]
 async fn bench_fuse() {
     let w = bench_world().await;
+    w.create("1G").await;
     let tarball = source_tarball(w.dir.path());
     let (dir, mnt) = (w.mnt("fuse"), w.mnt("ext4"));
     let mut c = Cleanup::default();
@@ -681,7 +779,7 @@ async fn bench_fuse() {
     let dev = losetup(&d.path, false, &mut c);
     bench_device("FUSE + loop", &dev, &mnt, &tarball);
     detach(&dev, &mut c);
-    assert_eq!(d.stop().await, 0);
+    report(&w, "volume", d).await;
 }
 
 #[cfg(feature = "ublk")]
@@ -692,10 +790,188 @@ async fn bench_ublk() {
         return;
     }
     let w = bench_world().await;
+    w.create("1G").await;
     let tarball = source_tarball(w.dir.path());
     let mnt = w.mnt("ext4");
     let d = w.serve(&["ublk", "--id", "43"]).await;
     let dev = p(&d.path).to_string();
     bench_device("ublk", &dev, &mnt, &tarball);
-    assert_eq!(d.stop().await, 0);
+    report(&w, "volume", d).await;
+}
+
+/// The repository's `packages/fuse`, where zen-mount's CLI and its
+/// modules are.
+fn fuse_pkg() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/fuse")
+}
+
+/// Set fs 1's chunking (as the admin, key 1) through `@zen/client`.
+fn set_chunking(w: &World, chunking: &str) {
+    let admin = w.dir.path().join("admin.json");
+    key(1).save(&admin).unwrap();
+    const SCRIPT: &str = r#"
+import { readFile } from 'node:fs/promises';
+import { bytes, connect, zw } from '@zen/client';
+const d = JSON.parse(await readFile(process.env.ZEN_KEY, 'utf8'));
+const client = await connect(process.env.ZEN_URL);
+const s = await client.signInDevice({
+  identity: zw.SigningIdentity.fromSeed(bytes.fromHex(d.identity_seed)),
+  device: zw.DeviceSecret.fromSeed(bytes.fromHex(d.device_seed)),
+  cert: bytes.fromHex(d.cert),
+});
+const fs = await s.fs(1).unlock({ device: zw.DeviceSecret.fromSeed(bytes.fromHex(d.device_seed)) });
+await fs.setPolicy({ chunking: process.env.ZEN_CHUNKING });
+process.exit(0);
+"#;
+    let st = Command::new("node")
+        .args(["--input-type=module", "-e", SCRIPT])
+        .current_dir(fuse_pkg())
+        .env("ZEN_KEY", &admin)
+        .env("ZEN_URL", &w.srv.url)
+        .env("ZEN_CHUNKING", chunking)
+        .status()
+        .unwrap();
+    assert!(st.success(), "setting the policy");
+}
+
+/// Set when zen-mount reports a refused queued write.
+static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Start zen-mount on a new tree at `dir`, with its replica in the temp
+/// dir; wait until it has mounted.
+fn zen_mount(w: &World, dir: &Path) -> Daemon {
+    let cli = std::env::var("ZEN_MOUNT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| fuse_pkg().join("dist/cli.js"));
+    let cache = w.dir.path().join("mount-cache");
+    let mut c = Command::new("node");
+    c.arg(cli)
+        .args([&w.srv.url, p(dir)])
+        .arg("--device-key")
+        .arg(&w.key_file)
+        .args(["--fs", "1", "--new-tree", "--foreground", "--cache-dir"])
+        .arg(&cache)
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut err = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(err.read_line(&mut line).unwrap() > 0, "zen-mount exited");
+        if line.starts_with("mounted fs") {
+            break;
+        }
+    }
+    // Pass its stderr on (and keep the pipe drained), noting refused writes.
+    std::thread::spawn(move || {
+        for l in err.lines().map_while(Result::ok) {
+            if l.contains("queued writes refused") {
+                REFUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            eprintln!("[zen-mount] {l}");
+        }
+    });
+    Daemon {
+        child: Some(child),
+        path: dir.join("disk.img"),
+    }
+}
+
+/// The same workload on an image kept as a zen-fs file: zen-mount, a
+/// sparse 1 GiB file in it, and a loop device on the file.
+async fn bench_file(chunking: &str) {
+    let w = bench_world().await;
+    set_chunking(&w, chunking);
+    let tarball = source_tarball(w.dir.path());
+    let (dir, mnt) = (w.mnt("zen-mount"), w.mnt("ext4"));
+    // Dropped after the daemon: a dead zen-mount's mount is taken away.
+    let mut gone = Cleanup::default();
+    gone.mounts.push(dir.clone());
+    let d = zen_mount(&w, &dir);
+    ok("truncate", &["-s", "1G", p(&d.path)]);
+    let mut c = Cleanup::default();
+    let dev = losetup(&d.path, false, &mut c);
+    bench_device(
+        &format!("zen-mount + loop ({chunking})"),
+        &dev,
+        &mnt,
+        &tarball,
+    );
+    detach(&dev, &mut c);
+    report(&w, "file", d).await;
+    gone.mounts.clear();
+    assert!(
+        !REFUSED.load(std::sync::atomic::Ordering::SeqCst),
+        "zen-mount's queued writes were refused"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a bench: run with --ignored, in release, as root (and npm run build)"]
+async fn bench_file_cdc() {
+    bench_file("cdc").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a bench: run with --ignored, in release, as root (and npm run build)"]
+async fn bench_file_fixed() {
+    bench_file("fixed").await;
+}
+
+/// `import` and `export` of a 1 GiB ext4 image holding the source tree and
+/// 256 MiB of random data (made with `mkfs.ext4 -d`).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a bench: run with --ignored, in release, as root"]
+async fn bench_image() {
+    let w = bench_world().await;
+    let tarball = source_tarball(w.dir.path());
+    let src = w.mnt("src");
+    ok("tar", &["-xf", p(&tarball.0), "-C", p(&src)]);
+    ok(
+        "dd",
+        &[
+            "if=/dev/urandom",
+            &format!("of={}", p(&src.join("random"))),
+            "bs=1M",
+            "count=256",
+            "status=none",
+        ],
+    );
+    let img = w.dir.path().join("in.img");
+    ok(
+        "mkfs.ext4",
+        &["-q", "-F", "-b", "4096", "-d", p(&src), p(&img), "1G"],
+    );
+    let alloc = |f: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(f).unwrap().blocks() as f64 * 512.0 / (1 << 20) as f64
+    };
+    let in_mib = alloc(&img);
+    let t = Instant::now();
+    let o = w.run(&["import", "--create", p(&img)]).await;
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let import_s = t.elapsed().as_secs_f64();
+    let out = w.dir.path().join("out.img");
+    let t = Instant::now();
+    let o = w.run(&["export", p(&out)]).await;
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let export_s = t.elapsed().as_secs_f64();
+    assert!(std::fs::read(&img).unwrap() == std::fs::read(&out).unwrap());
+    println!("\nimport and export of a 1 GiB ext4 image ({in_mib:.0} MiB allocated)");
+    println!(
+        "  import --create                  {import_s:>8.2} s, {:>6.1} MiB/s of data",
+        in_mib / import_s
+    );
+    println!(
+        "  export                           {export_s:>8.2} s, {:>6.1} MiB/s of data",
+        in_mib / export_s
+    );
+    println!(
+        "  exported, allocated              {:>8.1} MiB",
+        alloc(&out)
+    );
+    println!(
+        "  stored                           {:>8.1} MiB",
+        stored_mib(&w).await
+    );
 }

@@ -6,9 +6,12 @@
 //!
 //! Both present a disk with a volatile write cache: writes are buffered,
 //! and a flush (FLUSH, FUA, `fsync`) returns once they are committed.
+//!
+//! [`image`] copies raw images in (`import`) and out (`export`).
 
 pub mod disk;
 pub mod fuse;
+pub mod image;
 #[cfg(feature = "ublk")]
 pub mod ublk;
 

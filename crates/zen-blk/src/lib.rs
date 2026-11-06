@@ -20,4 +20,4 @@ mod tree;
 mod volume;
 
 pub use volume::{Volume, VolumeOptions};
-pub use zen_core::blk::BLOCK_SIZE;
+pub use zen_core::blk::{BLOCK_SIZE, RootRecord};
