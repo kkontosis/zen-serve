@@ -280,7 +280,49 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * **The `session_of` control:** with `find` in place of `rfind` and the jump, `export_import_round_trip` fails at `dump.rs:266`, picking the expired session.
       * **After removing the hack:** the 5 dump tests pass on embedded; `cargo fmt --check` and clippy `-p zen-server --all-targets -D warnings` are clean.
       * **Not run:** local FDB, given about 2.7 GB of disk free; CI's `fdb` job runs it.
+      * Pushed d2b5202. **CI green on both runs** (push and pull_request), `fdb` included.
+  * **PR #68 merged** (the plan and the dump-test fix).
+  * **The session's container was replaced** while it was idle: the repo was kept at d2b5202, and this file was restored from `docs/MILESTONE-8.md` with the lines since. Disk now has about 30 GB free; `target/`, `node_modules` and every `dist/` are gone. Before implementing: `npm ci`, `scripts/build-wasm.sh`, `npm run build`, and a zen-server build for the tests (cold).
+  * **The implementation goes in a new PR.** On the user's "go":
+    1. restart from main
+    2. `cp` this file to `docs/MILESTONE-8.md` (bringing in these log lines)
+    3. implement "Step 8.4 in detail"
+    4. push and open the PR
     * **A note for 8.7's OPS pitfalls** (no code change): a cross-backend `migrate` or `import` changes the version scale, so upload sessions (like leases) may read as expired on the target, and their uploads start over.
+  * **Implementation** (on "go"): restarted from main (416b662), this file copied in.
+    * **Setup** for the new container: Rust 1.99.1 with the wasm32 target, wasm-bindgen-cli 0.2.129, `npm ci`, `scripts/build-wasm.sh`, `npm run build`, a zen-server build; `fuse` and `libfuse-dev` installed, and `@cocalc/fuse-native` built, for the mount tests.
+    * **Spec:** fs.md §11.1, "Content" (only the chunks around what changed; untouched pages taken over) and a new "File handles" bullet. It rides in the implementation commit, since it only describes the replica.
+    * **Client:**
+      * `Edit.zeros`, streamed in 1 MiB pieces (`editBytes`, `inserted`); `stageEdit`'s no-base branch yields the parts and passes `size`
+      * exports of the 8.3 types the replica needs (`AnyManifest`, `Chunking`, `Edit`, `EditOptions`, `FileManifest`, `KnownPage`, `UploadCommit`, `UploadSessionInfo`)
+    * **`@zen/fs`:**
+      * `handle.ts` rewritten over extents (base, memory up to 4 MiB each and doubling, zeros), with `dirtyBytes` and spills past the bound
+      * a flush with base extents left is an edit (`queueEdit` → `sealEdit` → `tree.editUpload`); otherwise a whole rewrite (`queueFlush`, `previous` from `indexOf`, none for empty content)
+      * `queueSealed` takes the local version before awaiting the send (`store` returns `{sent}`)
+      * new `records.ts`: the binary per-page and inline records, written in `sealed()` from `Upload.index`; `indexOf` reads legacy, then records, then reads once and keeps the records
+      * `ReplicaOptions.dirtyBytes` and `cdc`; `sealWrite` without `chunking: 'fixed'`; `chunkSize()` and the handle's `chunkSize`/`index` gone
+      * `QWrite.index` is legacy only; `done` keeps writing a legacy entry's JSON index (only those entries carry one)
+    * **zen-mount:** `MountOptions.integrity` (every op, read and write included, checks `trusted`; release drops the handle; unmount drops open files unflushed); the CLI's `--integrity` (`refuse` exits 3 on an alarm at attach, unlock or the first sync; `stop` skips the drain once untrusted, then `integrity.close()`; exit 3 if untrusted).
+    * **Changes from the plan:**
+      * **A handle copies what it's given.** FUSE hands `write` a `Buffer`, whose `slice` shares memory; the first mount run failed with "Cannot perform Construct on a detached ArrayBuffer". The handle now copies with `new Uint8Array(data)`.
+      * **The memory test measures growth past the middle.** With `gc()` before each sample (exposed through `v8.setFlagsFromString` and `vm`, since vitest workers don't expose it), RSS at 128 MiB was about 113 MiB over the start, most of it fixed: wasm memory, the page memo and caches, and the HTTP client. Past the middle it grew by only 10 to 15 MiB. With the bound off, it grew linearly (+61 MiB over the second half). So the test asserts a total under 160 MiB and growth past the middle under 32 MiB, alongside `dirtyBytes` ≤ bound + one write, instead of one 96 MiB bound.
+      * **The memory test uses a session that isn't watched:** the `watch` helper keeps every request, chunk bytes included (245 MiB in the first run).
+      * **A flush with `wait` of an unchanged handle doesn't wait for earlier entries.** The random-operations test's first failures were a close without wait followed by a flush with wait; the test now also awaits `r.flush()`.
+      * **The legacy v1-entry case checks `indexOf` returns the entry's index and that no read happens,** rather than counting `chunks/get`: the content of a queued write is local, so a read would make no request either. The record tests count `tree.chunkIndex` calls for the same reason.
+      * **The in-process integrity test** follows the fs rollback test (Alice writes and checkpoints on `self`, Bob verifies there, then Bob's replica is served the copy), and first mounts without integrity to show the stale content reads.
+    * **Tests:**
+      * new `packages/fs/test/handles.test.ts`, 9: the memory bound; random operations against a model (CDC and fixed, 300 ops each, files of 1.5–3 MB, a 64 KiB bound); an edit's cost (a 1-byte overwrite: ≤ 2 pages, chunks sent equal to those the chunker changes, chunks fetched equal to those it removes; a 1-byte append: 1 page); `close({wait})`; index records (a rewrite with no read; after an edit, one read, then none; a legacy JSON record); a v1 queue entry with its index; zeros (64 MiB by `truncate`, `dirtyBytes` 4, then grown to 80 MiB by an edit); a crash mid-write (server killed, 3 spills queued, the replica closed with the handle open, then restarted: the file is the bytes up to the last spill)
+      * `cdc.test.ts`: zeros in an edit, into a base and with none, and a negative count refused
+      * `writes.test.ts`: the v3 case now stays v3 and sends at most 2 pages
+      * `mount.test.ts`: the 1-byte test's fs set to `fixed`; "a rolled-back tree fails the mount closed" (in-process); the CLI with `--integrity` (exit 1 without pins storage; on a fork, exit 0 and the device's checkpoint naming the tree on `self`, then exit 3 with a `rollback` alarm and "not mounting" on the copy)
+    * **Negative controls** (each run once, then restored):
+      * the bound off (`dirtyBytes` Infinity): the memory test fails (`dirtyBytes` 134,217,728 > 4,325,376; RSS grew linearly)
+      * every flush a whole rewrite: the edit test fails (1,717 chunks sent, not 1)
+      * the old `queueFlush` (reading the overlay after the send): the `close({wait})` test fails ("reading 'local'")
+      * the per-page lookup off: the records test fails (`chunkIndex` called once, expected 0)
+      * the `trusted` check off in `mount.ts`: the in-process test fails (the read resolved with "v1")
+    * **Docs:** CLIENT.md §8 (handles, records, chunking) and §9 (the mapping, `--integrity`); INTEGRITY.md §5 and §8; TECH_DEBT TD-FUSE-INTEGRITY resolved.
+    * **Known, not changed:** index records are never evicted (nor were the JSON ones). A whole rewrite of a large file without records reads it once, as planned; in zen-mount that is the first spill of a `w` open over a large file.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

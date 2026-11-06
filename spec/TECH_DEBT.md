@@ -384,7 +384,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-FUSE-INTEGRITY
 
-* **Status:** open
+* **Status:** resolved, in milestone 8 step 4 (docs/MILESTONE-8.md): `zen-mount --integrity` keeps the pins in the vault's store, else the cache dir's (one is required), signs with the device key file or the vault's device, exits 3 on an alarm at start, answers `EIO` to every operation after one while mounted (`MountOptions.integrity`), and writes a last checkpoint at a clean stop. Tests: an in-process mount of a rolled-back tree (reads, listings, `stat` and writes give `EIO`, where without the option the stale content reads), and the CLI on a forked server (exit 0 and the checkpoint on the original, exit 3 with a `rollback` alarm on the copy).
 * **Context:** zen-mount (`packages/fuse`, docs/CLIENT.md §9) never attaches integrity, so its replica runs without tree checks and its writes add no checkpoints. Only the `apps/shared` workers (`ZEN_INTEGRITY=1`), the ledger and zen-ublk (always) attach it.
 * **Why deferred:** A feature, not a format: the replica's checks (milestone 6 step 4) work for any caller that attaches integrity.
 * **What it would take:** `zen-mount --integrity`, with the pins kept in the mount's store directory and the device key file as the signer; an alarm from the replica surfaced as `EIO` on the mount's files and a log line (the replica already stops its feed); `close` writing a last checkpoint on unmount; and a test with the adversary that a rolled-back tree makes reads fail.

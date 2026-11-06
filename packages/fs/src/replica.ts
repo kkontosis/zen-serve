@@ -9,13 +9,13 @@
 import {
   type BroadcastChannelLike,
   bytes,
-  CHUNK_SIZE,
   type ChangeBatch,
   type ChannelFactory,
   type ChunkIndex,
   defaultChannel,
   defaultLocks,
   displayNames,
+  type Edit,
   type FileSource,
   type FileVersion,
   IntegrityError,
@@ -30,10 +30,11 @@ import {
   type TreeChange,
   type TreeNode,
   type UnlockedFs,
+  type Upload,
   ZenError,
   zw,
 } from '@zen/client';
-import type { CheckpointEntry, Info, NodeMeta } from '@zen/wasm';
+import type { CdcParams, CheckpointEntry, Info, NodeMeta } from '@zen/wasm';
 import { FileHandle, type OpenFlags, type OpenOptions } from './handle.js';
 import {
   buildOverlay,
@@ -57,6 +58,7 @@ import {
   type QueueEntry,
   type QWrite,
 } from './queue.js';
+import { indexFromRecords, recordsOf } from './records.js';
 import { Sender } from './sender.js';
 import { Content, Records, replicaStores, useKey } from './store.js';
 import { decodeXattrs, encodeXattrs } from './xattr.js';
@@ -75,6 +77,13 @@ export interface ReplicaOptions {
   waitMs?: number;
   /** Take part in the owner election (default true). */
   owner?: boolean;
+  /**
+   * The most bytes a file handle keeps in memory before it queues them as
+   * a write of its own (default 64 MiB).
+   */
+  dirtyBytes?: number;
+  /** The chunker's parameters for new content (`TreeOptions.cdc`; default the server's). */
+  cdc?: CdcParams;
 }
 
 export type NodeType = 'dir' | 'file' | 'symlink';
@@ -140,6 +149,7 @@ export interface Entry {
 }
 
 const DEFAULT_CACHE = 1 << 30;
+const DEFAULT_DIRTY = 64 << 20;
 const DEFAULT_WAIT = 25_000;
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 30_000;
@@ -208,6 +218,7 @@ export class Replica {
   private evicting = false;
   private readonly cacheBytes: number;
   private readonly waitMs: number;
+  private readonly dirtyBound: number;
   private readonly root: TreeNode;
   // Local writes: the queue, entries sent but not yet caught up with, and what they show.
   private queue: QueueEntry[] = [];
@@ -247,12 +258,14 @@ export class Replica {
   ) {
     this.cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE;
     this.waitMs = opts.waitMs ?? DEFAULT_WAIT;
+    this.dirtyBound = opts.dirtyBytes ?? DEFAULT_DIRTY;
     this.rec = new Records(opts.local, `zfs/${fs.id}/${bytes.hex(id)}`);
     this.content = new Content(this.rec, () => this.maybeEvict());
     this.tree = fs.tree(id, {
       chunkCache: this.content.chunks,
       pageCache: this.content.pages,
       info: () => this.info(),
+      ...(opts.cdc ? { cdc: opts.cdc } : {}),
     });
     this.root = {
       id: ROOT,
@@ -1136,7 +1149,8 @@ export class Replica {
       this.learned.set(k, d);
       this.sentDots.set(k, d);
     }
-    // Indexes of what was written, for later writes' chunk reuse.
+    // Indexes of what was written: entries queued before the index records
+    // (fs.md §11.1) carry their whole index, kept as before.
     for (const e of entries) {
       const d = dots.get(e.key);
       for (const o of e.ops) {
@@ -1240,6 +1254,18 @@ export class Replica {
     content: { chunks: Uint8Array[]; pages: Uint8Array[] } = { chunks: [], pages: [] },
     wait = false,
   ): Promise<void> {
+    const { sent } = await this.store(ops, content);
+    if (wait) await sent;
+  }
+
+  /**
+   * Store and show one call's entry. Resolves once it is stored, with a
+   * promise of its send (handled, so it may be dropped).
+   */
+  private async store(
+    ops: QOp[],
+    content: { chunks: Uint8Array[]; pages: Uint8Array[] },
+  ): Promise<{ sent: Promise<void> }> {
     if (this.stopped) throw new ZenError(0, 'closed', 'the replica is closed');
     const key = newKey();
     const e: QueueEntry = {
@@ -1260,10 +1286,10 @@ export class Replica {
       ws.push({ ok, fail });
       this.waiters.set(e.key, ws);
     });
-    if (!wait) done.catch(() => {});
+    done.catch(() => {});
     if (this.owner.isOwner) this.sender.wake();
     else this.chan?.postMessage({ t: 'queued' });
-    if (wait) await done;
+    return { sent: done };
   }
 
   // ------------------------------------------------------------ writes
@@ -1303,20 +1329,37 @@ export class Replica {
     };
   }
 
-  /** A version's chunk index: kept, or built once with a streamed read (undefined offline). */
+  /**
+   * A version's chunk index, for reuse by a whole rewrite: kept (a legacy
+   * record, or the index records of its pages), or built once with a
+   * streamed read, whose records are then kept (undefined offline).
+   */
   async indexOf(node: Uint8Array, v: ShownVersion): Promise<ChunkIndex | undefined> {
-    if (isLocal(v)) return v.index;
-    const key = bytes.concat(node, v.dot);
-    const raw = await this.rec.get('index', key);
-    if (raw) return decodeJson<ChunkIndex>(raw);
+    if (isLocal(v) && v.index) return v.index;
+    if (!isLocal(v)) {
+      const raw = await this.rec.get('index', bytes.concat(node, v.dot));
+      if (raw) return decodeJson<ChunkIndex>(raw);
+    }
+    const kept = await indexFromRecords(v, (k) => this.rec.get('index', k));
+    if (kept) return kept;
     try {
       const ix = await this.tree.chunkIndex(node, v);
-      this.rec.put('index', key, encodeJson(ix));
+      await this.keepIndex(v.manifest, v.sealedManifest, ix);
       return ix;
     } catch (e) {
       if (isCode(e, 'network') || isCode(e, 'offline')) return undefined;
       throw e;
     }
+  }
+
+  /** Keep the index records of content (when its index has hashes). */
+  private async keepIndex(
+    m: FileVersion['manifest'],
+    sealedManifest: Uint8Array,
+    ix: ChunkIndex | undefined,
+  ): Promise<void> {
+    if (!ix) return;
+    for (const [k, v] of await recordsOf(m, sealedManifest, ix)) this.rec.put('index', k, v);
   }
 
   /**
@@ -1359,37 +1402,61 @@ export class Replica {
     base: ShownVersion | undefined,
     previous?: ChunkIndex,
   ): Promise<{ op: QWrite; chunks: Uint8Array[]; pages: Uint8Array[] }> {
+    const s = this.sink();
+    const u = await this.tree.seal(node, data, {
+      ...(previous ? { previous } : {}),
+      sink: s.sink,
+    });
+    return this.sealed(node, base, u, s);
+  }
+
+  /**
+   * Seal an edit of `base` (`Tree.editUpload`): only the pages and chunks
+   * around the edits; the rest is taken over unread.
+   */
+  async sealEdit(
+    node: Uint8Array,
+    base: ShownVersion,
+    edits: Edit[],
+  ): Promise<{ op: QWrite; chunks: Uint8Array[]; pages: Uint8Array[] }> {
+    const s = this.sink();
+    const u = await this.tree.editUpload(node, base, edits, { sink: s.sink });
+    return this.sealed(node, base, u, s);
+  }
+
+  /** A sink of sealed content into the store (kept, protected until queued). */
+  private sink() {
     const chunks: Uint8Array[] = [];
     const pages: Uint8Array[] = [];
-    const u = await this.tree.seal(node, data, {
-      chunking: 'fixed',
-      ...(previous ? { previous } : {}),
-      sink: async (cs, ps) => {
-        for (const c of cs) {
-          this.protect.add(useKey('chunk', c.id));
-          this.content.chunks.put(c.id, c.data);
-          chunks.push(c.id);
-        }
-        for (const p of ps) {
-          this.protect.add(useKey('page', p.id));
-          this.content.pages.put(p.id, p.data);
-          pages.push(p.id);
-        }
-      },
-    });
+    const sink = async (cs: { id: Uint8Array; data: Uint8Array }[], ps: typeof cs) => {
+      for (const c of cs) {
+        this.protect.add(useKey('chunk', c.id));
+        this.content.chunks.put(c.id, c.data);
+        chunks.push(c.id);
+      }
+      for (const p of ps) {
+        this.protect.add(useKey('page', p.id));
+        this.content.pages.put(p.id, p.data);
+        pages.push(p.id);
+      }
+    };
+    return { chunks, pages, sink };
+  }
+
+  /** The write op of sealed content, its index records kept. */
+  private async sealed(
+    node: Uint8Array,
+    base: ShownVersion | undefined,
+    u: Upload,
+    s: { chunks: Uint8Array[]; pages: Uint8Array[] },
+  ): Promise<{ op: QWrite; chunks: Uint8Array[]; pages: Uint8Array[] }> {
+    await this.keepIndex(u.manifest, u.sealedManifest, u.index);
     const { replaces, after } = this.replacesFor(node, base);
     const op: QWrite = {
       ...this.tree.writeOpOf(u, replaces),
       ...(after.length ? { after } : {}),
-      index: u.index,
     };
-    return { op, chunks, pages };
-  }
-
-  /** The default chunk size for new content. */
-  async chunkSize(): Promise<number> {
-    const limits = await this.tree.limits();
-    return Math.min(CHUNK_SIZE, limits.max_value_bytes - 64);
+    return { op, chunks: s.chunks, pages: s.pages };
   }
 
   /** Create a directory; returns its node id. */
@@ -1629,9 +1696,9 @@ export class Replica {
 
   /**
    * Open a file: `r` (read), `r+` (read and write), `w` (truncate; created
-   * if missing), `a` (append; created if missing). Writes touch whole
-   * chunks in memory; `flush` (and `close`) queues one write with only the
-   * changed chunks sealed.
+   * if missing), `a` (append; created if missing). Writes are kept in
+   * memory up to `dirtyBytes`, then queued; `flush` (and `close`) queues one
+   * write, an edit of the version opened that seals only what changed.
    */
   open(path: string, flags: OpenFlags = 'r', opts: OpenOptions = {}): Promise<FileHandle> {
     return this.serial(async () => {
@@ -1656,40 +1723,58 @@ export class Replica {
         node = e.node;
         base = await this.shown(e);
       }
-      const h = new FileHandle(
-        this,
-        path,
-        node.id,
-        base,
-        flags,
-        // Fixed chunks until the replica cuts by content (milestone 8 step 4):
-        // a base of variable chunks is rewritten whole on its first flush.
-        (base && base.manifest.version !== 3 ? base.manifest.chunkSize : undefined) ??
-          (await this.chunkSize()),
-      );
+      const h = new FileHandle(this, path, node.id, base, flags, this.dirtyBound);
       if (flags === 'w') await h.truncate(0);
       return h;
     });
   }
 
-  /** Queue a handle's flush (one entry): its meta (mtime) and its write. */
-  async queueFlush(
+  /**
+   * Queue a handle's flush of its whole content (one entry): its meta
+   * (mtime) and its write, chunks equal to the base's reused by hash.
+   */
+  queueFlush(
     node: Uint8Array,
     data: FileSource,
+    size: number,
     base: ShownVersion | undefined,
-    previous: ChunkIndex | undefined,
     wait: boolean,
   ): Promise<LocalVersion> {
-    return this.serial(async () => {
+    return this.queueSealed(node, wait, async () => {
+      // Empty content reuses nothing: no index is read for it.
+      const previous = base && size > 0 ? await this.indexOf(node, base) : undefined;
+      return this.sealWrite(node, data, base, previous);
+    });
+  }
+
+  /** Queue a handle's flush as an edit of its base (one entry). */
+  queueEdit(
+    node: Uint8Array,
+    base: ShownVersion,
+    edits: Edit[],
+    wait: boolean,
+  ): Promise<LocalVersion> {
+    return this.queueSealed(node, wait, () => this.sealEdit(node, base, edits));
+  }
+
+  private async queueSealed(
+    node: Uint8Array,
+    wait: boolean,
+    seal: () => Promise<{ op: QWrite; chunks: Uint8Array[]; pages: Uint8Array[] }>,
+  ): Promise<LocalVersion> {
+    const { local, sent } = await this.serial(async () => {
       const n = this.node(node);
       if (!n) throw new ZenError(404, 'not_found', 'the file is gone');
-      const w = await this.sealWrite(node, data, base, previous);
+      const w = await seal();
       const ops: QOp[] = [];
       if (n.meta) ops.push(this.metaOp(n, { mtimeMs: Date.now() }));
       ops.push(w.op);
-      await this.enqueue(ops, w, wait);
-      return this.ov.files.get(bytes.hex(node))!.local;
+      const { sent } = await this.store(ops, w);
+      // The version shown now: once sent, the entry leaves the overlay.
+      return { local: this.ov.files.get(bytes.hex(node))!.local, sent };
     });
+    if (wait) await sent;
+    return local;
   }
 
   /** Read part of a version (fetched, or kept). */

@@ -22,9 +22,24 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { bytes, memoryLocalStore, ROOT, sealedStore, Tree, type UnlockedFs, zw } from '@zen/client';
+import {
+  bytes,
+  connect,
+  fullGrants,
+  type Integrity,
+  IntegrityError,
+  member,
+  memoryLocalStore,
+  ROOT,
+  type SealedStore,
+  sealedStore,
+  Tree,
+  type UnlockedFs,
+  zw,
+} from '@zen/client';
 import { openReplica, type Replica } from '@zen/fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { type TestServer, type TestUser, testUser } from '../../client/src/testing/index.js';
 import { type World, world } from '../../client/test/helpers.js';
 import { type Net, watch } from '../../fs/test/helpers.js';
 import { type Mount, type MountOptions, mount } from '../src/mount.js';
@@ -349,6 +364,9 @@ describe.skipIf(!canMount)('zen-mount, large files', () => {
     const u = await wl.session
       .fs(1)
       .init((k) => [zw.createPassphraseSlot(k, bytes.utf8('pp'), 65536, 1, 1)]);
+    // Fixed chunks (this max_value_bytes has no chunker parameters anyway):
+    // the counts below are fixed-size ones (fs.md §4.1).
+    await u.setPolicy({ chunking: 'fixed' });
     net = watch(wl.session);
     dir = await mkdtemp(join(tmpdir(), 'zen-mnt-large-'));
     const id = Tree.newId();
@@ -507,5 +525,229 @@ describe.skipIf(!canMount)('the zen-mount CLI with a vault and a cache', () => {
     await expect(readFile(p('b.txt'))).rejects.toMatchObject({ code: 'EIO' });
     expect(await run.stop()).toBe(0);
     expect(run.err()).toContain("can't be reached");
+  });
+});
+
+describe.skipIf(!canMount)('zen-mount with integrity', () => {
+  let wi: World;
+  let bob: TestUser;
+  let recoveryKey = new Uint8Array(0);
+  let dir: string;
+  const servers: TestServer[] = [];
+  const closers: (() => Promise<unknown> | unknown)[] = [];
+
+  beforeAll(async () => {
+    wi = await world();
+    bob = testUser(2);
+    await wi.session.acl.update(wi.admin.identity, (doc) => {
+      doc.members.push(member(bob.identity, [bob.cert]));
+      doc.grants.push(...fullGrants(1, bob.fp));
+    });
+    const u = await wi.session.fs(1).init((k) => {
+      const r = zw.createRecoverySlot(k);
+      recoveryKey = r.recoveryKey;
+      return [r.slot];
+    });
+    u.close();
+    servers.push(wi.server);
+    dir = await mkdtemp(join(tmpdir(), 'zen-mnt-integ-'));
+  });
+
+  afterAll(async () => {
+    for (const c of closers.reverse()) await Promise.resolve(c()).catch(() => {});
+    for (const s of servers) await s.stop().catch(() => {});
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  const pins = (): SealedStore =>
+    sealedStore(memoryLocalStore(), { device: false, plaintext: true });
+
+  /** `user` on `url`, fs 1 with integrity (pins in `local`, signed by the user's device). */
+  async function side(url: string, user: TestUser, local: SealedStore) {
+    const client = await connect(url, { origin: wi.client.origin });
+    const session = await client.signInDevice(user);
+    const fs = session.fs(1);
+    const integ = await fs.integrity({ device: { device: user.device, cert: user.cert }, local });
+    const ufs = await fs.unlock({ recoveryKey });
+    closers.push(() => ufs.close());
+    return { integ, ufs };
+  }
+
+  async function replicaOn(ufs: UnlockedFs, id: Uint8Array) {
+    const r = await openReplica(ufs, id, {
+      local: sealedStore(memoryLocalStore()),
+      locks: null,
+      channel: null,
+      waitMs: 300,
+    });
+    closers.push(() => r.close());
+    return r;
+  }
+
+  /** Wait until `integ` has checked the tree at `ops`. */
+  async function checkedAt(integ: Integrity, r: Replica, id: Uint8Array, ops: bigint) {
+    await eventually(async () => {
+      await r.sync();
+      const e = integ.floor(`2${bytes.hex(id)}`) as { ops?: bigint } | undefined;
+      if (e?.ops !== ops) throw new Error(`at ${e?.ops}, not ${ops}`);
+    });
+  }
+
+  it('a rolled-back tree fails the mount closed: every operation is EIO', async () => {
+    const la = pins();
+    const lb = pins();
+    const a = await side(wi.server.url, wi.admin, la);
+    const id = Tree.newId();
+    const t = a.ufs.tree(id);
+    await t.writeFile(await t.create(ROOT, 'f.txt'), bytes.utf8('v1'));
+    const { self, copy } = await wi.server.fork();
+    servers.splice(0, servers.length, self, copy);
+    // Alice writes on the original and checkpoints; Bob verifies it there.
+    const a1 = await side(self.url, wi.admin, la);
+    const ra = await replicaOn(a1.ufs, id);
+    await ra.sync();
+    await ra.writeFile('/f.txt', bytes.utf8('v2'));
+    await ra.mkdir('/x');
+    await ra.flush();
+    await checkedAt(a1.integ, ra, id, (await a1.ufs.tree(id).chain()).ops);
+    await a1.integ.checkpoint();
+    const b1 = await side(self.url, bob, lb);
+    await b1.integ.sync();
+
+    // Bob's replica, with his pins, is served the copy.
+    const b = await side(copy.url, bob, lb);
+    const rb = await replicaOn(b.ufs, id);
+    const err = await rb.sync().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(IntegrityError);
+    expect((err as IntegrityError).alarm.kind).toBe('rollback');
+    expect(b.integ.trusted).toBe(false);
+
+    // Mounted without integrity, the attack works: the stale content reads.
+    let m = await mount(rb, join(dir, 'plain'), { attrTimeout: 0 });
+    expect(await readFile(join(dir, 'plain/f.txt'), 'utf8')).toBe('v1');
+    expect(await readdir(join(dir, 'plain'))).toEqual(['f.txt']);
+    await m.unmount();
+
+    // With it, the mount fails closed; unmounting still works.
+    m = await mount(rb, join(dir, 'checked'), { attrTimeout: 0, integrity: b.integ });
+    const q = (s: string) => join(dir, 'checked', s);
+    await expect(readFile(q('f.txt'))).rejects.toMatchObject({ code: 'EIO' });
+    await expect(readdir(q(''))).rejects.toMatchObject({ code: 'EIO' });
+    await expect(stat(q('f.txt'))).rejects.toMatchObject({ code: 'EIO' });
+    await expect(writeFile(q('new.txt'), 'x')).rejects.toMatchObject({ code: 'EIO' });
+    await m.unmount();
+    expect((await rb.status()).queued).toBe(0);
+  });
+});
+
+describe.skipIf(!canMount)('the zen-mount CLI with --integrity', () => {
+  let wc: World;
+  let dir: string;
+  const id = Tree.newId();
+  const root = resolve(import.meta.dirname, '../../..');
+  const servers: TestServer[] = [];
+  const children: ChildProcess[] = [];
+
+  beforeAll(async () => {
+    wc = await world();
+    const u = await wc.session
+      .fs(1)
+      .init((k) => [zw.createDeviceSlot(k, wc.admin.device.devicePublic)]);
+    await u.tree(id).mkdir(ROOT, 'docs');
+    u.close();
+    servers.push(wc.server);
+    dir = await mkdtemp(join(tmpdir(), 'zen-mnt-icli-'));
+    execFileSync('npx', ['tsc', '-p', 'packages/fuse/tsconfig.json'], { cwd: root });
+  });
+
+  afterAll(async () => {
+    for (const c of children) c.kill('SIGKILL');
+    try {
+      execFileSync('fusermount', ['-uz', join(dir, 'mnt')], { stdio: 'ignore' });
+    } catch {
+      // not mounted
+    }
+    for (const s of servers) await s.stop().catch(() => {});
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  /** Run the CLI in the foreground against `url`, with no secret in its environment. */
+  function cli(url: string, ...args: string[]) {
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !k.startsWith('ZEN_')),
+    );
+    const child = spawn(
+      process.execPath,
+      [
+        join(root, 'packages/fuse/dist/cli.js'),
+        url,
+        join(dir, 'mnt'),
+        '--origin',
+        wc.client.origin,
+        '--tree',
+        bytes.hex(id),
+        '--foreground',
+        ...args,
+      ],
+      { env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    children.push(child);
+    let err = '';
+    child.stderr!.on('data', (d) => {
+      err += d;
+    });
+    const exit = new Promise<number | null>((r) => child.once('exit', (c) => r(c)));
+    return {
+      exit,
+      err: () => err,
+      async stop() {
+        child.kill('SIGTERM');
+        return exit;
+      },
+    };
+  }
+
+  const p = (s: string) => join(dir, 'mnt', s);
+
+  it('needs somewhere to keep pins; signs a last checkpoint; refuses a rolled-back copy', async () => {
+    const keyFile = join(dir, 'device.json');
+    await writeFile(
+      keyFile,
+      JSON.stringify({
+        identity_seed: bytes.hex(new Uint8Array(32).fill(1)),
+        device_seed: bytes.hex(new Uint8Array(32).fill(0x81)),
+        cert: bytes.hex(wc.admin.cert),
+      }),
+    );
+    // Pins in memory only would trust whatever a server shows: refused.
+    let run = cli(wc.server.url, '--device-key', keyFile, '--integrity');
+    expect(await run.exit).toBe(1);
+    expect(run.err()).toContain('--integrity needs --vault or --cache-dir');
+
+    const { self, copy } = await wc.server.fork();
+    servers.splice(0, servers.length, self, copy);
+    const vault = ['--vault', join(dir, 'vault'), '--integrity'];
+    // On the original: a write, and a checkpoint at the stop.
+    run = cli(self.url, '--device-key', keyFile, ...vault);
+    await eventually(() => readdir(p('docs')));
+    await writeFile(p('docs/new.txt'), 'written');
+    expect(await run.stop()).toBe(0);
+    expect(run.err()).not.toContain('integrity alarm');
+    const check = await connect(self.url, { origin: wc.client.origin });
+    const fs = (await check.signInDevice(wc.admin)).fs(1);
+    const integ = await fs.integrity({});
+    const ufs = await fs.unlock({ device: wc.admin.device });
+    await integ.sync();
+    const head = integ.deviceHead(wc.admin.device.fingerprint);
+    expect(head).toBeDefined();
+    expect(head!.body.objects.some((o) => o.type === 'tree' && bytes.equal(o.tree, id))).toBe(true);
+    await integ.close();
+    ufs.close();
+
+    // The copy is older than what the vault's pins have seen: no mount, exit 3.
+    run = cli(copy.url, ...vault);
+    expect(await run.exit).toBe(3);
+    expect(run.err()).toMatch(/integrity alarm: rollback/);
+    expect(run.err()).toContain('not mounting');
   });
 });

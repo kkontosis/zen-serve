@@ -278,6 +278,36 @@ async function fileKeyFor(
   return from;
 }
 
+/** Zero bytes are streamed in pieces of this size. */
+const ZERO_PIECE = 1 << 20;
+
+/** The bytes an edit inserts (`insert` and `zeros`). */
+export function editBytes(e: Edit): number {
+  const z = e.zeros ?? 0;
+  if (!Number.isSafeInteger(z) || z < 0) {
+    throw new ZenError(0, 'bad_value', 'zeros must be a byte count');
+  }
+  return (e.insert?.length ?? 0) + z;
+}
+
+/** An edit's inserted bytes: `insert`, then `zeros` in pieces of at most 1 MiB. */
+function* insertedBy(e: Edit): Generator<Uint8Array> {
+  if (e.insert?.length) yield e.insert;
+  let z = e.zeros ?? 0;
+  if (!z) return;
+  const piece = new Uint8Array(Math.min(z, ZERO_PIECE));
+  while (z > 0) {
+    const n = Math.min(z, piece.length);
+    yield n === piece.length ? piece : piece.subarray(0, n);
+    z -= n;
+  }
+}
+
+/** Every edit's inserted bytes in turn (the content of a file with no base). */
+export function* inserted(edits: Edit[]): Generator<Uint8Array> {
+  for (const e of edits) yield* insertedBy(e);
+}
+
 /**
  * The source of an edit of `base`: its untouched pages as known pages, the
  * untouched chunks of touched pages as known chunks, the kept bytes of the
@@ -289,7 +319,7 @@ export async function* editSource(
   edits: Edit[],
 ): AsyncGenerator<Item> {
   // The new content as kept ranges of the base and inserts, in order.
-  type Seg = { keep: [number, number] } | { insert: Uint8Array };
+  type Seg = { keep: [number, number] } | { insert: Edit };
   const segs: Seg[] = [];
   let pos = 0;
   for (const e of edits) {
@@ -304,7 +334,7 @@ export async function* editSource(
       throw new ZenError(0, 'bad_value', 'edits must be in order, apart, and within the file');
     }
     if (e.offset > pos) segs.push({ keep: [pos, e.offset] });
-    if (e.insert?.length) segs.push({ insert: e.insert });
+    if (editBytes(e)) segs.push({ insert: e });
     pos = e.offset + remove;
   }
   if (pos < base.size) segs.push({ keep: [pos, base.size] });
@@ -326,7 +356,7 @@ export async function* editSource(
   };
   for (const s of segs) {
     if ('insert' in s) {
-      yield s.insert;
+      yield* insertedBy(s.insert);
       continue;
     }
     const [a, b] = s.keep;

@@ -1,10 +1,11 @@
 // The FUSE mapping: POSIX calls onto a local replica of a zen-serve tree
 // (@zen/fs, spec/fs.md §11). Lookups, listings and metadata come from the
 // replica's node table; reads and writes go through its file handles, which
-// keep only the chunks written and queue one write per flush. Offline, what
+// keep at most a bound of written bytes in memory and queue one write per
+// flush, sealing only what changed. Offline, what
 // the replica keeps still reads, and writes queue until the server is back.
 import { createRequire } from 'node:module';
-import { bytes, isCode, ZenError } from '@zen/client';
+import { bytes, type Integrity, isCode, ZenError } from '@zen/client';
 import type { FileHandle, OpenFlags, Replica, Stat } from '@zen/fs';
 
 export { conflictName } from '@zen/fs';
@@ -33,6 +34,12 @@ export interface MountOptions {
   attrTimeout?: number;
   /** Log FUSE errors other than ENOENT to stderr. */
   verbose?: boolean;
+  /**
+   * The fs's integrity (fs.md §9): once it raises an alarm, every operation
+   * answers EIO (fails closed), and open files are dropped unflushed at
+   * unmount.
+   */
+  integrity?: Integrity;
 }
 
 /** A mounted replica. */
@@ -87,6 +94,10 @@ export async function mount(
   const uid = process.getuid?.() ?? 0;
   const gid = process.getgid?.() ?? 0;
   const ro = !!opts.readOnly;
+  const untrusted = () => !!opts.integrity && !opts.integrity.trusted;
+  const guard = () => {
+    if (untrusted()) throw F.EIO!;
+  };
 
   const errno = (e: unknown): number => {
     if (typeof e === 'number') return e;
@@ -107,7 +118,10 @@ export async function mount(
     <A extends unknown[]>(f: (...a: A) => Promise<unknown[] | undefined>) =>
     (...args: [...A, Cb]) => {
       const cb = args.pop() as Cb;
-      f(...(args as unknown as A)).then(
+      (async () => {
+        guard();
+        return f(...(args as unknown as A));
+      })().then(
         (r) => cb(0, ...(r ?? [])),
         (e) => cb(errno(e)),
       );
@@ -205,6 +219,18 @@ export async function mount(
   const flagsOf = (flags: number): OpenFlags =>
     (flags & 3) === 0 ? 'r' : flags & O_TRUNC ? 'w' : flags & O_APPEND ? 'a' : 'r+';
 
+  const releaseOp = op(async (_path: string, fd: number) => {
+    const o = handles.get(fd);
+    if (o) {
+      try {
+        await onHandle(o, () => o.h.close());
+      } finally {
+        handles.delete(fd);
+      }
+    }
+    return undefined;
+  });
+
   const ops = {
     getattr: op(async (path: string) => [await attr(path)]),
     fgetattr: op(async (path: string) => [await attr(path)]),
@@ -235,6 +261,7 @@ export async function mount(
       cb: (n: number) => void,
     ) => {
       (async () => {
+        guard();
         const o = handle(fd);
         const data = await onHandle(o, () => o.h.read(len, pos));
         buf.set(data);
@@ -250,6 +277,7 @@ export async function mount(
       cb: (n: number) => void,
     ) => {
       (async () => {
+        guard();
         const o = handle(fd);
         if (!o.writable) throw F.EBADF!;
         return onHandle(o, () => o.h.write(buf.subarray(0, len), pos));
@@ -281,17 +309,15 @@ export async function mount(
       await onHandle(o, () => o.h.flush());
       return undefined;
     }),
-    release: op(async (_path: string, fd: number) => {
-      const o = handles.get(fd);
-      if (o) {
-        try {
-          await onHandle(o, () => o.h.close());
-        } finally {
-          handles.delete(fd);
-        }
+    release: (path: string, fd: number, cb: Cb) => {
+      // Untrusted: the handle is dropped, its writes with it.
+      if (untrusted()) {
+        handles.delete(fd);
+        cb(F.EIO!);
+        return;
       }
-      return undefined;
-    }),
+      releaseOp(path, fd, cb);
+    },
     mkdir: op(async (path: string, mode: number) => {
       mutating();
       await replica.mkdir(path, { mode: mode & 0o7777 });
@@ -369,7 +395,10 @@ export async function mount(
   return {
     mountpoint,
     async unmount() {
-      for (const o of handles.values()) await onHandle(o, () => o.h.close()).catch(() => {});
+      // Untrusted, open files are dropped unflushed.
+      if (!untrusted()) {
+        for (const o of handles.values()) await onHandle(o, () => o.h.close()).catch(() => {});
+      }
       handles.clear();
       await new Promise<void>((ok, fail) => fuse.unmount((err) => (err ? fail(err) : ok())));
     },
