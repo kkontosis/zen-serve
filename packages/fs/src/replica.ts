@@ -1025,14 +1025,19 @@ export class Replica {
         }
       }
     }
-    // Queued content isn't on the server yet.
-    for (const e of [...this.settling, ...this.queue]) {
-      for (const c of e.chunks) keep.add(useKey('chunk', c));
-      for (const p of e.pages) keep.add(useKey('page', p));
-    }
-    for (const k of this.protect) keep.add(k);
     await this.rec.flush();
-    const left = await this.content.evict(this.cacheBytes, keep);
+    // Queued content isn't on the server yet, and sealed content not queued
+    // yet is protected: both as they are when the store deletes, not as
+    // they were when eviction began (seals and queueing go on meanwhile).
+    const left = await this.content.evict(this.cacheBytes, () => {
+      const now = new Set(keep);
+      for (const e of [...this.settling, ...this.queue]) {
+        for (const c of e.chunks) now.add(useKey('chunk', c));
+        for (const p of e.pages) now.add(useKey('page', p));
+      }
+      for (const k of this.protect) now.add(k);
+      return now;
+    });
     await this.rec.flush();
     return left;
   }
@@ -1276,6 +1281,7 @@ export class Replica {
     };
     this.rec.put('queue', key, encodeEntry(e));
     await this.rec.flush();
+    // Queued now, and so kept (seals are serialized: none is going on).
     this.protect.clear();
     this.queue.push(e);
     this.queue.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
