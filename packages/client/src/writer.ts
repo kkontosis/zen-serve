@@ -613,20 +613,8 @@ export async function stage(
   let renewAt = 0;
   const ttlSecs = Number(opts.sessionTtlSecs ?? limits.upload_ttl_secs ?? 0);
   const sessionCall = async (path: 'open' | 'renew') => {
-    const s = tree.fs.session;
-    if (path === 'open') {
-      const r = await s.call('/v1/fs/upload/open', zw.encodeUploadOpen, zw.decodeUploadSession, {
-        fs: fs.id,
-        ...(ttlSecs ? { ttl_secs: BigInt(ttlSecs) } : {}),
-      });
-      session = r.session;
-    } else {
-      await s.call('/v1/fs/upload/renew', zw.encodeUploadRenew, zw.decodeUploadExpiry, {
-        fs: fs.id,
-        session: session!,
-        ...(ttlSecs ? { ttl_secs: BigInt(ttlSecs) } : {}),
-      });
-    }
+    if (path === 'open') session = (await tree.openUpload(ttlSecs || undefined)).session;
+    else await tree.renewUpload(session!, ttlSecs || undefined);
     renewAt = Date.now() + ((ttlSecs || 604_800) * 1000) / 2;
   };
   if ((opts.session || session) && !opts.sink) {

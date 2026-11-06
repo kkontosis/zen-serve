@@ -1,9 +1,11 @@
 // The replica's sender (spec/fs.md §11), run by the owner: queued entries
 // in order, packed into commits within the limits. Each batch's sealed
-// content is uploaded first (idempotent), then the commit, which is stored
-// before its first send and sent again, as is, until its outcome is known.
+// content is uploaded first (idempotent), under an upload session where the
+// server has them, so what early commits put stays until the write lands;
+// then the commit, which is stored before its first send and sent again, as
+// is, until its outcome is known.
 import { bytes, type PendingOp, type Prepared, sendCommit, type Tree, ZenError } from '@zen/client';
-import type { ChunkPut, Limits, PagePut } from '@zen/wasm';
+import type { ChunkPut, Limits, PagePut, UploadRef } from '@zen/wasm';
 import {
   decodeJson,
   encodeEntry,
@@ -16,6 +18,8 @@ import {
 import type { Records } from './store.js';
 
 const OP_OVERHEAD = 512;
+/** What a put under an upload session adds toward `max_commit_bytes`. */
+const SESSION_COST = 64;
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 30_000;
 
@@ -92,6 +96,8 @@ export class Sender {
   private wakeUp: (() => void) | undefined;
   /** Commits (hex id) whose content was uploaded by this process. */
   private readonly uploaded = new Set<string>();
+  /** When the batch's upload session is next renewed (ms). */
+  private renewAt = 0;
   private rebases = 0;
   private cap = Number.POSITIVE_INFINITY;
 
@@ -198,7 +204,7 @@ export class Sender {
   }
 
   /** Send the queued content of `entries` (chunks, then the pages listing them). */
-  private async upload(entries: QueueEntry[], limits: Limits): Promise<void> {
+  private async upload(entries: QueueEntry[], limits: Limits, ref?: UploadRef): Promise<void> {
     const { tree, rec } = this.host;
     const fs = tree.fs.id;
     const puts: { kind: 'chunks' | 'pages'; id: Uint8Array }[] = [];
@@ -209,10 +215,12 @@ export class Sender {
     let size = 0;
     const send = async () => {
       if (!chunks.length && !pages.length) return;
+      if (ref) await this.keepSession(ref.session, limits);
       await sendCommit(tree.fs.session, {
         commit_id: bytes.randomBytes(16),
         ...(chunks.length ? { chunks } : {}),
         ...(pages.length ? { pages } : {}),
+        ...(ref ? { upload: ref } : {}),
       });
       chunks = [];
       pages = [];
@@ -229,7 +237,12 @@ export class Sender {
         inPages = true;
         await send();
       }
-      const c = data.length + 16 + OP_OVERHEAD + (p.kind === 'pages' ? 48 * (data.length / 16) : 0);
+      const c =
+        data.length +
+        16 +
+        OP_OVERHEAD +
+        (ref ? SESSION_COST : 0) +
+        (p.kind === 'pages' ? 48 * (data.length / 16) : 0);
       if (
         size + c > limits.max_commit_bytes ||
         chunks.length + pages.length + 1 > limits.max_commit_ops
@@ -243,6 +256,48 @@ export class Sender {
     await send();
   }
 
+  /** Renew the batch's session once half its ttl has passed. */
+  private async keepSession(session: Uint8Array, limits: Limits): Promise<void> {
+    if (Date.now() < this.renewAt) return;
+    await this.host.tree.renewUpload(session);
+    this.renewAt = Date.now() + (Number(limits.upload_ttl_secs ?? 604_800n) * 1000) / 2;
+  }
+
+  /**
+   * The upload session for the batch in flight: its stored one, renewed,
+   * or a new one (stored with it). `undefined` without content to put or
+   * a server without sessions. A new session means content put under an
+   * expired one may be gone: everything is uploaded again.
+   */
+  private async session(inf: Inflight, entries: QueueEntry[], limits: Limits, id: string) {
+    const { tree, rec } = this.host;
+    if (!entries.some((e) => e.chunks.length || e.pages.length)) return undefined;
+    if (!(await tree.info()).features.includes('upload_sessions')) return undefined;
+    if (inf.session) {
+      try {
+        if (!this.uploaded.has(id) || Date.now() >= this.renewAt) {
+          this.renewAt = 0;
+          await this.keepSession(inf.session, limits);
+        }
+        return inf.session;
+      } catch (e) {
+        if (!(e instanceof ZenError) || e.code !== 'upload_gone') throw e;
+        this.uploaded.delete(id);
+      }
+    }
+    inf.session = (await tree.openUpload()).session;
+    this.renewAt = Date.now() + (Number(limits.upload_ttl_secs ?? 604_800n) * 1000) / 2;
+    rec.put('queue', INFLIGHT, encodeJson(inf));
+    await rec.flush();
+    return inf.session;
+  }
+
+  /** Close a finished batch's session (it expires anyway if this fails). */
+  private async closeSession(inf: Inflight | undefined): Promise<void> {
+    if (!inf?.session) return;
+    await this.host.tree.closeUpload(inf.session).catch(() => {});
+  }
+
   /** Send one batch: the stored commit in flight, or a new one. */
   private async once(): Promise<void> {
     const { tree, rec, learned } = this.host;
@@ -254,6 +309,7 @@ export class Sender {
     if (inf) {
       const found = inf.keys.map((k) => queue.find((e) => e.key === k));
       if (found.some((e) => !e)) {
+        await this.closeSession(inf);
         await this.dropInflight();
         return;
       }
@@ -272,14 +328,24 @@ export class Sender {
     this.host.sending(entries, id);
     let r: Awaited<ReturnType<typeof sendCommit>>;
     try {
+      const session = await this.session(inf, entries, limits, id);
       if (!this.uploaded.has(id)) {
-        await this.upload(entries, limits);
+        await this.upload(entries, limits, session ? { fs: tree.fs.id, session } : undefined);
         this.uploaded.add(id);
       }
       r = await sendCommit(tree.fs.session, inf.commit, 1);
     } catch (e) {
       if (isNet(e) || !(e instanceof ZenError)) throw e;
       this.uploaded.delete(id);
+      if (e.code === 'upload_gone') {
+        // The session expired mid-upload: a new one, and everything again.
+        delete inf.session;
+        rec.put('queue', INFLIGHT, encodeJson(inf));
+        await rec.flush();
+        return;
+      }
+      // Rebuilt or refused: the batch's session is done.
+      await this.closeSession(inf);
       if (e.code === 'stale_op' || e.code === 'clock_skew') {
         const ops = inf.commit.crdt_ops ?? [];
         const p: Prepared = prepared ?? {
@@ -310,6 +376,7 @@ export class Sender {
     this.uploaded.delete(id);
     this.rebases = 0;
     this.cap = Number.POSITIVE_INFINITY;
+    await this.closeSession(inf);
     for (const o of inf.commit.crdt_ops ?? []) {
       if (o.op === 'move' || o.op === 'meta') tree.clock.accept(o.hlc);
     }

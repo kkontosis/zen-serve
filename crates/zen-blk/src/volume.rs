@@ -780,7 +780,17 @@ impl Volume {
     }
 
     /// Blocks per commit: `batch_blocks`, within the server's commit limits
-    /// for a block and a full path of new nodes each.
+    /// for a block and a full path of new nodes each. A flush of at most
+    /// this many buffered blocks is one commit.
+    pub fn blocks_per_commit(&self) -> usize {
+        self.per_commit()
+    }
+
+    /// The root record this volume holds (its `seq`, `prev` and `writer`).
+    pub async fn root_record(&self) -> RootRecord {
+        self.0.tree.read().await.record.clone()
+    }
+
     fn per_commit(&self) -> usize {
         let l = &self.0.fs.session().info().limits;
         let d = blk::depth(self.0.blocks) as usize;
@@ -903,12 +913,23 @@ impl Volume {
             }
         }
         drop(tree);
-        if let Some(p) = &self.0.opts.pin {
-            pin::save(p, &self.0.vol_id, &Pin { seq, hash: rh })?;
-        }
+        self.save_pin(seq, rh).await?;
         self.0
             .integrity
             .note(vol_entry(&self.0.vol_id, seq, rh), true)
+    }
+
+    /// Save the root pin on the blocking pool: its fsyncs can take hundreds
+    /// of milliseconds under I/O load, and on a runtime worker they would
+    /// hold up the lease's renewals and other requests meanwhile.
+    async fn save_pin(&self, seq: u64, hash: Hash) -> Result<()> {
+        let Some(p) = self.0.opts.pin.clone() else {
+            return Ok(());
+        };
+        let vol = self.0.vol_id.clone();
+        tokio::task::spawn_blocking(move || pin::save(&p, &vol, &Pin { seq, hash }))
+            .await
+            .map_err(|e| Error::Io(format!("saving the volume pin: {e}")))?
     }
 
     /// Settle a commit whose outcome stayed unknown, from the stored root:
@@ -927,9 +948,7 @@ impl Volume {
                 let seq = record.seq;
                 *tree = Tree::new(record, rh, self.0.opts.cache_nodes);
                 self.st().root = (seq, rh);
-                if let Some(p) = &self.0.opts.pin {
-                    pin::save(p, &self.0.vol_id, &Pin { seq, hash: rh })?;
-                }
+                self.save_pin(seq, rh).await?;
                 self.0
                     .integrity
                     .note(vol_entry(&self.0.vol_id, seq, rh), true)?;

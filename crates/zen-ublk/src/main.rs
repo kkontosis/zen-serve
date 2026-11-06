@@ -18,7 +18,7 @@ use zen_blk::{Volume, VolumeOptions};
 use zen_client::cli::{ConnectArgs, Connected, exit_code, print_error};
 use zen_client::{Error, IntegrityOptions, UnlockedFs, hex};
 use zen_ublk::disk::Disk;
-use zen_ublk::{fuse, parse_size, vol_pin_path};
+use zen_ublk::{fuse, image, parse_size, vol_pin_path};
 
 #[derive(Parser)]
 #[command(
@@ -65,6 +65,37 @@ enum Command {
     },
     /// Print the volume's size and root (seq, RH) as JSON.
     Info,
+    /// Copy a raw image (a file or a block device, the volume's size) into
+    /// the volume, resumably; print its root.
+    Import {
+        image: PathBuf,
+        /// Create the volume at the image's size.
+        #[arg(long)]
+        create: bool,
+        /// Where the import records how far it got (default: the volume
+        /// pin's path + `.import`).
+        #[arg(long)]
+        progress: Option<PathBuf>,
+        /// Ignore the progress file and start over.
+        #[arg(long)]
+        restart: bool,
+        /// Stop after N windows, leaving the progress file (for tests).
+        #[arg(long, hide = true)]
+        stop_after: Option<u64>,
+    },
+    /// Write the volume to IMAGE, a sparse file (read-only: no lease);
+    /// print the root exported.
+    Export {
+        image: PathBuf,
+        /// Replace IMAGE if it exists.
+        #[arg(long)]
+        force: bool,
+        /// After N windows, wait until FILE exists (for tests).
+        #[arg(long, hide = true, requires = "pause_file")]
+        pause_after: Option<u64>,
+        #[arg(long, hide = true)]
+        pause_file: Option<PathBuf>,
+    },
     /// Serve DIR/disk.img until DIR is unmounted or the daemon is signalled.
     Fuse { dir: PathBuf },
     /// Serve /dev/ublkbN until signalled.
@@ -234,6 +265,65 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             integrity.close().await?;
             return Ok(0);
         }
+        Command::Import {
+            image,
+            create,
+            progress,
+            restart,
+            stop_after,
+        } => {
+            if cli.read_only {
+                return Err(Error::local("param", "an import writes: not --read-only"));
+            }
+            let device = integrity
+                .device_fp()
+                .ok_or_else(|| Error::local("param", "an import needs a device key"))?;
+            let o = options(&cli, &name);
+            let progress = progress.clone().unwrap_or_else(|| {
+                let mut s = o.pin.clone().unwrap_or_default().into_os_string();
+                s.push(".import");
+                PathBuf::from(s)
+            });
+            let v = image::import(
+                &u,
+                &name,
+                image::Import {
+                    image: image.clone(),
+                    create: *create,
+                    progress,
+                    restart: *restart,
+                    stop_after: *stop_after,
+                    vol: o,
+                    device,
+                },
+            )
+            .await?;
+            let root = root_json(&v);
+            v.close().await?;
+            integrity.close().await?;
+            println!("{root}");
+            return Ok(0);
+        }
+        Command::Export {
+            image,
+            force,
+            pause_after,
+            pause_file,
+        } => {
+            let v = Volume::open_read_only(&u, &name, options(&cli, &name)).await?;
+            let o = image::Export {
+                image: image.clone(),
+                force: *force,
+                pause: pause_after.zip(pause_file.clone()),
+            };
+            let r = image::export(&v, &o).await;
+            let root = root_json(&v);
+            v.close().await?;
+            integrity.close().await?;
+            r?;
+            println!("{root}");
+            return Ok(0);
+        }
         _ => Disk::new(
             open(&cli, &u, &name).await?,
             Duration::from_millis(cli.io_timeout_ms),
@@ -253,7 +343,10 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             )
             .await
         }
-        Command::Create { .. } | Command::Info => unreachable!(),
+        Command::Create { .. }
+        | Command::Info
+        | Command::Import { .. }
+        | Command::Export { .. } => unreachable!(),
     };
     let closed = disk.close().await;
     let ck = integrity.close().await;

@@ -150,6 +150,13 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Progress:** milestone 5 step 7f built the server side: pages, the paged `write`, version-2 manifests with file keys (spec/formats.md §11.3–11.6, fs.md §4). Step 7g moved the client onto them, and made file keys a policy of the fs.
 * **Plan (milestone 5):** steps 7f/7g build two-level pages (immutable, server-visible chunk-id pages listed with their digests in a sealed v2 manifest, about 640 GiB at the defaults) and per-file content keys; the rest (upload sessions, repacking) is milestone 8 (docs/MILESTONE-8.md).
 
+## TD-FS-SPARSE
+
+* **Status:** open
+* **Context:** zen-fs files have no holes. A file grown by `truncate` (or a write past its end) is written with its zeros as content: a replica's handle keeps the gap as a zero extent in memory (milestone 8 step 4), but its flush seals and uploads the zeros, so a sparse 1 GiB image file costs 1 GiB sealed, sent and stored. Under CDC, long zero runs are cut at the chunker's `max`. Measured in milestone 8 step 6 (docs/BLK.md §8), where it is why an image kept as a file stores its whole size and a volume only what was written.
+* **Why deferred:** A hole is a format change (manifests, readers, the writer, the replica), out of place in a step about zen-ublk.
+* **What it would take:** a zero-extent entry in v3 manifests and pages (a length with no chunk, formats.md §11.3 and §11.6), which readers fill with zeros and the server never references; the writer emitting one for whole zero chunks (detected when cutting); the replica's handle passing zero extents through (`Edit.zeros`) as holes; `SEEK_HOLE`/`SEEK_DATA` in zen-mount; vectors; and a leakage note (the server sees where the holes are and how long they are).
+
 ## TD-STORE-COMPACTION
 
 * **Status:** open
@@ -363,6 +370,23 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * **Resize:** a root record whose `blocks` differs from its predecessor's, with the tree's depth changing at powers of 128 (a new top node over the old one, or the old top's first child when shrinking) and the cut-off blocks deleted in the same commits.
   * **Delete:** paged clears of the volume's keys (a clear over more than `max_range_items` keys is refused), and a tombstone root record that stays, so a server can't resurrect a deleted volume by serving its old root.
   * **Readers at a snapshot:** a read-only opener that keeps the values of its root, which needs the snapshots above, since the writer deletes and overwrites them.
+
+## TD-BLK-SNAPSHOT-FILES
+
+* **Status:** open
+* **Context:** `zen-ublk export` (milestone 8 step 6, docs/BLK.md §2) writes a volume to a raw image on the local disk. A volume snapshot kept in zen-fs instead, as a file of the fs, would be a server-side backup and a transport format.
+* **For:**
+  * Any zen-fs client can read it, without zen-ublk, and it can be mounted read-only through zen-mount and a loop device.
+  * It dedupes across snapshots: a second snapshot of a mostly unchanged volume, written with the first as `previous`, stores only the chunks that changed (fixed chunks of a multiple of 4 KiB keep in-place block writes on chunk boundaries).
+  * Its versions are covered by the tree's own integrity (signed checkpoints, formats.md §14).
+* **Against:**
+  * **Consistency:** a consistent snapshot of a live volume needs TD-BLK-SNAPSHOTS, a pinned root whose blocks the writer doesn't overwrite or delete meanwhile. Today `export` fails when the root moves.
+  * **Code:** zen-client (Rust) has no tree writer. One would be needed (sealing chunks and pages and the manifest, as `@zen/client` does), or the snapshot made by a TS tool reading the volume.
+  * **Storage:** it doubles until the file is removed. Blocks are sealed per stored key and chunks per file, so the two can't share bytes.
+  * **Freshness:** the volume's freshness (its root `seq` in checkpoints, blk.md §6) doesn't carry over. The file would need the root it came from recorded (`vol_id`, `seq`, `RH` in its meta), and a checkpoint entry linking the two, for a reader to know it holds the volume as of that root and not an older one.
+* **How it could open later:** after TD-BLK-SNAPSHOTS:
+  * `zen-ublk snapshot --tree TREE PATH` pins a root and streams the blocks into a Rust `Tree::write` with fixed 64 KiB chunks, the previous snapshot as `previous`, recording `(vol_id, seq, RH)` in the file's meta.
+  * `import` takes a zen-fs file as its source, which makes a restore an `import`.
 
 ## TD-WITNESS
 

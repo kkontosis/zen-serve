@@ -172,6 +172,31 @@ describe.skipIf(!canMount)('zen-mount', () => {
     expect(bytes.equal(new Uint8Array(buf), big.subarray(65500, 65600))).toBe(true);
   });
 
+  it('an operation that takes over 15 s finishes (no per-operation timeout)', async () => {
+    const client = await connect(w.server.url, { origin: w.client.origin });
+    const u = await (await client.signInDevice(w.admin)).fs(1).unlock({ passphrase: 'pp' });
+    const x = await mountReplica(u, treeId, join(base, 'slow'));
+    mounts.push(x);
+    // From now on, content reaches the mount 16 s late (fuse-native's
+    // default timeout is 15 s).
+    const s = u.session;
+    const orig = s.call.bind(s);
+    s.call = (async (path: string, enc: never, dec: never, req: never) => {
+      if (path === '/v1/fs/chunks/get') await new Promise((r) => setTimeout(r, 16_000));
+      return orig(path, enc, dec, req);
+    }) as typeof s.call;
+    // A file written elsewhere: the mount reads its content from the server.
+    const t = ufs.tree(treeId);
+    const f = await t.create(ROOT, 'slow.bin');
+    const data = new Uint8Array(200_000).map((_, i) => (i * 13) % 251);
+    await t.writeFile(f, data);
+    const p = join(x.mountpoint, 'slow.bin');
+    await eventually(() => stat(p));
+    const back = new Uint8Array(await readFile(p));
+    expect(bytes.equal(back, data)).toBe(true);
+    s.call = orig;
+  }, 90_000);
+
   it('a second mount sees changes, and concurrent writes show a conflict copy', async () => {
     const a = mounts[0]!;
     const other = await w.session.fs(1).unlock({ passphrase: 'pp' });

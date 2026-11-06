@@ -19,6 +19,10 @@ zen-ublk CONNECT --vol NAME [--vol-pin FILE] [--read-only] [--lease-ttl-ms MS] [
          [--idle-flush-ms MS] [--io-timeout-ms MS] COMMAND
   create SIZE       create the volume (bytes, or with K/M/G/T; a multiple of 4,096), print its root
   info              the volume's size and root, as JSON
+  import IMAGE [--create] [--progress FILE] [--restart]
+                    copy a raw image (a file or a block device) into the volume, resumably
+  export IMAGE [--force]
+                    write the volume to IMAGE, a sparse file (read-only: no lease)
   fuse DIR          serve DIR/disk.img until DIR is unmounted or the daemon is signalled
   ublk [--id N] [--queues Q] [--depth D]     serve /dev/ublkbN until signalled  (feature "ublk")
 ```
@@ -45,6 +49,25 @@ mount /dev/ublkb0 /mnt/disk
 `--id N` makes the device name stable. If a killed daemon left device N behind, the next `zen-ublk ublk --id N` deletes it first. If N is still served, it exits with `busy`.
 
 **Read-only exports** (`--read-only`) need no lease and refuse writes (`EROFS`). Mount them `-o ro,noload` (ext4 would otherwise replay its journal). A read-only export reads one root. When the writer moves it, reads that need the new root fail with `EIO`, and the message says to restart the export (TD-BLK-SNAPSHOTS: pinned snapshots).
+
+**Moving images in and out.**
+* **`import IMAGE`** copies a raw disk image into the volume. The image is a file or a block device of exactly the volume's size; with `--create`, the volume is created at the image's size.
+  * **Empty blocks:** holes in the image and blocks of zeros aren't stored. On a volume the import created there is nothing to store there, and on an existing volume they are discarded, so the volume ends equal to the image.
+  * **Commits:** the image goes in windows of `--batch-blocks` blocks (1 MiB by default, within the server's limits), each one commit.
+  * **Resuming:** after each window, a progress file (the volume pin's path + `.import`, or `--progress FILE`) records how far it got and the root it left. Run the same command again to continue from there. That works if the volume is still at that root, or one commit past it by this device (a crash between a commit and its record).
+  * **Refusals:** if the volume or the image changed since, the import refuses and says so. `--restart` starts over, discarding what the image doesn't have.
+  * **Output:** it prints the volume's root at the end.
+* **`export IMAGE`** writes the volume to a new file (`--force` replaces one).
+  * **Read-only:** it needs no lease, so it can run while a writer serves the volume, and it reads the root it opened, checked as every read is.
+  * **Holes:** blocks never written or written with zeros are holes in the file, so a mostly empty 1 TiB volume exports to a small file.
+  * **Atomic:** it writes `IMAGE.part` and renames it at the end, and prints the root it exported.
+  * **A volume in use:** if the writer moves the root meanwhile, the export fails and leaves nothing. Stop the writer, or freeze its filesystem (`fsfreeze -f`), and export again (a consistent export of a live volume waits for snapshots, TD-BLK-SNAPSHOTS).
+  * **Block devices:** it writes regular files only. To put an image on a device, export it, then `dd if=IMAGE of=/dev/sdX bs=1M` (not `conv=sparse`: on a device, a skipped block keeps what was there).
+
+```sh
+zen-ublk $CONNECT --vol vm import --create vm.raw     # resumable: run it again after an interruption
+zen-ublk $CONNECT --vol vm export vm-backup.raw       # sparse; prints {"size":…,"seq":…,"root":…}
+```
 
 **Stopping.** SIGINT or SIGTERM, or unmounting the FUSE directory, stops the daemon. It then flushes, writes a checkpoint and releases the lease. A FUSE directory still in use (a loop device on it) can't be unmounted: the daemon says so and keeps serving. Detach the loop device first.
 
