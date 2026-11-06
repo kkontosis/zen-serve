@@ -232,7 +232,12 @@ describe('changed chunks only', () => {
   it('a file of variable chunks (version 3) reads, and its edits stay v3 and touch few pages', async () => {
     const { id, r, net, seen } = await setup();
     const cdc = admin.tree(id, { cdc: { min: 64, avgBits: 8, max: 1984 } });
-    const data = blob(150_000, 3);
+    // Not `blob`: its bytes repeat every 256, and content-defined cuts
+    // shifted by an edit never realign in periodic data.
+    const data = new Uint8Array(150_000);
+    for (let i = 0; i < data.length; i += 65536) {
+      crypto.getRandomValues(data.subarray(i, i + 65536));
+    }
     const f = await cdc.create(ROOT, 'cdc.bin');
     expect((await cdc.writeFile(f, data)).manifest.version).toBe(3);
     await r.sync();

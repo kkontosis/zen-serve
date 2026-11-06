@@ -323,6 +323,9 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * the `trusted` check off in `mount.ts`: the in-process test fails (the read resolved with "v1")
     * **Docs:** CLIENT.md §8 (handles, records, chunking) and §9 (the mapping, `--integrity`); INTEGRITY.md §5 and §8; TECH_DEBT TD-FUSE-INTEGRITY resolved.
     * **Known, not changed:** index records are never evicted (nor were the JSON ones). A whole rewrite of a large file without records reads it once, as planned; in zen-mount that is the first spill of a `w` open over a large file.
+    * **Checks:** `npm run check` and `npm run build` clean; `handles` 3× (RSS 112–115 MiB over the start, 10–17 past the middle); the full `npx vitest run`: 613 passed, 34 skipped, none failed, but 4 files didn't load (`apps/echo` connect and ssh, `packages/svc` sshlayer and sshwasm) for want of OpenSSH in this container. With `openssh-client` installed they pass, with the fs and fuse suites (75 tests).
+    * **Found in the rerun:** `writes.test.ts`'s v3 case failed 3 runs in 4 (6 pages, all 583 chunks sent). Its content was `blob()`, whose bytes repeat every 256: after an edit, content-defined cuts are shifted by a phase and never realign in periodic data (the writer's `pending` stayed the same at every page), so the whole file is cut again. It passed only when the edit happened to leave the chunker in phase. The writer is right: the test now uses random content (6 of 6 runs pass). Periodic content (and long zero runs, cut at `max`) is where CDC can't resync after a length-changing edit; STATS notes it in 8.7.
+    * Committed 1cb1440 (and the test fix after it); pushed.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
