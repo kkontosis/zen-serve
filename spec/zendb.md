@@ -1430,13 +1430,19 @@ A Loro document (a rich text, list, map or tree, DESIGN-3 §0) merges on the cli
 * **Name.** A document has a text `name`, unique within its database.
 * **Topic.** Its updates are messages (§10) on the topic `("zen", "loro", ns, name)`, one topic per document.
 * **Message.** Type `zen.loro.update`, body the bytes of one Loro update (`export({mode: "update"})`, or several local updates merged). A body over `max_envelope_bytes` goes to parts (§10.3), with no `ttl`.
-* **Snapshot.** The `$loro` row of the document (§11.5) holds a Loro snapshot and the offset of the last event it covers. It is absent until the first compaction.
+* **Snapshot.** The `$loro` row of the document (§11.5) holds a Loro snapshot and the offset of the last event it covers. It is absent until the first compaction. The row is one of two forms:
+  * **Inline:** `{name, offset, snapshot}`, the snapshot's bytes in the row.
+  * **A file:** `{name, offset, file}`, for a snapshot too large for a row (§20.5). `file` is `{tree, node, manifest, size}`: the zen-fs file holding the snapshot (`tree` and `node`, 16-byte ids), the SHA-256 of its version's sealed manifest (32 bytes), and the snapshot's length.
+  * The row is sealed and authenticated like every row, so the hash binds it to one version of the file: a server can't pair the row with another version, an older one included, without the reader noticing.
 
 ### 20.2 Loading
 
 A client builds the document in this order:
 1. **Kept state** (`loro/<ns>`, key `d ‖ name`, §9.3), if any: the snapshot is imported, and the offset is where the log is read from. A document opens offline from it.
-2. **The `$loro` row:** if its offset is newer than the kept one (or nothing is kept), its snapshot is imported and its offset taken.
+2. **The `$loro` row:** if its offset is newer than the kept one (or nothing is kept), its snapshot is imported and its offset taken. For a file row:
+   1. The node's versions are read, and the one whose sealed manifest hashes to `manifest` is read whole (its length checked against `size`) and imported.
+   2. When no version matches, the row is read again: a compaction may have replaced the file between the two reads. If it now names another version, back to 1.
+   3. When it names the same missing version, the client warns and goes on without the snapshot: the tail is read from the kept offset, or from the start of the log. That is slower, but complete.
 3. **The tail:** every event after the offset, read in order (`/v1/log/read`), each imported; the offset moves to each event read.
 4. **Live:** an `on` subscription after the offset (§11.2). Events at or before the offset are skipped, so a reconnection never imports twice (doing so would be harmless anyway).
 5. **The outbox** (below) is imported too: its updates may be newer than the kept snapshot.
@@ -1461,12 +1467,20 @@ The snapshot and the offset of the last imported event are written to `d ‖ nam
 
 * **Who.** The owner (§9.2) of each database where the document is open. Without Web Locks every instance owns, which is still safe.
 * **When.** After `N` events (default 100) or `M` bytes of update bodies (default 1 MiB) imported since the `$loro` row's offset, and on an explicit `compact()`.
-* **How.** One transaction reads the `$loro` row and, only if its offset is older than the client's, writes `{name, offset, snapshot}` at the client's offset. The offset only moves forward, so two compacting clients need no leader: one conflicts, re-runs and finds nothing to do.
+* **How.** One transaction reads the `$loro` row and, only if its offset is older than the client's, writes the row at the client's offset. The offset only moves forward, so two compacting clients need no leader: one conflicts, re-runs and finds nothing to do (or writes again, with what it reads in the re-run).
+* **Inline or a file.** A snapshot of at most half of `max_commit_bytes` is written inline. A larger one, or an inline write that fails `too_large`, goes to a file:
+  * **Which file.** The row's file's tree and node when it has one. Otherwise a new tree of the document's own, with a node created at its root under the name `snapshot`.
+  * **The upload** is made before the transaction (fs.md §4.1), under an upload session when the server has `upload_sessions`, so a slow upload outlives the grace period. The session is closed after the transaction, whether it wrote or not: an upload that wasn't written is released one grace period later.
+  * **The transaction** carries, besides the row `{name, offset, file}`, the node's `create` (for a new node) and the file's `write`, replacing the node's current versions as read in that run. So the node keeps one version at a time.
+  * **Removed nodes.** When a file row is replaced by an inline one, the same transaction removes the file's node (to `TRASH`, fs.md §6). When the row read in the transaction names a node other than the one this client uploaded to (two clients made a document's first file at once, and the other committed first), the transaction removes that node and writes its own.
+  * A client from before file rows loads a file row from its kept offset or the whole log, which is correct. If it compacts inline over a file row, the file's node stays behind: harmless, but its storage is not released.
 * **Why it is complete.** Every event up to the offset was imported, in order, before the snapshot was exported. A snapshot holding more (local edits not yet emitted) is harmless: they arrive again as events.
-* **Too large.** A snapshot that makes the commit too large (`too_large`, about `max_commit_bytes`) keeps the old row; the client warns once and stops compacting that document (TD-LORO-LARGE-SNAPSHOT).
+* **Too large.** Only a snapshot larger than one file holds (fs.md §4.1) is too large. It keeps the old row; the client warns once and stops compacting that document, and `compact()` fails with `too_large`.
 * **The log.** Events covered by a snapshot stay in the log until log retention exists (TD-LOG-RETENTION).
 
 ### 20.6 Leakage
 
 Beyond §15, the server sees each document's topic, when and how often it is edited, from which devices, and the sizes of its updates and snapshots (the `$loro` row is not padded, §4.3). It sees neither the name, nor the content, nor what an edit did.
+
+For a snapshot in a file, the server also sees the file's tree, its size and chunk lengths (as for any file, fs.md §10), and that one commit carries both the row and the file's write. The size was visible in an inline row already. The tree id links the document's compactions, which the row's key linked already.
 
