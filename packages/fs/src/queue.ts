@@ -32,6 +32,13 @@ export interface QueueEntry {
 export interface Inflight {
   keys: string[];
   commit: Commit;
+  /**
+   * The upload session its content is put under (api.md §12.1), so content
+   * put in earlier commits stays until the write lands, past the grace
+   * period; renewed after a restart. Absent: none (no content, a server
+   * without sessions, or a record from before them).
+   */
+  session?: Uint8Array;
 }
 
 export const INFLIGHT = bytes.utf8('inflight');

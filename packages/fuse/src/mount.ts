@@ -387,6 +387,11 @@ export async function mount(
   const fuse = new Fuse(mountpoint, ops as unknown as Record<string, (...args: never[]) => void>, {
     force: true,
     mkdir: true,
+    // No per-operation timeout (fuse-native's default is 15 s, answered
+    // ETIMEDOUT while the operation goes on): a flush of a large file, or
+    // a read waiting on the network, takes as long as it takes, as on any
+    // FUSE mount.
+    timeout: false,
     attrTimeout: opts.attrTimeout ?? 1,
     entryTimeout: opts.attrTimeout ?? 1,
   });

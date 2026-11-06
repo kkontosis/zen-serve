@@ -1283,6 +1283,32 @@ export class Tree {
     return r.sessions.map((s) => ({ session: s.session, expiresMs: Number(s.expires_ms) }));
   }
 
+  /**
+   * Open an upload session (api.md §12.1): chunks and pages put by commits
+   * that name it stay until it is closed or expires (`ttlSecs`, default
+   * the server's `upload_ttl_secs`).
+   */
+  async openUpload(ttlSecs?: number): Promise<UploadSessionInfo> {
+    const r = await this.session.call(
+      '/v1/fs/upload/open',
+      zw.encodeUploadOpen,
+      zw.decodeUploadSession,
+      { fs: this.fs.id, ...(ttlSecs ? { ttl_secs: BigInt(ttlSecs) } : {}) },
+    );
+    return { session: r.session, expiresMs: Number(r.expires_ms) };
+  }
+
+  /** Renew an upload session for `ttlSecs` from now (`upload_gone` once it expired). */
+  async renewUpload(session: Uint8Array, ttlSecs?: number): Promise<number> {
+    const r = await this.session.call(
+      '/v1/fs/upload/renew',
+      zw.encodeUploadRenew,
+      zw.decodeUploadExpiry,
+      { fs: this.fs.id, session, ...(ttlSecs ? { ttl_secs: BigInt(ttlSecs) } : {}) },
+    );
+    return Number(r.expires_ms);
+  }
+
   /** Close an upload session: what it holds is released (and collected after `chunk_grace_secs` unless written). */
   async closeUpload(session: Uint8Array): Promise<void> {
     await this.session.call('/v1/fs/upload/close', zw.encodeUploadClose, zw.decodeEmpty, {
