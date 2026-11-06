@@ -391,6 +391,66 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 6 plan`
     4. push and open the PR
   * Then implement on "go".
+  * Plan committed (eac2689), PR #71.
+  * **CI on eac2689 (docs only):** the pull_request run's `devices` job failed: `fuse_ext4_round_trip` lost its writer's 2 s lease, as in 8.2. The push run was green.
+    * **Measured locally** (timing in the renewal loop):
+      * a volume commit of about 260 writes takes up to 320 ms on the debug server
+      * a renewal queued behind such commits took 899 ms
+      * the renewal timer fired 667 ms late
+      * a pin save's fsyncs on a runtime worker took up to 397 ms under disk load
+      * A 2 s lease leaves 1.33 s of slack for all of that.
+    * **Fix, its own commit 98c151c** (not pushed yet):
+      * the device tests' lease is 6 s; the killed-writer tests wait 6.5 s
+      * zen-blk saves the root pin on the blocking pool (`save_pin`)
+    * **Checks:** the device tests passed 8 runs. One run hung with no output (killed at 600 s) and wasn't reproduced in 6 more.
+  * **Implemented so far (uncommitted):**
+    * zen-blk: `blocks_per_commit()`, `root_record()`, and the re-export of `RootRecord`
+    * zen-ublk:
+      * `src/image.rs`: import (one commit per window, the progress file, the resume check) and export (`.part`, holes)
+      * `main.rs`: the `import` and `export` commands (hidden `--stop-after`, `--pause-after`/`--pause-file`)
+    * `tests/image.rs`: the 5 tests, passing 3×
+    * `tests/devices.rs`: `image_import_serve_export`, passing; the benches `bench_file_cdc`, `bench_file_fixed` and `bench_image`; `bench_fuse` and `bench_ublk` now report the stop time, peak RSS and stored bytes
+    * ci.yml: `devices-bench` builds zen-mount (wasm, Node, `npm run build`)
+  * **Negative controls,** all failing as required:
+    * zeros written instead of skipped: test 1
+    * no discard on an existing volume: test 2
+    * any seq accepted: the resume refusal
+    * no `seq + 1` acceptance: the crash case
+    * no cleanup of a failed export: test 5
+    * **Changes from the plan:**
+      * The "zeros skipped" control first made zeros *discarded*, which stores nothing on a new volume, so it passed. It now writes zeros as data.
+      * The "no .part" control is now "no cleanup": writing straight to `IMAGE` with the cleanup kept still removes the file. The test's wait for the export to start now has a deadline (it hung).
+  * **The volume baseline** (`bench_fuse`, release, this container, one run):
+    * 25.6 MiB/s write, 149 MiB/s read, 8.3 ms per dsync 4 KiB write, untar 0.21 s
+    * stop 0.02 s, peak RSS 62 MiB, 279 MiB stored
+  * **Found by the file benches** (zen-mount + loop):
+    1. **fuse-native's per-operation timeout:** zen-mount ran with the default 15 s, so a flush or close of a large file answered `ETIMEDOUT` while it went on. `mount.ts` now passes `timeout: false` (uncommitted).
+    2. **A sparse file's first flush** is a whole write, so `truncate -s 1G` seals and stores 1 GiB of zeros.
+    3. **Queued writes refused** (`unknown chunk in page`, then `queued content … is missing` for the edits built on it):
+       * The replica's sender puts a queued write's chunks and pages in commits of their own, then the write, with no upload session. Content a slow upload put in an early commit can be collected by the grace sweep before the write lands.
+       * The bench's short grace (0, then 20 s) made it certain. The default grace (1 day) only bounds it.
+       * Every later entry that edits that local version is then refused too.
+  * **Decided:** fix (3) in 8.6 (the user's choice), below ("Step 8.6, continued").
+  * Failed bench runs left dead zen-mount mounts that made `ps` and `losetup -a` hang; they were cleaned up (`umount -l`, `losetup -D`).
+  * **On "continue" (plan approved):**
+    * **Commit 2007fdc:** zen-ublk import and export. The benches use the default grace and report stored bytes at the stop (superseded content included). `bench_file` fails on a refused queued write and unmounts a dead zen-mount.
+    * **Commit 4fa20a5:** the sender's sessions and zen-mount's `timeout: false`.
+      * `Tree.openUpload` and `renewUpload` (the writer uses them)
+      * `Inflight.session`
+      * `upload_gone` mid-upload starts over under a new session
+    * **Tests:** new `packages/fs/test/sessions.test.ts`, 2 cases, passing 3×; zen-mount "an operation that takes over 15 s finishes".
+    * **Negative controls:**
+      * without `upload` on the content commits, the session test fails: the bench's `unknown chunk in page`, then `not_found: /big` on another replica
+        * At first the test checked the result only after a later rewrite, which re-uploads what it needs and passed. It now reads the first write back on another replica at once.
+      * without `timeout: false`, the mount test fails: the kernel read returned **other bytes than the file's**, not just an error
+        * The first form of the test delayed the fetch during the replica's `sync` (prefetch) and passed. The delay now starts after mounting, and the file is written afterwards.
+    * **Checks:** `npm run check` and `npm run build` clean; `@zen/fs` (all 5 files), client `cdc` and `mount`: 72 passed.
+    * **Docs:**
+      * BLK.md §2 ("Moving images in and out")
+      * CLIENT.md §8 (sending under sessions) and §9 (no per-operation timeout; zeros written)
+      * TECH_DEBT: TD-BLK-SNAPSHOT-FILES and TD-FS-SPARSE
+      * README
+    * Pushed 4fa20a5.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -1636,6 +1696,77 @@ zen-ublk CONNECT --vol NAME export IMAGE [--force]
 * **Export is read-only and fails if the root moves,** rather than taking the lease, so it never stops a writer. A consistent live export waits for TD-BLK-SNAPSHOTS.
 * **Export writes regular files only.**
 * **The comparison runs in this container,** with the figures in BLK.md; STATS gets them in 8.7, with the CI bench job.
+
+## Step 8.6, continued: the replica's uploads under sessions, and zen-mount
+
+The file benches found three things outside zen-ublk (see the 8.6 log). The user chose to fix the replica's uploads in this step. The work below goes on the same branch and PR (#71), after the work already done.
+
+### 1. The replica's sender uploads under an upload session (`@zen/fs`, `sender.ts`)
+
+**The problem:**
+* `Sender.upload(entries)` puts a batch's chunks, then its pages, in commits of their own, and then `once()` sends the write commit.
+* Nothing references that content until the write lands, so a slow upload (larger than the grace allows, or slowed by the network) can lose its early chunks to the grace sweep. The page commit then fails `unknown chunk in page`, or the write fails.
+* Every later queued entry that edits the refused local version is refused in turn.
+
+**The fix:**
+* **Opening:** when the server has `upload_sessions` and the batch has content, `upload` opens a session (`/v1/fs/upload/open`, the server's default ttl).
+* **Using it:** every content commit carries `upload: {fs, session}`, renewed between commits once half the ttl has passed, as `writer.ts` does.
+* **Closing:** the session is closed after the write commit's outcome is final, whether written or refused. A close that fails is ignored, since the session then expires.
+* **Across a restart:** the session is kept in the stored commit in flight (`Inflight.session`, optional, so old records still load).
+  * A restart renews it before uploading again. On `upload_gone` it opens a new one and uploads everything again (the puts are idempotent).
+  * `uploaded` (in memory) is still what skips a second upload within one process.
+* **Without `upload_sessions`:** as today.
+* **Code reuse:** `Tree` gains `openUpload(ttlSecs?)` and `renewUpload(session, ttlSecs?)`, next to `closeUpload`. `writer.ts`'s `sessionCall` uses them too.
+* **Cost:** each put under a session costs `SESSION_COST` (64 B) more toward `max_commit_bytes`, so the sender's packing in `upload` counts it.
+
+**Test (new case in `packages/fs/test/writes.test.ts`, or `handles.test.ts`):**
+* **The setup:** a world with `chunk_grace_secs: 1`, `sweep_interval_secs: 1` and a small `max_commit_bytes`, so a 2 MB file's queued write takes several content commits.
+* **The delay:** the replica's `session.call` is wrapped so that, once the first content commit has applied, the next commit waits 3 s (past the grace, with sweeps running).
+* **The checks:**
+  * the write lands, and the file reads back on a second replica
+  * a later queued edit of the same file also lands
+  * `tree.uploads()` is empty afterwards: the session was closed
+* **A restart case:** the replica is closed after the content commits and before the write. It's reopened past the grace, and the write still lands, because the session was renewed from `Inflight.session`.
+* **Negative control:** with `upload` left out of the content commits, the test fails (`unknown chunk in page`).
+
+### 2. zen-mount without fuse-native's per-operation timeout (`packages/fuse/src/mount.ts`)
+
+* `timeout: false` (done, uncommitted). Without it, an operation over 15 s (the flush of a large file, a read waiting on the network) answers `ETIMEDOUT` while its work goes on.
+* **Test:** an in-process mount (`mount.test.ts`) whose replica's `session.call` delays the commit of a flush by 16 s. `close` (via `fs.closeSync` in a worker, or `fs.promises` with the handle) succeeds, where it gave `ETIMEDOUT` before.
+* **Negative control:** without `timeout: false`, the test fails with `ETIMEDOUT`.
+* **Cost:** about 16 s added to the mount suite.
+
+### 3. A sparse file's zeros (no code change in 8.6)
+
+* The first flush of a file that `truncate` grew writes its zeros as content, so a 1 GiB sparse image file costs 1 GiB sealed, uploaded and stored. CDC cuts long zero runs at `max`.
+* The benches measure it, and BLK.md "Files or volumes" says so: an image kept as a file stores its whole size, and a volume stores only what was written.
+* **New TD-FS-SPARSE:** holes in zen-fs files (a zero-extent entry in v3 manifests, or a shared all-zero chunk per key), and the replica's handle keeping a hole as one. A format change, out of place here.
+
+### Then, as planned
+
+1. **The file benches**, with the default grace. Stored bytes are read after the stop: the server holds superseded versions' chunks until their grace passes, and the table says so. With sessions, a short grace would also work; the default keeps the benches realistic.
+2. **`bench_image`, `bench_fuse` and `bench_ublk`** (ublk only where `/dev/ublk-control` exists; not in this container).
+3. **The docs:**
+   * BLK.md §2, the new §8 and the limits
+   * TECH_DEBT: TD-BLK-SNAPSHOT-FILES and TD-FS-SPARSE
+   * README
+   * CLIENT.md §8–§9: the replica's sender under sessions, and zen-mount without the timeout
+4. **The log** in both copies; then commit, push and retitle PR #71.
+
+### Commits
+
+1. 98c151c (the device tests' lease; done)
+2. `ublk: import and export of raw images (milestone 8 step 6)`: zen-blk, zen-ublk, tests, ci.yml
+3. `fs: the replica's queued uploads under an upload session; zen-mount without the per-operation timeout`: `@zen/client` (`openUpload`/`renewUpload`), `@zen/fs` sender, `@zen/fuse`, tests
+4. `docs: files or volumes (milestone 8 step 6)`: BLK.md and the bench figures, TECH_DEBT, README, CLIENT.md, the log
+
+### Verification (added to 8.6's)
+
+* `npm run check`; `npm run build`
+* **Suites:** `@zen/fs` `writes`, `handles`, `replica` and `integrity`; the client `cdc`; `mount` (FUSE); each new test 3×; then the full `npx vitest run`
+* **Negative controls:** the two above
+* **The file benches** run to completion: no refused writes in zen-mount's stderr (the bench fails on a `queued writes refused` line)
+* **CI:** green on both runs
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
