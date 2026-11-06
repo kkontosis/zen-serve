@@ -7,9 +7,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   bytes,
+  ROOT,
   type SealedStore,
   type Session,
   sealedStore,
+  TRASH,
+  Tree,
   type UnlockedFs,
   ZenError,
   zw,
@@ -17,6 +20,7 @@ import {
 import { nodeDiskLocalStore } from '@zen/client/node';
 import { Db, type DbOptions, type LockManagerLike } from '@zen/db';
 import type { Commit } from '@zen/wasm';
+import { LoroDoc } from 'loro-crdt';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { type World, world } from '../../client/test/helpers.js';
 import type { BroadcastChannelLike } from '../../db/src/proxy.js';
@@ -332,45 +336,346 @@ async function count(local: SealedStore, store: string): Promise<number> {
   return k;
 }
 
-describe('a snapshot too large for a commit (§20.5)', () => {
+describe('a snapshot larger than a commit goes to a file (§20.1, §20.2, §20.5)', () => {
+  // 64 KiB commits and 16 KiB values: a snapshot of about 100 KiB is
+  // several chunks, uploaded in commits of their own.
   let small: World;
   beforeAll(async () => {
-    small = await world({ limits: { max_commit_bytes: 64 * 1024 } });
+    small = await world({ limits: { max_commit_bytes: 64 * 1024, max_value_bytes: 16 * 1024 } });
     await small.session
       .fs(1)
       .init((k) => [zw.createDeviceSlot(k, small.admin.device.devicePublic)]);
   });
   afterAll(() => small?.server.stop());
 
-  it('keeps the old row and warns once', async () => {
-    const s = await small.client.signInDevice(small.admin);
-    const fs = await s.fs(1).unlock({ device: small.admin.device });
+  const big = { snapshotEvery: 1e9, snapshotBytes: 1e12 };
+
+  async function inst(on: World, name: string, opts: DbOptions = {}) {
+    const s = await on.client.signInDevice(on.admin);
+    const fs = await s.fs(1).unlock({ device: on.admin.device });
     const warns: string[] = [];
-    const db = await Db.open(fs, 'big', {
-      warn: (m) => warns.push(m),
-      locks: null,
-      scheduler: false,
-      indexer: false,
-    });
-    const h = await openLoro(db, 'doc', { snapshotEvery: 1e9, snapshotBytes: 1e12 });
-    await h.ready;
-    type(h, 'small');
-    await h.flush();
-    await until(() => !!h.lastOffset);
-    await h.compact();
-    const first = (await db.table('$loro').get('doc'))!.offset as Uint8Array;
-    // Random text doesn't compress: 100 KiB of it, sent in small updates.
-    for (let i = 0; i < 100; i++) {
+    const n = net(s);
+    const d = await open(fs, name, { warn: (m) => warns.push(m), ...opts });
+    return { s, fs, d, n, warns };
+  }
+
+  /** 100 KiB of random text (it doesn't compress), sent in small updates. */
+  async function fill(h: LoroHandle, k = 100): Promise<void> {
+    for (let i = 0; i < k; i++) {
       type(h, bytes.hex(bytes.randomBytes(512)));
       await h.flush();
     }
-    await until(() => !!h.lastOffset && bytes.compare(h.lastOffset, first) > 0);
-    await expect(h.compact()).rejects.toMatchObject({ code: 'too_large' });
-    const row = (await db.table('$loro').get('doc'))!;
-    expect(bytes.equal(row.offset as Uint8Array, first)).toBe(true);
-    expect(warns.filter((m) => m.includes('TD-LORO-LARGE-SNAPSHOT'))).toHaveLength(1);
+    await until(() => !!h.lastOffset && h.pending === 0);
+  }
+
+  /** Wait until `h` imported the topic's last event. */
+  async function settled(h: LoroHandle): Promise<void> {
+    await until(async () => {
+      let last: Uint8Array | undefined;
+      for await (const e of h.topic.read()) last = e.offset;
+      return !!last && !!h.lastOffset && bytes.equal(last, h.lastOffset);
+    });
+  }
+
+  type File = { tree: Uint8Array; node: Uint8Array; manifest: Uint8Array; size: number };
+  const fileRow = async (d: Db): Promise<File | undefined> =>
+    (await snapRow(d, 'doc'))?.file as File | undefined;
+  const sha = async (b: Uint8Array) =>
+    new Uint8Array(await crypto.subtle.digest('SHA-256', b as Uint8Array<ArrayBuffer>));
+
+  it('a large snapshot compacts into a file, under a session closed after', async () => {
+    const a = await inst(small, ns());
+    const h = await openLoro(a.d, 'doc', big);
+    await h.ready;
+    await fill(h);
+    await settled(h);
+    await h.compact();
+    const row = (await snapRow(a.d, 'doc'))!;
+    expect(row.snapshot).toBeUndefined();
+    expect(bytes.equal(row.offset as Uint8Array, h.lastOffset!)).toBe(true);
+    const f = row.file as File;
+    expect(f.size).toBeGreaterThan(100 * 1024);
+    const tree = a.fs.tree(f.tree);
+    const vs = await tree.versions(f.node);
+    expect(vs).toHaveLength(1);
+    expect(bytes.equal(await sha(vs[0]!.sealedManifest), f.manifest)).toBe(true);
+    // The upload took commits of its own, under a session.
+    expect(a.n.commits.filter((c) => c.upload).length).toBeGreaterThan(1);
+    expect(await tree.uploads()).toEqual([]);
+    expect(a.warns.filter((m) => m.includes('too large'))).toEqual([]);
     await h.close();
-    await db.close();
+    await a.d.close();
+  });
+
+  it('a load is the file snapshot plus the tail; the next compaction replaces the version', async () => {
+    const name = ns();
+    const a = await inst(small, name);
+    const h = await openLoro(a.d, 'doc', big);
+    await h.ready;
+    await fill(h);
+    await settled(h);
+    await h.compact();
+    for (let i = 0; i < 5; i++) {
+      type(h, `+${i}`);
+      await h.flush();
+    }
+    await settled(h);
+
+    const b = await inst(small, name);
+    const hb = await openLoro(b.d, 'doc', big);
+    await hb.ready;
+    expect(text(hb)).toBe(text(h));
+    expect(b.n.readEvents).toBe(5);
+
+    await h.compact();
+    const f = (await fileRow(a.d))!;
+    const vs = await a.fs.tree(f.tree).versions(f.node);
+    expect(vs).toHaveLength(1);
+    expect(bytes.equal(await sha(vs[0]!.sealedManifest), f.manifest)).toBe(true);
+    const row = (await snapRow(a.d, 'doc'))!;
+    expect(bytes.equal(row.offset as Uint8Array, h.lastOffset!)).toBe(true);
+    await h.close();
+    await hb.close();
+    await a.d.close();
+    await b.d.close();
+  });
+
+  it('two owners making the first file at once: the row moves forward, one version, no session left', async () => {
+    const name = ns();
+    const a = await inst(w, name);
+    const b = await inst(w, name);
+    const opts = { ...big, fileBytes: 0 };
+    const ha = await openLoro(a.d, 'doc', opts);
+    const hb = await openLoro(b.d, 'doc', opts);
+    await Promise.all([ha.ready, hb.ready]);
+    for (let i = 0; i < 20; i++) {
+      type(i % 2 ? ha : hb, 'x');
+      await sleep(5);
+    }
+    await Promise.all([ha.flush(), hb.flush()]);
+    await until(() => text(ha).length === 20 && text(hb).length === 20);
+    await Promise.all([ha.compact(), hb.compact()]);
+    const row = (await snapRow(a.d, 'doc'))!;
+    const max = [ha.lastOffset!, hb.lastOffset!].sort(bytes.compare)[1]!;
+    expect(bytes.equal(row.offset as Uint8Array, max)).toBe(true);
+    const f = row.file as File;
+    expect(await a.fs.tree(f.tree).versions(f.node)).toHaveLength(1);
+    expect(await a.fs.tree(f.tree).uploads()).toEqual([]);
+
+    const c = await inst(w, name);
+    const hc = await openLoro(c.d, 'doc');
+    await hc.ready;
+    expect(text(hc)).toBe(text(ha));
+    expect(c.n.readEvents).toBe(0);
+    for (const h of [ha, hb, hc]) await h.close();
+    for (const x of [a, b, c]) await x.d.close();
+  });
+
+  it("a row naming another client's new file: that node is removed and ours written", async () => {
+    const name = ns();
+    const a = await inst(w, name);
+    const h = await openLoro(a.d, 'doc', { ...big, fileBytes: 0 });
+    await h.ready;
+    type(h, 'first');
+    await h.flush();
+    await settled(h);
+    const early = h.lastOffset!;
+    type(h, ' second');
+    await h.flush();
+    await settled(h);
+    // Another client's first file, at the earlier offset, committed just
+    // before ours: in our transaction's first run, after it read the row.
+    const t2 = a.fs.tree(Tree.newId());
+    const b2 = t2.batch();
+    const other = b2.create(ROOT, 'snapshot');
+    await t2.send(b2.ops);
+    const ow = await t2.writeFile(other, new LoroDoc().export({ mode: 'snapshot' }));
+    const ov = (await t2.versions(other))[0]!;
+    expect(ow.dot).toBeDefined();
+    let injected = false;
+    const call = a.s.call.bind(a.s);
+    a.s.call = (async (path, enc, dec, req) => {
+      const c = req as Commit;
+      if (path === '/v1/commit' && !injected && !c.upload && (c.crdt_ops?.length ?? 0) > 0) {
+        injected = true;
+        a.s.call = call;
+        await a.d.transaction(async (tx) => {
+          await tx.table('$loro').put({
+            name: 'doc',
+            offset: early,
+            file: {
+              tree: t2.id,
+              node: other,
+              manifest: await sha(ov.sealedManifest),
+              size: ov.size,
+            },
+          });
+        });
+      }
+      return call(path, enc, dec, req);
+    }) as Session['call'];
+    await h.compact();
+    expect(injected).toBe(true);
+    const f = (await fileRow(a.d))!;
+    expect(bytes.equal(f.tree, t2.id)).toBe(false);
+    expect(bytes.equal((await snapRow(a.d, 'doc'))!.offset as Uint8Array, h.lastOffset!)).toBe(
+      true,
+    );
+    const gone = await t2.getOne(other);
+    expect(bytes.equal(gone!.parent!, TRASH)).toBe(true);
+    await h.close();
+    await a.d.close();
+  });
+
+  it('a version replaced between the row read and the file read: the row is read again', async () => {
+    const name = ns();
+    const wr = await inst(w, name);
+    const hw = await openLoro(wr.d, 'doc', { ...big, fileBytes: 0 });
+    await hw.ready;
+    type(hw, 'one');
+    await hw.flush();
+    await settled(hw);
+    await hw.compact();
+
+    const r = await inst(w, name);
+    const call = r.s.call.bind(r.s);
+    let held = false;
+    r.s.call = (async (path, enc, dec, req) => {
+      if (path === '/v1/fs/file/get' && !held) {
+        held = true;
+        // The writer compacts further meanwhile, replacing the version.
+        type(hw, ' two');
+        await hw.flush();
+        await settled(hw);
+        await hw.compact();
+      }
+      return call(path, enc, dec, req);
+    }) as Session['call'];
+    const n = net(r.s);
+    const hr = await openLoro(r.d, 'doc', big);
+    await hr.ready;
+    expect(held).toBe(true);
+    expect(text(hr)).toBe('one two');
+    expect(n.readEvents).toBe(0);
+    expect(r.warns.filter((m) => m.includes('no version'))).toEqual([]);
+    await hw.close();
+    await hr.close();
+    await wr.d.close();
+    await r.d.close();
+  });
+
+  it('a row naming no version: a warning, and the load reads the whole log', async () => {
+    const name = ns();
+    const wr = await inst(w, name);
+    const hw = await openLoro(wr.d, 'doc', { ...big, fileBytes: 0 });
+    await hw.ready;
+    for (const s of ['a', 'b', 'c']) {
+      type(hw, s);
+      await hw.flush();
+    }
+    await settled(hw);
+    await hw.compact();
+    const row = (await snapRow(wr.d, 'doc'))!;
+    await wr.d.transaction(async (tx) => {
+      await tx.table('$loro').put({
+        ...row,
+        file: { ...(row.file as File), manifest: bytes.randomBytes(32) },
+      });
+    });
+    const r = await inst(w, name);
+    const hr = await openLoro(r.d, 'doc', big);
+    await hr.ready;
+    expect(text(hr)).toBe('abc');
+    expect(r.n.readEvents).toBe(3);
+    expect(r.warns.filter((m) => m.includes('no version'))).toHaveLength(1);
+    await hw.close();
+    await hr.close();
+    await wr.d.close();
+    await r.d.close();
+  });
+
+  it("the row's hash picks its version, not a newer sibling", async () => {
+    const name = ns();
+    const wr = await inst(w, name);
+    const hw = await openLoro(wr.d, 'doc', { ...big, fileBytes: 0 });
+    await hw.ready;
+    type(hw, 'mine');
+    await hw.flush();
+    await settled(hw);
+    await hw.compact();
+    const f = (await fileRow(wr.d))!;
+    const other = new LoroDoc();
+    other.getText('t').insert(0, 'intruder');
+    other.commit();
+    const tree = wr.fs.tree(f.tree);
+    await tree.writeFile(f.node, other.export({ mode: 'snapshot' }), { replaces: [] });
+    expect(await tree.versions(f.node)).toHaveLength(2);
+
+    const r = await inst(w, name);
+    const hr = await openLoro(r.d, 'doc', big);
+    await hr.ready;
+    expect(text(hr)).toBe('mine');
+    await hw.close();
+    await hr.close();
+    await wr.d.close();
+    await r.d.close();
+  });
+
+  it('back to inline: the row holds the snapshot and the file is removed', async () => {
+    const name = ns();
+    const a = await inst(w, name);
+    const h = await openLoro(a.d, 'doc', { ...big, fileBytes: 0 });
+    await h.ready;
+    type(h, 'small');
+    await h.flush();
+    await settled(h);
+    await h.compact();
+    const f = (await fileRow(a.d))!;
+    await h.close();
+
+    const h2 = await openLoro(a.d, 'doc', big);
+    await h2.ready;
+    type(h2, ' again');
+    await h2.flush();
+    await settled(h2);
+    await h2.compact();
+    const row = (await snapRow(a.d, 'doc'))!;
+    expect(row.snapshot).toBeInstanceOf(Uint8Array);
+    expect(row.file).toBeUndefined();
+    const node = await a.fs.tree(f.tree).getOne(f.node);
+    expect(bytes.equal(node!.parent!, TRASH)).toBe(true);
+    await h2.close();
+    await a.d.close();
+  });
+
+  it('without upload sessions on the server, the file is uploaded without one', async () => {
+    const name = ns();
+    const a = await inst(w, name);
+    (a.d as unknown as { features: string[] }).features = a.d.features.filter(
+      (f) => f !== 'upload_sessions',
+    );
+    const paths: string[] = [];
+    const call = a.s.call.bind(a.s);
+    a.s.call = ((path, enc, dec, req) => {
+      paths.push(path);
+      return call(path, enc, dec, req);
+    }) as Session['call'];
+    const h = await openLoro(a.d, 'doc', { ...big, fileBytes: 0 });
+    await h.ready;
+    type(h, 'no session');
+    await h.flush();
+    await settled(h);
+    await h.compact();
+    expect((await snapRow(a.d, 'doc'))!.file).toBeDefined();
+    expect(paths.filter((p) => p.startsWith('/v1/fs/upload/'))).toEqual([]);
+    const b = await inst(w, name);
+    const hb = await openLoro(b.d, 'doc', big);
+    await hb.ready;
+    expect(text(hb)).toBe('no session');
+    await h.close();
+    await hb.close();
+    await a.d.close();
+    await b.d.close();
   });
 });
 

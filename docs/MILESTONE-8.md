@@ -326,6 +326,58 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * **Checks:** `npm run check` and `npm run build` clean; `handles` 3× (RSS 112–115 MiB over the start, 10–17 past the middle); the full `npx vitest run`: 613 passed, 34 skipped, none failed, but 4 files didn't load (`apps/echo` connect and ssh, `packages/svc` sshlayer and sshwasm) for want of OpenSSH in this container. With `openssh-client` installed they pass, with the fs and fuse suites (75 tests).
     * **Found in the rerun:** `writes.test.ts`'s v3 case failed 3 runs in 4 (6 pages, all 583 chunks sent). Its content was `blob()`, whose bytes repeat every 256: after an edit, content-defined cuts are shifted by a phase and never realign in periodic data (the writer's `pending` stayed the same at every page), so the whole file is cut again. It passed only when the edit happened to leave the chunker in phase. The writer is right: the test now uses random content (6 of 6 runs pass). Periodic content (and long zero runs, cut at `max`) is where CDC can't resync after a length-changing edit; STATS notes it in 8.7.
     * Committed 1cb1440 (and the test fix after it); pushed.
+    * PR #69 opened. **CI green on both runs** of 6abe026 (push and pull_request): `rust`, `pure-rust`, `fdb`, `devices` and `client`; the benches and `openssh-pq` skipped as usual. A safety-net check-in is scheduled; the PR waits on review and merge.
+    * **PR #69 merged.** Step 8.4 is done. The check-in was cancelled.
+    * These lines are only in this file; they reach `docs/MILESTONE-8.md` at the next restart from main.
+* **Step 8.5** (Loro snapshots as files, TD-LORO-LARGE-SNAPSHOT): planned below ("Step 8.5 in detail").
+  * **First:**
+    1. restart from main (f6b7e98)
+    2. `cp` this file to `docs/MILESTONE-8.md` (bringing in the 8.4 log lines)
+    3. commit `docs: milestone 8 step 5 plan`
+    4. push and open the PR
+  * Then implement on "go", in a new PR.
+  * Plan committed (2953c99), PR #70.
+  * **Decided at "go":** PR #70 wasn't merged yet, so the implementation goes on the same branch, on top of the plan commit. PR #70 is retitled to cover the plan and the implementation.
+  * **On "go":**
+    1. Set up the container if needed: `npm ci`, `scripts/build-wasm.sh`, `npm run build`, and a zen-server build for the tests.
+    2. The `spec:` commit (zendb.md §20).
+    3. Implement and test "Step 8.5 in detail", then the docs.
+    4. Log the step in both copies.
+    5. Push, retitle PR #70, and confirm CI is green on both runs.
+  * **Implementation** (on "go"):
+    * **Setup:** this container had `node_modules`, the wasm package and the builds; only `zen-serve` was rebuilt.
+    * **`spec:` commit** 86114a3 (zendb.md §20.1, §20.2, §20.5, §20.6).
+    * **`@zen/loro` (`loro.ts`):**
+      * `LoroOptions.fileBytes`
+      * the row helpers `rowOffset` and `fileOf`, which checks a file row's shape (ids of 16 bytes, a hash of 32, a safe integer size)
+      * `writeInline`, which removes a file row's node
+      * `writeFile`: upload, then one transaction. It starts over, up to 3 times, when the row no longer names the node it uploaded to.
+      * `removeIn`: reads the node first, so the move sorts after its creation (the kanban clock race of 8.3)
+      * `snapshotOf` and `readFile` for loading. A version whose size differs from the row's is refused (`poisoned`).
+    * **Changes from the plan:**
+      * **`writeFile` starts over when its node is stale.** That covers a node taken from the row before the upload that the row no longer names by the transaction: the file went back inline (the node is in `TRASH`), or another client replaced it. Writing there would put the snapshot in a removed node, so the attempt starts over with the row read again. After 3 attempts nothing is written (the next compaction tries again).
+      * **Test 3 was split in two.** A real race of two owners mostly ends with equal offsets, so the loser writes nothing. A second, deterministic test therefore commits another client's first file (at an earlier offset) between our transaction's row read and its commit, and checks that the transaction's re-run removes that node and writes its own.
+    * **Tests:** the "too large" describe became "a snapshot larger than a commit goes to a file", with 9 cases:
+      * on the small world (64 KiB commits, 16 KiB values), with the snapshot uploaded in several session commits:
+        1. the compaction to a file
+        2. the load (exactly the 5 tail events), then the next compaction replacing the version
+      * on the main world, with `fileBytes: 0`:
+        3. two owners at once
+        4. another client's new file removed
+        5. a version replaced between the reads (0 events read)
+        6. a row naming no version (one warning, the whole log read)
+        7. the hash picking the row's version over a newer sibling
+        8. back to inline (the node in `TRASH`)
+        9. no upload sessions (no `/v1/fs/upload/` call)
+    * **Negative controls** (each run once, then restored):
+      * the newest version instead of the hash match: test 7 fails (the document reads back empty)
+        * The first form of this control compared objects from two `versions()` calls, so it never matched and the loader fell back to the log, and the test passed. The fixed control takes the last version.
+      * `replaces: []` on every write: test 2 fails (2 versions)
+      * no reread: test 5 fails (2 events read, not 0)
+      * the session left open: test 1 fails
+      * no remove of the other node: test 4 fails
+    * **Docs:** DB.md (Loro limits); TECH_DEBT TD-LORO-LARGE-SNAPSHOT resolved.
+    * **Checks:** `npm run check` and `npm run build` clean; `loro` 3× (17 passed).
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -1201,6 +1253,175 @@ Step 8.4 makes the `@zen/fs` replica write large files in bounded memory and edi
 * **Content arrays stay in queue entries,** since the bound limits them, rather than new content-list records (a change from the milestone plan's "entries name content lists").
 * **zen-mount:** an alarm at startup exits 3 without mounting; pins are kept in the vault, else the cache dir, and one of them is required.
 * **TD-FUSE-INTEGRITY is resolved in this step,** with the code, not in 8.7.
+
+## Step 8.5 in detail
+
+Step 8.5 lets a Loro document's snapshot be larger than one commit: past a threshold, compaction stores it as a zen-fs file. The `$loro` row then names the file's version instead of holding the bytes, and loading reads the snapshot from that file (TD-LORO-LARGE-SNAPSHOT). The change is in `@zen/loro` and the spec, with no Rust, wasm or zen-db change.
+
+**Survey:**
+* **`packages/loro/src/loro.ts` (552 lines):**
+  * `writeSnapshot(explicit)` exports a snapshot. One transaction reads the `$loro` row and, if its offset is older, puts `{name, offset, snapshot}`.
+  * On `too_large` it warns once (the TD), sets `noCompact` and keeps the old row; `compact()` rejects with `too_large`.
+  * `catchUp()` imports `row.snapshot` when the row's offset is newer than the kept one, then reads the tail and subscribes.
+  * `isTooLarge` and `isNetwork` classify errors.
+* **zen-db has what is needed:**
+  * A `Db` carries its `UnlockedFs` (`db.fs`), so `db.fs.tree(id)` gives a `Tree`. It also carries `db.limits` and `db.features`.
+  * `tx.fs(tree)` (`packages/db/src/files.ts`) adds a tree's ops and an uploaded file's `write` to the transaction's commit (zendb.md §7.6).
+  * kanban's `attachFile` is the pattern: `tree.batch().create(parent, name)` builds the node first, so the upload is sealed for it; `tree.upload(node, data)`; then one transaction carries `ops(create)`, `write(up, {replaces: []})` and the row.
+* **Rows take nested objects** (`cbor.ts` `Value`), so the row can hold the file's reference.
+* **The client (8.3):**
+  * `upload(…, {session: true})` keeps the content past the grace period until `closeUpload(session)`.
+  * A version's dot is assigned by the server at commit, so a row written in the same commit can't name it. A `FileVersion` carries its `sealedManifest`, though, and the upload has the same bytes (`Upload.sealedManifest`).
+  * `TreeBatch.remove(node)` moves a node to `TRASH`, and the sweeper purges it and releases its content.
+* **Tests** (`packages/loro/test/loro.test.ts`, 467 lines):
+  * a world with `claim_ttl_ms` 1000
+  * `installation()`, `open()`, and `net(s)`, which wraps `session.call` to count commits, events read and row reads, and to go offline
+  * "a snapshot too large for a commit" runs on a world with `max_commit_bytes` 64 KiB, types 100 × 512 random hex characters, and expects `too_large` with one warning
+
+### Spec (`spec:` commit)
+
+**zendb.md §20.1, "Snapshot":**
+* The `$loro` row holds `{name, offset, snapshot}` (inline) or `{name, offset, file}`.
+* `file` is `{tree, node, manifest, size}`:
+  * `tree` and `node` are 16-byte ids
+  * `manifest` is the SHA-256 of the version's sealed manifest (32 bytes)
+  * `size` is the snapshot's length
+* The row is sealed and authenticated like every row, and the hash binds it to one version. A server can't serve the row with another version of the file, an older one included, without the reader noticing.
+
+**§20.2, step 2 (loading), for a file row:**
+1. Read the node's versions, and take the one whose sealed manifest hashes to `manifest`.
+2. Read it whole (`Tree.read`) and import it.
+3. **When no version matches**, read the row again: a compaction may have replaced the file between the two reads. If the reread names another version, go back to step 1.
+4. **When the reread names the same missing version**, warn and go on without the snapshot: from the kept offset if there is one, else the whole log. That is slower, but complete.
+
+**§20.5 (compaction), "How":**
+* **The threshold.** A snapshot of at most `max_commit_bytes / 2` (the threshold) is written inline, as before. A larger one goes to a file, and so does an inline write that fails `too_large`.
+* **The file:**
+  * **Which file.** The row's file's tree and node when it has one. Otherwise a new tree of the document's own, with the node created at its root under the name `snapshot`.
+  * **The upload.** Uploaded before the transaction, under an upload session when the server has `upload_sessions` (fs.md §4.1), so a slow upload outlives the grace period.
+  * **One transaction** reads the row. Only if the row's offset is older than the client's does it write three things: the `create` (for a new node), the file's `write` replacing the node's current versions, and the row `{name, offset, file}`. The old version goes in the same commit, so the node has one version at a time.
+  * **The session** is closed after the transaction, whether it wrote or not. An upload that wasn't written (a newer row, or an error) is released one grace period later.
+* **Switching form:**
+  * **From a file to inline:** when a row with a file is replaced by an inline one, the same transaction removes the file's node (to `TRASH`).
+  * **Another client's node:** when the row read in the transaction names a node other than the one this client uploaded to, the transaction removes that node and writes its own. This happens when two clients make a document's first file at once and the other one committed first.
+* **Two compacting clients** still need no leader. The row read conflicts, and the re-run either finds nothing to do or rewrites with the node's versions read again.
+
+**§20.5, "Too large":**
+* Only a snapshot past what one file holds (fs.md §4.1) is too large now.
+* The rest of the paragraph stays: the old row is kept, the client warns once and stops compacting, and `compact()` fails `too_large`.
+
+**§20.6 (leakage):**
+* For a file row, the server sees the document's snapshot tree.
+* It sees the file's size and chunk lengths, as for any file (fs.md §10).
+* It sees that one commit carries the row and the file's write.
+* That is what an inline row's size already showed, plus the tree id, which links the document's compactions to each other. They were linked already through the row's key.
+
+**Older clients:**
+* **Loading.** A client from before this step finds no `snapshot` in a file row, so it loads from its kept offset or the whole log: correct, just slower.
+* **Compacting.** If it writes an inline row over a file row, the file's node stays behind (not removed). The spec notes that as harmless but wasted storage.
+
+### `@zen/loro`
+
+**`LoroOptions.fileBytes?: number`:** the threshold, in snapshot bytes. It defaults to `max_commit_bytes / 2` (from `db.limits`). Tests set it to force either form.
+
+**`writeSnapshot`:**
+1. Export the snapshot.
+2. If it is at most the threshold, run the inline transaction as now. If that fails `too_large`, go on as for a file.
+3. **For a file:**
+   1. Read the row outside the transaction (`db.table('$loro').get`). If its offset isn't older, stop.
+   2. **Pick the target:** the row's `file.tree` and `file.node`, or a new tree (`Tree.newId()`) and a node made by `tree.batch().create(ROOT, 'snapshot')`, keeping the batch's ops.
+   3. Upload with `tree.upload(node, snapshot, {session})`. `session` is true when `db.features` has `upload_sessions`.
+   4. **Run the transaction:**
+      * Re-read the row; if its offset isn't older, return.
+      * If it names a node other than ours, `tx.fs(theirTree).ops([remove])`.
+      * If our node is new, `ops(create)` and `write(up, {replaces: []})`.
+      * Otherwise `write(up)`, which replaces `'current'`, read in each run.
+      * Put `{name, offset, file: {tree, node, manifest: sha256(up.sealedManifest), size}}`.
+   5. In a `finally`, `tree.closeUpload(session)`, ignoring errors.
+4. **An inline write over a file row** adds `tx.fs(tree).ops([remove(file.node)])` in the same transaction.
+5. **Errors:**
+   * `too_large` from the file path (past a file's capacity) warns once, as now, with the message updated.
+   * Other errors are handled as now: rejected for an explicit `compact()`, warned otherwise, and silent offline.
+
+**`catchUp`:**
+* An inline row is imported as now.
+* **A file row** whose offset is newer than the kept one goes through `loadFile(row)`, which follows §20.2's steps:
+  1. `tree.versions(node)`, then the version matching the hash.
+  2. `tree.read(node, {version})`, checked against `size`, then `doc.import`.
+  3. If none matches: one reread of the row, and a retry if it names another version.
+  4. If the reread names the same missing version: a warning, and the row's snapshot is skipped; `snapOffset` still moves.
+* A read that fails with `not_found` (the version was purged while being read) counts as no match.
+
+**Unchanged:**
+* The kept state (`d ‖ name`) still holds the whole snapshot on the device.
+* The outbox, sending, and the tab behavior are as before.
+
+### Docs
+
+* **docs/DB.md (Loro limits):** large snapshots go to a file, with `fileBytes`. Only a single update too large for a commit is still dropped.
+* **spec/TECH_DEBT.md:** TD-LORO-LARGE-SNAPSHOT resolved, by the 8.5 commits.
+* **The plan log,** in both copies.
+
+### Tests (`packages/loro/test/loro.test.ts`)
+
+The "too large" describe becomes "a snapshot larger than a commit (§20.5)". Its world gets `max_commit_bytes` 64 KiB and `max_value_bytes` 16 KiB, so a snapshot of about 100 KiB is several chunks and commits; CDC falls back to fixed chunks at that value size. Each case uses a namespace of its own.
+
+1. **The old "too large" test now compacts:**
+   * The same 100 KiB of random text: `compact()` resolves.
+   * The row has `file` and no `snapshot`, and its offset is the handle's.
+   * The node has exactly one version, whose sealed manifest hashes to `file.manifest`.
+   * No `TD-LORO-LARGE-SNAPSHOT` warning, and `tree.uploads()` is empty (the session was closed).
+2. **A load is the file snapshot plus the tail:**
+   * After the compaction, 5 more edits are flushed.
+   * A fresh installation's load (counted with `net`) reads only those 5 events, and its document equals the writer's.
+   * A second compaction replaces the version: still one version on the node, and the row names it.
+3. **Two owners compacting at once (file form):**
+   * Two installations, both owners, compact the same document at once, both for a document's first file.
+   * The row's offset is the larger one, and only the row's node holds a version. The other node is in `TRASH`, or was never created.
+   * No session stays open for either.
+   * A fresh load reads the document whole.
+4. **A missing file version reloads the row:**
+   * Installation A's `session.call` is wrapped (as `net` does) so that its first version listing waits while installation B compacts further, replacing the version A's row named.
+   * A then finds no match, rereads the row, and loads B's version. Its document is whole, and it read only the tail after B's offset.
+5. **A row naming no version** (a `$loro` row put by the test with a wrong `manifest`):
+   * The load warns, skips the snapshot, reads the whole log, and the document is whole.
+6. **The hash picks the row's version:**
+   * The test writes a sibling version to the file's node (`writeFile` with `replaces: []`, a newer dot) holding another document's snapshot.
+   * A fresh load imports the row's version, so the document is the writer's, without the other document's text.
+7. **Back to inline:**
+   * A handle with a large `fileBytes` compacts a file-form document.
+   * The row is inline again, and the old node is under `TRASH`.
+8. **A server without `upload_sessions`** (`db.features` with it removed): the file path uploads without a session and still compacts.
+
+The other Loro suites run unchanged: inline rows, two installations, offline, resends and tabs.
+
+**Negative controls** (each run once, then restored):
+* **The newest version instead of the hash match:** test 6 fails (the other document's text appears).
+* **`replaces: []` on every write:** tests 1 and 2 fail (two versions on the node).
+* **No reread of the row:** test 4 fails (A reads the whole log).
+* **The session left open:** test 1 fails (`uploads()` not empty).
+* **No remove of the other client's node:** test 3 fails (two nodes with versions).
+
+### Files
+
+* **Spec:** `spec/zendb.md` (§20.1, §20.2, §20.5, §20.6)
+* **Code:** `packages/loro/src/loro.ts`, and `packages/loro/src/index.ts` if the options type is re-exported
+* **Tests:** `packages/loro/test/loro.test.ts`
+* **Docs:** `docs/DB.md`, `spec/TECH_DEBT.md`, `docs/MILESTONE-8.md`
+
+### Verification
+
+* `npm run check` (biome, and every tsc project, `packages/loro/tsconfig.test.json` included); `npm run build`
+* **Suites:** `loro` 3×; the zen-db `txn` and `files` tests, and kanban's attach test, once (shared paths, unchanged); then the full `npx vitest run`
+* **Negative controls:** the five above
+* **CI:** green on both runs
+
+**Defaults chosen (overridable):**
+* **One tree per large document,** made at its first file snapshot and named in the row, rather than one tree per database. All clients find it through the row, with no ids to agree on in advance.
+* **The row names the version by its sealed manifest's hash,** since the dot isn't known before the commit.
+* **The threshold is half of `max_commit_bytes`,** as the milestone plan has it, overridable with `fileBytes`.
+* **No chunk reuse between snapshot versions:** each compaction uploads the whole snapshot. Reusing chunks would need the previous version's index kept per document; 8.7's STATS can measure whether that's worth it.
+* **The kept state stays a single record of the whole snapshot.**
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.

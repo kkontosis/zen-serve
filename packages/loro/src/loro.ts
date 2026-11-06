@@ -1,9 +1,29 @@
 // A Loro document on a zen-db topic (spec/zendb.md §20): updates are
 // messages on ("zen", "loro", ns, name), a snapshot sits in the `$loro`
-// row, and the document's state and unsent edits are kept on the local
-// store, so it opens and is edited offline.
-import { bytes, type SealedStore, type Topic, type TopicEvent, ZenError } from '@zen/client';
-import { appendMsg, cbor, type Db, DbError, type OnSubscription, openMessage } from '@zen/db';
+// row (or, when large, in a zen-fs file the row names), and the document's
+// state and unsent edits are kept on the local store, so it opens and is
+// edited offline.
+import {
+  bytes,
+  type PendingOp,
+  ROOT,
+  type SealedStore,
+  type Topic,
+  type TopicEvent,
+  Tree,
+  type Upload,
+  ZenError,
+} from '@zen/client';
+import {
+  appendMsg,
+  cbor,
+  type Db,
+  DbError,
+  type DbTransaction,
+  type OnSubscription,
+  openMessage,
+  type Value,
+} from '@zen/db';
 import { decodeImportBlobMeta, LoroDoc } from 'loro-crdt';
 
 /** The message type of a Loro update (§20.1). */
@@ -19,7 +39,48 @@ export interface LoroOptions {
   batchMs?: number;
   /** Write the kept state this long after a change (ms, default 500). */
   keepMs?: number;
+  /** Snapshots larger than this go to a zen-fs file (bytes, default half of `max_commit_bytes`). */
+  fileBytes?: number;
 }
+
+/** A `$loro` row's file (§20.1): the version of a zen-fs file holding the snapshot. */
+interface SnapshotFile {
+  tree: Uint8Array;
+  node: Uint8Array;
+  /** SHA-256 of the version's sealed manifest. */
+  manifest: Uint8Array;
+  size: number;
+}
+
+type Row = Record<string, Value | undefined> | undefined;
+
+const rowOffset = (row: Row) => (row?.offset instanceof Uint8Array ? row.offset : undefined);
+
+/** The row's file, if it is a well-formed file row. */
+function fileOf(row: Row): SnapshotFile | undefined {
+  const f = row?.file;
+  if (
+    !f ||
+    typeof f !== 'object' ||
+    f instanceof Uint8Array ||
+    Array.isArray(f) ||
+    f instanceof Map
+  )
+    return undefined;
+  const { tree, node, manifest, size } = f as Record<string, Value | undefined>;
+  if (!(tree instanceof Uint8Array) || tree.length !== 16) return undefined;
+  if (!(node instanceof Uint8Array) || node.length !== 16) return undefined;
+  if (!(manifest instanceof Uint8Array) || manifest.length !== 32) return undefined;
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return undefined;
+  return { tree, node, manifest, size };
+}
+
+async function sha256(b: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', b as Uint8Array<ArrayBuffer>));
+}
+
+const isGone = (e: unknown) =>
+  e instanceof ZenError && (e.status === 404 || e.code === 'not_found');
 
 const ZERO12 = new Uint8Array(12);
 /** At most this many bytes of updates per emit transaction. */
@@ -231,10 +292,12 @@ export class LoroHandle {
 
   /** The `$loro` row, the tail, then live events (§20.2). */
   private async catchUp(): Promise<void> {
-    const row = await this.db.table('$loro').get(this.name);
-    const off = row?.offset instanceof Uint8Array ? row.offset : undefined;
-    if (off && row?.snapshot instanceof Uint8Array && newer(off, this.offset)) {
-      this.doc.import(row.snapshot);
+    let row: Row = await this.db.table('$loro').get(this.name);
+    let snapshot: Uint8Array | undefined;
+    if (newer(rowOffset(row), this.offset)) [row, snapshot] = await this.snapshotOf(row);
+    const off = rowOffset(row);
+    if (off && snapshot && newer(off, this.offset)) {
+      this.doc.import(snapshot);
       this.offset = off;
       this.since = { n: 0, bytes: 0 };
       this.notify();
@@ -262,6 +325,49 @@ export class LoroHandle {
     });
     // Closed while subscribing: `close` saw no subscription to stop.
     if (this.closed) await this.sub.close();
+  }
+
+  /**
+   * The row's snapshot: inline, or read from its file (§20.2). When the
+   * file has no version matching the row, the row is read again (a newer
+   * compaction may have replaced it); when that names the same missing
+   * version, there is none (with a warning).
+   */
+  private async snapshotOf(row: Row): Promise<[Row, Uint8Array | undefined]> {
+    for (let i = 0; ; i++) {
+      if (row?.snapshot instanceof Uint8Array) return [row, row.snapshot];
+      const f = fileOf(row);
+      if (!f) return [row, undefined];
+      const s = await this.readFile(f);
+      if (s) return [row, s];
+      const again: Row = await this.db.table('$loro').get(this.name);
+      const g = fileOf(again);
+      if (i >= 3 || (g && bytes.equal(g.manifest, f.manifest))) {
+        this.db.warn(
+          `loro ${this.name}: the snapshot's file has no version the $loro row names; loading from the log`,
+        );
+        return [again, undefined];
+      }
+      row = again;
+    }
+  }
+
+  /** A file snapshot's bytes, or undefined when its version is gone. */
+  private async readFile(f: SnapshotFile): Promise<Uint8Array | undefined> {
+    const tree = this.db.fs.tree(f.tree);
+    try {
+      for (const v of await tree.versions(f.node)) {
+        if (!bytes.equal(await sha256(v.sealedManifest), f.manifest)) continue;
+        if (v.size !== f.size) {
+          throw new DbError('poisoned', 'the snapshot file has another size than its row');
+        }
+        return await tree.read(f.node, v, 0, v.size);
+      }
+      return undefined;
+    } catch (e) {
+      if (isGone(e)) return undefined;
+      throw e;
+    }
   }
 
   private async open(e: TopicEvent) {
@@ -479,15 +585,19 @@ export class LoroHandle {
     if (!offset) return;
     const snapshot = this.doc.export({ mode: 'snapshot' });
     const since = { ...this.since };
+    const max = this.opts.fileBytes ?? Math.floor(this.db.limits.max_commit_bytes / 2);
     try {
-      const wrote = await this.db.transaction(async (tx) => {
-        const t = tx.table('$loro');
-        const row = await t.get(this.name);
-        const at = row?.offset instanceof Uint8Array ? row.offset : undefined;
-        if (!newer(offset, at)) return at;
-        await t.put({ name: this.name, offset, snapshot });
-        return offset;
-      });
+      let wrote: Uint8Array | undefined;
+      if (snapshot.length <= max) {
+        try {
+          wrote = await this.writeInline(offset, snapshot);
+        } catch (e) {
+          if (!isTooLarge(e)) throw e;
+          wrote = await this.writeFile(offset, snapshot);
+        }
+      } else {
+        wrote = await this.writeFile(offset, snapshot);
+      }
       if (wrote && newer(wrote, this.snapOffset)) {
         this.snapOffset = wrote;
         this.since = {
@@ -499,16 +609,95 @@ export class LoroHandle {
       if (isTooLarge(e)) {
         if (!this.noCompact) {
           this.db.warn(
-            `loro ${this.name}: the snapshot is too large for one commit; the stored one stays (TD-LORO-LARGE-SNAPSHOT)`,
+            `loro ${this.name}: the snapshot is too large for a file; the stored one stays`,
           );
         }
         this.noCompact = true;
-        if (explicit) throw new DbError('too_large', 'the snapshot is too large for one commit');
+        if (explicit) throw new DbError('too_large', 'the snapshot is too large for a file');
         return;
       }
       if (explicit) throw e;
       if (!isNetwork(e)) this.db.warn(`loro ${this.name}: compacting: ${message(e)}`);
     }
+  }
+
+  /** The inline row (§20.5), removing the file a file row named. Returns the row's offset after. */
+  private writeInline(offset: Uint8Array, snapshot: Uint8Array): Promise<Uint8Array | undefined> {
+    return this.db.transaction(async (tx) => {
+      const t = tx.table('$loro');
+      const row: Row = await t.get(this.name);
+      const at = rowOffset(row);
+      if (!newer(offset, at)) return at;
+      const f = fileOf(row);
+      if (f) await this.removeIn(tx, f);
+      await t.put({ name: this.name, offset, snapshot });
+      return offset;
+    });
+  }
+
+  /** Remove a snapshot file's node in a transaction (read first, so the move sorts after its creation). */
+  private async removeIn(tx: DbTransaction, f: SnapshotFile): Promise<void> {
+    const tree = this.db.fs.tree(f.tree);
+    await tree.getOne(f.node);
+    await tx.fs(tree).ops(tree.batch().remove(f.node));
+  }
+
+  /**
+   * The snapshot in a file and the row naming it (§20.5): uploaded first
+   * (under a session when the server has them), then the row and the
+   * file's write in one transaction. Returns the row's offset after.
+   */
+  private async writeFile(
+    offset: Uint8Array,
+    snapshot: Uint8Array,
+  ): Promise<Uint8Array | undefined> {
+    for (let i = 0; i < 3; i++) {
+      const pre: Row = await this.db.table('$loro').get(this.name);
+      if (!newer(offset, rowOffset(pre))) return rowOffset(pre);
+      const old = fileOf(pre);
+      let tree: Tree;
+      let node: Uint8Array;
+      let create: PendingOp[] | undefined;
+      if (old) {
+        tree = this.db.fs.tree(old.tree);
+        node = old.node;
+      } else {
+        tree = this.db.fs.tree(Tree.newId());
+        const b = tree.batch();
+        node = b.create(ROOT, 'snapshot');
+        create = [...b.ops];
+      }
+      const session = this.db.features.includes('upload_sessions');
+      const up: Upload = await tree.upload(node, snapshot, session ? { session: true } : {});
+      try {
+        const manifest = await sha256(up.sealedManifest);
+        const r = await this.db.transaction(async (tx) => {
+          const t = tx.table('$loro');
+          const row: Row = await t.get(this.name);
+          const at = rowOffset(row);
+          if (!newer(offset, at)) return { at };
+          const cur = fileOf(row);
+          const ours = !!cur && bytes.equal(cur.tree, tree.id) && bytes.equal(cur.node, node);
+          // A node uploaded to as the row's, which the row no longer names: start over.
+          if (!create && !ours) return { again: true };
+          if (cur && !ours) await this.removeIn(tx, cur);
+          const files = tx.fs(tree);
+          if (create) {
+            await files.ops(create);
+            await files.write(up, { replaces: [] });
+          } else {
+            await files.write(up);
+          }
+          const file: SnapshotFile = { tree: tree.id, node, manifest, size: snapshot.length };
+          await t.put({ name: this.name, offset, file: { ...file } });
+          return { at: offset };
+        });
+        if (!('again' in r)) return r.at;
+      } finally {
+        if (up.session) await tree.closeUpload(up.session).catch(() => {});
+      }
+    }
+    return undefined;
   }
 
   // ------------------------------------------------------------ helpers
