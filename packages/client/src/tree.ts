@@ -65,8 +65,14 @@ const FETCH_PARALLEL = 4;
 const STREAM_WINDOW = 4 << 20;
 /** Windows `readStream` fetches ahead by default. */
 const READ_AHEAD = 3;
-/** Decoded pages kept per tree. */
+/** Decoded pages kept per tree, at most (`TreeOptions.pageMemoPages`). */
 const PAGE_MEMO = 256;
+/**
+ * Chunk ids kept in decoded pages per tree, at most
+ * (`TreeOptions.pageMemoIds`): a decoded id is an object of its own,
+ * about 190 B of heap, so a full v2 page is about 1 MB decoded.
+ */
+const PAGE_MEMO_IDS = 65_536;
 
 const serverInfo = new WeakMap<Client, Promise<Info>>();
 
@@ -450,6 +456,10 @@ export interface TreeOptions {
   info?: () => Promise<Info>;
   /** The chunker's parameters for new content under CDC (default `cdcDefaults(max_value_bytes)`). */
   cdc?: CdcParams;
+  /** Decoded pages kept for reuse, at most (default 256). */
+  pageMemoPages?: number;
+  /** Chunk ids kept in decoded pages, at most (default 65,536, about 12 MB of heap). */
+  pageMemoIds?: number;
 }
 
 /** Metadata given to `mkdir` / `create`. */
@@ -937,6 +947,33 @@ export class Tree {
   }
 
   private readonly pageMemo = new Map<string, AnyPage>();
+  private pageMemoCount = 0;
+
+  /** What the page memo holds: decoded pages and their chunk ids. */
+  get pageMemoSize(): { pages: number; ids: number } {
+    return { pages: this.pageMemo.size, ids: this.pageMemoCount };
+  }
+
+  private memoPut(key: string, page: AnyPage): void {
+    const old = this.pageMemo.get(key);
+    if (old) {
+      this.pageMemo.delete(key);
+      this.pageMemoCount -= old.ids.length;
+    }
+    this.pageMemo.set(key, page);
+    this.pageMemoCount += page.ids.length;
+  }
+
+  /** Drop the least recently used pages past either bound. */
+  private memoTrim(): void {
+    const pages = this.opts.pageMemoPages ?? PAGE_MEMO;
+    const ids = this.opts.pageMemoIds ?? PAGE_MEMO_IDS;
+    for (const [key, page] of this.pageMemo) {
+      if (this.pageMemo.size <= pages && this.pageMemoCount <= ids) break;
+      this.pageMemo.delete(key);
+      this.pageMemoCount -= page.ids.length;
+    }
+  }
 
   /**
    * Pages `p0..=p1` of a paged version, each checked against its digest,
@@ -966,14 +1003,13 @@ export class Tree {
       const memo = this.pageMemo.get(key);
       if (memo) {
         // Most recently used last.
-        this.pageMemo.delete(key);
-        this.pageMemo.set(key, memo);
+        this.memoPut(key, memo);
         e = this.pageEntries(v, p, memo);
       } else if (cache) {
         const bytes = await cache.get(refs[p]!.id);
         const c = bytes && check(p, bytes);
         if (c) {
-          this.pageMemo.set(key, c[0]);
+          this.memoPut(key, c[0]);
           e = c[1];
         }
       }
@@ -992,13 +1028,11 @@ export class Tree {
         const c = check(p, d.data);
         if (!c) throw new ZenError(0, 'format', `page ${p} doesn't match its manifest`);
         await cache?.put(refs[p]!.id, d.data);
-        this.pageMemo.set(hex(refs[p]!.digest), c[0]);
+        this.memoPut(hex(refs[p]!.digest), c[0]);
         out[p - p0] = c[1];
       }
     }
-    while (this.pageMemo.size > PAGE_MEMO) {
-      this.pageMemo.delete(this.pageMemo.keys().next().value!);
-    }
+    this.memoTrim();
     return out as PageEntries[];
   }
 
