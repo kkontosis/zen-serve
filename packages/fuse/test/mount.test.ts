@@ -556,7 +556,7 @@ describe.skipIf(!canMount)('the zen-mount CLI with a vault and a cache', () => {
 describe.skipIf(!canMount)('zen-mount with integrity', () => {
   let wi: World;
   let bob: TestUser;
-  let recoveryKey = new Uint8Array(0);
+  let recoveryKey: Uint8Array = new Uint8Array(0);
   let dir: string;
   const servers: TestServer[] = [];
   const closers: (() => Promise<unknown> | unknown)[] = [];

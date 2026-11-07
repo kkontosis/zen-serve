@@ -104,7 +104,7 @@ describe.skipIf(!process.env.ZEN_BENCH || !canMount)('a large file through zen-m
   /** The newest version of `/big` on the server, if any. */
   async function onServer(u: UnlockedFs, id: Uint8Array) {
     const t = u.tree(id);
-    const big = (await t.list(ROOT)).find((n) => n.name === 'big');
+    const big = (await t.list(ROOT)).find((n) => n.meta?.name === 'big');
     return big ? { node: big.id, v: (await t.versions(big.id))[0] } : undefined;
   }
 

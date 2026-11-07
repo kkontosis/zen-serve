@@ -288,7 +288,7 @@ jobs:
         run: |
           npx biome check
           npx tsc -p packages/client/tsconfig.test.json
-          npx tsc -p packages/fuse/tsconfig.json --noEmit
+          npx tsc -p packages/fuse/tsconfig.test.json
           npx tsc -p packages/db/tsconfig.test.json
           npx tsc -p packages/fs/tsconfig.test.json
           npx tsc -p packages/loro/tsconfig.test.json
