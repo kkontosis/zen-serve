@@ -106,6 +106,7 @@ From fastest-growing to slowest (rates and retention in STATS.md §2–3):
 | One extra git worktree with its own `target/` | **~8 GB** per worktree |
 | Release builds of all variants | ~1.5 GB |
 | A FoundationDB test cluster | ~300 MB data + ~110 MB trace logs |
+| `bench_file_cdc` (an ext4 image as a zen-fs file under CDC, `tests/devices.rs`) | **up to ~20 GB** while it runs: about 9 GB stored by the in-process server (every flush's new chunks, until their grace), the store's overhead, and zen-mount's cache dir. `bench_file_fixed` needs about a third of that. Free `target/debug` first (below) |
 | Each `scripts/install-fdb.sh` test install | 144–277 MB |
 
 * **Use `CARGO_INCREMENTAL=0`**: incremental caches are large and rarely worth it with LTO-free debug builds of this size.
@@ -146,3 +147,36 @@ Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are
 * **`sigEvery: 1` in a browser** signs a checkpoint after every change: 2.6 ms of WASM per change, plus a put of about 4.4 KB (docs/STATS.md §6). Natively it's 0.2 ms. Use it for handlers and volumes that need the window closed, and the default cadence elsewhere.
 * **Checkpoints count toward the fs quota:** up to `checkpoint_keep` (1,024) per device, about 4.5 MB per device that keeps writing. Lower `limits.checkpoint_keep` for fs with many devices and small quotas; a verifier needs only each device's newest.
 * **`adversary = true` is for tests only.** The server refuses it unless built with `test-utils`, and production builds shouldn't have that feature.
+
+## 6. Memory
+
+**RAM is a first-class cost.** Treat it like disk and round trips: every buffer, queue, cache and backlog gets a bound, a setting for it, and a measured figure. Milestone 8 step 6b found zen-mount at 1.9 GB under an image workload, although every part looked bounded on its own. The rules:
+
+* **Producers wait for slow consumers.** A write-behind, a queue or a prefetch that only grows when its consumer is slower holds whatever the consumer hasn't taken. Wait on it instead (the replica's records: `pendingBytes`, 32 MiB by default). A cache may drop instead of waiting: the replica doesn't keep fetched content while its records are past the bound, so reads stay fast.
+* **Count bytes, not items.** "256 pages" sounds small, but a decoded page of 5,624 chunk ids is about 1 MB of heap: each id is an object of about 190 B, against 16 B on the wire. Bound caches by what they hold (the page memo: `pageMemoIds`, 65,536 ids, about 12 MB).
+* **Never hold a whole file.** Fetch, seal and copy in windows. A pinned file's content is fetched 256 chunks at a time, and each window waits for the store.
+* **Peaks stay.** Node's allocator and wasm's linear memory keep what they grew to: RSS after a burst stays at the burst's size, and `VmHWM` is what a host has to provision. A backlog that drains is still a cost.
+* **Garbage counts until collected.** V8 lets the heap grow to a large share of the machine before a full collection, so churn (decoding the same large structure over and over) shows up as RSS even when little of it is live.
+
+**The settings** (with their defaults):
+
+| What | Setting | Default |
+|---|---|---|
+| A file handle's written bytes in memory | `ReplicaOptions.dirtyBytes`, `zen-mount --dirty-size` | 64 MiB |
+| Records waiting to be written to the local store | `ReplicaOptions.pendingBytes`, `zen-mount --pending-size` | 32 MiB |
+| Chunk ids in decoded pages kept per tree | `TreeOptions.pageMemoIds` (`ReplicaOptions.pageMemoIds`, `zen-mount --page-memo`) | 65,536 (about 12 MB) |
+| Decoded pages kept per tree | `TreeOptions.pageMemoPages` | 256 |
+| Read-ahead windows of `readStream` | `readAhead` | 3 × 4 MiB |
+| Upload commits in flight | `WriteOptions.parallel` | 3 × `max_commit_bytes` |
+| Content kept on disk (not RAM) | `ReplicaOptions.cacheBytes`, `zen-mount --cache-size` | 1 GiB |
+
+**Measuring:**
+* **Peak RSS:** `VmHWM` in `/proc/PID/status` (the device benches report it per daemon).
+* **The split:** `process.memoryUsage()` separates the JS heap, `external`/`arrayBuffers` (byte buffers) and the rest (wasm memory, native).
+* **Any Node process, without changing the code:**
+  * `NODE_OPTIONS="--require memlog.cjs"`, a preload that logs `memoryUsage()` every 500 ms and calls `v8.writeHeapSnapshot()` past given RSS thresholds
+  * then group the snapshot's large objects by their retainer path
+  * A snapshot forces a full GC first, so what it shows is live. A big gap between it and `heapUsed` is garbage.
+* **Bounds go in tests:** each bound has a test that fails with it off (`packages/fs/test/memory.test.ts` and `handles.test.ts`, the page memo case in `cdc.test.ts`).
+
+Known hot spots, measured or not yet: TD-MEMORY (spec/TECH_DEBT.md).

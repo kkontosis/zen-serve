@@ -1,6 +1,8 @@
 // The replica's records on the sealed local store (spec/zendb.md §9.3,
 // fs.md §11), in stores `zfs/<fs>/<hex tree>/<kind>`. Records are written
-// behind (every 100 ms and at close); reads see pending writes first.
+// behind (every 100 ms and at close); reads see pending writes first. The
+// bytes waiting to be written are bounded: past the bound, `room()` makes
+// the producers wait for the store (zen-mount's memory, milestone 8 step 6b).
 import { bytes, type ChunkCache, type SealedStore } from '@zen/client';
 
 export type Kind =
@@ -26,6 +28,11 @@ export const KINDS: Kind[] = [
 ];
 
 const FLUSH_MS = 100;
+/** Default bound on the bytes of records waiting to be written. */
+export const DEFAULT_PENDING = 32 << 20;
+
+type Pending = { kind: Kind; key: Uint8Array; value?: Uint8Array };
+const sizeOf = (p: Pending | undefined) => p?.value?.length ?? 0;
 
 /** The store names of a replica of tree `tree` of fs `fs`. */
 export function replicaStores(fs: number, tree: Uint8Array): string[] {
@@ -34,17 +41,27 @@ export function replicaStores(fs: number, tree: Uint8Array): string[] {
 
 /** Write-behind access to one replica's stores. */
 export class Records {
-  private readonly pending = new Map<string, { kind: Kind; key: Uint8Array; value?: Uint8Array }>();
+  private readonly pending = new Map<string, Pending>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private flushing: Promise<void> = Promise.resolve();
+  /** Bytes of values pending or in a batch not yet written. */
+  private backlog = 0;
+  private waiters: (() => void)[] = [];
 
   constructor(
     readonly sealed: SealedStore,
     readonly base: string,
+    /** The most bytes waiting to be written before `room()` waits. */
+    readonly maxPending: number = DEFAULT_PENDING,
   ) {}
 
   name(kind: Kind): string {
     return `${this.base}/${kind}`;
+  }
+
+  /** Bytes of records waiting to be written (pending, or being written). */
+  get pendingBytes(): number {
+    return this.backlog;
   }
 
   async get(kind: Kind, key: Uint8Array): Promise<Uint8Array | undefined> {
@@ -54,13 +71,36 @@ export class Records {
   }
 
   put(kind: Kind, key: Uint8Array, value: Uint8Array): void {
-    this.pending.set(`${kind}:${bytes.hex(key)}`, { kind, key, value });
-    this.schedule();
+    this.set({ kind, key, value });
   }
 
   delete(kind: Kind, key: Uint8Array): void {
-    this.pending.set(`${kind}:${bytes.hex(key)}`, { kind, key });
+    this.set({ kind, key });
+  }
+
+  private set(p: Pending): void {
+    const k = `${p.kind}:${bytes.hex(p.key)}`;
+    this.backlog += sizeOf(p) - sizeOf(this.pending.get(k));
+    this.pending.set(k, p);
     this.schedule();
+  }
+
+  /**
+   * Resolves once the bytes waiting to be written are within the bound:
+   * at once below it, else when the store has caught up (a flush is
+   * started now rather than at the next tick).
+   */
+  room(): Promise<void> {
+    if (this.backlog <= this.maxPending) return Promise.resolve();
+    if (this.pending.size) void this.flush().catch(() => {});
+    return new Promise((r) => this.waiters.push(r));
+  }
+
+  private wake(): void {
+    if (this.backlog > this.maxPending || !this.waiters.length) return;
+    const ws = this.waiters;
+    this.waiters = [];
+    for (const w of ws) w();
   }
 
   /** Every record of a kind, pending writes included. */
@@ -82,7 +122,7 @@ export class Records {
     }, FLUSH_MS);
   }
 
-  /** Write what is pending. */
+  /** Write what is pending. A batch that fails doesn't stop the later ones. */
   flush(): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
@@ -90,19 +130,33 @@ export class Records {
     }
     const batch = [...this.pending.values()];
     this.pending.clear();
-    this.flushing = this.flushing.then(async () => {
-      for (const p of batch) {
-        const store = this.name(p.kind);
-        if (p.value) await this.sealed.put(store, p.key, p.value);
-        else await this.sealed.delete(store, [p.key]);
-      }
-    });
+    this.flushing = this.flushing
+      .catch(() => {})
+      .then(async () => {
+        let i = 0;
+        try {
+          for (; i < batch.length; i++) {
+            const p = batch[i]!;
+            const store = this.name(p.kind);
+            if (p.value) await this.sealed.put(store, p.key, p.value);
+            else await this.sealed.delete(store, [p.key]);
+            this.backlog -= sizeOf(p);
+            this.wake();
+          }
+        } finally {
+          // A failed write: what is left of the batch isn't waiting any more.
+          for (; i < batch.length; i++) this.backlog -= sizeOf(batch[i]);
+          this.wake();
+        }
+      });
     return this.flushing;
   }
 
   /** Delete every record of every kind (`Replica.wipe`). */
   async clear(): Promise<void> {
+    for (const p of this.pending.values()) this.backlog -= sizeOf(p);
     this.pending.clear();
+    this.wake();
     await this.flushing;
     for (const k of KINDS) await this.sealed.clear(this.name(k));
   }
@@ -126,10 +180,16 @@ export function decodeUse(b: Uint8Array): { size: number; used: number } | undef
 /**
  * Kept chunks and pages, as the tree's caches: sealed bytes as on the
  * server, each with a use record for eviction (least recently used first).
+ * What the tree fetches is only a cache: while the records waiting to be
+ * written are past their bound, it isn't kept (unless `keeping`), so reads
+ * neither wait for the store nor fill memory. Sealed content goes through
+ * `keep`, which always stores it.
  */
 export class Content {
   /** Bytes added since the last eviction pass (a hint to run one). */
   added = 0;
+  /** While above 0, fetched content is kept past the bound too (pinned content). */
+  keeping = 0;
 
   constructor(
     private readonly rec: Records,
@@ -144,12 +204,22 @@ export class Content {
         return b;
       },
       put: (id, data) => {
-        this.rec.put(kind, id, data);
-        this.use(tag, id, data.length);
-        this.added += data.length;
-        this.onAdd();
+        if (!this.keeping && this.rec.pendingBytes > this.rec.maxPending) return;
+        this.store(kind, tag, id, data);
       },
     };
+  }
+
+  private store(kind: 'chunks' | 'pages', tag: number, id: Uint8Array, data: Uint8Array): void {
+    this.rec.put(kind, id, data);
+    this.use(tag, id, data.length);
+    this.added += data.length;
+    this.onAdd();
+  }
+
+  /** Store sealed content, whatever is waiting (the caller waits with `Records.room`). */
+  keep(kind: 'chunks' | 'pages', id: Uint8Array, data: Uint8Array): void {
+    this.store(kind, kind === 'chunks' ? 0x63 : 0x70, id, data);
   }
 
   readonly chunks = this.cache('chunks', 0x63);

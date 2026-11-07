@@ -60,7 +60,7 @@ import {
 } from './queue.js';
 import { indexFromRecords, recordsOf } from './records.js';
 import { Sender } from './sender.js';
-import { Content, Records, replicaStores, useKey } from './store.js';
+import { Content, DEFAULT_PENDING, Records, replicaStores, useKey } from './store.js';
 import { decodeXattrs, encodeXattrs } from './xattr.js';
 
 /** Options of `openReplica`. */
@@ -82,6 +82,14 @@ export interface ReplicaOptions {
    * a write of its own (default 64 MiB).
    */
   dirtyBytes?: number;
+  /**
+   * The most bytes of records (content included) waiting to be written to
+   * `local` (default 32 MiB). Past it, sealing waits for the store, and
+   * content fetched for reads isn't kept (a pinned file's still is).
+   */
+  pendingBytes?: number;
+  /** The most chunk ids the tree keeps in decoded pages (`TreeOptions.pageMemoIds`). */
+  pageMemoIds?: number;
   /** The chunker's parameters for new content (`TreeOptions.cdc`; default the server's). */
   cdc?: CdcParams;
 }
@@ -122,6 +130,8 @@ export interface ReplicaStatus {
   queued: number;
   /** A batch of them is being sent. */
   sending: boolean;
+  /** Bytes of records waiting to be written to the local store. */
+  pendingBytes: number;
   /** The integrity alarm that stopped the feed (fs.md §9), if any. */
   alarm?: IntegrityError;
 }
@@ -154,6 +164,8 @@ const DEFAULT_WAIT = 25_000;
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 30_000;
 const FETCHERS = 2;
+/** Chunks a pinned file's content is fetched by at a time. */
+const FETCH_WINDOW = 256;
 const CURSOR = bytes.utf8('cursor');
 const FULL = bytes.utf8('full');
 const INFO = bytes.utf8('info');
@@ -259,13 +271,18 @@ export class Replica {
     this.cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE;
     this.waitMs = opts.waitMs ?? DEFAULT_WAIT;
     this.dirtyBound = opts.dirtyBytes ?? DEFAULT_DIRTY;
-    this.rec = new Records(opts.local, `zfs/${fs.id}/${bytes.hex(id)}`);
+    this.rec = new Records(
+      opts.local,
+      `zfs/${fs.id}/${bytes.hex(id)}`,
+      opts.pendingBytes ?? DEFAULT_PENDING,
+    );
     this.content = new Content(this.rec, () => this.maybeEvict());
     this.tree = fs.tree(id, {
       chunkCache: this.content.chunks,
       pageCache: this.content.pages,
       info: () => this.info(),
       ...(opts.cdc ? { cdc: opts.cdc } : {}),
+      ...(opts.pageMemoIds !== undefined ? { pageMemoIds: opts.pageMemoIds } : {}),
     });
     this.root = {
       id: ROOT,
@@ -964,8 +981,20 @@ export class Replica {
         try {
           for (const v of await this.versionsOf(n)) {
             if (!v.chunkCount) continue;
-            const ids = await this.tree.chunkIds(v, 0, v.chunkCount - 1);
-            await this.tree.fetchChunks(ids, v);
+            // In windows, so the file's plaintext isn't held whole, each
+            // waiting for the store to take what the last one kept; kept
+            // past the bound, since a pin is what must be there offline.
+            for (let i = 0; i < v.chunkCount; i += FETCH_WINDOW) {
+              if (this.stopped) return;
+              await this.rec.room();
+              const last = Math.min(v.chunkCount, i + FETCH_WINDOW) - 1;
+              this.content.keeping++;
+              try {
+                await this.tree.fetchChunks(await this.tree.chunkIds(v, i, last), v);
+              } finally {
+                this.content.keeping--;
+              }
+            }
           }
         } catch (e) {
           if (!isCode(e, 'offline') && !isCode(e, 'network')) {
@@ -1437,14 +1466,15 @@ export class Replica {
     const sink = async (cs: { id: Uint8Array; data: Uint8Array }[], ps: typeof cs) => {
       for (const c of cs) {
         this.protect.add(useKey('chunk', c.id));
-        this.content.chunks.put(c.id, c.data);
+        this.content.keep('chunks', c.id, c.data);
         chunks.push(c.id);
       }
       for (const p of ps) {
         this.protect.add(useKey('page', p.id));
-        this.content.pages.put(p.id, p.data);
+        this.content.keep('pages', p.id, p.data);
         pages.push(p.id);
       }
+      await this.rec.room();
     };
     return { chunks, pages, sink };
   }
@@ -1795,6 +1825,11 @@ export class Replica {
 
   // ------------------------------------------------------------ lifecycle
 
+  /** Bytes of records waiting to be written to the local store (`pendingBytes` bounds it). */
+  get pendingBytes(): number {
+    return this.rec.pendingBytes;
+  }
+
   async status(): Promise<ReplicaStatus> {
     return {
       online: this.online,
@@ -1804,6 +1839,7 @@ export class Replica {
       pins: this.pins.size,
       queued: this.queue.length,
       sending: this.sender.sending,
+      pendingBytes: this.rec.pendingBytes,
       ...(this.alarm ? { alarm: this.alarm } : {}),
     };
   }

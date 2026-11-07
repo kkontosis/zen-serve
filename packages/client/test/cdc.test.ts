@@ -393,6 +393,33 @@ describe('content-defined chunks (version 3)', () => {
     await check(three, cut);
   });
 
+  it('the page memo keeps at most its bounds: chunk ids and pages (TreeOptions)', async () => {
+    const t = tree();
+    const f = await t.create(ROOT, name());
+    const data = random(2_000_000);
+    const w = await t.writeFile(f, data);
+    const pages = v3(w.manifest).pages!;
+    expect(pages.length).toBeGreaterThan(4);
+    const n = pages.reduce((s, p) => s + p.count, 0);
+    // A fresh tree per bound, each reading the whole file.
+    const read = async (opts: Parameters<UnlockedFs['tree']>[1]) => {
+      const r = ufs.tree(t.id, { cdc: CDC, ...opts });
+      const v = (await r.versions(f))[0]!;
+      expect(equal(await collect(r.readStream(f, { version: v })), data)).toBe(true);
+      return r.pageMemoSize;
+    };
+    // The defaults hold every page of this file.
+    expect(await read({})).toEqual({ pages: pages.length, ids: n });
+    // By chunk ids: whole pages, the least recently used dropped first.
+    const byIds = await read({ pageMemoIds: 2 * PS });
+    expect(byIds.ids).toBeLessThanOrEqual(2 * PS);
+    expect(byIds.pages).toBeGreaterThanOrEqual(1);
+    // By pages.
+    expect((await read({ pageMemoPages: 2 })).pages).toBe(2);
+    // Off: nothing kept, and reads still work.
+    expect(await read({ pageMemoIds: 0 })).toEqual({ pages: 0, ids: 0 });
+  });
+
   it('refuses pages that disagree with the manifest, and known items not of the base', async () => {
     const t = tree();
     const f = await t.create(ROOT, name());
