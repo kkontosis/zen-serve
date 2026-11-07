@@ -165,7 +165,7 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
             'the version',
             `${v.chunkCount} chunks (mean ${(N / v.chunkCount / 1024).toFixed(1)} KiB), ` +
               `${v.pages.length} pages, manifest ${v.sealedManifest.length} B; ` +
-              `sent ${mib(tw.sent)} MiB; data dir +${mib(du(w.server.dataDir) - before)} MiB; ` +
+              `sent ${mib(tw.sent)} MiB; data dir +${mib(du(w.server.dataDir) - before)} MiB allocated; ` +
               `largest upload state ${(stateMost / 1024).toFixed(1)} KiB; ${up.uploaded} chunks uploaded`,
           );
           let parts: Part[] = [{ seed: 1, from: 0, to: N }];
@@ -200,7 +200,9 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
 
           // 4. Append 1 MiB.
           const [more] = keystream(9, 0, MiB);
-          const ap = await measured(w, () => traffic(s, () => ufs.tree(id).append(f, more!)));
+          const ap = await measured(w, () =>
+            traffic(s, () => ufs.tree(id).append(f, more!, { session: true })),
+          );
           parts = [...parts, more!];
           row(form, 'append 1 MiB', `${ap.ms.toFixed(0)} ms; ${counts(ap.result[1])}`);
 
@@ -209,7 +211,9 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
           const [over] = keystream(10, 0, 4096);
           const ow = await measured(w, () =>
             traffic(s, () =>
-              ufs.tree(id).edit(f, undefined, [{ offset: mid, remove: 4096, insert: over! }]),
+              ufs.tree(id).edit(f, undefined, [{ offset: mid, remove: 4096, insert: over! }], {
+                session: true,
+              }),
             ),
           );
           parts = edited(parts, mid, 4096, over!);
@@ -228,7 +232,9 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
           }
           const at = Math.floor(insSize / 2) + MiB;
           const ie = await measured(w, () =>
-            traffic(s, () => ufs.tree(id).edit(g, undefined, [{ offset: at, insert: ins! }])),
+            traffic(s, () =>
+              ufs.tree(id).edit(g, undefined, [{ offset: at, insert: ins! }], { session: true }),
+            ),
           );
           row(
             form,

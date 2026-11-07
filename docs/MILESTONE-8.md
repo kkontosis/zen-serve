@@ -567,6 +567,45 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. commit `docs: milestone 8 step 7 plan`
     4. push and open the PR
   * Then implement on "go".
+  * Plan committed (f68d66b), PR #74.
+  * **On "go":**
+    * Release zen-server built. FoundationDB 7.3.79 installed in `/opt/foundationdb`; its `--features fdb` build waits until the embedded benches finish, since it replaces the binary they run.
+    * Commit 23aa632 `test: large-file benches (milestone 8 step 7)`: `benchkit.ts` (shared), the client, replica and zen-mount benches, the Loro case, and ci.yml `files-bench`. Pushed.
+    * **Fixed in the benches during the 128 MiB smoke run:**
+      * The 16 writers are one device, so they share one `TreeClock`. Each session on its own clock gave `operation timestamp reused`.
+      * The resync count compares cut positions rather than hex-encoding every chunk: 196 s down to 3 s.
+  * **The client bench at 4 GiB** (embedded, release, this container):
+    * **CDC:**
+      * Write: 56 MiB/s in 550 commits. 114,722 chunks (mean 36.6 KiB), 26 pages; the largest upload state 566 KiB.
+      * `readStream`: 113 MiB/s at readAhead 3, 122 at 1.
+      * Random 4 KiB reads: median 1.1 ms, p99 7–8 ms.
+      * Append 1 MiB: 85 ms, 1 page and 1 chunk fetched, 29 chunks sent. 4 KiB overwrite: 218 ms. 100-byte insertion: 91 ms, 1 chunk and 1 page each.
+      * A resume at half after 12 s (grace 5 s) sent only the rest. Without a session: refused, 400.
+      * Pipelining at 1 GiB: 39.5 MiB/s with 1 in flight, 58.4 with 3.
+      * 16 writers: 68 MiB/s in all. The client peaked at 1.4 GiB: 16 × 3 commits in flight.
+      * The chunker: 389 MiB/s, mean 36.4 KiB, 195 GiB per version full and 97 GiB at the fill rule's worst. Insertions of 1–100 B changed 1 chunk 99.1 % of the time, 2 chunks 0.7 %, 5 chunks 0.2 %.
+    * **Fixed:**
+      * Write: 69 MiB/s. Reads: 112–127 MiB/s.
+      * **The run failed at the 100-byte insertion** (`unknown chunk in page`). The bench's fault: the edit re-uploads half of a 1 GiB file, about 9 s, and ran without a session against a grace of 5 s. The edits now pass `session: true` (uncommitted).
+    * **The server:** 2.2–4.1 GiB peak RSS (`VmHWM`) with one writer; redb's cache is 1 GiB by default.
+    * **The data dir grew** 8 GiB under CDC and 10 GiB under fixed, for 4 GiB.
+  * **A probe** (not committed): the allocated disk (`du -B1`) per GiB written, one world each.
+    * Fixed 64 KiB: 2.04 GiB. Fixed 64 KiB − 256 B: 1.05. Fixed 32 KiB: 2.07. CDC: 1.66.
+    * The apparent file size is twice the allocated size: redb grows its file sparse.
+    * **The cause:** redb's buddy allocator rounds each page allocation up to a power of two (`page_manager.rs` `ceil_log2`). A sealed 64 KiB chunk (65,584 B) needs 17 pages of 4 KiB, so it gets 32.
+    * The benches now report allocated bytes (uncommitted). STATS §1.2's "1.1–1.5×" was an estimate; it's wrong for large values.
+  * **The replica bench at 4 GiB:**
+    * write 9.2 MiB/s (the cache dir's fsync per record), with RSS at most 579 MiB, `dirtyBytes` 65 MiB and `pendingBytes` 39 MiB
+    * a 1-byte edit 4.4 s
+    * cold read 60 MiB/s
+    * pin 11.9 MiB/s, with RSS 810 MiB
+    * the server 2.2–3.1 GiB
+  * **Decided (the user):**
+    1. The default fixed chunk becomes 65,280 B (64 KiB − 256), kept even with the split below: about 6 % less in the replica's disk cache.
+    2. Fix the embedded store's large values in 8.7.
+    3. Investigate and fix the server's memory in 8.7.
+    4. No data compatibility is needed between revisions: the app isn't deployed.
+    * Planned below ("Step 8.7, continued").
 
 
 ## Steps (one PR each; each planned in detail before it starts)
@@ -2163,6 +2202,140 @@ There's no format change and no `spec:` commit. The code is the benches and a CI
 * **The fixed form's insertion on a 1 GiB file.**
 * **The CI job measures and doesn't gate.**
 * **Fixes the benches find:** small and local ones go in this PR with a test; anything larger goes to the user.
+
+## Step 8.7, continued: the embedded store's large values, fixed chunks, the server's memory
+
+The 4 GiB benches found three things in zen-serve itself:
+1. The embedded backend stores a large value at up to twice its size.
+2. 64 KiB fixed chunks land just past a power of two.
+3. The server peaks at 2–4 GiB RSS with one writer.
+
+The user chose to fix all three in this PR (#74), before the benches are re-run and the docs written. No data compatibility is needed, so the store's format changes without a migration.
+
+### 1. Large values in the embedded backend (`crates/zen-store/src/embedded.rs`)
+
+**The cause:**
+* redb (4.3) keeps an entry larger than its 4 KiB page in a leaf of its own.
+* The buddy allocator rounds that leaf up to a power of two of pages. A sealed 64 KiB chunk (65,584 B) needs 17 pages and gets 32.
+* CDC chunks of 8–88 KiB round up to 16 or 32 pages: 1.66× measured.
+* A sealed zen-blk block (4,144 B) is just past one page, so it gets 2 (computed: to be measured in the test).
+
+**The fix:** a value whose entry doesn't fit one page is split into pieces that each fill one leaf page exactly.
+* **Tables:**
+  * `kv`: key → tagged value. `0x00 ‖ bytes` is inline. `0x01 ‖ u32 len ‖ u32 pieces` is split.
+  * New `parts`: `u32be(len(key)) ‖ key ‖ u32be(i)` → piece `i`.
+  * The length prefix keeps one key's pieces contiguous and apart from every other key's.
+* **The piece size** is what fits a one-entry leaf: `4096 − 12 − len(parts key)`. The 12 bytes are redb's leaf header: 4 B, plus a `u32` key end and a `u32` value end per entry (`btree_base.rs` `LeafAccessor`).
+  * A value is split when its own entry wouldn't fit one page: `12 + len(key) + 1 + len(value) > 4096`.
+  * Smaller values stay inline and share leaves as now.
+  * So every piece but the last fills a page. The last one shares a leaf with small entries, and the record in `kv` is 9 B.
+  * The page size is set explicitly (`Builder::set_page_size(4096)`), so the arithmetic can't drift from redb's default.
+* **Reads:**
+  * `get` and range reads decode the tag. A split value is read from `parts` in the same read transaction, the `Snapshot` holding both tables.
+  * The piece count and total length are checked; a mismatch is `Error::Io`, naming the key.
+* **Writes:**
+  * In `commit_blocking`, `Set`, `VsKey` and `VsValue` go through one `put`, which:
+    1. reads the old record
+    2. removes its pieces if it was split
+    3. writes the new record and its pieces
+  * `Clear` removes the pieces likewise.
+  * `ClearRange` collects the split keys in its `retain_in` closure, which sees each value, and removes their pieces.
+  * `Add` decodes and writes inline (counters are 8 B).
+  * The meta version key is tagged like any value.
+* **A format marker:**
+  * `meta/format` = 2, written at create.
+  * `open` refuses a file that holds data but no marker: "zen.redb was written by an older zen-serve; start from an empty data_dir". That's cheaper than a silent misread, since no migration is needed.
+* **Unchanged:** the `Storage`/`Txn` trait and everything above it, the FoundationDB backend, and `export`/`import`. Those go through the trait, so dumps carry plain values.
+
+**Tests:**
+* **`conformance.rs`** (both backends; values up to 100,000 B, within FoundationDB's limit):
+  * sizes 0, 1, piece − 1, piece, piece + 1, 3 pieces and 100,000
+  * each through `get`, `get_range` forward and reverse with limits, and `snapshot_get`
+  * overwrites large → small → large
+  * `clear`, and a `clear_range` spanning split and inline values
+  * an old read version still seeing the large value it read, after an overwrite
+  * a versionstamped value past a page
+* **`tests/embedded.rs`:**
+  1. **Disk:**
+     * 1,500 random values in four sets: CDC-like lengths of 8,192–89,984 B, 65,584 B, 65,328 B and 4,144 B (blocks).
+     * Each set's allocated growth of the file (`st_blocks × 512`) must be at most 1.12 × its logical bytes. With the fix it's about 1.03–1.06×; today it's about 2× for the fixed sizes.
+  2. **No pieces left behind:** after overwrites (large → small, large → larger), clears and a clear range, a test-only count of `parts` entries (`Embedded::part_count`, under the `testing` feature) is what the live values need.
+  3. **An old file is refused:** a redb file with a `kv` table and a version key but no marker.
+* **Negative controls** (each run once, then restored):
+  * the piece size 16 B larger (each piece then spills into a second page): test 1 fails at about 2×
+  * no removal of the old pieces on an overwrite: test 2 fails
+  * splitting off: test 1 fails for every set
+
+### 2. Fixed chunks of 65,280 B (`@zen/client`)
+
+* **The change:**
+  * `CHUNK_SIZE` becomes 65,280 (64 KiB − 256), so a sealed chunk (65,328 B) is under 64 KiB on any store that rounds to 4 KiB blocks: the replica's disk cache (one file per record), and filesystems generally.
+  * One constant, exported from `tree.ts` and used by `writer.ts` (it's duplicated today).
+* **Existing versions** keep their chunk size through `previous`/`base`, as before. No data needs carrying over anyway.
+* **Updated:**
+  * tests that assume 65,536: those that don't pass `chunkSize` explicitly
+  * docs that say "64 KiB chunks": STATS §1.1 and §1.3, CLIENT.md, fs.md/formats.md where they give the default
+  * v2 capacity: 5,624 × 1,870 × 65,280 ≈ 638 GiB
+* **Test:** `tree.test.ts` asserts a default fixed write's `chunkSize` is 65,280 and every sealed chunk is at most 65,536 B. With 65,536 it fails.
+
+### 3. The server's memory
+
+**Measure first, as in 8.6b:** the client bench's CDC write at 4 GiB (`-t cdc`, with the write and the first read), with the server under:
+1. **As built:** `VmHWM`, plus `smaps_rollup` (anonymous against file-backed) every second.
+2. **`MALLOC_ARENA_MAX=2`:** if the peak falls sharply, the cause is glibc keeping freed memory per arena. Commits run on tokio's blocking pool, and each thread can get an arena.
+3. **jemalloc preloaded** (`LD_PRELOAD=libjemalloc.so.2`, installed here):
+   * `MALLOC_CONF=stats_print:true` gives live, resident and retained bytes at exit.
+   * If live bytes are large, `prof:true` with jeprof (or `heaptrack`, installable) names the allocation sites.
+4. **redb's cache** at 1 GiB (the default) against 256 MiB (a temporary build with the setting below).
+
+**Suspects from reading:**
+* redb's cache: 1 GiB for the read cache and write buffer together.
+* The embedded transaction copies every value twice: `overlay` and `ops` each own a `Vec`. That's on top of the request body and its decoded form, so a commit of 8 MB holds about 4 copies while it runs.
+* glibc arenas across the blocking pool's threads.
+* hyper's body buffers.
+
+**The fix, by what the measurement shows** (the findings and the design go in the log before any code; anything beyond the items below goes to the user first):
+* **`[storage] cache_bytes`** for the embedded backend, in any case (OPS §6: every cache gets a setting). It's `Options.cache_bytes` → `Builder::set_cache_size`. The default is the smallest that keeps the bench's write and read throughput within 10 % of 1 GiB's.
+* **One copy per value in a transaction,** if the copies show up: `ops` and `overlay` share one `Arc<[u8]>`.
+* **The allocator,** only if fragmentation shows: `mallopt(M_ARENA_MAX, …)` at start-up, or jemalloc as the server's global allocator (a new dependency). The user decides which.
+* **Tests:**
+  * a config test for `cache_bytes` (parsed, checked at least 1 MiB, reaching `Options`)
+  * for the copies, a unit test that a transaction's buffered bytes are counted once (a test-only `EmbeddedTxn::buffered_bytes`)
+  * RSS itself isn't asserted in a test (too noisy); the benches re-measure it
+
+### Then, as planned
+
+1. Re-run the client, replica and zen-mount benches at 4 GiB (embedded), and the client bench at 1 GiB on local FoundationDB (`--features fdb` release build, a cluster from `zen-serve init`).
+2. Run the negative control for a resume one byte off.
+3. Start `files-bench` once on CI, at 16 GiB.
+4. The docs, as "Step 8.7 in detail" §6, plus:
+   * STATS §1.2: measured multipliers before and after the split, for CDC, fixed and blocks
+   * OPS §2: measure redb's file with `du`, not `ls` (it's sparse)
+   * OPS §6: `[storage] cache_bytes` in the settings table
+   * TD-MEMORY: the server's figures and their cause
+   * spec/keyspace.md or OPS §1.2: the embedded store's two tables
+5. The Outcome.
+
+### Commits (after 23aa632)
+
+1. `test: the benches' edits under sessions; disk as allocated`
+2. `store: split large values across whole pages in the embedded backend`
+3. `client: fixed chunks of 64 KiB − 256 B`
+4. `server: …` (memory, by cause; `[storage] cache_bytes` at least)
+5. `docs: large files measured, and the milestone 8 outcome`
+
+### Verification
+
+* **Rust:**
+  * `cargo fmt --check`
+  * clippy `--all-targets -D warnings` on the workspace (default, `--no-default-features`, `--all-features`)
+  * `cargo test -p zen-store` (embedded; conformance on FoundationDB once, with the local cluster)
+  * `cargo test -p zen-server` (dump, fs, api)
+  * `cargo test -p zen-blk -p zen-ublk`
+* **JS:** `npm run check`, `npm run build`, then the full `npx vitest run`: 646 passed plus the new skips, none failed.
+* **The negative controls above.**
+* **The benches re-run:** the data dir's allocated growth near 1.05× of the bytes sent under fixed and CDC alike, and the server's peak against the figures above.
+* **CI:** green on both runs, `fdb` included (conformance on FoundationDB).
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.

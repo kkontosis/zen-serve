@@ -123,10 +123,10 @@ export function resetPeak(pid: number | 'self' = 'self'): void {
   }
 }
 
-/** Bytes on disk under `dir` (`du`). */
+/** Bytes allocated on disk under `dir` (`du`; not the apparent size: redb's file is sparse). */
 export function du(dir: string): number {
   try {
-    return Number(execFileSync('du', ['-sb', dir], { encoding: 'utf8' }).split('\t')[0]);
+    return Number(execFileSync('du', ['-sB1', dir], { encoding: 'utf8' }).split('\t')[0]);
   } catch {
     return Number.NaN;
   }
@@ -141,7 +141,7 @@ export function diskPeak(dir: string, ms = 2000): { stop(): Promise<number> } {
   let on = true;
   const once = () =>
     new Promise<void>((ok) =>
-      execFile('du', ['-sb', dir], (_, out) => {
+      execFile('du', ['-sB1', dir], (_, out) => {
         const n = Number(String(out).split('\t')[0]);
         if (Number.isFinite(n)) most = Math.max(most, n);
         ok();
