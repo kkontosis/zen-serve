@@ -606,6 +606,69 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. Investigate and fix the server's memory in 8.7.
     4. No data compatibility is needed between revisions: the app isn't deployed.
     * Planned below ("Step 8.7, continued").
+  * **On "go" (after the compaction):**
+    * **1. The embedded store splits large values** (`crates/zen-store/src/embedded.rs`):
+      * **Changes from the plan:**
+        * **A split value's tail stays in its `kv` record** (`0x01 ‖ u32 len ‖ u32 pieces ‖ tail`), and only whole pieces go to `parts`. The first form put the tail in `parts` too: it sat between two full pieces in key order, so it got a leaf of its own, and blocks (4,144 B) still took 2 pages (2.05×). A tail is shorter than a piece, so the record still fits one page.
+        * **The page size isn't set:** redb's `Builder::set_page_size` exists only in its own tests. `PAGE` is its default, 4 KiB, and the disk test catches drift.
+        * **The marker is `meta/store_format`**, so it can't meet a server `meta` name.
+      * **Measured** (`large_values_cost_their_size_on_disk`, allocated growth over the bytes stored): CDC lengths 1.062×, 65,584 B 1.049×, 65,328 B 1.050×, blocks of 4,144 B 1.075×.
+      * **Tests:**
+        * `conformance.rs` gains `large_values` (both backends): 236 lengths from 0 to 100,000 B, densely around one and two pages; points, ranges forward and reverse with limits, overwrites (small, 100,000, 9,000, empty), an older read version, a clear and a range clear over split and inline values, a key written again, and versionstamped values and keys past a page.
+        * `tests/embedded.rs`: the disk test; `no_pieces_left_behind` (exact piece counts through overwrites, clears, a range clear, a set and clear in one transaction, a versionstamped value over a split one, and 0 after clearing everything); `another_layout_is_refused` (no marker, and format 3).
+      * **Negative controls** (each run once, then restored):
+        * pieces 16 B larger: the disk test fails for every set (2.02–2.05×)
+        * old pieces kept on an overwrite: the pieces test fails
+        * no splitting: the disk test fails for CDC (1.49×), 65,584 B (2.01×) and blocks (2.00×), but not for 65,328 B (1.01×): a 65,280 B chunk fits 16 pages without the split. So the plan's "fails for every set" holds for three of the four.
+      * **Checks:** `cargo fmt --check`; clippy `--all-targets -D warnings` on the workspace (default and `--no-default-features`) and zen-store (`--all-features`); `cargo test -p zen-store`, and `-p zen-server -p zen-blk -p zen-ublk` (26 suites, all passing).
+      * Committed d51bfc3.
+    * **2. Fixed chunks of 65,280 B** (`@zen/client`):
+      * `CHUNK_SIZE` is defined once, in `writer.ts`, and re-exported from `tree.ts` (the other way round would make the two modules import each other's values).
+      * spec: fs.md §4.1 (the default named), formats.md §11.3 and §11.5 (about 640 GiB a version and about 350 MiB a page at 65,280 B), glossary "chunk". STATS waits for the docs commit.
+      * **Test:** `tree.test.ts`, "fixed chunks are 64 KiB − 256 by default, sealed within 64 KiB": 4 chunks sealed at most 65,536 B, the manifest's `chunkSize` 65,280. With 65,536 it fails ("expected 65584 to be less than or equal to 65536").
+      * The existing chunk-counting tests still hold: `tree.test.ts`'s 11-chunk file is 11 chunks at either size.
+      * **Checks:** `npm run check`, `npm run build`; the full `npx vitest run`: 647 passed, 22 skipped (the opt-in benches), none failed. Committed 4402e78.
+    * **3. The server's memory, measured** (release, embedded, this container; a probe not committed: one 4 GiB CDC write under a session and a `readStream`, or 16 writers of 256 MiB at once; the server's `VmHWM` per phase, and `smaps_rollup` every second):
+
+      | redb cache | Allocator | 1 writer: write | read | 16 writers |
+      |---|---|---|---|---|
+      | 1 GiB (the default) | glibc as is | 1,927 MiB | 2,668 MiB | 3,071 MiB |
+      | 1 GiB | `MALLOC_ARENA_MAX=2` | 1,349–1,401 | 1,613–1,667 | |
+      | 1 GiB | jemalloc (preloaded) | 1,750 | 1,815 | |
+      | 256 MiB | glibc as is | 1,362 | 1,358 | |
+      | 256 MiB | `MALLOC_ARENA_MAX=2` | 637 | 639 | 908 |
+      | 64 MiB | `MALLOC_ARENA_MAX=2` | 273 | 274 | |
+
+      * **Throughput doesn't depend on the cache here:** 61–65 MiB/s writing and 117–124 MiB/s reading at every size, and 69–72 MiB/s for the 16 writers.
+      * **All of it is anonymous memory** (the file-backed part is 10 MB).
+      * **Cause 1, redb's cache:** a commit's pages go into the read cache once written (`cached_file.rs` `flush_write_buffer`), so a steady write fills it to `cache_bytes`, 1 GiB by default, whether or not anything reads them again.
+      * **Cause 2, glibc's arenas:** about 0.6–1 GiB more is memory freed but kept per arena. Commits run on tokio's blocking pool, and its threads get arenas of their own. `MALLOC_ARENA_MAX=2` gives it back; jemalloc did less well at 1 GiB.
+      * **Cause 3, the commits in flight** (heaptrack, 16 writers at 2 GiB, cache 256 MiB; peak heap 630 MB):
+        * redb's pages: about 355 MB (the cache, and the write buffer of the commit being applied)
+        * request bodies being read: about 140 MB
+        * the decoded commits (zen-proto): about 140 MB
+        * the transaction's two copies (`overlay` and `ops`): about 59 MB
+        * Embedded commits apply one at a time, and up to 48 (16 × 3 in flight) wait their turn, each holding its body or its decoded form. So the server's memory grows with clients × `parallel` × the commit size, and nothing bounds it.
+      * **Decided (the user):**
+        1. **The allocator:** zen-serve calls `mallopt(M_ARENA_MAX, 2)` at start, before any thread (glibc only, no new dependency), unless `MALLOC_ARENA_MAX` or `GLIBC_TUNABLES` is set.
+        2. **The cache:** `[storage] cache_bytes`, 256 MiB by default (a hedge for metadata-heavy loads, which weren't measured; 64 MiB was as fast for large files).
+        3. **The commits:** one shared buffer per value in a transaction, plus a byte budget for commit bodies in flight.
+      * **Implemented:**
+        * `zen-store`: `Options.cache_bytes` (`DEFAULT_CACHE_BYTES` 256 MiB) → `Builder::set_cache_size`; `Op::Set` and the overlay share one `Arc<[u8]>`.
+        * `zen-server`:
+          * `[storage] cache_bytes` (at least 1 MiB), used by `open_store` and `migrate`
+          * `main` builds its runtime by hand, after `cap_malloc_arenas()`
+          * `limits.commit_buffer_bytes` (64 MiB; at least `max_commit_bytes`, below 4 GiB; not sent to clients)
+          * `commit::Budget`, an extractor that takes the request's Content-Length (or `max_commit_bytes` + 1 MB when absent, at most the budget) from a semaphore and holds it until the commit is answered, on `/v1/commit` and `/v1/log/append`
+      * **Change from the first form:** the budget was first a middleware on the route, before authentication. A test showed a request without a session is answered 401 before its body is read, so it held nothing, but it still queued for the budget. It's now an extractor after `Caller`, so only a signed-in caller waits for it or holds it.
+      * **Known, not changed:** a signed-in caller that stalls its bodies holds its share until the connection drops, so enough stalled commits can hold the whole budget and make other commits on that node wait. zen-serve has no body read timeout. OPS §6 and TD-MEMORY say so.
+      * **Tests:**
+        * `embedded::tests::a_set_value_is_buffered_once` (a test-only `buffered_bytes` counts each allocation once): 1 MiB + 3 B. With two copies: 2,097,158.
+        * `config` units: `storage_cache_bytes`, `commit_buffer_bytes_is_checked`.
+        * `tests/api.rs` `commits_past_the_buffer_budget_wait` (budget 1,000,000): a stalled body without a session is answered 401; a signed-in stalled body of 900,000 makes another 900,000 wait (still waiting after 1.5 s) while 50,000 goes through; once the stalled connection drops, the waiting one is answered. Without `Budget` on the handler it fails ("B waits while A holds the budget").
+        * The arena cap has no test (glibc doesn't report its arenas); the benches measure it.
+      * **Re-measured with the defaults** (no environment set): 1 writer 613 MiB writing (57.1 MiB/s) and 621 reading (116.7 MiB/s); 16 writers 712 MiB (64.9 MiB/s). Throughput is 8–10 % below the 1 GiB runs in this one run each; the benches re-run below.
+      * **Checks:** `cargo fmt --check`; clippy on the workspace and zen-server `--no-default-features`; `cargo test -p zen-store -p zen-server` (22 suites). Committed d6d066c.
 
 
 ## Steps (one PR each; each planned in detail before it starts)
