@@ -121,7 +121,7 @@ write {node, replaces: [dot], chunks: [chunk_id] | pages: [page_id], manifest}
 
 ### 4.1 Chunks
 
-* A chunk is an immutable sealed blob (formats.md §11.4), at most `max_value_bytes`. Clients cut a file into chunks by the fs policy (formats.md §12): by content (`chunking = cdc`, formats.md §11.7: 8 KiB to about 88 KiB, 32 KiB on average at the defaults), so that an insertion re-uploads only the chunks around it; or at a fixed 64 KiB (`fixed`).
+* A chunk is an immutable sealed blob (formats.md §11.4), at most `max_value_bytes`. Clients cut a file into chunks by the fs policy (formats.md §12): by content (`chunking = cdc`, formats.md §11.7: 8 KiB to about 88 KiB, 32 KiB on average at the defaults), so that an insertion re-uploads only the chunks around it; or at a fixed size (`fixed`), 65,280 B by default (64 KiB − 256, so a sealed chunk stays within 64 KiB).
 * Chunk ids are random 16-byte ids chosen by the client. They belong to the fs, not to a tree.
 * Chunks are uploaded through the commit field `chunks` (api.md §6). Large files are uploaded over several commits, then referenced by one `write`.
 * **Pages** (formats.md §11.6) are uploaded through the commit field `pages`, each `{fs, id, data}`. Every chunk a page lists must exist when the page is uploaded: uploaded earlier, or in the same commit (the commit's chunks apply before its pages). A page is immutable: re-uploading identical bytes stores nothing new but restarts its grace period, and different bytes under an existing id are refused (400). The first upload of a page counts one reference to each chunk it lists (once per occurrence), so a page shared by many versions holds its chunks once.

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   bytes,
+  CHUNK_SIZE,
   type ChangeBatch,
   displayNames,
   memoryClockStore,
@@ -296,6 +297,33 @@ describe('large files and limits', () => {
     // The old last chunk (1000 bytes) is now full; it and the new tail upload.
     expect(w3.uploaded).toBe(2);
     expect(equal(await t.readFile(f), appended)).toBe(true);
+  });
+
+  it('fixed chunks are 64 KiB − 256 by default, sealed within 64 KiB', async () => {
+    const t = a.tree(Tree.newId());
+    const f = await t.create(ROOT, 'fixed.bin');
+    const sealed: number[] = [];
+    const orig = w.session.call;
+    w.session.call = ((path: string, enc: unknown, dec: unknown, req: unknown) => {
+      if (path === '/v1/commit') {
+        for (const c of (req as { chunks?: { data: Uint8Array }[] }).chunks ?? []) {
+          sealed.push(c.data.length);
+        }
+      }
+      return (orig as (...x: unknown[]) => unknown).call(w.session, path, enc, dec, req);
+    }) as Session['call'];
+    try {
+      const data = random(3 * CHUNK_SIZE + 5);
+      const wrote = await t.writeFile(f, data, { chunking: 'fixed' });
+      expect(sealed.length).toBe(4);
+      expect(Math.max(...sealed)).toBeLessThanOrEqual(65_536);
+      expect(wrote.manifest.version).toBe(2);
+      expect(wrote.manifest.version === 2 && wrote.manifest.chunkSize).toBe(65_280);
+      expect(CHUNK_SIZE).toBe(65_280);
+      expect(equal(await t.readFile(f), data)).toBe(true);
+    } finally {
+      w.session.call = orig;
+    }
   });
 
   it('writes from a stream of uneven pieces', async () => {
