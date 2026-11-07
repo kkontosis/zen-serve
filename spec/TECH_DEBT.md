@@ -157,6 +157,24 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** A hole is a format change (manifests, readers, the writer, the replica), out of place in a step about zen-ublk.
 * **What it would take:** a zero-extent entry in v3 manifests and pages (a length with no chunk, formats.md §11.3 and §11.6), which readers fill with zeros and the server never references; the writer emitting one for whole zero chunks (detected when cutting); the replica's handle passing zero extents through (`Edit.zeros`) as holes; `SEEK_HOLE`/`SEEK_DATA` in zen-mount; vectors; and a leakage note (the server sees where the holes are and how long they are).
 
+## TD-MEMORY
+
+* **Status:** open, a standing list. RAM use is a first-class cost (spec/OPS.md §6), and this entry tracks where memory goes, what bounds it, and what isn't measured yet. Fixes go in by step; the list stays.
+* **Bounded, with a setting and a test:**
+  * a replica's file handle: `dirtyBytes`, 64 MiB (milestone 8 step 4)
+  * the replica's records waiting to be written: `pendingBytes`, 32 MiB (step 6b)
+  * the client's page memo: `pageMemoIds`, 65,536 ids, about 12 MB, and `pageMemoPages`, 256 (step 6b)
+  * pinned content fetched in windows of 256 chunks (step 6b); content fetched for reads isn't kept past `pendingBytes`
+  * `readStream` read-ahead and pipelined uploads: a few windows or commits each
+* **Not bounded, or not measured yet:**
+  * **Decoded pages as objects:** a v2 page decodes to 5,624 separate `Uint8Array` ids (wasm's `decodeAnyPage`), about 1 MB of heap per 90 KB page, and every edit of a large file decodes and builds a few of them. A compact form (one buffer of ids, lengths in a typed array) would cut that about 10×.
+  * **wasm linear memory** never shrinks: one large operation sets the floor for the process's life.
+  * **zen-mount under an image workload:** after step 6b, the peak is what the benches show (docs/BLK.md §8); the JS heap's churn from page decoding is most of what is left.
+  * **The server:** commit buffers (up to `max_commit_bytes` per request in flight), relayed connections' windows (STATS.md §2.1), and the embedded store's caches. No figure yet for a server under many writers.
+  * **The Loro kept state:** a document's whole snapshot is one record in memory (zendb.md §20).
+  * **The browser:** IndexedDB-backed replicas under the same workloads.
+* **What it would take:** memory figures for every frontend and the server as part of each milestone's benches (milestone 8 step 7 first), a bound and a setting for each item above, and the compact page form.
+
 ## TD-STORE-COMPACTION
 
 * **Status:** open

@@ -60,6 +60,14 @@ Mount:
   --cache-dir DIR        keep the replica here (sealed): the node table, content,
                          pins and writes not yet sent (default: in memory)
   --cache-size BYTES     the most content to keep (default 1 GiB; pins don't count)
+
+Memory (each a bound on what zen-mount holds in RAM):
+  --dirty-size BYTES     written bytes an open file holds before they are queued
+                         as a write of their own (default 64 MiB)
+  --pending-size BYTES   bytes waiting to be written to the cache (content
+                         included) before writes and reads wait (default 32 MiB)
+  --page-memo IDS        chunk ids kept in decoded pages, about 190 B each
+                         (default 65536, about 12 MB)
   --pin PATH             keep PATH (a file, or a folder and all under it) offline;
                          repeatable, and remembered in --cache-dir
   --offline-ok           mount from --cache-dir when the server can't be reached
@@ -91,6 +99,9 @@ export interface Args {
   foreground: boolean;
   cacheDir?: string;
   cacheSize: number;
+  dirtySize?: number;
+  pendingSize?: number;
+  pageMemo?: number;
   pins: string[];
   vault?: string;
   offlineOk: boolean;
@@ -116,6 +127,9 @@ export function parse(argv: string[]): Args {
       foreground: { type: 'boolean', default: false },
       'cache-dir': { type: 'string' },
       'cache-size': { type: 'string', default: String(2 ** 30) },
+      'dirty-size': { type: 'string' },
+      'pending-size': { type: 'string' },
+      'page-memo': { type: 'string' },
       pin: { type: 'string', multiple: true, default: [] },
       vault: { type: 'string' },
       'offline-ok': { type: 'boolean', default: false },
@@ -129,9 +143,19 @@ export function parse(argv: string[]): Args {
   }
   if (!values.tree === !values['new-tree'])
     throw new Error('give exactly one of --tree and --new-tree');
+  const count = (flag: string, v: string | undefined, min: number) => {
+    if (v === undefined) return undefined;
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n < min)
+      throw new Error(`--${flag} takes a number of at least ${min}`);
+    return n;
+  };
   const cacheSize = Number(values['cache-size']);
   if (!Number.isSafeInteger(cacheSize) || cacheSize < 0)
     throw new Error('--cache-size takes a number of bytes');
+  const dirtySize = count('dirty-size', values['dirty-size'], 1);
+  const pendingSize = count('pending-size', values['pending-size'], 0);
+  const pageMemo = count('page-memo', values['page-memo'], 0);
   if (values['offline-ok'] && (!values['cache-dir'] || !values.vault))
     throw new Error('--offline-ok needs --cache-dir and --vault');
   if (values.integrity && !values['cache-dir'] && !values.vault)
@@ -155,6 +179,9 @@ export function parse(argv: string[]): Args {
     foreground: values.foreground!,
     ...(values['cache-dir'] ? { cacheDir: values['cache-dir'] } : {}),
     cacheSize,
+    ...(dirtySize !== undefined ? { dirtySize } : {}),
+    ...(pendingSize !== undefined ? { pendingSize } : {}),
+    ...(pageMemo !== undefined ? { pageMemo } : {}),
     pins: values.pin as string[],
     ...(values.vault ? { vault: values.vault } : {}),
     offlineOk: values['offline-ok']!,
@@ -347,6 +374,9 @@ async function main(): Promise<void> {
   const replica = await openReplica(ufs, treeId, {
     local: local ?? sealedStore(memoryLocalStore()),
     cacheBytes: a.cacheSize,
+    ...(a.dirtySize !== undefined ? { dirtyBytes: a.dirtySize } : {}),
+    ...(a.pendingSize !== undefined ? { pendingBytes: a.pendingSize } : {}),
+    ...(a.pageMemo !== undefined ? { pageMemoIds: a.pageMemo } : {}),
     locks: null,
     channel: null,
   });

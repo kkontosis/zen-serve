@@ -469,6 +469,92 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * **import:** 37 MiB/s of data; **export:** 108 MiB/s; a 294 MiB-allocated 1 GiB image exports to 262 MiB allocated
     * **Not resolved:** zen-mount's 1.5–1.8 GB peak RSS under this load, against the handle's 64 MiB bound. Not investigated; BLK.md says so.
     * **Not run:** `bench_ublk` (no `/dev/ublk-control` here).
+    * Pushed be9f8aa (the docs and this log).
+    * **CI green on both runs** of be9f8aa (push and pull_request): `rust`, `pure-rust`, `fdb`, `devices` and `client`; the benches and `openssh-pq` skipped as usual. PR #72 waits on review and merge (check-in set for 00:40 UTC).
+    * The check-in at 00:40 found nothing new, so check-ins stopped.
+    * **PR #72 merged.** Step 8.6 is done; "plan 8.7" waits on the user's word. These lines are only in this file; they reach `docs/MILESTONE-8.md` at the next restart from main.
+* **Step 8.6b** (zen-mount's memory): planned below ("Step 8.6b in detail").
+  * **Decided at "plan 8.7":** this session investigates and fixes zen-mount's 1.5–1.8 GB peak RSS (the user's choice), and 8.7 is planned in another session.
+  * **The user, on RAM:** RAM use is a big issue in general, so it gets noted in the docs as well. It becomes a standing rule (OPS.md §6), a TD listing the known hot spots, and a priority for 8.7's memory figures.
+  * Plan committed (15fc9d8), PR #73.
+  * **Measured** (on "go"): `bench_file_fixed` in release, with zen-mount under `NODE_OPTIONS=--require memlog.cjs` (a `memoryUsage` line every 500 ms, and heap snapshots at 700 and 1,300 MiB RSS). Peak RSS was 1,882 MiB (1,879 by the bench), with 408 writes unsent at stop. There are **two causes, at two different times:**
+    1. **At 10–13 s (mkfs and the first writes): the records' write-behind backlog.**
+       * ArrayBuffers reached 951 MB while the JS heap held 36 MB.
+       * In the 700 MiB snapshot, 492 of the 594 MiB of buffers were 7,860 records of about 64 KiB, held by the `batch` arrays of `Records.flush` in its promise chain (`store.ts`), waiting to be written one file and one fsync at a time (`nodeDiskLocalStore.put` → `writeAtomic`).
+       * Nothing makes the writer wait for the disk.
+       * Once the backlog drained, ArrayBuffers fell to about 90 MB but RSS stayed at 1.2 GB: the allocator keeps freed memory, so the peak stays as it was.
+    2. **From about 110 s (the 4 KiB dsync writes): the client's page memo.**
+       * The JS heap grew from 116 to more than 674 MB.
+       * The 1,300 MiB snapshot (taken after a full GC) holds 126 MiB live: 1.3 M objects, most of them the chunk ids of decoded pages in `Tree.pageMemo` (`tree.ts:939`). That's 5,624 separate `Uint8Array`s per v2 page, about 190 B each with headers, so about 1 MB of heap per 90 KB page.
+       * The memo keeps 256 pages by digest. Each 4 KiB fsync makes a new version with 1–2 new pages, so the memo fills with stale pages: up to about 256 MB live, and that much churn again, which V8 collects late (the rest of the 674 MB was garbage).
+       * The plan's survey figure ("the page memo, at most about 23 MB") counted raw page bytes, not decoded objects. It was about 10× low.
+    * **Ruled out by the snapshots:** the handle (bounded), the sender, eviction, fuse-native buffers, and wasm memory (25 MiB).
+    * **Not run:** the tmpfs cross-check. The retainers name the cause directly.
+  * **The fix, for approval** (cause 2 is in `@zen/client`, outside `@zen/fs` and zen-mount):
+    1. **`Records` bound** (`@zen/fs`), as planned: pending bytes (`pending` plus the batches not yet written) of at most `ReplicaOptions.pendingBytes` (32 MiB). Then `room()`, awaited by the replica's content sink and at the start of `net()` (every fetch that may cache content).
+    2. **The page memo bounded by entries, not pages** (`@zen/client` `tree.ts`): at most 65,536 chunk ids memoized (about 12 MB of objects, 11 v2 pages or 16 full v3 pages), alongside the 256-page cap. A test counts the memo's ids after reading a file of many pages, and a negative control with the old cap must fail it.
+  * **Decided:** fix both (the user's choice), and make every cap a setting.
+  * **Implemented:**
+    * **`@zen/fs` `store.ts`:** `Records` counts its backlog (the values pending and in batches not yet written), `room()` waits past `maxPending`, and a failed batch no longer stops the later ones: the chain recovers, since a stuck backlog would block `room()` forever.
+    * **`replica.ts`:**
+      * `ReplicaOptions.pendingBytes` (32 MiB) and `pageMemoIds` (passed to the tree)
+      * the content sink and `net()` await `room()`
+      * pinned content fetched in windows of 256 chunks (`FETCH_WINDOW`), each waiting for room: found by reading, since `fetchLoop` fetched a whole file's chunks in one `fetchChunks`
+      * `replica.pendingBytes` and `status().pendingBytes`
+    * **`@zen/client` `tree.ts`:** `TreeOptions.pageMemoIds` (65,536) and `pageMemoPages` (256); `memoPut` and `memoTrim` count ids; `tree.pageMemoSize`.
+    * **zen-mount:** `--dirty-size`, `--pending-size` and `--page-memo`. `dirtyBytes` had no flag before.
+  * **Tests:**
+    * **new `packages/fs/test/memory.test.ts`:** a store whose puts take 2 ms; 48 MiB written as one `writeFile` (sealed whole before it's queued, like zen-mount's first flush of a large file), then read back in 1 MiB reads on a second replica, with `pendingBytes` sampled every 5 ms.
+      * Writing peaks at 8.9 MiB (the bound of 2 MiB plus one commit's content), reading at 3.1 MiB.
+    * **`cdc.test.ts`,** "the page memo keeps at most its bounds": the defaults hold all pages, `pageMemoIds: 818` holds at most 818, `pageMemoPages: 2` holds 2, and 0 holds none.
+  * **Changes from the plan:** the write side is tested with one large write, not through a handle in 128 KiB writes. A handle's spill already awaits `rec.flush()` when it queues, so writes through a handle were bounded by `dirtyBytes` already. Without the bound, the first form of the test passed on the write side (0.007 MiB), and only its read side failed. RSS isn't asserted: the backlog is the direct measure.
+  * **Negative controls** (each run once, then restored):
+    * `room()` never waiting: the memory test fails, with 44.7 MiB pending while writing and 47.4 reading
+    * `memoTrim` with only the 256-page cap: the memo test fails (1,699 ids, bound 818)
+  * **Checks:** `npm run check`, `npm run build`; `@zen/fs` (all), client `cdc` and `mount`: 75 passed.
+  * **Re-measured (release, this container):**
+    * **`bench_file_fixed`:** peak RSS 1,879 → **426 MiB**
+      * write 7.7 MiB/s (8.7 before), cold read 21.7 (23.5), dsync 139 ms (188), untar and sync 2.85 s (0.60: writes now wait for the cache dir), stop 15.9 s, 430 writes unsent
+      * What's left at the peak (about 65 s) is about 190 MB of ArrayBuffers; a snapshot run follows.
+    * **`bench_file_cdc`:** peak RSS 1,544 → **560 MiB**
+      * write 0.8 MiB/s, dsync 2,087 ms, untar 34 s, stop 43 s, 373 unsent
+      * but the cold read fell from 10.5 to 3.0 MiB/s: reads waited for fetched content to be written to the cache dir (one file and fsync per record, many small CDC chunks)
+    * **A second fixed run with snapshots** (peak 621 MiB this time; peaks vary by run). At 380 MiB RSS, 135 MiB was live, all within the designed bounds:
+      * 52 MiB: a handle's flush holding its memory extents (`dirtyBytes`)
+      * 12 MiB: the handle's next writes
+      * 30 MiB: records waiting (`pendingBytes`)
+      * 25 MiB: wasm memory
+      * The RSS beyond that is the allocator keeping freed memory, and garbage.
+  * **Changed after the re-measure: fetched content is a cache, so it's dropped rather than waited for.**
+    * `Content`'s tree cache `put` doesn't keep anything while the backlog is past `maxPending`, unless `keeping`.
+    * Sealed content goes through `Content.keep` (always stored, and the sink waits with `room()`).
+    * `net()` no longer waits.
+    * The pinned fetch loop waits for room before each window and sets `keeping` during it, so a pin is kept whole, with at most one window past the bound per fetcher.
+    * **The memory test gained:**
+      * the reader keeps less than half the file (1.06 of 48 MiB)
+      * a third replica pins the file: it's kept whole (48.06 MiB) and pending peaks at 11.2 MiB (the bound plus one window)
+    * **Negative controls** (each run once, then restored):
+      * `room()` never waiting: fails (45.5 MiB writing)
+      * the drop off: fails (47.5 MiB reading)
+      * `keeping` not raised in the pinned loop: fails (41.2 of 48 MiB kept)
+  * **The final figures** (release, this container), in BLK.md §8:
+    * **fixed:** peak RSS **446 MiB** (1,822 before); mkfs 5.0 s, write 7.6 MiB/s, cold read 24 MiB/s, dsync 146 ms, untar 0.86 s, stop 15.9 s with 428 unsent, 1,338 MiB stored
+    * **CDC:** peak RSS **575 MiB** (1,544 before); mkfs 75 s (3.5 before), write 0.8 MiB/s, cold read 16.4 MiB/s (10.5 before, 3.0 while reads waited), dsync 2,905 ms, untar 32 s, stop 39.1 s with 314 unsent, 10,246 MiB stored
+    * **The price of the bound:** writes go at the cache disk's pace. Under CDC, the first flush of the image's gigabyte of zeros now waits for the cache dir, which is most of mkfs's 75 s. `--pending-size` trades memory back for it.
+  * **The first CDC re-run failed with ENOSPC** near its end, after 1,168 s. The test server stores about 10 GB under CDC, plus the store's overhead and the cache dir, which took more than the 20 GB free.
+    * A second run with the disk watched grew about 1 GB a minute through the write phase, as CDC re-cuts long zero runs at every edit (the periodic-content case of 8.4).
+    * `target/debug/incremental` and `deps` were deleted (no Rust change in this step), and the run finished.
+    * OPS.md §2.2 now says what the CDC bench needs (up to about 20 GB).
+  * **Docs:**
+    * spec/OPS.md §6 "Memory": the rules, the settings table, how to measure
+    * spec/TECH_DEBT.md TD-MEMORY
+    * docs/CLIENT.md §8 (the bounds, `pendingBytes`, `pageMemoIds`) and §9 (the flags)
+    * docs/BLK.md §8 (the figures, the cause and the price)
+  * **Checks:**
+    * `npm run check` and `npm run build` clean
+    * the memory test passed 4 runs, beside the controls
+    * the full `npx vitest run`: 646 passed, 15 skipped (the opt-in benches), none failed
+
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -1785,6 +1871,110 @@ The file benches found three things outside zen-ublk (see the 8.6 log). The user
 * **Negative controls:** the two above
 * **The file benches** run to completion: no refused writes in zen-mount's stderr (the bench fails on a `queued writes refused` line)
 * **CI:** green on both runs
+
+## Step 8.6b in detail: zen-mount's memory under the image workload
+
+**The problem:** in 8.6's file benches, zen-mount (fixed and CDC) peaked at 1,544–1,822 MiB RSS (`VmHWM`) while serving an ext4 image through loop. A `FileHandle` holds at most 64 MiB dirty, and the volume frontend took 62 MiB under the same workload. Nobody looked into why.
+
+**The intended outcome:**
+* the cause found by measurement, not guessed
+* fixed in `@zen/fs` or zen-mount (or the client's local store, if that's where it is), with a test and a negative control
+* the figure re-measured
+* RAM recorded as a first-class cost in the docs (the user's note)
+
+### Survey (read so far)
+
+* **The handle has backpressure:** `write` and `truncate` await the current flush (`handle.ts:150–224`). Past the bound, `spill` awaits a flush, so the kernel's writes wait. So the handle alone can't hold more than about 64 MiB plus one flush.
+* **The sender is bounded:** `Sender.upload` (`sender.ts:207`) reads one put at a time from the records and sends at most `max_commit_bytes` (8 MB) at once.
+* **The records' write-behind has no backpressure. This is the first suspect.**
+  * `Records.put` (`store.ts`) adds to `pending` and schedules a flush every 100 ms.
+  * `flush()` moves the batch into a promise chain (`this.flushing.then(…)`), which writes its records one at a time.
+  * zen-mount's cache dir is `nodeDiskLocalStore`, whose `put` is `writeAtomic`: a temp file, `writeFile`, `fsync`, `close` and a rename, per record.
+  * Each sealed chunk costs one content record plus an `lru` use record (`Content.use`), and reads add `lru` records too.
+  * If records arrive faster than one fsync each can drain them, the batches wait in the chain with their values, so memory grows with the backlog. Nothing makes a handle's flush or the kernel wait for it.
+  * The sealed store adds a copy per value (AES-GCM through WebCrypto).
+  * The 447 writes left unsent at stop show the queue was far behind, which fits.
+* **Other candidates, to be ruled in or out by the measurement:**
+  * eviction: `Content.evict` lists every `lru` record, reading each file, at every `cacheBytes / 16` added
+  * the client's page memo (256 pages, at most about 23 MB)
+  * wasm linear memory, which never shrinks
+  * fuse-native's write buffers, plus the handle's copy of each
+  * the sender's in-flight record (`Inflight.pending`, the batch's ops as JSON)
+  * the overlay and the queue entries in memory
+
+### 1. Measure (no repo change)
+
+**The run:** `bench_file_fixed` (the 1,822 MiB case, about 4 min in release), with zen-mount started through `NODE_OPTIONS`. The bench runs `node CLI`, and `Command` passes the environment through, so nothing in the repo changes for the profiling.
+* `--require $SCRATCH/memlog.cjs`: a preload that writes `process.memoryUsage()` (`rss`, `heapUsed`, `external`, `arrayBuffers`) every 500 ms to a log under `target/`
+* `--heapsnapshot-signal=SIGUSR2`: the bench's runner script sends it at about 1 GB RSS and again near the peak
+* `--max-old-space-size` left alone
+
+**Splitting the bytes:**
+* **JS heap against ArrayBuffers** (`external` and `arrayBuffers`) against the rest (wasm memory, native).
+* **Retainers:** a small script in the scratchpad parses the `.heapsnapshot` (nodes, edges and the retainer path of the largest ArrayBuffer and Uint8Array owners, summed by path). It gives the top retainers by retained size.
+  * If they're `Records.pending` or the closures in the `flushing` chain, the first suspect is confirmed.
+* **A cross-check:** the same run with the cache dir on tmpfs. Fsyncs then cost nothing, so a backlog peak would drop sharply if write-behind is the cause.
+
+**What gets logged:** the breakdown, the top 5 retainers, and the tmpfs figure, all in this log. The fix's design goes here before any code, and the code waits for the user's "go".
+
+### 2. Fix (the likely shape, if the write-behind is confirmed)
+
+* **`Records` gets a bound on what's pending:** bytes waiting to be written, counted over `pending` and the batches in the chain. The default is 32 MiB, and `ReplicaOptions.pendingBytes` overrides it.
+* **Callers wait once past it:** a new `Records.room(): Promise<void>` resolves once the backlog is under the bound. Puts stay synchronous, since many call sites rely on that.
+  * Content sealing awaits it (the sinks in `sealWrite`/`sealEdit`, and the client cache's `put` via `Content`), so a handle's flush slows to what the disk takes.
+  * The kernel's writes then wait through the handle's existing backpressure.
+* **Fewer fsyncs, if the measurement shows they're the bottleneck:**
+  * The `lru` use records are coalesced: one per id per flush (already true through the `pending` map). Hits on content that was just written don't rewrite its record within a few seconds.
+  * `nodeDiskLocalStore` gets a way to write a batch with one directory fsync rather than one fsync per file? That's a change in `@zen/client`'s local store. It's considered only if the bound alone leaves throughput too low, and if so it's described here first.
+* **If the cause is something else** (eviction, wasm, fuse-native): the fix is designed here from the retainers, under the same rule. If it's local to `@zen/fs` or zen-mount, fix it; otherwise investigate further before deciding.
+
+### 3. Tests
+
+* **New `packages/fs/test/memory.test.ts`** (or a case in `handles.test.ts`):
+  * a replica over a deliberately slow store: a `LocalStore` wrapper whose `put` takes 5 ms
+  * 256 MiB written through one handle in 128 KiB writes
+  * the replica's pending bytes (a getter for tests) never pass the bound plus one record
+  * RSS growth past the middle stays bounded, as the handles test measures it (quarter medians, `gc()` exposed)
+  * the file reads back whole on another replica
+* **Negative control:** with the bound off (`pendingBytes` Infinity), the test fails: pending grows to most of the file, and RSS grows linearly.
+* **The existing suites:** `@zen/fs` (all), client `cdc` and `mount`, then the full `npx vitest run`.
+
+### 4. Re-measure and document
+
+* **The re-runs:** `bench_file_fixed` and `bench_file_cdc`, with peak RSS, throughput (the bound may slow writes to the disk's pace), stop time and unsent writes.
+* **BLK.md §8:** the table updated, the "not investigated" line replaced with the cause and the fix.
+* **RAM as a first-class cost (the user's note), in the docs:**
+  * **spec/OPS.md, a new §6 "Memory":**
+    * Every buffer, queue, cache and backlog has a bound and a figure.
+    * Producers wait on slow consumers, never buffer for them.
+    * How to measure: `VmHWM`, the `memoryUsage` split, heap snapshots via `NODE_OPTIONS`, and the retainer script's method.
+    * What never shrinks (wasm memory).
+  * **spec/TECH_DEBT.md, new TD-MEMORY:**
+    * the known hot spots and their bounds: the handle (64 MiB), the records' backlog (new), the page memo, wasm memory, the server's commit buffers, and the Loro kept state (a whole snapshot in memory)
+    * those not yet measured
+    * kept open as a standing list
+  * **docs/MILESTONE-8.md:** 8.7's memory figures for the replica, zen-mount and the server become a required part of 8.7, not an extra.
+* **The log** in both copies.
+
+### Branch, PR and commits
+
+* **On approval:**
+  1. restart from main (e4b11ca)
+  2. `cp` this file to `docs/MILESTONE-8.md` (bringing in the 8.6 log lines)
+  3. commit `docs: milestone 8 step 6b plan (zen-mount's memory)`
+  4. push and open the PR
+  5. run step 1, the measurement, right away: it changes nothing in the repo, and its findings go in the log
+* **On "go":** the fix, tests and docs:
+  * `fs: bound the replica's pending records (zen-mount's memory)`
+  * `docs: memory (milestone 8 step 6b)`
+
+### Verification
+
+* `npm run check`, `npm run build`
+* the new test 3×, with the negative control run once
+* the `@zen/fs` suites, client `cdc`, `mount`, and the full vitest run
+* **The benches:** `bench_file_fixed` and `bench_file_cdc` in release, as root. Clear the bench temp dirs between runs, and keep logs and snapshots under `target/` (snapshots can be GBs: delete them after analysis).
+* **CI:** green on both runs.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.

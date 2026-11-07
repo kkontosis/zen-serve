@@ -149,18 +149,18 @@ On the 4-core development machine, FUSE + loop measured 18–25 MiB/s, 113–140
 
 ## 8. Files or volumes
 
-The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [zen-mount](CLIENT.md#9-zen-mount) mounts the tree, and a loop device runs on the image file in it. The same ext4 workload on both (`tests/devices.rs`, `bench_fuse`, `bench_file_cdc`, `bench_file_fixed`; release build, an embedded server in the test process, the development container: 4 cores, loopback, one run each):
+The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [zen-mount](CLIENT.md#9-zen-mount) mounts the tree, and a loop device runs on the image file in it. The same ext4 workload on both (`tests/devices.rs`, `bench_fuse`, `bench_file_cdc`, `bench_file_fixed`; release build, an embedded server in the test process, the development container: 4 cores, loopback, one run each; the file columns after milestone 8 step 6b's memory bounds):
 
 | ext4 on a 1 GiB image | volume (FUSE + loop) | file, fixed chunks | file, CDC |
 |---|---|---|---|
-| `mkfs.ext4` | 0.10 s | 3.8 s | 3.5 s |
-| Write 256 MiB, `conv=fsync` | 25.6 MiB/s | 9.6 MiB/s | 0.7 MiB/s |
-| Read 256 MiB, cold | 149 MiB/s | 45 MiB/s | 10.5 MiB/s |
-| A synchronous 4 KiB write (`oflag=dsync`) | 8.3 ms | 126 ms | 2,172 ms |
-| Untar 245 files (4.6 MiB), then `sync` | 0.21 s | 0.96 s | 30 s |
-| The daemon's stop | 0.02 s | 14.5 s, 447 writes left unsent | 36.8 s, 402 writes left unsent |
-| Its peak RSS | 62 MiB | 1,822 MiB | 1,544 MiB |
-| Stored on the server at the stop | 279 MiB | 1,333 MiB | 8,182 MiB |
+| `mkfs.ext4` | 0.10 s | 5.0 s | 75 s |
+| Write 256 MiB, `conv=fsync` | 25.6 MiB/s | 7.6 MiB/s | 0.8 MiB/s |
+| Read 256 MiB, cold | 149 MiB/s | 24 MiB/s | 16.4 MiB/s |
+| A synchronous 4 KiB write (`oflag=dsync`) | 8.3 ms | 146 ms | 2,905 ms |
+| Untar 245 files (4.6 MiB), then `sync` | 0.21 s | 0.86 s | 32 s |
+| The daemon's stop | 0.02 s | 15.9 s, 428 writes left unsent | 39.1 s, 314 writes left unsent |
+| Its peak RSS | 62 MiB | 446 MiB (426–621 over three runs; 1,822 before step 6b) | 575 MiB (560 in another run; 1,544 before) |
+| Stored on the server at the stop | 279 MiB | 1,338 MiB | 10,246 MiB |
 
 **What makes the file slower:**
 * **An fsync is a version.** The loop device passes ext4's barriers on as `fsync` on the file, and each is a flush of zen-mount's handle: an edit of the 1 GiB file, sealing the pages and chunks around what changed into a new version (CLIENT.md §8). A volume flushes the dirty blocks and the top of its tree.
@@ -168,7 +168,15 @@ The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [
 * **The image's zeros are content.** zen-fs files have no holes (TD-FS-SPARSE), so `truncate -s 1G` seals and uploads a gigabyte of zeros at the first flush. A volume stores only blocks written.
 * **Superseded versions stay until their grace passes** (a day by default), so the server holds every flushed version's new chunks until then: the stored column above. A volume overwrites blocks in place.
 * **The queue lags.** zen-mount's fsync is durable on the device (`--cache-dir`) and sent later (CLIENT.md §9). Under this load it fell behind: at the stop, 400 to 450 writes were still queued (kept for the next mount, as zen-mount does after its 10 s wait). A volume's fsync returns once the server has the blocks.
-* **Memory** peaked at 1.5–1.8 GB in zen-mount, against the handle's 64 MiB bound for written data (which the replica's own test holds, at 128 MiB through one handle). Where the rest goes under this load isn't known yet.
+* **Memory** (spec/OPS.md §6):
+  * **Before milestone 8 step 6b,** zen-mount peaked at 1.5–1.9 GB under this load, for two reasons:
+    * The replica writes its records to the cache dir behind, one file and fsync each, and nothing waited for it, so up to 951 MB of sealed content queued in memory.
+    * The client's page memo kept up to 256 decoded pages. Each is about 1 MB of small objects, and every fsync made new ones.
+  * **Now both are bounded:**
+    * Sealing waits once 32 MiB of records are waiting (`--pending-size`), and content fetched for reads isn't kept past that.
+    * The memo keeps 65,536 chunk ids, about 12 MB (`--page-memo`).
+    * What's live at the peak is the handle's written data (up to `--dirty-size`, 64 MiB), the records waiting, and wasm memory. The RSS beyond that is the allocator keeping what it freed.
+  * **The price:** writes now go at the cache disk's pace. Under CDC the first flush of the image's gigabyte of zeros takes most of `mkfs`'s 75 s (3.5 s before, when it went to memory), and a 4 KiB synchronous write takes 2.9 s instead of 2.2. A larger `--pending-size` trades memory back for that.
 
 **Which to use:**
 * **A volume** to run a filesystem: fsync means the server has it, reads are checked per block against a Merkle root, the root's freshness rides in checkpoints, and one writer at a time holds a fenced lease. It has a fixed size and no history yet (TD-BLK-SNAPSHOTS).
