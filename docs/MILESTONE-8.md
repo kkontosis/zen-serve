@@ -554,6 +554,19 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * `npm run check` and `npm run build` clean
     * the memory test passed 4 runs, beside the controls
     * the full `npx vitest run`: 646 passed, 15 skipped (the opt-in benches), none failed
+  * Pushed 2491d86 (the fix) and 95d303b (the docs); PR #73 retitled to cover the implementation.
+  * **CI green on both runs** of 95d303b (push and pull_request). PR #73 waits on review and merge; a check-in is set for 15:22 UTC.
+  * These two lines are only in this file; they reach `docs/MILESTONE-8.md` at the next restart from main.
+  * The check-in at 15:22 found nothing new, so check-ins stopped.
+  * **PR #73 merged.** Step 8.6b is done.
+  * **Next:** "plan 8.7", in another session (the user's word). 8.7's memory figures (the replica, zen-mount, the server) are required, per OPS.md §6 and TD-MEMORY.
+* **Step 8.7** (benches, docs, outcome): planned below ("Step 8.7 in detail").
+  * **First:**
+    1. restart from main (57b052e)
+    2. `cp` this file to `docs/MILESTONE-8.md` (bringing in the 8.6b log lines)
+    3. commit `docs: milestone 8 step 7 plan`
+    4. push and open the PR
+  * Then implement on "go".
 
 
 ## Steps (one PR each; each planned in detail before it starts)
@@ -1975,6 +1988,181 @@ The file benches found three things outside zen-ublk (see the 8.6 log). The user
 * the `@zen/fs` suites, client `cdc`, `mount`, and the full vitest run
 * **The benches:** `bench_file_fixed` and `bench_file_cdc` in release, as root. Clear the bench temp dirs between runs, and keep logs and snapshots under `target/` (snapshots can be GBs: delete them after analysis).
 * **CI:** green on both runs.
+
+## Step 8.7 in detail: benches, docs, outcome
+
+Step 8.7 is the milestone's last step. It measures what 8.1–8.6b built, at multi-GiB sizes. Memory is part of every figure, as OPS.md §6 and TD-MEMORY require: the client, the replica, zen-mount and the server. Then it writes the docs and the Outcome.
+
+There's no format change and no `spec:` commit. The code is the benches and a CI job, plus whatever the benches find wrong. A small, local fix goes in with a test and a negative control. Anything larger goes to the user first.
+
+**Survey:**
+* **The harness** (`packages/client/src/testing/server.ts`):
+  * `spawnServer`/`world()` give `pid` (for `/proc/PID/status`), `dataDir`, `limits`, and `extra` TOML. A `[storage]` table with `backend = "fdb"` and `cluster_file` selects FoundationDB.
+  * `ZEN_SERVE_BIN` picks the release binary.
+* **vitest uses `pool: 'forks'`,** so each file runs in its own process, and `/proc/self/status` `VmHWM` is that bench's alone.
+* **The opt-in bench pattern** (`integritybench.test.ts`, `loro/test/bench.test.ts`): `describe.skipIf(!process.env.ZEN_BENCH)`, and markdown table lines printed at the end. 8.0's 256 MiB probe wasn't committed.
+* **What gets measured:**
+  * `Tree.writeFile`/`upload` (`session`, `parallel`, `onProgress`, `resume`), `readStream` (`readAhead`), `read`, `edit`, `append`, `uploads`
+  * `@zen/fs`: `openReplica`, `FileHandle`, `status()` (`pendingBytes`, `cacheBytes`), `sealedStore(nodeDiskLocalStore(dir))` (zen-mount's store)
+  * zen-mount: `packages/fuse/dist/cli.js`, run as `mount.test.ts` runs it
+* **The TS client has no quota read,** so stored bytes are the data dir's size on disk after a sweep (`du`), beside the logical figure computed from the formats.
+* **CI:** `devices-bench` (`workflow_dispatch` only) is the template. No TS bench job exists.
+* **Here:** 27 GB of disk free, no FoundationDB installed (`scripts/install-fdb.sh`). STATS has §1–§6, so §7 is new.
+
+### 1. The client bench (`packages/client/test/largebench.test.ts`, new)
+
+**Running it:**
+* Started with `ZEN_BENCH=1 ZEN_SERVE_BIN=target/release/zen-serve npx vitest run packages/client/test/largebench.test.ts`.
+* The size is `ZEN_BENCH_GIB` (4 by default).
+* Before anything else it checks free disk under the temp dir. It refuses to start below 3 × the size, naming what it needs (8.6b's ENOSPC).
+
+**The source:**
+* AES-128-CTR keystream over zeros (`node:crypto`). It's random-looking, so it's not periodic and CDC resyncs, and it's fast.
+* It's seekable (counter = offset / 16), so a resume can restart the source at any offset.
+* Read-backs compare SHA-256 computed while streaming. No file is kept on disk.
+
+**The world:**
+* The release server with `chunk_grace_secs` 5 and `sweep_interval_secs` 1, so superseded content goes quickly and a resume happens past the grace.
+* One world per form: CDC (the default), then `fixed` (`setPolicy`). Each is stopped and its data deleted before the next.
+
+**Per form:**
+1. **Write:** `writeFile(…, {session: true})` from the stream.
+   * MiB/s and commits
+   * the last `UploadState`'s JSON size (it should stay compact)
+   * the client's peak RSS, and its `memoryUsage` split (sampled every 200 ms)
+   * the server's `VmHWM`
+   * stored bytes after a sweep
+2. **Cold read:** `readStream` of the whole file at `readAhead` 3, and again at 1, in MiB/s, with the hash checked.
+3. **Random reads:** 1,000 reads of 4 KiB at random offsets, median and p99 ms. First on a fresh `Tree` (cold page memo), then again (warm).
+4. **Append** 1 MiB (`tree.append`): ms, plus pages and chunks fetched and sent, counted through `session.call`, as `cdc.test.ts` counts them.
+5. **Edits:**
+   * **A 4 KiB overwrite and a 100-byte insertion at the middle** (`tree.edit`), counted the same way.
+   * **Fixed form:** the insertion shifts every later block, so it's measured on a separate 1 GiB file to bound the time. The docs say why CDC is the default.
+6. **Resume:**
+   1. A second file's source throws at half the size.
+   2. Wait 2 × the grace, with sweeps running.
+   3. Resume from the last reported state. It sends only the rest (the bytes counted), and the file reads back.
+   4. **Without a session:** the same at 64 MiB fails, showing what the session buys.
+7. **Pipelining:** a 1 GiB write at `parallel` 1 and at 3.
+
+**Once (in the CDC world):**
+8. **The server under many writers:** 16 clients, each with its own session, write size / 16 each at once. Aggregate MiB/s, and zen-serve's `VmHWM` (TD-MEMORY's open server figure).
+9. **The chunker at the defaults:**
+   * wasm `Chunker.push` in MiB/s
+   * the mean chunk length, giving CDC capacity at the defaults and in the half-full worst case of the fill rule
+   * **the resync distribution:** 1,000 random insertions of 1–100 bytes into 4 MiB random buffers, with a histogram of chunks changed, counted exactly as in `cdc.test.ts` (8.3's figures were at small parameters)
+
+**FoundationDB:**
+* `ZEN_BENCH_BACKEND=fdb` with `ZEN_BENCH_CLUSTER_FILE` adds the `[storage]` table.
+* Locally: run at 1 GiB, CDC only, with a release `--features fdb` server and a cluster from `install-fdb.sh` and `zen-serve init` (OPS §3).
+* If the cluster doesn't fit the disk, the log says so.
+
+**Output:** a table per form and backend, printed at the end.
+
+### 2. The replica bench (`packages/fs/test/bench.test.ts`, new)
+
+**The setup:**
+* The replica runs over `sealedStore(nodeDiskLocalStore(tmp))`, as zen-mount runs it, with the defaults: `dirtyBytes` 64 MiB, `pendingBytes` 32 MiB, `cacheBytes` 1 GiB, CDC.
+* The size is `ZEN_BENCH_GIB`.
+* The same source and disk check as the client bench.
+
+**What it measures:**
+1. **Write:** one `FileHandle`, 1 MiB writes, then close.
+   * MiB/s until the last write is queued, then the time until the queue drains (`idle()`), in MiB/s
+   * sampled every 50 ms: the peaks of RSS, `heapUsed`, `arrayBuffers`, `dirtyBytes` and `pendingBytes`
+   * the cache dir's size at its peak, since queued content stays local until sent
+2. **Edit:** a 1-byte overwrite at the middle through a handle. The flush time, plus pages and chunks sent.
+3. **Cold read:** on a second replica with a fresh cache dir, in 1 MiB reads. MiB/s, peak RSS, and `cacheBytes` kept at the end.
+4. **Pin:** a third replica pins the file. MiB/s and peak `pendingBytes`.
+
+### 3. The zen-mount bench (`packages/fuse/test/bench.test.ts`, new)
+
+* **Setup:** `ZEN_BENCH=1`, and FUSE available (`canMount`). zen-mount runs as a child, as `mount.test.ts` runs it, with `--cache-dir` and the defaults.
+* **Write:** the test writes a file of the size into the mount in 1 MiB writes, then fsyncs and closes it. It reports MiB/s, zen-mount's `VmHWM` (read before the stop), and the stop time (the drain).
+* **Read:** remount with a fresh cache dir and read the file back, hashed, in MiB/s, with `VmHWM`.
+* **Edit:** a 1-byte `pwrite` at the middle plus `fsync`, in ms.
+* 8.6b's image benches (BLK.md §8) cover zen-mount's other workload. These add a large single file.
+
+### 4. Loro (one case in `packages/loro/test/bench.test.ts`)
+
+* A document whose snapshot is about 16 MiB: the compaction to a file, and a load from it.
+* In ms, beside the inline figures.
+
+### 5. CI: a `files-bench` job, started by hand
+
+* **The trigger:** `workflow_dispatch` gains an input `files_gib` (default 16). The job runs only on dispatch, as `devices-bench` does.
+* **Disk:**
+  * It frees runner disk (`/usr/share/dotnet`, `/usr/local/lib/android`, `/opt/ghc`, the CodeQL cache) and prints `df`.
+  * It sets `TMPDIR` to the larger of `/` and `/mnt`, so the servers' data goes there.
+* **Build:** the release zen-server, the wasm, `npm ci`, `npm run build`, and FUSE (`fuse3`).
+* **Runs:**
+  * the client bench at `files_gib`
+  * the replica and zen-mount benches at 4 GiB, to bound the time
+  * `timeout-minutes: 150`
+* **Not gating:** it measures. It's started once on this PR's branch (`actions_run_trigger`), and its figures go in STATS with the runner named.
+
+### 6. Docs
+
+* **docs/STATS.md:**
+  * **§1.1:**
+    * rows for CDC content: per chunk at the measured mean, 20 B in a page, 56 B per page reference
+    * an upload session: its records, plus one `ur` key per chunk and page while it's open
+  * **§1.3:**
+    * CDC capacity, measured (the mean chunk, the fill rule's worst case)
+    * the v3 inline limit
+    * that fixed keeps 640 GiB, and when the writer picks it
+  * **§2:** a row for editing a large file (CDC: the touched pages; fixed: an insertion costs the rest of the file).
+  * **New §7, "Large files"** (measured):
+    * throughput: write, read, random reads, append, edits, resume and pipelining, for CDC and fixed, embedded and FDB, here and on the runner
+    * reuse after inserts: the resync distribution, plus periodic content and long zero runs (8.4, 8.6b)
+    * memory: the client, the replica, zen-mount and the server under 16 writers
+    * sessions: overhead and sweep rounds
+    * the Loro file snapshot
+* **spec/OPS.md:**
+  * **§2.1:** open upload sessions hold storage until they're closed or expire (7 days by default, at most 30), at most 64 per user and fs. A user removed from the ACL keeps theirs until they expire.
+  * **§2.2:** the large-file benches' disk needs.
+  * **A new §7, "Large-file pitfalls":**
+    * a cross-backend `migrate` or `import` changes the version scale, so upload sessions and leases may read as expired, and uploads start over (8.4's note)
+    * CDC re-cuts periodic content and long zero runs after a length-changing edit, so use `fixed` for disk images and sparse-heavy files (TD-FS-SPARSE)
+    * a whole rewrite without index records reads the file once
+    * zen-mount's fsync is durable on the device, not on the server
+  * **§6:** the measured figures linked from STATS §7.
+* **spec/TECH_DEBT.md:**
+  * TD-FS-LARGE-FILES fully resolved (its status names the 8.x commits)
+  * new TD-FS-CDC-HUGE: two-level pages for CDC files past the v3 capacity
+  * TD-MEMORY: the measured figures, with the server's no longer "no figure"
+  * a check that TD-FUSE-INTEGRITY and TD-LORO-LARGE-SNAPSHOT read as resolved
+* **docs/CLIENT.md §8–§9:** the figures linked, and what to set for large files (`parallel`, `readAhead`, sessions, `chunking`).
+* **docs/BLK.md §8 and docs/DB.md §20:** a link each to STATS §7.
+* **The milestone closes:**
+  * README: "Milestone 8: done"
+  * DESIGN-3 §6 item 8: "Done"
+  * `docs/MILESTONE-8.md`: the log, and an **Outcome** in milestone 6's form (what was built, the differences from the plan, tests, measurements)
+
+### Commits
+
+1. `test: large-file benches (milestone 8 step 7)`: the three bench files, the Loro case, and ci.yml
+2. any fix a bench finds, as its own commit with its test and control
+3. `docs: large files measured, and the milestone 8 outcome`
+
+### Verification
+
+* **Checks:** `npm run check` and `npm run build`. The full `npx vitest run` without `ZEN_BENCH` gives 646 passed and the skipped count up by the new benches, none failed.
+* **The benches,** each once here:
+  * client, replica and zen-mount at 4 GiB, embedded, with `target/debug` pruned first for the release build
+  * the client bench at 1 GiB on local FDB
+  * a run's temp dirs deleted after it (only this session's, checked not mounted)
+* **CI:** `files-bench` once, at 16 GiB.
+* **The benches' own checks:** hashes equal, the resume sends only the rest, an edit's counts.
+  * **Negative control:** a resume from an offset one byte off must fail the bench at its hash check.
+* **CI green on both runs** (push and pull_request).
+
+**Defaults chosen (overridable):**
+* **Sizes:** 4 GiB here (the disk), 16 GiB on the runner. FDB here at 1 GiB, CDC only.
+* **A 5 s grace in the bench worlds,** so superseded content goes and each resume runs past the grace with only a session keeping it.
+* **The fixed form's insertion on a 1 GiB file.**
+* **The CI job measures and doesn't gate.**
+* **Fixes the benches find:** small and local ones go in this PR with a test; anything larger goes to the user.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
