@@ -102,8 +102,7 @@ describe('the memory bound', () => {
     let peak = 0;
     let dirty = 0;
     let spills = 0;
-    let half = 0;
-    let late = 0;
+    const samples: number[] = [];
     const h = await r.open('/big.bin', 'w');
     const sum = createHash('sha256');
     const W = 128 << 10;
@@ -119,17 +118,21 @@ describe('the memory bound', () => {
       gc();
       const rss = process.memoryUsage().rss - rss0;
       peak = Math.max(peak, rss);
-      // Fixed costs (wasm memory, caches, the HTTP client) come first; what
-      // grows with the file shows as growth past the middle.
-      if (i === 512) half = rss;
-      if (i >= 512) late = Math.max(late, rss - half);
+      samples.push(rss);
     }
+    // Fixed costs (wasm memory, caches, the HTTP client) come first; what
+    // grows with the file shows as a trend: the last quarter's samples
+    // against the second quarter's, by their medians (one noisy sample on
+    // either side moves neither).
+    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[xs.length >> 1]!;
+    const q = samples.length / 4;
+    const late = median(samples.slice(3 * q)) - median(samples.slice(q, 2 * q));
     await h.close({ wait: true });
     await r.flush();
     expect(dirty).toBeLessThanOrEqual((4 << 20) + W);
     const mib = (x: number) => (x / 2 ** 20).toFixed(1);
     console.log(
-      `handles: RSS growth ${mib(peak)} MiB, ${mib(late)} past the middle; ${spills} spills`,
+      `handles: RSS growth ${mib(peak)} MiB, ${mib(late)} from the second quarter to the last; ${spills} spills`,
     );
     expect(peak).toBeLessThan(160 << 20);
     expect(late).toBeLessThan(32 << 20);

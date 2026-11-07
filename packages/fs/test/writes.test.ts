@@ -561,4 +561,32 @@ describe('eviction', () => {
     await r.flush();
     expect(await (await seen()).readFile('/big')).toEqual(data);
   });
+
+  it('keeps what is sealed and queued while it runs, with seals going on at once', async () => {
+    // Offline, so queued content outgrows the cache and every eviction
+    // has to evict all it may.
+    const { r, net, seen } = await setup({ cacheBytes: 1000, dirtyBytes: 3 * CS });
+    const refused: unknown[] = [];
+    r.onError((e) => refused.push(e));
+    net.down = true;
+    const a = blob(120 * CS, 5);
+    const b = blob(25 * CS, 6);
+    const h = await r.open('/a', 'w');
+    // A handle spilling every few writes, and another file's writes, at once.
+    const spills = (async () => {
+      for (let i = 0; i < a.length; i += CS) await h.write(a.subarray(i, i + CS), i);
+      await h.close();
+    })();
+    const others = (async () => {
+      for (let k = 1; k <= 25; k++) await r.writeFile('/b', b.subarray(0, k * CS));
+    })();
+    await Promise.all([spills, others]);
+    await r.evict();
+    net.down = false;
+    await r.flush();
+    expect(refused).toEqual([]);
+    const v = await seen();
+    expect(bytes.equal(await v.readFile('/a'), a)).toBe(true);
+    expect(bytes.equal(await v.readFile('/b'), b)).toBe(true);
+  });
 });

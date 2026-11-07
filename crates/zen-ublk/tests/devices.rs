@@ -836,6 +836,8 @@ process.exit(0);
 
 /// Set when zen-mount reports a refused queued write.
 static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The writes zen-mount left unsent when it stopped.
+static UNSENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Start zen-mount on a new tree at `dir`, with its replica in the temp
 /// dir; wait until it has mounted.
@@ -868,6 +870,15 @@ fn zen_mount(w: &World, dir: &Path) -> Daemon {
             if l.contains("queued writes refused") {
                 REFUSED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            // "zen-mount: N write(s) not sent yet; kept in …": its stop
+            // waits 10 s for the queue, then leaves the rest for the next mount.
+            if let Some(n) = l
+                .strip_prefix("zen-mount: ")
+                .and_then(|r| r.split_once(" write(s) not sent yet"))
+                .and_then(|(n, _)| n.parse().ok())
+            {
+                UNSENT.store(n, std::sync::atomic::Ordering::SeqCst);
+            }
             eprintln!("[zen-mount] {l}");
         }
     });
@@ -899,6 +910,10 @@ async fn bench_file(chunking: &str) {
     );
     detach(&dev, &mut c);
     report(&w, "file", d).await;
+    println!(
+        "  file: writes left unsent at stop {:>8}",
+        UNSENT.load(std::sync::atomic::Ordering::SeqCst)
+    );
     gone.mounts.clear();
     assert!(
         !REFUSED.load(std::sync::atomic::Ordering::SeqCst),

@@ -147,15 +147,45 @@ On the 4-core development machine, FUSE + loop measured 18–25 MiB/s, 113–140
 * **`--batch-blocks`** (default 256, 1 MiB) is a commit's size and the buffered blocks that force a flush. Larger batches commit less often (each commit rewrites the top of the tree and the root record), but a flush then waits for a larger commit, and the daemon holds more unflushed data. A commit's blocks are also capped by the server's limits, budgeting a full path of new nodes per block: with the default `max_commit_bytes` (8 MB), about 420 blocks at depth 3 (volumes up to 8 GiB) and 340 at depth 4.
 * **`--idle-flush-ms`** (default 5,000) bounds how long written data waits in the daemon when nothing flushes it. ext4 flushes on its own every 5 s (`commit=5`) and on every `fsync`, so this matters mostly for direct writes to the FUSE file. Lower it for a disk that's written rarely and must lose little; `0` leaves flushing to the filesystem.
 
-## 8. Limits
+## 8. Files or volumes
+
+The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [zen-mount](CLIENT.md#9-zen-mount) mounts the tree, and a loop device runs on the image file in it. The same ext4 workload on both (`tests/devices.rs`, `bench_fuse`, `bench_file_cdc`, `bench_file_fixed`; release build, an embedded server in the test process, the development container: 4 cores, loopback, one run each):
+
+| ext4 on a 1 GiB image | volume (FUSE + loop) | file, fixed chunks | file, CDC |
+|---|---|---|---|
+| `mkfs.ext4` | 0.10 s | 3.8 s | 3.5 s |
+| Write 256 MiB, `conv=fsync` | 25.6 MiB/s | 9.6 MiB/s | 0.7 MiB/s |
+| Read 256 MiB, cold | 149 MiB/s | 45 MiB/s | 10.5 MiB/s |
+| A synchronous 4 KiB write (`oflag=dsync`) | 8.3 ms | 126 ms | 2,172 ms |
+| Untar 245 files (4.6 MiB), then `sync` | 0.21 s | 0.96 s | 30 s |
+| The daemon's stop | 0.02 s | 14.5 s, 447 writes left unsent | 36.8 s, 402 writes left unsent |
+| Its peak RSS | 62 MiB | 1,822 MiB | 1,544 MiB |
+| Stored on the server at the stop | 279 MiB | 1,333 MiB | 8,182 MiB |
+
+**What makes the file slower:**
+* **An fsync is a version.** The loop device passes ext4's barriers on as `fsync` on the file, and each is a flush of zen-mount's handle: an edit of the 1 GiB file, sealing the pages and chunks around what changed into a new version (CLIENT.md §8). A volume flushes the dirty blocks and the top of its tree.
+* **Under CDC an edit re-cuts its neighbourhood:** about 3 chunks of ~32 KiB and their pages for a 4 KiB write, until the cuts resync. Fixed chunks cost one chunk. The figures above show it by an order of magnitude, so **an image file wants `chunking: fixed`** (`fs.setPolicy`, or a tree of its own in an fs with that policy).
+* **The image's zeros are content.** zen-fs files have no holes (TD-FS-SPARSE), so `truncate -s 1G` seals and uploads a gigabyte of zeros at the first flush. A volume stores only blocks written.
+* **Superseded versions stay until their grace passes** (a day by default), so the server holds every flushed version's new chunks until then: the stored column above. A volume overwrites blocks in place.
+* **The queue lags.** zen-mount's fsync is durable on the device (`--cache-dir`) and sent later (CLIENT.md §9). Under this load it fell behind: at the stop, 400 to 450 writes were still queued (kept for the next mount, as zen-mount does after its 10 s wait). A volume's fsync returns once the server has the blocks.
+* **Memory** peaked at 1.5–1.8 GB in zen-mount, against the handle's 64 MiB bound for written data (which the replica's own test holds, at 128 MiB through one handle). Where the rest goes under this load isn't known yet.
+
+**Which to use:**
+* **A volume** to run a filesystem: fsync means the server has it, reads are checked per block against a Merkle root, the root's freshness rides in checkpoints, and one writer at a time holds a fenced lease. It has a fixed size and no history yet (TD-BLK-SNAPSHOTS).
+* **A file** to keep or carry an image rather than run on it: any zen-fs client can read it, it works offline, its versions are history until collected, and identical chunks are shared with other files of the fs. Write it whole (`writeFile`, or `cp` into a zen-mount), under `chunking: fixed`, not through a loop device. Two devices writing it at once leave siblings (no lease).
+* **To move between them:** `export` a volume to a raw image and copy it into zen-fs, or take an image out of zen-fs and `import` it (§2). Snapshots of volumes kept as zen-fs files are TD-BLK-SNAPSHOT-FILES.
+
+`import` and `export` (`bench_image`): a 1 GiB ext4 image with 294 MiB allocated (the source tree and 256 MiB of random data) imports in 8.0 s (37 MiB/s of data) and exports in 2.7 s (108 MiB/s), to a file with 262 MiB allocated; the volume stores 271 MiB.
+
+## 9. Limits
 
 * **One writer per volume.** Others can export it read-only.
 * **A fixed size,** set at creation. No snapshots, clones or deletion yet (TD-BLK-SNAPSHOTS).
-* **Read-only exports read one root.** When the writer moves it, reads that need the new root fail with `EIO` (`volume_changed`); restart the export (pinned snapshots: TD-BLK-SNAPSHOTS).
+* **Read-only exports read one root.** When the writer moves it, reads that need the new root fail with `EIO` (`volume_changed`); restart the export (pinned snapshots: TD-BLK-SNAPSHOTS). The same holds for `export IMAGE`: it fails if the writer moves the root meanwhile.
 * **ublk** needs a `zen-ublk` built with `--features ublk` (libclang at build time, for libublk's bindings) and the `ublk_drv` module at run time. The FUSE frontend needs neither: only `/dev/fuse`, `fusermount3` and a loop device.
 * **Throughput** is bounded by round trips, not by crypto: a flush is a commit, and reads that miss the page cache are a request each. It's a disk for a filesystem that syncs a few times a second, not for a database that fsyncs every write (STATS.md §6.3).
 
-## 9. Running it under systemd
+## 10. Running it under systemd
 
 A unit for the ublk frontend, and a mount that needs it:
 

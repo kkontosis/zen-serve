@@ -161,9 +161,11 @@ export class Content {
 
   /**
    * Evict least recently used content until the total is at most `limit`,
-   * never what `keep` holds (hex `c`/`p` ‖ id). Returns the total left.
+   * never what `keep()` holds (hex `c`/`p` ‖ id). `keep` is asked once the
+   * content is listed, with nothing awaited from there to the deletes, so
+   * what was sealed or queued meanwhile is in it. Returns the total left.
    */
-  async evict(limit: number, keep: Set<string>): Promise<number> {
+  async evict(limit: number, keep: () => Set<string>): Promise<number> {
     this.added = 0;
     const all = await this.rec.list('lru');
     const items: { key: string; size: number; used: number }[] = [];
@@ -179,9 +181,10 @@ export class Content {
     }
     if (total <= limit) return total;
     items.sort((a, b) => a.used - b.used);
+    const kept = keep();
     for (const it of items) {
       if (total <= limit) break;
-      if (keep.has(it.key)) continue;
+      if (kept.has(it.key)) continue;
       const key = bytes.fromHex(it.key);
       this.rec.delete(key[0] === 0x63 ? 'chunks' : 'pages', key.slice(1));
       this.rec.delete('lru', key);
