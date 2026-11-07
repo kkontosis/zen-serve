@@ -245,14 +245,23 @@ describe('changed chunks only', () => {
     expect(await r.readFile('/cdc.bin')).toEqual(data);
     const pages = (await admin.tree(id).versions(f))[0]!.pages.length;
     expect(pages).toBeGreaterThan(3);
+    const before = (await admin.tree(id).versions(f))[0]!.pages;
     const h = await r.open('/cdc.bin', 'r+');
     await h.write(text('edited'), 1000);
     await h.write(text('!'), data.length);
     net.reset();
     await h.close();
     await r.flush();
-    // The first page and the last: the others are taken over unread.
-    expect(sent(net).pages).toBeLessThanOrEqual(2);
+    // The first page and the last are re-cut; the others are taken over
+    // unread. A re-cut page that gains a chunk past its capacity becomes
+    // two (the fill rule allows it), so count new pages rather than 2.
+    const after = (await admin.tree(id).versions(f))[0]!.pages;
+    const old = new Set(before.map((p) => bytes.hex(p)));
+    const fresh = after.filter((p) => !old.has(bytes.hex(p)));
+    const middle = before.slice(1, -1).map((p) => bytes.hex(p));
+    expect(after.map((p) => bytes.hex(p))).toEqual(expect.arrayContaining(middle));
+    expect(sent(net).pages).toBe(fresh.length);
+    expect(fresh.length).toBeLessThanOrEqual(3);
     const next = bytes.concat(data, text('!'));
     next.set(text('edited'), 1000);
     const view = await seen();
