@@ -495,7 +495,8 @@ async fn lookup(st: &Shared, cid_key: &[u8]) -> ApiResult<Option<Vec<u8>>> {
 /// body is read until it's answered: its Content-Length (or the most a
 /// commit may be, when absent), at most the whole budget. Taken after the
 /// caller is authenticated (extractors run in order, the body's last), so
-/// only a signed-in caller waits for it or holds it.
+/// only a signed-in caller waits for it or holds it. The budget is fair: a
+/// commit waits behind those queued before it, even one it would fit beside.
 pub struct Budget(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
 
 impl axum::extract::FromRequestParts<Shared> for Budget {

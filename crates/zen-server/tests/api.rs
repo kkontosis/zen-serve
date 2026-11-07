@@ -1757,16 +1757,17 @@ async fn commits_past_the_buffer_budget_wait() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf, b"HTTP/1.1 401");
-    // Signed in, it holds 900,000: another 900,000 waits, 50,000 doesn't.
+    // Signed in, it holds 900,000: 50,000 more fits, another 900,000 waits.
+    // (The budget is fair: one that fits still waits behind one queued
+    // before it, so the small one goes first.)
     let a = stall(Some(bearer.clone())).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let b = post(900_000);
-    let small = post(50_000);
-    let s = tokio::time::timeout(Duration::from_secs(10), small)
+    let s = tokio::time::timeout(Duration::from_secs(10), post(50_000))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(s, 400, "the small commit is answered (not CBOR)");
+    let b = post(900_000);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(!b.is_finished(), "B waits while A holds the budget");
     drop(a);
