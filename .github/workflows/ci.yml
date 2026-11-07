@@ -3,8 +3,12 @@ name: CI
 on:
   push:
   pull_request:
-  # Started by hand: the openssh-pq job (TD-SVC-SSH-PQ-CI).
+  # Started by hand: the openssh-pq job (TD-SVC-SSH-PQ-CI) and the benches.
   workflow_dispatch:
+    inputs:
+      files_gib:
+        description: 'files-bench: the client bench file size, in GiB'
+        default: '16'
 
 env:
   CARGO_TERM_COLOR: always
@@ -132,6 +136,63 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
           ZEN_TEST_REQUIRE_UBLK: "1"
         run: cargo test --release -p zen-ublk --features device-tests,ublk --test devices bench -- --ignored --nocapture --test-threads 1
+
+  # Large files (docs/STATS.md §7): the client bench at `files_gib`, the
+  # replica and zen-mount at 4 GiB, in release. By hand only; it measures,
+  # it doesn't gate.
+  files-bench:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk, and the temp dir on the larger disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt
+          root=$(df --output=avail -B1 / | tail -1)
+          mnt=$(df --output=avail -B1 /mnt | tail -1)
+          if [ "$mnt" -gt "$root" ]; then
+            sudo mkdir -p /mnt/zen-tmp && sudo chown "$USER" /mnt/zen-tmp
+            echo "TMPDIR=/mnt/zen-tmp" >> "$GITHUB_ENV"
+          fi
+          nproc; free -m
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: wasm-bindgen-cli at the Cargo.lock version
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+          echo "WASM_BINDGEN_VERSION=$v" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: FUSE
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fuse3 libfuse-dev pkg-config
+          sudo chmod 666 /dev/fuse
+      - name: Build
+        run: |
+          cargo build --release -p zen-server
+          scripts/build-wasm.sh
+          npm ci
+          npm run build
+      - name: Bench
+        env:
+          ZEN_BENCH: "1"
+          ZEN_APPS_BUILT: "1"
+          ZEN_SERVE_BIN: target/release/zen-serve
+        run: |
+          echo "TMPDIR=${TMPDIR:-/tmp}"; df -h "${TMPDIR:-/tmp}"
+          ZEN_BENCH_GIB=${{ inputs.files_gib }} npx vitest run packages/client/test/largebench.test.ts
+          ZEN_BENCH_GIB=4 npx vitest run packages/fs/test/bench.test.ts
+          ZEN_BENCH_GIB=4 npx vitest run packages/fuse/test/bench.test.ts
 
   openssh-pq:
     if: github.event_name == 'workflow_dispatch'
