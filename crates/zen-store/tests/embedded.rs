@@ -57,6 +57,7 @@ async fn too_old_after_window() {
         dir.path().join("db.redb"),
         Options {
             window: Duration::from_millis(50),
+            ..Options::default()
         },
     )
     .unwrap();

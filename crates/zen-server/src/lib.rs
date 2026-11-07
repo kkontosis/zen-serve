@@ -63,7 +63,7 @@ use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zen_proto::{API_VERSION, Info, Limits};
 use zen_store::Storage;
-use zen_store::embedded::{Embedded, Options};
+use zen_store::embedded::Embedded;
 use zen_store::prefixed::Prefixed;
 
 /// `GET /v1/info`.
@@ -427,7 +427,7 @@ pub fn open_store(cfg: &Config) -> Result<Arc<dyn Storage>, String> {
         config::Backend::Embedded => {
             std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data_dir: {e}"))?;
             Arc::new(
-                Embedded::open(cfg.data_dir.join("zen.redb"), Options::default())
+                Embedded::open(cfg.data_dir.join("zen.redb"), cfg.embedded_options())
                     .map_err(|e| format!("open database: {e}"))?,
             )
         }

@@ -491,9 +491,41 @@ async fn lookup(st: &Shared, cid_key: &[u8]) -> ApiResult<Option<Vec<u8>>> {
 }
 
 /// `POST /v1/commit`.
+/// A commit's share of `limits.commit_buffer_bytes`, held from before its
+/// body is read until it's answered: its Content-Length (or the most a
+/// commit may be, when absent), at most the whole budget. Taken after the
+/// caller is authenticated (extractors run in order, the body's last), so
+/// only a signed-in caller waits for it or holds it.
+pub struct Budget(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
+impl axum::extract::FromRequestParts<Shared> for Budget {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        st: &Shared,
+    ) -> Result<Self, ApiError> {
+        let budget = st.cfg.limits.commit_buffer_bytes;
+        let most = u64::from(st.cfg.limits.max_commit_bytes) + 1_000_000;
+        let len = parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+            .unwrap_or(most);
+        let n = len.min(budget).min(most).max(1) as u32;
+        st.commit_budget
+            .clone()
+            .acquire_many_owned(n)
+            .await
+            .map(Budget)
+            .map_err(|_| internal("the commit budget is closed"))
+    }
+}
+
 pub async fn commit(
     State(st): State<Shared>,
     caller: Caller,
+    _budget: Budget,
     Cbor(req): Cbor<Commit>,
 ) -> ApiResult<Cbor<CommitResult>> {
     execute(&st, &caller, req, None).await.map(Cbor)
@@ -503,6 +535,7 @@ pub async fn commit(
 pub async fn append(
     State(st): State<Shared>,
     caller: Caller,
+    _budget: Budget,
     Cbor(req): Cbor<LogAppend>,
 ) -> ApiResult<Cbor<CommitResult>> {
     let c = Commit {

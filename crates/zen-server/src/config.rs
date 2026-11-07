@@ -91,6 +91,9 @@ pub struct StorageConfig {
     /// Serve the keyspace under this key prefix (UTF-8 bytes), e.g. a clone
     /// restored with `zen-serve restore --add-prefix` (operations.md).
     pub key_prefix: String,
+    /// The embedded backend's page cache, in bytes (at least 1 MiB).
+    /// Absent: `zen_store::embedded::DEFAULT_CACHE_BYTES`.
+    pub cache_bytes: Option<u64>,
 }
 
 /// `[fdb]`: the supervised `fdbserver` processes (operations.md).
@@ -470,6 +473,12 @@ pub struct LimitsConfig {
     pub upload_ttl_secs: u64,
     /// Longest upload-session lifetime (api.md §12.1).
     pub upload_max_ttl_secs: u64,
+    /// Commit request bodies this node reads and holds at once, in bytes
+    /// (each counted by its Content-Length, at most this). A commit past
+    /// it waits before its body is read, so the memory commits hold
+    /// doesn't grow with the clients in flight (spec/OPS.md §6). At least
+    /// `max_commit_bytes`. Not sent to clients.
+    pub commit_buffer_bytes: u64,
 }
 
 impl Default for LimitsConfig {
@@ -498,6 +507,7 @@ impl Default for LimitsConfig {
             checkpoint_keep: 1024,
             upload_ttl_secs: 7 * 86_400,
             upload_max_ttl_secs: 30 * 86_400,
+            commit_buffer_bytes: 64 << 20,
         }
     }
 }
@@ -566,6 +576,15 @@ impl Config {
         })
     }
 
+    /// Options for the embedded backend.
+    pub fn embedded_options(&self) -> zen_store::embedded::Options {
+        let mut o = zen_store::embedded::Options::default();
+        if let Some(n) = self.storage.cache_bytes {
+            o.cache_bytes = usize::try_from(n).unwrap_or(usize::MAX);
+        }
+        o
+    }
+
     /// The cluster file to connect with, if any.
     pub fn cluster_file(&self) -> Option<PathBuf> {
         self.storage.cluster_file.clone().or_else(|| {
@@ -582,6 +601,17 @@ impl Config {
         }
         if self.fdb.processes == 0 {
             return Err("fdb.processes must be at least 1".into());
+        }
+        if self.limits.commit_buffer_bytes < u64::from(self.limits.max_commit_bytes.max(1))
+            || self.limits.commit_buffer_bytes > u64::from(u32::MAX)
+        {
+            return Err(
+                "limits.commit_buffer_bytes must be at least max_commit_bytes and below 4 GiB"
+                    .into(),
+            );
+        }
+        if self.storage.cache_bytes.is_some_and(|n| n < 1 << 20) {
+            return Err("storage.cache_bytes must be at least 1 MiB (1048576)".into());
         }
         // Event offsets and dots index a commit's appends and writes with a
         // u16 (keyspace.md §2).
@@ -771,6 +801,37 @@ mod tests {
         }
         let t = "data_dir = \"/tmp/x\"\n[limits]\nupload_ttl_secs = 60\nupload_max_ttl_secs = 60";
         assert!(Config::from_toml(t).is_ok());
+    }
+
+    #[test]
+    fn commit_buffer_bytes_is_checked() {
+        let c = Config::from_toml("data_dir = \"/tmp/x\"").unwrap();
+        assert_eq!(c.limits.commit_buffer_bytes, 64 << 20);
+        for bad in [
+            "commit_buffer_bytes = 7999999",
+            "max_commit_bytes = 1000\ncommit_buffer_bytes = 999",
+            "commit_buffer_bytes = 4294967296",
+        ] {
+            let t = format!("data_dir = \"/tmp/x\"\n[limits]\n{bad}");
+            assert!(Config::from_toml(&t).is_err(), "{bad}");
+        }
+        let t =
+            "data_dir = \"/tmp/x\"\n[limits]\nmax_commit_bytes = 1000\ncommit_buffer_bytes = 1000";
+        assert!(Config::from_toml(t).is_ok());
+    }
+
+    #[test]
+    fn storage_cache_bytes() {
+        let c = Config::from_toml("data_dir = \"/tmp/x\"").unwrap();
+        assert_eq!(
+            c.embedded_options().cache_bytes,
+            zen_store::embedded::DEFAULT_CACHE_BYTES
+        );
+        let c =
+            Config::from_toml("data_dir = \"/tmp/x\"\n[storage]\ncache_bytes = 268435456").unwrap();
+        assert_eq!(c.embedded_options().cache_bytes, 256 << 20);
+        let t = "data_dir = \"/tmp/x\"\n[storage]\ncache_bytes = 1048575";
+        assert!(Config::from_toml(t).is_err());
     }
 
     #[test]

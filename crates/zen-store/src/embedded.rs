@@ -189,12 +189,23 @@ struct Tables {
 pub struct Options {
     /// MVCC window: how long a read version stays valid. Default 5 s.
     pub window: Duration,
+    /// redb's page cache, its read cache and write buffer together
+    /// (`Builder::set_cache_size`). Pages a commit writes go into it, so a
+    /// steady write fills it. Default [`DEFAULT_CACHE_BYTES`].
+    pub cache_bytes: usize,
 }
+
+/// The default of [`Options::cache_bytes`].
+/// 256 MiB rather than redb's 1 GiB: the cache fills with every page a
+/// commit writes, and large-file throughput was the same from 64 MiB up
+/// (spec/OPS.md §6).
+pub const DEFAULT_CACHE_BYTES: usize = 256 << 20;
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             window: Duration::from_secs(5),
+            cache_bytes: DEFAULT_CACHE_BYTES,
         }
     }
 }
@@ -269,7 +280,10 @@ impl Embedded {
     /// another layout (an older zen-serve's) is refused.
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Self> {
         let path = path.as_ref();
-        let db = Database::create(path).map_err(io)?;
+        let db = Database::builder()
+            .set_cache_size(opts.cache_bytes)
+            .create(path)
+            .map_err(io)?;
         let last = {
             let w = db.begin_write().map_err(io)?;
             let last = {
@@ -359,6 +373,17 @@ impl Embedded {
                 st.snapshots.insert(now, s.clone());
                 Ok(s)
             }
+        }
+    }
+
+    fn txn(&self, snap: Snapshot) -> EmbeddedTxn {
+        EmbeddedTxn {
+            store: self.clone(),
+            snap,
+            overlay: BTreeMap::new(),
+            cleared: Vec::new(),
+            ops: Vec::new(),
+            read_conflicts: Vec::new(),
         }
     }
 
@@ -490,15 +515,7 @@ impl Embedded {
 #[async_trait::async_trait]
 impl Storage for Embedded {
     async fn begin(&self, read_version: Option<Version>) -> Result<Box<dyn Txn>> {
-        let snap = self.snapshot(read_version)?;
-        Ok(Box::new(EmbeddedTxn {
-            store: self.clone(),
-            snap,
-            overlay: BTreeMap::new(),
-            cleared: Vec::new(),
-            ops: Vec::new(),
-            read_conflicts: Vec::new(),
-        }))
+        Ok(Box::new(self.txn(self.snapshot(read_version)?)))
     }
 
     async fn watch(&self, key: &[u8]) -> Result<Watch> {
@@ -556,7 +573,8 @@ impl Storage for Embedded {
 }
 
 enum Op {
-    Set(Vec<u8>, Vec<u8>),
+    /// The value is shared with the overlay's entry: one copy per value.
+    Set(Vec<u8>, Arc<[u8]>),
     Clear(Vec<u8>),
     ClearRange(Vec<u8>, Vec<u8>),
     VsKey(Vec<u8>, Vec<u8>, Vec<u8>),
@@ -567,7 +585,7 @@ enum Op {
 /// Overlay entry for read-your-writes.
 #[derive(Clone)]
 enum Pending {
-    Value(Vec<u8>),
+    Value(Arc<[u8]>),
     Cleared,
     Unreadable,
 }
@@ -590,7 +608,7 @@ impl EmbeddedTxn {
 
     fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.overlay.get(key) {
-            Some(Pending::Value(v)) => return Ok(Some(v.clone())),
+            Some(Pending::Value(v)) => return Ok(Some(v.to_vec())),
             Some(Pending::Cleared) => return Ok(None),
             Some(Pending::Unreadable) => return Err(Error::Unreadable),
             None => {}
@@ -652,7 +670,7 @@ impl EmbeddedTxn {
             if take_over {
                 let (k, p) = o_next.take().expect("overlay entry");
                 match p {
-                    Pending::Value(v) => out.push((k.clone(), v.clone())),
+                    Pending::Value(v) => out.push((k.clone(), v.to_vec())),
                     Pending::Cleared => {}
                     Pending::Unreadable => return Err(Error::Unreadable),
                 }
@@ -734,9 +752,10 @@ impl Txn for EmbeddedTxn {
     }
 
     fn set(&mut self, key: &[u8], value: &[u8]) {
+        let value: Arc<[u8]> = Arc::from(value);
         self.overlay
-            .insert(key.to_vec(), Pending::Value(value.to_vec()));
-        self.ops.push(Op::Set(key.to_vec(), value.to_vec()));
+            .insert(key.to_vec(), Pending::Value(value.clone()));
+        self.ops.push(Op::Set(key.to_vec(), value));
     }
 
     fn clear(&mut self, key: &[u8]) {
@@ -785,5 +804,49 @@ impl Txn for EmbeddedTxn {
         tokio::task::spawn_blocking(move || store.commit_blocking(*self))
             .await
             .map_err(joined)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl EmbeddedTxn {
+        /// The bytes of values the transaction buffers, each allocation once.
+        fn buffered_bytes(&self) -> usize {
+            let mut seen = std::collections::HashSet::new();
+            let mut n = 0;
+            let mut count = |v: &[u8]| {
+                if seen.insert(v.as_ptr() as usize) {
+                    n += v.len();
+                }
+            };
+            for p in self.overlay.values() {
+                if let Pending::Value(v) = p {
+                    count(v);
+                }
+            }
+            for op in &self.ops {
+                match op {
+                    Op::Set(_, v) => count(v),
+                    Op::VsKey(_, _, v) => count(v),
+                    _ => {}
+                }
+            }
+            n
+        }
+    }
+
+    /// A set value is held once, by the overlay and the write together,
+    /// and still reads back.
+    #[test]
+    fn a_set_value_is_buffered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Embedded::open(dir.path().join("db.redb"), Options::default()).unwrap();
+        let mut t = s.txn(s.snapshot(None).unwrap());
+        t.set(b"k", &vec![7; 1 << 20]);
+        t.set(b"j", &[1, 2, 3]);
+        assert_eq!(t.buffered_bytes(), (1 << 20) + 3);
+        assert_eq!(t.read(b"k").unwrap(), Some(vec![7; 1 << 20]));
     }
 }

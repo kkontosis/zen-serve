@@ -78,6 +78,9 @@ zen-store = { path = "../zen-store" }
 # SIGTERM for the supervised FoundationDB processes (a safe `kill` wrapper).
 nix = { version = "0.30", default-features = false, features = ["signal"], optional = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 async-trait = "0.1"
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pkcs8"] }

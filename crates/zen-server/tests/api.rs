@@ -1692,3 +1692,87 @@ async fn range_bytes_group_cap_and_body_limits() {
         assert_eq!(status, Some(413), "{path}");
     }
 }
+
+/// A commit whose body doesn't fit `limits.commit_buffer_bytes` beside
+/// those being read waits before its body is read, and goes on once they
+/// finish (spec/OPS.md §6). The budget is taken after authentication: a
+/// caller without a session is answered without holding any.
+#[tokio::test(flavor = "multi_thread")]
+async fn commits_past_the_buffer_budget_wait() {
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let h = Harness::start_with(|c| {
+        c.limits.max_commit_bytes = 1_000_000;
+        c.limits.commit_buffer_bytes = 1_000_000;
+    })
+    .await;
+    let admin = User::new(1);
+    h.claim(&admin, &[]).await;
+    let tok = h.sign_in(&admin).await.unwrap();
+    let bearer = format!(
+        "Bearer {}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tok)
+    );
+    // A stalled body: 900,000 bytes announced, 1,000 sent, then nothing.
+    let stall = |auth: Option<String>| {
+        let addr = h.server.addr;
+        let host = h.host_header();
+        async move {
+            let mut a = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let auth = auth
+                .map(|b| format!("Authorization: {b}\r\n"))
+                .unwrap_or_default();
+            let head = format!(
+                "POST /v1/commit HTTP/1.1\r\nHost: {host}\r\n{auth}\
+                 Content-Type: application/cbor\r\nContent-Length: 900000\r\n\r\n"
+            );
+            a.write_all(head.as_bytes()).await.unwrap();
+            a.write_all(&[0u8; 1000]).await.unwrap();
+            a
+        }
+    };
+    let post = |n: usize| {
+        let (http, url, bearer) = (
+            h.http.clone(),
+            format!("{}/v1/commit", h.base),
+            bearer.clone(),
+        );
+        tokio::spawn(async move {
+            let r = http
+                .post(url)
+                .header("content-type", "application/cbor")
+                .header("authorization", bearer)
+                .body(vec![0u8; n])
+                .send()
+                .await
+                .unwrap();
+            r.status().as_u16()
+        })
+    };
+    // Without a session, a stalled body holds nothing: it's answered 401.
+    let mut anon = stall(None).await;
+    let mut buf = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(5), anon.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"HTTP/1.1 401");
+    // Signed in, it holds 900,000: another 900,000 waits, 50,000 doesn't.
+    let a = stall(Some(bearer.clone())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let b = post(900_000);
+    let small = post(50_000);
+    let s = tokio::time::timeout(Duration::from_secs(10), small)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s, 400, "the small commit is answered (not CBOR)");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!b.is_finished(), "B waits while A holds the budget");
+    drop(a);
+    let s = tokio::time::timeout(Duration::from_secs(10), b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s, 400, "B is answered once A is gone");
+}

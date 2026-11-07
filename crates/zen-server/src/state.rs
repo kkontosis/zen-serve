@@ -60,6 +60,8 @@ pub struct AppState {
     /// Failed password sign-ins per method and login name, on this node
     /// (methods 6 and 3, counted separately).
     pub pw_limiter: crate::password::Limiter,
+    /// Commit bodies being read and held, in bytes (`limits.commit_buffer_bytes`).
+    pub commit_budget: Arc<tokio::sync::Semaphore>,
     /// The cluster's OPAQUE server setup, once read or created
     /// (`opaque::setup`).
     pub opaque_setup:
@@ -99,6 +101,9 @@ impl AppState {
                 cfg.auth.password_max_failures,
                 std::time::Duration::from_secs(cfg.auth.password_lockout_secs),
             ),
+            commit_budget: Arc::new(tokio::sync::Semaphore::new(
+                cfg.limits.commit_buffer_bytes as usize,
+            )),
             params_key: Mutex::new(None),
             opaque_setup: Mutex::new(None),
             svc: crate::svc::Svc::new(&cfg),

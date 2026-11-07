@@ -8,7 +8,7 @@ use zen_server::config::Config;
 use zen_server::dump;
 #[cfg(feature = "fdb")]
 use zen_server::supervisor::{self, Supervisor};
-use zen_store::embedded::{Embedded, Options};
+use zen_store::embedded::Embedded;
 
 #[derive(Parser)]
 #[command(
@@ -237,8 +237,31 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-#[tokio::main]
-async fn main() {
+/// At most 2 malloc arenas (glibc), unless the environment sets them.
+/// Each thread that allocates may get an arena of its own, and glibc keeps
+/// what is freed in each: under a steady write that was 0.6–1 GiB beyond
+/// the live heap (spec/OPS.md §6). Called before any thread starts.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cap_malloc_arenas() {
+    let set = |v| std::env::var_os(v).is_some();
+    if !set("MALLOC_ARENA_MAX") && !set("GLIBC_TUNABLES") {
+        // SAFETY: mallopt only changes the allocator's parameters; no
+        // other thread exists yet.
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+    }
+}
+
+fn main() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    cap_malloc_arenas();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(cli());
+}
+
+async fn cli() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -378,7 +401,7 @@ async fn main() {
             force,
         } => {
             let cfg = load(&config);
-            let from = Embedded::open(from_data_dir.join("zen.redb"), Options::default())
+            let from = Embedded::open(from_data_dir.join("zen.redb"), cfg.embedded_options())
                 .unwrap_or_else(|e| fail(format!("{}: {e}", from_data_dir.display())));
             let to = zen_server::open_store(&cfg).unwrap_or_else(|e| fail(e));
             let st = dump::copy(&from, to.as_ref(), force)
