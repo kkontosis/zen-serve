@@ -12,7 +12,8 @@ Every sealed object costs **48 bytes** over its plaintext (formats.md §4: 8-byt
 
 | What | Stored per item, beyond the user's bytes |
 |---|---|
-| **File content, per 64 KiB chunk** (clients chunk at 64 KiB) | ~180 B: the seal (48), the chunk key, its refcount and GC pointer (~100), and 32 B in the version's chunk list and sealed manifest. **≈ 0.27 %** |
+| **File content, per chunk** (cut by content by default, 36.5 KiB on average measured; or fixed at 65,280 B) | ~170 B: the seal (48), the chunk key, its refcount and GC pointer (~100), and 20 B in its page (`id ‖ u32 len`; 16 B under fixed chunks, whose pages hold ids only). **≈ 0.45 %** at the CDC mean, **≈ 0.25 %** at 65,280 B. A page reference costs 56 B in the sealed manifest (52 under fixed) |
+| **Upload session** (api.md §12.1), while open | ~200 B for its records (`us`, `ux`, `uu`), plus one `ur` key (~60 B) and a reference count per chunk and page put under it: **about 0.2 %** of a CDC upload. Released by the sweeper when it closes or expires (7 days by default, at most 30) |
 | **Each file or directory** (node, meta, indexes, one version record) | ~650 B fixed: node record (~125 B + sealed meta ~70 B + name), children and change-feed index entries, a version record and a sealed manifest. A move also logs ~90 B for 7 days. |
 | **KV value** | 48 (seal) + 10 (versionstamp) + key (16 B per path element + ~8 B prefix) ≈ **+90 B** per entry for a 2-element key |
 | **Event** (log append) | 48 (seal) + log key (~40) + fs-wide index (~40) + per-key index (~60, keyed events only) ≈ **+150–190 B** per event |
@@ -29,23 +30,26 @@ Every sealed object costs **48 bytes** over its plaintext (formats.md §4: 8-byt
 | 1 KiB | ~1.85 KiB | **~1.8×** |
 | 10 KiB | ~10.8 KiB | ~1.08× |
 | 100 KiB | ~101 KiB | ~1.01× |
-| 1 MiB and up | +0.27 % + 650 B | **~1.003×** |
+| 1 MiB and up | +0.3–0.5 % + 650 B | **~1.005×** |
 
 Small files are dominated by the ~650 B per-file metadata; large files cost almost nothing extra. The last chunk of a file is stored at its real size: zen-serve doesn't pad (a client may, to hide sizes: spec/fs.md §10).
 
-### 1.2 On disk (what the storage engine adds): estimates
+### 1.2 On disk (what the storage engine adds)
 
 | Backend | Multiplier on the logical bytes |
 |---|---|
-| Embedded (`redb`, B-tree, 4 KiB pages) | **~1.1–1.5×**. Freed pages are reused, but **the file never shrinks**: zen-serve doesn't compact it. |
+| Embedded (`redb`, B-tree, 4 KiB pages) | **measured 1.05–1.08×** for large values (`zen-store` `tests/embedded.rs`: CDC-sized chunks 1.06×, 65,584 B 1.05×, 65,328 B 1.05×, 4,144 B blocks 1.08×), and **1.08–1.11×** for a 4 GiB file through the server, every key and index included (§7). Before milestone 8 step 7 a value larger than a page got a leaf rounded up to a power of two of pages: 2.0× for 64 KiB chunks and blocks, 1.5× for CDC lengths. Freed pages are reused, but **the file never shrinks**: zen-serve doesn't compact it. The file is sparse, so measure it with `du`, not `ls` (its apparent size was twice what it held). |
 | FoundationDB (`ssd` engine) | **~1.2–2× per replica**, times the replication factor: `single` ×1, `double` ×2, `triple` ×3 across nodes (operations.md §3.2). Plus the transaction logs (bounded, transient). Deleted space is reused; files shrink only slowly. |
 
-**Rule of thumb for large files:** ~1.0× logical, so about 1.1–1.5× on an embedded node and 1.2–2× per replica on FoundationDB. A triple-replicated 1 TB of large files needs roughly 4–6 TB of raw cluster disk.
+**Rule of thumb for large files:** ~1.0× logical, so about 1.1× on an embedded node and 1.2–2× per replica on FoundationDB. A triple-replicated 1 TB of large files needs roughly 4–6 TB of raw cluster disk.
 
 ### 1.3 Limits worth knowing
 
-* **Largest file version at the defaults is about 640 GiB** with paged versions (spec/fs.md §4; the server since milestone 5 step 7f, and clients page any file past the inline limit since step 7g). A page holds up to 5,624 chunk ids (about 351 MiB at 64 KiB), and the sealed manifest lists up to about 1,870 pages at 48 B each. An inline version (the chunk list in the version itself) still tops out at about 175 MiB: 32 B per chunk within `max_value_bytes` = 90,000.
-* **Page costs.** A page is one value of `4 + 16n` bytes, plus one reference-count add per chunk when first uploaded; a version that appends to a file reuses every full page of the one it replaces.
+* **Largest file version at the defaults:**
+  * **Cut by content (the default, manifest version 3): about 196 GiB**, measured. A form-2 page holds 4,499 entries (`id ‖ u32 len`), a version lists up to 1,248 pages, and chunks average 36.5 KiB. Pages may be less than full after edits (the fill rule keeps any two neighbours over a page), so the worst case is half that, **about 98 GiB**; `edit` repacks when a write would pass it. An inline version-3 file holds up to about 4,400 chunks (20 B each), **about 155 MiB**.
+  * **Fixed chunks (`chunking: fixed`, version 2): about 640 GiB.** A page holds 5,624 ids (about 350 MiB at 65,280 B) and the manifest about 1,870 pages. The writer picks fixed for a file whose size it knows to be past the CDC capacity, and otherwise fails `too_large` with the hint; two-level pages for larger CDC files are TD-FS-CDC-HUGE.
+  * An inline version-2 file still tops out at about 175 MiB: 32 B per chunk within `max_value_bytes` = 90,000.
+* **Page costs.** A page is one value of `4 + 16n` bytes (fixed) or `4 + 20n` (CDC), plus one reference-count add per chunk when first uploaded. A version that appends to or edits a file takes over every page it doesn't touch (§2).
 * A commit carries at most `max_commit_bytes` = 8 MB, so a large file is uploaded over several commits (spec/fs.md §4.1).
 
 ## 2. Do updates explode the disk?
@@ -57,6 +61,7 @@ No, as long as clients use the CRDT filesystem as designed. Each case:
 | **Rewrite a file** (a `write` that replaces the current version) | The new chunks are added. If the client **reuses the ids of unchanged chunks**, only changed chunks are uploaded; otherwise the whole file is new. | Old chunks lose their last reference at once, and are **deleted after the chunk grace period (24 h)**. So up to ~2× for the rewritten part, for one day. |
 | **Concurrent writes** (siblings) | Every sibling version is kept. | When a later write replaces them (a client resolving the conflict). Unresolved siblings stay forever. |
 | **Delete a file** (move to TRASH) | Nothing new. | Purged after the **horizon (7 days)** plus `crdt_max_skew_ms`; its chunks then follow after another **24 h**: about **8 days**. |
+| **Edit a large file** (`Tree.edit`, `append`, a replica's file handle) | Only the pages the edit touches and the chunks around it: under CDC, until the cuts resync, which is 1 chunk for 98 % of small insertions (§7); every other page is taken over unread. A 100-byte insertion into 4 GiB measured 1 page and 1 chunk. Under fixed chunks an insertion or deletion that isn't a whole number of chunks shifts every later block, so it re-uploads the rest of the file (half of a 1 GiB file measured). | As for a rewrite: the replaced pages and chunks after the grace period. |
 | **Rename or move** | ~90 B in the move log | Move log entries after **7 days** |
 | **KV overwrite** | none: the value is replaced in place | at once (the engine reuses the space) |
 | **KV delete / clear_range** | none | at once |
@@ -351,3 +356,122 @@ The same bench: 50 appends of a short payload, and five reads of 1,000 events, o
   * `sigEvery: 1` costs a checkpoint per change: about 7 ms more per change in a browser, and 4.5 KB stored. A handler step (§5.5) takes 16–20 ms, so a checkpoint per step adds about a third.
 * **ext4 over a volume** is bounded by commits. A write that fills a batch flushes before it returns, so sequential writes wait for one commit per MiB. A synchronous 4 KiB write (`O_DSYNC`, as a database's `fsync` does) costs ext4 a data write and a journal commit with its cache flushes, which is several engine commits: 4–12 ms depending on the machine. Reads that miss the page cache are one request per block the kernel asks for, with readahead making them large.
 * **ublk and FUSE + loop are close** on one machine (the CI columns): ublk is about 10 % faster for writes and 25 % for reads, since it skips the loop device and FUSE's copies, but both are bounded by the engine's round trips. `mkfs` costs almost nothing on an empty volume: discarding blocks that were never written commits nothing (spec/blk.md §4).
+
+## 7. Large files (measured)
+
+Milestone 8's benches, opt-in (`ZEN_BENCH=1`), with the release server (`ZEN_SERVE_BIN=target/release/zen-serve`) on loopback; `ZEN_BENCH_GIB` sets the size (4 by default):
+* `packages/client/test/largebench.test.ts`: `@zen/client` writes, reads, edits, resumes, pipelining, 16 writers and the chunker, CDC and fixed (FoundationDB with `ZEN_BENCH_BACKEND=fdb`, CDC only)
+* `packages/fs/test/bench.test.ts`: the `@zen/fs` replica over a disk store, as zen-mount keeps it
+* `packages/fuse/test/bench.test.ts`: zen-mount as a child process
+* CI's `files-bench` job, started by hand (`files_gib`, 16 by default)
+
+The source is an AES-CTR keystream (random-looking, so content-defined cuts resync, and seekable, so a resume restarts it anywhere), hashed as it streams: no file is kept on disk. Each world has a 5 s chunk grace, so superseded content goes quickly and a resume happens past the grace. Memory is the peak resident set (`VmHWM`) per step, of the bench's process and of the server. "Here" is a 4-core container with 15 GB of RAM, embedded backend.
+
+### 7.1 Throughput and edits
+
+A 4 GiB file here (fixed: the insertion on a 1 GiB file, since it re-uploads the rest):
+
+| | CDC (the default) | Fixed (65,280 B) |
+|---|---|---|
+| Write, under an upload session | **51–54 MiB/s**, 550 commits | **67 MiB/s**, 546 commits |
+| Allocated on the server's disk, for 4.0 GiB sent | +4.5 GiB (**1.11×**) | +4.3 GiB (**1.08×**) |
+| `readStream`, `readAhead` 3 / 1 | **108 / 116 MiB/s** | **121 / 122 MiB/s** |
+| 1,000 random 4 KiB reads, cold / warm | median 1.6 / 1.4 ms, p99 9 ms | median 1.6 / 1.4 ms, p99 7 ms |
+| Append 1 MiB | **137 ms**: 1 page and 1 chunk fetched; 1 page and 27 chunks sent | 318 ms: 1 page and 1 chunk fetched, 17 chunks sent |
+| Overwrite 4 KiB at the middle | **302 ms**: 1 page and 1 chunk each way | 457 ms: the same |
+| Insert 100 bytes at the middle | **250 ms**: 1 page and 1 chunk each way | **24.7 s** on 1 GiB: 8,209 chunks and 512 MiB, every block after it |
+| Resume at half, 12 s later (grace 5 s) | 52 MiB/s, only the rest sent | 63 MiB/s |
+| The same at 64 MiB without a session | refused (400: its first chunks are gone) | refused |
+| 1 GiB with 1 / 3 commits in flight | 27 / **53 MiB/s** | 35 / **63 MiB/s** |
+| 16 writers of 256 MiB at once | **60 MiB/s** in all | |
+| The chunker (wasm, one thread) | 426 MiB/s | |
+
+On **FoundationDB** here (one `fdbserver` from `zen-serve init`, 1 GiB, CDC, two runs; ranges cover both):
+
+| | FoundationDB |
+|---|---|
+| Write, under a session | 27–33 MiB/s, 139 commits |
+| Allocated in the cluster's data dir, for 1.0 GiB sent | 1.0–1.9 GiB (the `ssd` engine's files and logs grow ahead of the data) |
+| `readStream`, `readAhead` 3 / 1 | 80–94 / 104–116 MiB/s |
+| 1,000 random 4 KiB reads, cold / warm | median 1.8–2.0 / 2.0–2.2 ms, p99 4–9 ms |
+| Append 1 MiB / overwrite 4 KiB / insert 100 bytes | 0.40–0.43 s / 0.95–1.18 s / 0.93–1.05 s, each 1 page and 1 chunk each way |
+| Resume at half, past the grace | 20–25 MiB/s, only the rest sent; without a session, refused |
+| 1 GiB with 1 / 3 commits in flight | 12–18 / 16–27 MiB/s |
+| 16 writers of 64 MiB at once | 17.4 MiB/s in all |
+| zen-serve's peak | 206–324 MiB with one writer, **1,091 MiB with 16** |
+
+A single-process cluster on the same 4 cores, so commits cost more than on the embedded store, and edits about 1 s. Several API nodes on one cluster scale the server side (operations.md §4); this bench doesn't measure that.
+
+On **CI's runner** (`files-bench`, 16 GiB): the run is in progress; its figures follow in the next commit.
+
+* **Edits cost the pages they touch,** not the file: the same 1 page and 1 chunk at 4 GiB as at 4 MiB. Fixed chunks are as cheap for overwrites and appends, but an insertion shifts every later block.
+* **Pipelining roughly doubles a single upload** (27 to 53 MiB/s under CDC). Above that the server applies commits one at a time (embedded), so 16 writers together go no faster than one.
+* **CDC writes are slower than fixed** (51–54 against 67 MiB/s): twice the chunks, each sealed, keyed and counted on its own.
+* **Random reads** are one page (memoized after the first) and one chunk per read.
+
+Through the `@zen/fs` replica and zen-mount, 4 GiB at the defaults (CDC, 1 MiB writes):
+
+| | The replica (a file handle) | zen-mount (through the kernel) |
+|---|---|---|
+| Write, until on the server | 9.9 MiB/s | 9.7 MiB/s (`fsync` and `close`, then the queue drained) |
+| Cold read on a fresh cache | 58 MiB/s (1 MiB reads) | 40 MiB/s |
+| A 1-byte write at the middle | 385 ms with `close({wait})`: 1 page and 1 chunk each way | 292 ms to `fsync`; 0.4 s to stop with it sent |
+| Pin the file | 13.8 MiB/s, kept whole | |
+
+Both write at the local disk's pace: each sealed chunk is a record in the cache dir, written and fsynced on its own, and writers wait once 32 MiB of records are pending (spec/OPS.md §6).
+
+### 7.2 Reuse after an insertion
+
+The chunker at the defaults (min 8,192, average 2^15, max 89,936 at `max_value_bytes` 90,000): a mean chunk of **36.5 KiB**, so a CDC version holds about **196 GiB** (4,499 chunks a page, 1,248 pages), and 98 GiB at the fill rule's worst. Over 1,000 random insertions of 1–100 bytes into 4 MiB of random data, the chunks that changed:
+
+| Chunks changed | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| Insertions | **98.1 %** | 1.4 % | 0.2 % | 0.1 % | 0.2 % |
+
+Normalized cutting depends on the position within a chunk, so an insertion can move a cut, and a few chunks can follow before the cuts line up again. **Content-defined cuts never resync in periodic data** (bytes repeating with a short period) or long runs of zeros, which are cut at `max`: after a length-changing edit, everything after it is cut again. Use `chunking: fixed` for disk images and sparse-heavy files (spec/OPS.md §7).
+
+### 7.3 Memory
+
+Peak resident set, with the defaults:
+
+| What | Peak RSS | What bounds it |
+|---|---|---|
+| **zen-serve, one 4 GiB writer** | **587–637 MiB** (1.9–2.7 GiB before milestone 8 step 7) | redb's cache (`[storage] cache_bytes`, 256 MiB), commits in flight (`limits.commit_buffer_bytes`, 64 MiB of bodies), 2 malloc arenas |
+| **zen-serve, 16 writers at once** | **691 MiB** (3.1 GiB before) | the same |
+| zen-serve under the replica bench | 499–541 MiB | |
+| zen-serve on FoundationDB, one writer / 16 | 206–324 / 1,091 MiB | FoundationDB's client library (its own cache and threads), not bounded by zen-serve's settings |
+| `@zen/client`, one 4 GiB write | 495–962 MiB, of which 110–160 MiB buffers | 3 commits in flight, the page memo |
+| `@zen/client`, 16 writers | 2,076 MiB (1.4 GiB of buffers) | 16 × 3 commits of up to 8 MB in flight |
+| The `@zen/fs` replica, writing 4 GiB through a handle | **564 MiB**; `dirtyBytes` at most 65 MiB, `pendingBytes` at most 39 MiB | the handle (64 MiB), the records' backlog (32 MiB) |
+| The replica, a cold read / a pin | 541 / 831 MiB | fetched content dropped past `pendingBytes`; pins fetched in windows |
+| zen-mount, writing 4 GiB / reading it back | **465 / 296 MiB**; its cache dir at most 1.5 GiB on disk | the replica's bounds |
+
+**What the server's memory was** (measured with a probe, the server's `VmHWM`, `smaps_rollup` each second, and heaptrack; spec/OPS.md §6):
+
+| redb cache | Allocator | 1 writer: write | read | 16 writers |
+|---|---|---|---|---|
+| 1 GiB (redb's default) | glibc as is | 1,927 MiB | 2,668 MiB | 3,071 MiB |
+| 1 GiB | `MALLOC_ARENA_MAX=2` | 1,349–1,401 | 1,613–1,667 | |
+| 1 GiB | jemalloc (preloaded) | 1,750 | 1,815 | |
+| 256 MiB | glibc as is | 1,362 | 1,358 | |
+| 256 MiB | `MALLOC_ARENA_MAX=2` | 637 | 639 | 908 |
+| 64 MiB | `MALLOC_ARENA_MAX=2` | 273 | 274 | |
+| **256 MiB, 2 arenas, the commit budget (the defaults now)** | | **613** | **621** | **712** |
+
+Three causes: redb puts every page a commit writes into its cache, so a steady write fills it whatever its size; glibc keeps what's freed in each thread's arena (0.6–1 GiB here); and embedded commits apply one at a time while the ones waiting held their bodies and decoded forms, with nothing bounding them (about 280 MB of 630 MB at 16 writers). Large-file throughput was the same from a 64 MiB cache up; 256 MiB is a hedge for metadata-heavy loads, which weren't measured.
+
+### 7.4 Upload sessions
+
+* **Cost:** about 200 B of records per session and one `ur` key per chunk and page put under it, about 0.2 % of a CDC upload, until the session closes or expires; each counts as a key in the fs quota.
+* **What they buy:** a resume after the grace period sends only the rest (§7.1). Without a session, content uploaded before the grace ran out is collected, and the resume is refused (400 `unknown chunk in page`).
+* **The upload state** a client keeps for a resume stays compact: at most 566 KiB (CDC) and 703 KiB (fixed) for 4 GiB, the pages done plus the tail since the last full page.
+
+### 7.5 A Loro snapshot as a file
+
+A document whose snapshot is past half of `max_commit_bytes` compacts to a zen-fs file (zendb.md §20.5). With 256 updates of 64 KiB of text, a **31 MiB** snapshot (`packages/loro/test/bench.test.ts`, median of 3):
+
+| | ms |
+|---|---|
+| Compact it to a file (an upload under a session, and one transaction for the row and the write) | **618** |
+| Open the document from it (the row, the version, a whole read and the import) | **305** |
+| For comparison: open from an inline snapshot plus a 100-event tail | 9.5 |

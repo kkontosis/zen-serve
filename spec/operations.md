@@ -18,9 +18,12 @@ How to run zen-serve: a single node on the embedded backend, or a FoundationDB c
 backend = "fdb"                       # or "embedded"
 cluster_file = "/etc/foundationdb/fdb.cluster"   # default: data_dir/fdb.cluster, then the platform default
 key_prefix = ""                       # serve the keyspace under this prefix (§5.3)
+cache_bytes = 268435456               # embedded only: redb's page cache (default 256 MiB)
 ```
 
 Both backends store exactly the same bytes (keyspace.md), so a store moves from one to the other unchanged (§6).
+
+**The embedded file's layout.** `zen.redb` holds two tables. `kv` maps each key to its value, tagged: `0x00 ‖ value` inline, or `0x01 ‖ u32 len ‖ u32 pieces ‖ tail` for a value whose entry doesn't fit one 4 KiB page. Such a value's leading pieces go to `parts`, under `u32be(len(key)) ‖ key ‖ u32be(i)`, each one filling a one-entry leaf exactly, and the rest (shorter than a piece) stays in the record. redb gives an entry larger than a page a leaf of its own rounded up to a power of two of pages, so unsplit, a 64 KiB chunk took 128 KiB. A marker, `("meta", "store_format")` = 2, is written at create; a file without it (from before milestone 8 step 7) or with another value is refused, and has to be exported with the zen-serve that wrote it. The file is sparse: measure it with `du`, not `ls`.
 
 ## 2. Installing FoundationDB
 

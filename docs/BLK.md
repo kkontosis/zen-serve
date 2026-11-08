@@ -149,6 +149,8 @@ On the 4-core development machine, FUSE + loop measured 18–25 MiB/s, 113–140
 
 ## 8. Files or volumes
 
+(A single large file through zen-mount, rather than an image under a filesystem, is measured in [STATS.md §7](STATS.md#7-large-files-measured).)
+
 The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [zen-mount](CLIENT.md#9-zen-mount) mounts the tree, and a loop device runs on the image file in it. The same ext4 workload on both (`tests/devices.rs`, `bench_fuse`, `bench_file_cdc`, `bench_file_fixed`; release build, an embedded server in the test process, the development container: 4 cores, loopback, one run each; the file columns after milestone 8 step 6b's memory bounds):
 
 | ext4 on a 1 GiB image | volume (FUSE + loop) | file, fixed chunks | file, CDC |
