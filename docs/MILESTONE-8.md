@@ -2495,7 +2495,7 @@ Measurements (docs/STATS.md §7):
 * **Disk:** 1.08–1.11× the bytes sent, every key included.
 * **Memory:** the server 0.6–0.7 GiB with one writer or 16; the replica 564 MiB writing 4 GiB; zen-mount 465 MiB.
 * **FoundationDB, 1 GiB, one process here:** writes 27–33 MiB/s, reads 80–116, edits about 1 s each (one page and one chunk); zen-serve 206–324 MiB with one writer and 1,091 MiB with 16 (FoundationDB's client library).
-* **CI's runner at 16 GiB:** in progress.
+* **CI's runner (4 cores, 16 GB) at 16 GiB:** CDC writes 51 MiB/s and reads 75, fixed 72 and 97; 1.05–1.08× on disk; every edit one page and one chunk; the server at most 726 MiB (16 writers). The client's own memory grows with the file (1.2–1.9 GiB at 16 GiB), a TD-MEMORY entry.
 
 ### Remaining (decided: wait for the runner)
 1. At the check-in (~01:25 UTC), read the `files-bench` Bench step's tables from dispatch run 42428472910 (client at 16 GiB, replica and zen-mount at 4 GiB, on the runner).
@@ -2507,3 +2507,35 @@ Measurements (docs/STATS.md §7):
 
 **Found:** `devices-bench` (8.6's image benches, dispatch only) was cancelled at its 45-minute job limit. Its Bench step ran from 00:12 to 00:54; `bench_file_cdc` alone took more than 20 minutes here.
 * **Fix** (`.github/workflows/ci.yml`): `timeout-minutes: 120`, its own commit `ci: devices-bench gets 120 minutes`. It rides in the push with the runner figures, so no extra dispatch is needed until its figures are wanted.
+* Done: 2bde53c, pushed.
+
+**At the 02:27 check-in, `files-bench` had passed** (dispatch run 42428472910 on 53ff0e4; the Bench step 00:16–01:43, 87 min; every bench's tests passed). The runner is GitHub's `ubuntu-latest`, 4 cores and 16 GB:
+* **Client, 16 GiB, embedded:**
+
+  | | CDC | Fixed |
+  |---|---|---|
+  | Write, under a session | 51.2 MiB/s, 2,196 commits | 71.7 MiB/s, 2,179 commits |
+  | The version | 459,627 chunks (mean 36.5 KiB), 103 pages | 263,173 chunks, 47 pages |
+  | Allocated on disk, for 16.0 GiB sent | +17.3 GiB (1.08×) | +16.9 GiB (1.05×) |
+  | `readStream`, readAhead 3 / 1 | 75.0 / 75.5 MiB/s | 96.9 / 98.5 MiB/s |
+  | 1,000 random 4 KiB reads, cold / warm | median 2.9 / 2.3 ms | 3.0 / 2.4 ms |
+  | Append 1 MiB / overwrite 4 KiB / insert 100 B | 110 ms / 1,558 ms / 345 ms, 1 page and 1 chunk each | 550 ms / 3,292 ms / 18.3 s on 1 GiB (8,209 chunks) |
+  | Resume at half, past the grace | 26.7 MiB/s, only the rest sent; without a session refused | 44.2 MiB/s; refused |
+  | 1 GiB, 1 / 3 in flight | 15.9 / 26.1 MiB/s | 28.1 / 38.5 MiB/s |
+  | Server peak | 601–622 MiB | 602–624 MiB |
+  | Largest upload state | 576 KiB | 707 KiB |
+
+  * 16 writers of 1 GiB: 49.9 MiB/s in all, the server 726 MiB, the client 3,597 MiB (1.45 GiB buffers).
+  * The chunker: 406 MiB/s; insertions changed 1 chunk 99.5 %, 2 0.3 %, 3 0.2 %.
+  * The client's own RSS grew with the file (1.2–1.9 GiB at 16 GiB, against 0.5–1.0 at 4 GiB; heap up to 762 MiB at the insertion). Not bounded by anything of ours yet: a TD-MEMORY line.
+* **Replica, 4 GiB:** write 13.0 MiB/s, RSS 571 MiB, `dirtyBytes` ≤ 65.0, `pendingBytes` ≤ 39.4, cache dir ≤ 1,811 MiB; a 1-byte edit 318 ms; a cold read 63.1 MiB/s (RSS 491); a pin 16.1 MiB/s (RSS 773); the server 558–564 MiB.
+* **zen-mount, 4 GiB:** write 11.2 MiB/s until closed and 11.1 until on the server, zen-mount 456 MiB, the server 496 MiB, cache dir ≤ 1,568 MiB, stop 0.6 s; a cold read 47.8 MiB/s (zen-mount 301 MiB); a 1-byte write and fsync 647 ms.
+
+**Done** (the steps below), committed with the figures:
+1. **STATS §7.1:** replace the runner placeholder sentence with a "CI's runner (4 cores, 16 GB), 16 GiB" table: the client rows above, the replica and zen-mount rows, and the 16-writer line.
+2. **STATS §7.3:** add a client row at 16 GiB (1.2–1.9 GiB RSS).
+3. **TD-MEMORY:** add a line on the client's RSS growing with a file's size (heap 762 MiB at an insertion into 16 GiB), not yet bounded or explained.
+4. **The Outcome:** replace "CI's runner at 16 GiB: in progress" with a summary line.
+5. Copy this file to `docs/MILESTONE-8.md`.
+6. Commit `docs: the 16 GiB figures from CI's runner` and push.
+7. Confirm CI is green on both runs of it, and that it was on 2bde53c. Then PR #74 waits on review and merge.

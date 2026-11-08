@@ -402,7 +402,22 @@ On **FoundationDB** here (one `fdbserver` from `zen-serve init`, 1 GiB, CDC, two
 
 A single-process cluster on the same 4 cores, so commits cost more than on the embedded store, and edits about 1 s. Several API nodes on one cluster scale the server side (operations.md §4); this bench doesn't measure that.
 
-On **CI's runner** (`files-bench`, 16 GiB): the run is in progress; its figures follow in the next commit.
+On **CI's runner** (`files-bench`: GitHub's `ubuntu-latest`, 4 cores, 16 GB; embedded), the client at **16 GiB**:
+
+| | CDC | Fixed |
+|---|---|---|
+| Write, under a session | **51 MiB/s**, 2,196 commits (459,627 chunks, 103 pages) | **72 MiB/s**, 2,179 commits (263,173 chunks, 47 pages) |
+| Allocated on disk, for 16.0 GiB sent | +17.3 GiB (**1.08×**) | +16.9 GiB (**1.05×**) |
+| `readStream`, `readAhead` 3 / 1 | 75 / 76 MiB/s | 97 / 99 MiB/s |
+| 1,000 random 4 KiB reads, cold / warm | median 2.9 / 2.3 ms | 3.0 / 2.4 ms |
+| Append 1 MiB / overwrite 4 KiB / insert 100 bytes | 110 ms / 1.6 s / 345 ms, 1 page and 1 chunk each | 550 ms / 3.3 s / 18.3 s on 1 GiB (8,209 chunks) |
+| Resume at half, past the grace | 27 MiB/s, only the rest sent | 44 MiB/s |
+| The same without a session | refused | refused |
+| 1 GiB with 1 / 3 commits in flight | 16 / 26 MiB/s | 28 / 39 MiB/s |
+| 16 writers of 1 GiB at once | 50 MiB/s in all | |
+| The server's peak | 601–622 MiB; 726 MiB with 16 writers | 602–624 MiB |
+
+And at 4 GiB there: the replica writes at 13.0 MiB/s (RSS 571 MiB), edits a byte in 318 ms, reads cold at 63 MiB/s and pins at 16 MiB/s; zen-mount writes at 11.2 MiB/s (456 MiB), reads cold at 48 MiB/s (301 MiB), and a 1-byte write with `fsync` takes 647 ms. Insertions of 1–100 bytes changed 1 chunk 99.5 % of the time there. At four times the size, every edit still costs one page and one chunk.
 
 * **Edits cost the pages they touch,** not the file: the same 1 page and 1 chunk at 4 GiB as at 4 MiB. Fixed chunks are as cheap for overwrites and appends, but an insertion shifts every later block.
 * **Pipelining roughly doubles a single upload** (27 to 53 MiB/s under CDC). Above that the server applies commits one at a time (embedded), so 16 writers together go no faster than one.
@@ -441,7 +456,8 @@ Peak resident set, with the defaults:
 | zen-serve under the replica bench | 499–541 MiB | |
 | zen-serve on FoundationDB, one writer / 16 | 206–324 / 1,091 MiB | FoundationDB's client library (its own cache and threads), not bounded by zen-serve's settings |
 | `@zen/client`, one 4 GiB write | 495–962 MiB, of which 110–160 MiB buffers | 3 commits in flight, the page memo |
-| `@zen/client`, 16 writers | 2,076 MiB (1.4 GiB of buffers) | 16 × 3 commits of up to 8 MB in flight |
+| `@zen/client`, 16 writers | 2,076 MiB (1.4 GiB of buffers); 3,597 MiB at 1 GiB each on the runner | 16 × 3 commits of up to 8 MB in flight |
+| `@zen/client`, one 16 GiB file (the runner) | 1.2–1.9 GiB, of which up to 762 MiB of heap (at the insertion) | not bounded: it grows with the file (TD-MEMORY) |
 | The `@zen/fs` replica, writing 4 GiB through a handle | **564 MiB**; `dirtyBytes` at most 65 MiB, `pendingBytes` at most 39 MiB | the handle (64 MiB), the records' backlog (32 MiB) |
 | The replica, a cold read / a pin | 541 / 831 MiB | fetched content dropped past `pendingBytes`; pins fetched in windows |
 | zen-mount, writing 4 GiB / reading it back | **465 / 296 MiB**; its cache dir at most 1.5 GiB on disk | the replica's bounds |
