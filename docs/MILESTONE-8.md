@@ -2560,6 +2560,51 @@ Measurements (docs/STATS.md §7):
 5. **Confirm CI is green on both runs** (`fdb` included). Then PR #74 waits on review and merge.
 * **CI on 5d57b29:** every job green but `fdb`, on both runs. Both `fdb` jobs died in "Install FoundationDB (pinned)": `curl: (22) The requested URL returned error: 504`, five tries each, at 10:19 UTC, before any build or test. The download host timed out; nothing of this PR ran.
   * **Re-run once (11:45 UTC): both `fdb` jobs passed. CI is green on both runs of 5d57b29**, every job. Step 8.7 and milestone 8 are done; PR #74 waits on review and merge. Nothing is left to do here until a review, a merge or a new CI event.
+  * e8c76c6 (the log sync): green on both runs. The 12:50 check-in found nothing new, so check-ins stopped; the next GitHub event or a message brings this session back.
+  * **PR #74 merged** (the user). Step 8.7 and milestone 8 are done.
+* **Step 8.8** (milestone 8's loose ends, the user's choice before milestone 9): planned below ("Step 8.8 in detail").
+
+## Step 8.8 in detail: the client's memory under a large file, and the device benches
+
+**Context:** CI's 16 GiB run found the TypeScript client's own memory growing with the file: 0.5–1.0 GiB RSS at 4 GiB, 1.2–1.9 GiB at 16 GiB, with heap up to 762 MiB at a 100-byte insertion (STATS §7.3, TD-MEMORY "the client's heap grows with a file's size"). RAM is a first-class cost (OPS §6), so it gets the 8.6b treatment: the cause measured, then a fix by cause with a test and a negative control. Also, `devices-bench` (8.6's image benches) never ran to the end on CI: it hit its 45-minute limit, now 120 (2bde53c).
+
+**Survey (read so far):**
+* `ChunkIndex` (`packages/client/src/tree.ts:144`) keeps `chunks: Uint8Array[]` and `hashes?: Uint8Array[]`: two objects per chunk, about 920,000 at 16 GiB under CDC (459,627 chunks). At about 150–200 B of heap per small `Uint8Array`, that's roughly 150–180 MB, against CLIENT.md's "about 52 bytes per chunk for the index". `upload`/`writeFile` always return it (`writer.ts:1023` sets `hashes`), and the bench keeps `up` alive.
+* Decoded pages are objects too (TD-MEMORY "decoded pages as objects": a v2 page is 5,624 `Uint8Array`s, about 1 MB of heap). An edit of a 16 GiB file decodes the touched pages, and `chunkIndex(…, {hashes: false})` decodes every page (103 at 16 GiB, about 100 MB).
+* The page memo is bounded at 65,536 ids (about 12 MB).
+
+### 1. Measure (no repo change)
+* **The run:** the client bench's CDC case (`-t "cdc: write"`) at 2 and 4 GiB here (the disk allows 4: 3 × N free), to get the growth per GiB. Node started with `--require memlog.cjs` from 8.6b (`memoryUsage` every 500 ms, heap snapshots at set RSS thresholds) through `NODE_OPTIONS` on vitest's fork.
+* **Snapshots:** after the write (`up` alive), after the reads, after the insertion; then group the large retainers by path (8.6b's script).
+* **Expected suspects, to confirm or rule out:** the returned `ChunkIndex`, decoded pages held beyond the memo, the upload state's tail, read windows.
+* **Logged here first:** the breakdown and the top retainers. The fix's design goes here before any code.
+
+### 2. Fix, by cause (the likely shape; anything that changes a public type goes to the user first)
+* **If it's the index:** a compact `ChunkIndex`. Ids in one `Uint8Array` of `n × 16`, hashes in one of `n × 32`, lengths in a `Uint32Array`, with accessors. That's about 52 B per chunk, as CLIENT.md says. It's an API change for `@zen/client`'s callers (`@zen/fs` `records.ts`, `indexOf`; kanban), so its shape goes to the user first. A smaller alternative: `WriteOptions.index: false` for callers that don't need it.
+* **If it's decoded pages:** a compact page form (one buffer of ids, lengths in a typed array), TD-MEMORY's own item, inside `tree.ts`'s page decoding and memo.
+* **Tests:** a heap-size test in `packages/client/test/` (an upload of a scaled file at small `max_value_bytes`, about 100,000 chunks; heap after GC through `--expose-gc` as `handles.test.ts` does, against a bound per chunk), with a negative control (the old form fails it).
+
+### 3. The device benches
+* **The run:** dispatch CI once (`workflow_dispatch`, `files_gib` small, e.g. 1, so `files-bench` is quick) for `devices-bench`'s figures with its 120 minutes.
+* **The figures:** compared with BLK.md §8's local ones. If they differ much, BLK.md §8 gets a runner column.
+
+### 4. Docs
+* STATS §7.3 (the client's rows re-measured), TD-MEMORY (resolved items moved), CLIENT.md §8 (the index's real cost), BLK.md §8 if the runner figures are added.
+* The log in both copies.
+
+### Branch, PR, commits
+* **First:**
+  1. restart from main (PR #74 merged): `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`, then `push --force-with-lease`
+  2. `cp` this file to `docs/MILESTONE-8.md` (bringing in the last log lines)
+  3. commit `docs: milestone 8 step 8 plan (the client's memory, the device benches)`
+  4. push and open the PR
+  5. run step 1, the measurement, right away: it changes nothing in the repo
+* **On "go":** the fix (`client: …`), its test, the docs.
+
+### Verification
+* `npm run check`, `npm run build`; the new test 3× and its negative control once; `cdc`, `tree`, `large` and the `@zen/fs` suites; then the full `npx vitest run`.
+* The client bench at 4 GiB re-run: the client's peak RSS against before.
+* CI green on both runs; `devices-bench` completing on the dispatch.
   * (Was: re-run the two failed `fdb` jobs once (`rerun_failed_jobs` on runs 42470900136 and 42470903701), as allowed for a job that died before any test body. If the download fails again, report it rather than re-running again: the fix would be a retry or a cache for the install step (`scripts/install-fdb.sh`). Then confirm green; PR #74 waits on review and merge.
 * **Done:** `renew` uses the `idempotent` form; `svc::node::tests::the_node_lease_survives_an_unknown_commit` (a store that applies a commit and answers `CommitUnknown` once) passes, and with the plain form fails (`Err("commit_unknown")`). clippy and fmt clean; the svc unit tests and `tests/dump.rs` and `tests/svc.rs` pass on embedded.
 
