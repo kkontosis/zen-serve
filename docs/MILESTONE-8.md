@@ -2614,6 +2614,16 @@ Measurements (docs/STATS.md §7):
     2. **kanban, "two concurrent moves of one card":** runs `[2, 3]`, not `[1, 2]`, so both moves re-ran before either won.
     3. **booking, "the scheduler leader killed before a reminder is due":** the other instance hadn't sent the reminder 15 s after the leader stopped.
     * Neither reproduces here: 8 runs each under CPU load (and kanban 6 more without), all passing. In kanban only the expected server conflicts appeared (a temporary log in `kv.ts`'s retry, removed). Their causes are not found yet.
+    * Committed the mount fix, 0614124.
+    * **Diagnostics (the user's choice), so a next failure names its cause:**
+      * **Kanban:** `racing` records the error behind every re-run (through the fs's transaction `retry`, which every re-run passes, reads and commits alike), with its time, as the assertion's message.
+      * **Booking:**
+        * `dbAs` keeps each Db's warnings instead of discarding them (`warn: () => {}`), so a scheduler's errors were lost before.
+        * On the failover's timeout, the error names each scheduler's `running` and `leading`, its clock against the due time, its last warnings, and the `$sched` rows left.
+      * **Forced failures,** once each and then restored, show both messages:
+        * kanban: `db 1 at 10 ms: conflict: transaction conflict`
+        * booking: both schedulers' state and `rows left: 1 [0] ms from due`
+      * Both files passed 2 runs after.
 
 ### The compact index (the design, for after the compaction)
 * **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):

@@ -49,6 +49,9 @@ async function closeAll(): Promise<void> {
   await Promise.all(cs.map((c) => c.close()));
 }
 
+/** Each Db's warnings (its scheduler's errors among them), kept quiet for failure messages. */
+const warnings = new WeakMap<Db, string[]>();
+
 /** A Db in a session of its own, signed in as `user`. */
 async function dbAs(user: string, extra: DbOptions = {}): Promise<Db> {
   const c = await signInWorker({
@@ -57,7 +60,39 @@ async function dbAs(user: string, extra: DbOptions = {}): Promise<Db> {
     passphrase: w.passphrase,
   });
   open.push(c);
-  return c.open(NS, { ...DB_OPTIONS, warn: () => {}, ...extra });
+  const log: string[] = [];
+  const db = await c.open(NS, {
+    ...DB_OPTIONS,
+    warn: (m) => log.push(`${new Date().toISOString().slice(11, 23)} ${m}`),
+    ...extra,
+  });
+  warnings.set(db, log);
+  return db;
+}
+
+/** What the schedulers of `dbs` are doing, and the rows left to deliver, for a failure message. */
+async function schedulers(dbs: Record<string, Db>, due: number): Promise<string> {
+  const out: string[] = [];
+  for (const [name, db] of Object.entries(dbs)) {
+    const s = db.scheduler;
+    const w = warnings.get(db) ?? [];
+    out.push(
+      `${name}: running ${s?.running}, leading ${s?.leading}, clock ${Math.round(now(db) - due)} ms past due, ` +
+        `warnings [${w.slice(-10).join(' | ')}]`,
+    );
+  }
+  const any = Object.values(dbs).at(-1)!;
+  try {
+    const rows = await any.transaction((tx) =>
+      tx.table<{ at: number }>('$sched').query().orderBy('at').all(),
+    );
+    out.push(
+      `rows left: ${rows.length} [${rows.map((r) => Math.round(r.at - due)).join(', ')}] ms from due`,
+    );
+  } catch (e) {
+    out.push(`rows left: unreadable (${(e as Error).message})`);
+  }
+  return out.join('; ');
 }
 
 const now = (db: Db) => db.fs.session.clock.now();
@@ -200,7 +235,9 @@ it('the scheduler leader killed before a reminder is due: another sends it late,
     expect(got).toEqual([]);
     await lead.scheduler!.stop({ release: false });
 
-    await until(() => got.length >= 1, 15_000, 'the reminder');
+    await until(() => got.length >= 1, 15_000, 'the reminder').catch(async (e: Error) => {
+      throw new Error(`${e.message}: ${await schedulers({ lead, other }, due)}`);
+    });
     await sleep(1500);
     expect(got.map((g) => [g.m.type, g.m.body.booking])).toEqual([['reminder', booking.id]]);
     expect(other.scheduler!.leading).toBe(true);
