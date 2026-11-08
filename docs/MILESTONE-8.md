@@ -2558,5 +2558,8 @@ Measurements (docs/STATS.md §7):
 3. **Checks:** `cargo fmt --check`; clippy `-p zen-server --all-targets -D warnings`; `cargo test -p zen-server --lib svc` and `--test dump` (embedded).
 4. **Commit** `server: the node lease retries an unknown commit at start-up`; log it here; `cp` to `docs/MILESTONE-8.md`; push.
 5. **Confirm CI is green on both runs** (`fdb` included). Then PR #74 waits on review and merge.
+* **CI on 5d57b29:** every job green but `fdb`, on both runs. Both `fdb` jobs died in "Install FoundationDB (pinned)": `curl: (22) The requested URL returned error: 504`, five tries each, at 10:19 UTC, before any build or test. The download host timed out; nothing of this PR ran.
+  * **Re-run once (11:45 UTC): both `fdb` jobs passed. CI is green on both runs of 5d57b29**, every job. Step 8.7 and milestone 8 are done; PR #74 waits on review and merge. Nothing is left to do here until a review, a merge or a new CI event.
+  * (Was: re-run the two failed `fdb` jobs once (`rerun_failed_jobs` on runs 42470900136 and 42470903701), as allowed for a job that died before any test body. If the download fails again, report it rather than re-running again: the fix would be a retry or a cache for the install step (`scripts/install-fdb.sh`). Then confirm green; PR #74 waits on review and merge.
 * **Done:** `renew` uses the `idempotent` form; `svc::node::tests::the_node_lease_survives_an_unknown_commit` (a store that applies a commit and answers `CommitUnknown` once) passes, and with the plain form fails (`Err("commit_unknown")`). clippy and fmt clean; the svc unit tests and `tests/dump.rs` and `tests/svc.rs` pass on embedded.
 
