@@ -2588,7 +2588,34 @@ Measurements (docs/STATS.md §7):
   * **The rest of the bench's 1.2–1.9 GiB is garbage, not live:** the bench samples peak RSS and `heapUsed` without collecting, and V8 lets the heap grow toward its limit before a full collection (OPS §6, "garbage counts until collected"). Reads and edits add about 1 MiB live.
   * **So the fix is the index's form.** Decoded pages are bounded by the memo, and nothing else grows.
 * **Decided (the user): a compact `ChunkIndex`.** Ids in one `Uint8Array` of `n × 16`, hashes in one of `n × 32`, lengths in a `Uint32Array`, with small accessors: about 52 B a chunk. A breaking type change across `@zen/client` (`tree.ts`, `writer.ts`, `index.ts`) and `@zen/fs` (`records.ts`, `queue.ts`, `overlay.ts`, `replica.ts`), and two test files (`tree.test.ts`, `large.test.ts`). No stored data needs carrying over: the replica's legacy JSON index records may simply be dropped and rebuilt.
-* **Next, on "go":** implement it (the detailed design below is updated first), with the heap-size test and its control.
+* **Next, on "go":** implement it as designed below ("The compact index"), with the heap-size test and its control.
+
+### The compact index (the design, for after the compaction)
+* **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):
+  ```ts
+  interface ChunkIndex {
+    n: number;
+    ids: Uint8Array;         // n × 16, chunk i at [16i, 16i + 16)
+    lens?: Uint32Array;      // CDC: plaintext lengths
+    hashes?: Uint8Array;     // n × 32, when every chunk's plaintext was seen
+    chunkSize?, cdc?, fileKey?, keyEpoch?, pageSize?, pages?   // unchanged
+  }
+  ```
+  * Helpers beside it: `chunkId(ix, i)` and `chunkHash(ix, i)` (`subarray` views, no copies), and a builder that grows its buffers by doubling, for the writer, which doesn't know `n` beforehand.
+  * Where code needs an array for one page, it takes views.
+* **The writer** (`writer.ts`): build the index with the builder instead of `push`ing per chunk (`index.chunks`, `index.hashes`, `lens`, around `writer.ts:1023`). Reuse by hash then looks hashes up through a `Map` keyed by `hex` of a view, built once per `previous`; check how `previous`'s hashes are matched today and keep the same cost.
+* **The readers of an index:**
+  * `tree.ts`: `chunkIndex()` (builds one from pages), `WrittenFile.index`, `Upload.index`, the `previous` matching
+  * `@zen/fs`:
+    * `records.ts`: the per-page binary records, written from `Upload.index` and read back into an index
+    * `replica.ts`: `indexOf`
+    * `queue.ts` and `overlay.ts`: the legacy `QWrite.index` JSON
+  * The legacy JSON index records and `QWrite.index` can be dropped rather than converted: no stored data needs carrying over. Drop them only where that's simpler; otherwise convert on load.
+* **The test:** in `packages/client/test/` (or `cdc.test.ts`), an upload at a small `max_value_bytes` and CDC parameters giving about 100,000 chunks, with the result kept, and the heap after `gc()` (as `handles.test.ts` exposes it). The bound is about 100 B a chunk of growth. The old form (about 390 B) must fail it: the negative control is the array form kept on the side.
+* **Then:** `npm run check` and `npm run build`; the `cdc`, `tree`, `large` and `@zen/fs` suites; the full vitest run; the probe at 1 and 2 GiB re-run (`zzclientmem.test.ts`, kept in the scratchpad, copied into `packages/client/test/` to run and removed after), expecting about 1.5 MiB per GiB live instead of 11.
+* **Docs:** CLIENT.md §8 (the index's form and cost), STATS §7.3 (the client's rows, and a note that peak RSS without a GC is mostly garbage), TD-MEMORY (the item resolved). The log here and the `cp` to `docs/MILESTONE-8.md`.
+* **The devices-bench dispatch** (`files_gib` 1), then BLK.md §8 if its figures differ from the local ones.
+* **Commits:** `client: a compact chunk index (about 52 bytes a chunk)`, then `docs: …`; push to PR #75; CI green on both runs.
 
 ### 1. Measure (no repo change)
 * **The run:** the client bench's CDC case (`-t "cdc: write"`) at 2 and 4 GiB here (the disk allows 4: 3 × N free), to get the growth per GiB. Node started with `--require memlog.cjs` from 8.6b (`memoryUsage` every 500 ms, heap snapshots at set RSS thresholds) through `NODE_OPTIONS` on vitest's fork.
