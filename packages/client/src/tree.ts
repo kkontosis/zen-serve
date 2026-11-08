@@ -21,6 +21,7 @@ import type {
   AnyManifest as WasmAnyManifest,
 } from '@zen/wasm';
 import { compare, equal, hex, randomBytes } from './bytes.js';
+import { Bytes, type ChunkIndex, pack } from './chunkindex.js';
 
 /** A manifest of any version (formats.md §11.3): 1, 2 (fixed chunks) or 3 (content-defined). */
 export type AnyManifest = WasmAnyManifest;
@@ -135,30 +136,16 @@ export interface FileVersion {
   sealedManifest: Uint8Array;
 }
 
-/**
- * What a writer knows of a version's content, for reuse: its chunk ids and
- * lengths, and a SHA-256 per chunk when its plaintext was seen, kept in
- * memory only (never sent). `writeFile` returns one for what it wrote;
- * `chunkIndex` builds one from a version (its bytes, or only its pages).
- */
-export interface ChunkIndex {
-  /** Fixed chunks: plaintext bytes per chunk. Absent under CDC. */
-  chunkSize?: number;
-  /** CDC: the chunker's parameters. */
-  cdc?: CdcParams;
-  chunks: Uint8Array[];
-  /** Plaintext lengths (CDC). */
-  lens?: number[];
-  /** Plaintext SHA-256s; absent when not every chunk's plaintext was seen. */
-  hashes?: Uint8Array[];
-  /** The file key the chunks are sealed under; absent: under the fs keys. */
-  fileKey?: Uint8Array;
-  /** The file key's epoch. */
-  keyEpoch?: number;
-  /** The most ids per page, when the version is paged: pages whose ids didn't change are reused. */
-  pageSize?: number;
-  pages?: (PageRef | PageRefV3)[];
-}
+export {
+  Bytes,
+  type ChunkIndex,
+  chunkHash,
+  chunkId,
+  compactIndex,
+  type LegacyChunkIndex,
+  pack,
+  U32s,
+} from './chunkindex.js';
 
 /**
  * A chunk of the base version (`previous`, or `base`) taken over without
@@ -1134,16 +1121,20 @@ export class Tree {
     const all = await this.entries(version, 0, n - 1);
     const index: ChunkIndex =
       m.version === 3
-        ? { cdc: m.cdc, chunks: all.ids, lens: all.lens }
-        : { chunkSize: m.chunkSize, chunks: all.ids };
+        ? { cdc: m.cdc, n, ids: pack(all.ids, 16), lens: Uint32Array.from(all.lens) }
+        : { chunkSize: m.chunkSize, n, ids: pack(all.ids, 16) };
     if (opts.hashes !== false) {
-      const hashes: Uint8Array[] = [];
+      const hashes = new Bytes(32 * n);
+      let got = 0;
       const src = data ?? this.readStream(node, { version });
-      for await (const block of splitBy(src, all.lens)) hashes.push(await sha256(block));
-      if (hashes.length !== n) {
+      for await (const block of splitBy(src, all.lens)) {
+        hashes.push(await sha256(block));
+        got++;
+      }
+      if (got !== n) {
         throw new ZenError(0, 'format', 'a version has the wrong number of chunks');
       }
-      index.hashes = hashes;
+      index.hashes = hashes.take();
     }
     if (m.version !== 1) {
       if (m.fileKey) Object.assign(index, { fileKey: m.fileKey, keyEpoch: m.keyEpoch });

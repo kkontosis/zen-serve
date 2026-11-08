@@ -7,6 +7,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   bytes,
   type ChunkIndex,
+  chunkHash,
+  chunkId,
   connect,
   memoryLocalStore,
   ROOT,
@@ -314,7 +316,7 @@ describe('the file-key policy (fs.md §4.2)', () => {
     expect(w1.manifest.fileKey).toBeDefined();
     expect(equal(w1.manifest.fileKey!, w2.manifest.fileKey!)).toBe(false);
     // f's chunks don't open under g's key.
-    const id = w1.index!.chunks[0]!;
+    const id = chunkId(w1.index!, 0);
     const sealed = (
       await w.session.call('/v1/fs/chunks/get', zw.encodeChunksGet, zw.decodeChunks, {
         fs: 2,
@@ -456,9 +458,9 @@ describe('sealing without sending (Tree.seal), known chunks', () => {
     const next = data.slice();
     next[at]! ^= 0xff;
     async function* src() {
-      for (let i = 0; i < ix.chunks.length; i++) {
+      for (let i = 0; i < ix.n; i++) {
         if (i === 150) yield next.subarray(i * CS, (i + 1) * CS);
-        else yield { id: ix.chunks[i]!, hash: ix.hashes![i]!, size: CS };
+        else yield { id: chunkId(ix, i), hash: chunkHash(ix, i)!, size: CS };
       }
     }
     const w2 = await t.writeFile(f, src(), { previous: ix, replaces: [w1.dot] });
@@ -476,7 +478,7 @@ describe('sealing without sending (Tree.seal), known chunks', () => {
     // A known chunk off a block boundary is fetched and cut again.
     const mid = async function* () {
       yield new Uint8Array(10);
-      yield { id: ix.chunks[1]!, hash: ix.hashes![1]!, size: CS };
+      yield { id: chunkId(ix, 1), hash: chunkHash(ix, 1)!, size: CS };
     };
     const r = await calls(w.session, () => t.writeFile(f, mid(), { previous: ix }));
     expect(r.count.get('/v1/fs/chunks/get')).toBe(1);
