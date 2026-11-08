@@ -2590,6 +2590,22 @@ Measurements (docs/STATS.md §7):
 * **Decided (the user): a compact `ChunkIndex`.** Ids in one `Uint8Array` of `n × 16`, hashes in one of `n × 32`, lengths in a `Uint32Array`, with small accessors: about 52 B a chunk. A breaking type change across `@zen/client` (`tree.ts`, `writer.ts`, `index.ts`) and `@zen/fs` (`records.ts`, `queue.ts`, `overlay.ts`, `replica.ts`), and two test files (`tree.test.ts`, `large.test.ts`). No stored data needs carrying over: the replica's legacy JSON index records may simply be dropped and rebuilt.
 * **Next, on "go":** implement it as designed below ("The compact index"), with the heap-size test and its control.
 
+* **On "go" (implemented):**
+  * **`packages/client/src/chunkindex.ts` (new):** `ChunkIndex { n, ids, lens?, hashes?, … }`, `chunkId`, `chunkHash`, `pack`, the growable `Bytes` and `U32s`, and `compactIndex` with `LegacyChunkIndex` (the array form). It's its own module, so `writer.ts` can import its values without importing `tree.ts` back.
+  * **`tree.ts`:** re-exports it; `chunkIndex()` packs.
+  * **`writer.ts`:** the index is built with `Bytes`/`U32s`, with hashes kept only while every entry has one. Reuse by hash and `previous`'s ids use views, and a page's digest input is the index's contiguous slice (no concat).
+  * **`@zen/fs`:**
+    * `records.ts`: the page and inline records encode from, and decode to, the packed form
+    * `indexFromRecords` builds packed buffers
+    * `QWrite.index` is typed `LegacyChunkIndex` and made compact on load
+    * the legacy JSON record is made compact when read
+    * the re-queue in `replica.ts` no longer carries an index (new entries leave it out, as its comment said)
+  * **Tests:** `large.test.ts` and `tree.test.ts` use `chunkId`/`chunkHash`. New `packages/client/test/chunkindex.test.ts`: the buffers' growth, views and `compactIndex`, and the memory test (about 36,000 chunks at `max_value_bytes` 8,192, heap plus buffers after two GCs, bound 120 B a chunk). It measured 53, 58 and 59 B a chunk. **Negative control** (`ZEN_INDEX_CONTROL=1`, the same index also held as one array per id and hash): 523 B a chunk, failing the bound.
+  * **Docs:** CLIENT.md §8 (the form, the helpers, about 24 MB at 16 GiB), STATS §7.3 (what the client keeps, and that the peaks are garbage), TD-MEMORY (the item moved to the bounded list).
+  * **Found by the full run:** `handles.test.ts`'s legacy queue-entry case stored the new packed index as "the earlier format". JSON turned its `Uint32Array` into a plain object, so the entry was neither form. It now stores the array form, as earlier replicas did.
+  * **Checks:** `npm run check`; the full `npx vitest run` (649 passed, 1 failed: the case above, then passing); the `@zen/fs`, fuse, `cdc`, `tree`, `large` and `chunkindex` suites (112 passed).
+  * **Re-measured** (the probe): after the write, heap 26.0 MiB at 1 and at 2 GiB (36.9 and 47.9 before); the index is now in array buffers, 1.5 and 2.9 MiB, about 1.4 MiB per GiB (11 before).
+
 ### The compact index (the design, for after the compaction)
 * **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):
   ```ts

@@ -457,7 +457,9 @@ Peak resident set, with the defaults:
 | zen-serve on FoundationDB, one writer / 16 | 206–324 / 1,091 MiB | FoundationDB's client library (its own cache and threads), not bounded by zen-serve's settings |
 | `@zen/client`, one 4 GiB write | 495–962 MiB, of which 110–160 MiB buffers | 3 commits in flight, the page memo |
 | `@zen/client`, 16 writers | 2,076 MiB (1.4 GiB of buffers); 3,597 MiB at 1 GiB each on the runner | 16 × 3 commits of up to 8 MB in flight |
-| `@zen/client`, one 16 GiB file (the runner) | 1.2–1.9 GiB, of which up to 762 MiB of heap (at the insertion) | not bounded: it grows with the file (TD-MEMORY) |
+| `@zen/client`, one 16 GiB file (the runner) | 1.2–1.9 GiB peak, of which up to 762 MiB of heap (at the insertion) | mostly garbage: see below |
+
+**What the client keeps** (milestone 8 step 8; after a full collection, a file's index kept as a caller keeps it): about 11 MiB per GiB written was live before, all of it the written file's chunk index, one small `Uint8Array` per id and per hash, about 390 B a chunk. The index is now packed (about 52 B a chunk, 53–59 measured: `chunkindex.test.ts`), so a 16 GiB file's is about 24 MB, and one at the CDC capacity about 300 MB. The rest of the peaks above are garbage: the benches sample peak RSS and heap without collecting, and V8 lets the heap grow toward its limit before a full collection. wasm memory adds about 35 MiB, fixed.
 | The `@zen/fs` replica, writing 4 GiB through a handle | **564 MiB**; `dirtyBytes` at most 65 MiB, `pendingBytes` at most 39 MiB | the handle (64 MiB), the records' backlog (32 MiB) |
 | The replica, a cold read / a pin | 541 / 831 MiB | fetched content dropped past `pendingBytes`; pins fetched in windows |
 | zen-mount, writing 4 GiB / reading it back | **465 / 296 MiB**; its cache dir at most 1.5 GiB on disk | the replica's bounds |
