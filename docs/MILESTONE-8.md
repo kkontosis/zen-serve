@@ -2496,3 +2496,14 @@ Measurements (docs/STATS.md §7):
 * **Memory:** the server 0.6–0.7 GiB with one writer or 16; the replica 564 MiB writing 4 GiB; zen-mount 465 MiB.
 * **FoundationDB, 1 GiB, one process here:** writes 27–33 MiB/s, reads 80–116, edits about 1 s each (one page and one chunk); zen-serve 206–324 MiB with one writer and 1,091 MiB with 16 (FoundationDB's client library).
 * **CI's runner at 16 GiB:** in progress.
+
+### Remaining (decided: wait for the runner)
+1. At the check-in (~01:25 UTC), read the `files-bench` Bench step's tables from dispatch run 42428472910 (client at 16 GiB, replica and zen-mount at 4 GiB, on the runner).
+2. If it failed, root-cause it before anything else.
+3. Fill in STATS §7.1's runner paragraph and the Outcome's runner line. Log the figures here, then `cp` this file to `docs/MILESTONE-8.md`.
+4. Commit `docs: the 16 GiB figures from CI's runner`, push, and confirm CI green on both runs. PR #74 then waits on review and merge.
+
+**At the 01:25 check-in:** `files-bench` was still in its Bench step (started 00:16; the job's limit is 240 min). Another check-in is due in about 60 min.
+
+**Found:** `devices-bench` (8.6's image benches, dispatch only) was cancelled at its 45-minute job limit. Its Bench step ran from 00:12 to 00:54; `bench_file_cdc` alone took more than 20 minutes here.
+* **Fix** (`.github/workflows/ci.yml`): `timeout-minutes: 120`, its own commit `ci: devices-bench gets 120 minutes`. It rides in the push with the runner figures, so no extra dispatch is needed until its figures are wanted.
