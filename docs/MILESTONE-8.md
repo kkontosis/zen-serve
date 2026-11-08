@@ -2663,6 +2663,8 @@ Measurements (docs/STATS.md §7):
 3. **The log** here (this check-in and the commit), then `cp` to `docs/MILESTONE-8.md`.
 4. **Commit and push:** `docs: the device benches on CI's runner (milestone 8 step 8)`. Then confirm CI is green on both runs and delete the spent check-in. PR #75 then waits on review and merge.
 * **Done:** BLK.md §8 has the runner's table (with ublk), the paragraph on what differs, and the runner's import and export figures; TD-MEMORY has the zen-ublk line. Committed with this log.
+* Pushed e7d6fef. **CI green on both runs** (push and pull_request), and the dispatch run 42521935996 green in full (`files-bench` and `devices-bench` included). **Step 8.8 is done;** PR #75 waits on review and merge. Open, for the user: why zen-ublk peaks at 373 MiB (TD-MEMORY), and the kanban and booking failures if they recur (their messages now name the cause).
+* **PR #75 merged** (aa57887). Milestone 8 and its loose ends are done. **Decided (the user):** zen-ublk's 373 MiB stays a TD-MEMORY item for now, not investigated. Next: plan milestone 9 (`@zen/sw`).
 
 ### The compact index (the design, for after the compaction)
 * **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):
