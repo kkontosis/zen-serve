@@ -2605,6 +2605,15 @@ Measurements (docs/STATS.md §7):
   * **Found by the full run:** `handles.test.ts`'s legacy queue-entry case stored the new packed index as "the earlier format". JSON turned its `Uint32Array` into a plain object, so the entry was neither form. It now stores the array form, as earlier replicas did.
   * **Checks:** `npm run check`; the full `npx vitest run` (649 passed, 1 failed: the case above, then passing); the `@zen/fs`, fuse, `cdc`, `tree`, `large` and `chunkindex` suites (112 passed).
   * **Re-measured** (the probe): after the write, heap 26.0 MiB at 1 and at 2 GiB (36.9 and 47.9 before); the index is now in array buffers, 1.5 and 2.9 MiB, about 1.4 MiB per GiB (11 before).
+  * Pushed a25bf53 (the code) and e1f5b85 (the docs). **CI green on both runs of e1f5b85.**
+  * **The red before it:** the pull_request run of 639b6e2 (the plan only) failed 3 tests in the `client` job, all in code this PR doesn't touch, each a first in the recent runs:
+    1. **mount.test.ts, "an operation that takes over 15 s finishes":** the read gave other bytes, in 150 ms with no fetch.
+       * **The cause, in the test:** it waited for `stat` to succeed, which happens once the mount sees the file's `create`, possibly before its write. The kernel then keeps the empty file's size for `attrTimeout` (1 s), so the read got nothing.
+       * **Reproduced** by forcing that order (a `stat` between the create and the write): the same failure, in 106 ms.
+       * **Fix:** wait until `stat` shows the file's full size. It passes with the order forced, and the mount suite passed 3 runs. No other wait in the file has this pattern.
+    2. **kanban, "two concurrent moves of one card":** runs `[2, 3]`, not `[1, 2]`, so both moves re-ran before either won.
+    3. **booking, "the scheduler leader killed before a reminder is due":** the other instance hadn't sent the reminder 15 s after the leader stopped.
+    * Neither reproduces here: 8 runs each under CPU load (and kanban 6 more without), all passing. In kanban only the expected server conflicts appeared (a temporary log in `kv.ts`'s retry, removed). Their causes are not found yet.
 
 ### The compact index (the design, for after the compaction)
 * **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):
