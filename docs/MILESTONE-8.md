@@ -2573,6 +2573,23 @@ Measurements (docs/STATS.md §7):
 * Decoded pages are objects too (TD-MEMORY "decoded pages as objects": a v2 page is 5,624 `Uint8Array`s, about 1 MB of heap). An edit of a 16 GiB file decodes the touched pages, and `chunkIndex(…, {hashes: false})` decodes every page (103 at 16 GiB, about 100 MB).
 * The page memo is bounded at 65,536 ids (about 12 MB).
 
+### Log
+* **Restarted from main** (820e2c3, PR #74's merge) by fast-forward; plan committed 950a8e8; PR #75 opened.
+* **Measured** (an uncommitted probe test: a CDC write under a session with the result kept, as the bench keeps it, then a `readStream` and a 100-byte `edit`; memory after two GCs at each point; heap snapshots at the start and after the write):
+
+  | After | 1 GiB | 2 GiB |
+  |---|---|---|
+  | The write (the result kept) | RSS 291, heap 36.9, external 34.8 MiB | RSS 304, heap 47.9, external 33.2 |
+  | The read | 320, 38.2, 34.9 | 334, 49.1, 33.4 |
+  | The edit | 326, 39.2, 34.9 | 338, 50.1, 33.3 |
+
+  * **What's live grows by about 11 MiB per GiB, all of it the returned `ChunkIndex`:** 28,765 ids and 28,765 hashes at 1 GiB, each a `Uint8Array` with its own `ArrayBuffer` (stores of exactly 16 and 32 B), held by `index.chunks` and `index.hashes`. That's about 390 B a chunk, against CLIENT.md's "about 52": 180 MB at 16 GiB, and 2.2 GB at CDC's 196 GiB capacity.
+  * **External memory is fixed:** one 35.9 MiB buffer, the wasm linear memory (1.4 MiB at the start), the same at 1 and 2 GiB.
+  * **The rest of the bench's 1.2–1.9 GiB is garbage, not live:** the bench samples peak RSS and `heapUsed` without collecting, and V8 lets the heap grow toward its limit before a full collection (OPS §6, "garbage counts until collected"). Reads and edits add about 1 MiB live.
+  * **So the fix is the index's form.** Decoded pages are bounded by the memo, and nothing else grows.
+* **Decided (the user): a compact `ChunkIndex`.** Ids in one `Uint8Array` of `n × 16`, hashes in one of `n × 32`, lengths in a `Uint32Array`, with small accessors: about 52 B a chunk. A breaking type change across `@zen/client` (`tree.ts`, `writer.ts`, `index.ts`) and `@zen/fs` (`records.ts`, `queue.ts`, `overlay.ts`, `replica.ts`), and two test files (`tree.test.ts`, `large.test.ts`). No stored data needs carrying over: the replica's legacy JSON index records may simply be dropped and rebuilt.
+* **Next, on "go":** implement it (the detailed design below is updated first), with the heap-size test and its control.
+
 ### 1. Measure (no repo change)
 * **The run:** the client bench's CDC case (`-t "cdc: write"`) at 2 and 4 GiB here (the disk allows 4: 3 × N free), to get the growth per GiB. Node started with `--require memlog.cjs` from 8.6b (`memoryUsage` every 500 ms, heap snapshots at set RSS thresholds) through `NODE_OPTIONS` on vitest's fork.
 * **Snapshots:** after the write (`up` alive), after the reads, after the insertion; then group the large retainers by path (8.6b's script).
