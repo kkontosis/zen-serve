@@ -164,6 +164,26 @@ The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [
 | Its peak RSS | 62 MiB | 446 MiB (426–621 over three runs; 1,822 before step 6b) | 575 MiB (560 in another run; 1,544 before) |
 | Stored on the server at the stop | 279 MiB | 1,338 MiB | 10,246 MiB |
 
+On CI's runner (`devices-bench`, started by hand: GitHub's ubuntu-24.04, 4 cores, 16 GB; the same benches, one run each, milestone 8 step 8), with zen-ublk too, which the development container can't run (no `/dev/ublk-control`):
+
+| ext4 on a 1 GiB image | volume (FUSE + loop) | volume (ublk) | file, fixed chunks | file, CDC |
+|---|---|---|---|---|
+| `mkfs.ext4` | 0.09 s | 0.08 s | 5.65 s | 71.0 s |
+| Write 256 MiB, `conv=fsync` | 18.9 MiB/s | 14.6 MiB/s | 7.3 MiB/s | 0.2 MiB/s |
+| Read 256 MiB, cold | 20.9 MiB/s | 15.0 MiB/s | 22.7 MiB/s | 6.6 MiB/s |
+| A synchronous 4 KiB write (`oflag=dsync`) | 9.3 ms | 10.8 ms | 103 ms | 3,091 ms |
+| Untar 245 files (4.6 MiB), then `sync` | 0.25 s | 0.54 s | 0.44 s | 41.2 s |
+| The daemon's stop | 0.05 s | 0.08 s | 12.9 s, 481 writes left unsent | 28.8 s, 390 writes left unsent |
+| Its peak RSS | 56 MiB | 373 MiB | 414 MiB | 636 MiB |
+| Stored on the server at the stop | 278 MiB | 278 MiB | 1,328 MiB | 21,003 MiB |
+
+Most rows agree with the container's within 1.5×. Three things differ:
+* **Cold reads of the volume** are 7× slower (21 against 149 MiB/s): the runner's disk and loopback are slower for reads.
+* **The CDC file** writes at a quarter of the container's pace and reads at 40 % of it. It stored twice as much by the stop: more of its versions were superseded and not yet collected.
+* **The import** runs at half the container's pace (below).
+
+The conclusions don't change. ublk and FUSE are close as volume frontends. zen-ublk's 373 MiB peak against FUSE's 56 isn't explained yet (spec/TECH_DEBT.md TD-MEMORY).
+
 **What makes the file slower:**
 * **An fsync is a version.** The loop device passes ext4's barriers on as `fsync` on the file, and each is a flush of zen-mount's handle: an edit of the 1 GiB file, sealing the pages and chunks around what changed into a new version (CLIENT.md §8). A volume flushes the dirty blocks and the top of its tree.
 * **Under CDC an edit re-cuts its neighbourhood:** about 3 chunks of ~32 KiB and their pages for a 4 KiB write, until the cuts resync. Fixed chunks cost one chunk. The figures above show it by an order of magnitude, so **an image file wants `chunking: fixed`** (`fs.setPolicy`, or a tree of its own in an fs with that policy).
@@ -185,7 +205,7 @@ The other way to keep a disk image in zen-serve is as a file of a zen-fs tree: [
 * **A file** to keep or carry an image rather than run on it: any zen-fs client can read it, it works offline, its versions are history until collected, and identical chunks are shared with other files of the fs. Write it whole (`writeFile`, or `cp` into a zen-mount), under `chunking: fixed`, not through a loop device. Two devices writing it at once leave siblings (no lease).
 * **To move between them:** `export` a volume to a raw image and copy it into zen-fs, or take an image out of zen-fs and `import` it (§2). Snapshots of volumes kept as zen-fs files are TD-BLK-SNAPSHOT-FILES.
 
-`import` and `export` (`bench_image`): a 1 GiB ext4 image with 294 MiB allocated (the source tree and 256 MiB of random data) imports in 8.0 s (37 MiB/s of data) and exports in 2.7 s (108 MiB/s), to a file with 262 MiB allocated; the volume stores 271 MiB.
+`import` and `export` (`bench_image`): a 1 GiB ext4 image with 294 MiB allocated (the source tree and 256 MiB of random data) imports in 8.0 s (37 MiB/s of data) and exports in 2.7 s (108 MiB/s), to a file with 262 MiB allocated; the volume stores 271 MiB. On CI's runner: an import in 15.3 s (19.3 MiB/s) and an export in 3.4 s (86.5 MiB/s), with the same sizes.
 
 ## 9. Limits
 

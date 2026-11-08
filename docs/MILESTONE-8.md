@@ -2624,6 +2624,45 @@ Measurements (docs/STATS.md §7):
         * kanban: `db 1 at 10 ms: conflict: transaction conflict`
         * booking: both schedulers' state and `rows left: 1 [0] ms from due`
       * Both files passed 2 runs after.
+    * Pushed f23b384. **CI green on both runs of 0614124 and of f23b384** (push and pull_request), every job.
+  * **Left for 8.8: the `devices-bench` figures** (dispatch run 42521935996 on e1f5b85; its Bench step running since 20:50; the check-in at 21:50 UTC reads it):
+    1. **If it passed:** read the Bench step's figures (`bench_fuse`, `bench_file_fixed`, `bench_file_cdc`, `bench_image`) and compare them with BLK.md §8's local ones. If they differ much (more than about 1.5× on any throughput, RSS or time row), add a "CI's runner (4 cores, 16 GB)" column to BLK.md §8's table and one sentence naming the machine. Otherwise, one sentence saying the runner agrees.
+    2. **If it failed or hit its 120 minutes:** root-cause it from the job log before anything else (a bench's own failure, or the time limit, with how far it got).
+    3. Log the figures here, `cp` to `docs/MILESTONE-8.md`, commit `docs: the device benches on CI's runner (milestone 8 step 8)`, push, and confirm CI green on both runs.
+    4. Then PR #75 waits on review and merge, and step 8.8 is done.
+  * **The 21:50 check-in: `devices-bench` passed** (Bench step 20:50–21:35, 45 min, 5 of 5; `bench_ublk` ran too, which it can't here: no `/dev/ublk-control`). CI's runner: GitHub's ubuntu-24.04, 4 cores, 16 GB, at e1f5b85, one run each:
+
+    | ext4 on a 1 GiB image | volume, FUSE | volume, ublk | file, fixed | file, CDC |
+    |---|---|---|---|---|
+    | `mkfs.ext4` | 0.09 s | 0.08 s | 5.65 s | 71.0 s |
+    | Write 256 MiB, `conv=fsync` | 18.9 MiB/s | 14.6 MiB/s | 7.3 MiB/s | 0.2 MiB/s |
+    | Read 256 MiB, cold | 20.9 MiB/s | 15.0 MiB/s | 22.7 MiB/s | 6.6 MiB/s |
+    | 4 KiB `oflag=dsync` | 9.33 ms | 10.79 ms | 103 ms | 3,091 ms |
+    | Untar 245 files, `sync` | 0.25 s | 0.54 s | 0.44 s | 41.2 s |
+    | Stop | 0.05 s | 0.08 s | 12.9 s, 481 unsent | 28.8 s, 390 unsent |
+    | Peak RSS | 56.4 MiB | 372.8 MiB | 414.3 MiB | 635.7 MiB |
+    | Stored at the stop | 278.1 MiB | 278.1 MiB | 1,328 MiB | 21,003 MiB |
+
+    * `bench_image`: import 15.25 s (19.3 MiB/s of data), export 3.40 s (86.5 MiB/s), 262.1 MiB allocated, 271.4 MiB stored.
+    * **Against the local figures (BLK.md §8):**
+      * **Close** (within 1.5×): the volume's write, dsync and untar; the fixed file's rows; the CDC file's mkfs, dsync and stop; the export.
+      * **Apart:**
+        * the volume's cold read: 20.9 against 149 MiB/s, 7×
+        * the CDC file: write 0.2 against 0.8 MiB/s, read 6.6 against 16.4, and 21.0 GB stored against 10.2 (more versions superseded before the stop)
+        * the import: 19.3 against 37 MiB/s
+      * The runner's disk and loopback are slower for reads; the conclusions (a volume to run a filesystem, fixed chunks for an image file) hold.
+    * **zen-ublk's peak RSS, 373 MiB against FUSE's 56 under the same load,** is a first figure (never measured here) and unexplained. OPS §6 wants every figure explained, so it goes on TD-MEMORY's "not yet explained" list, with the likely suspects to check: the ublk queues' I/O buffers (queue depth × max I/O size per queue) and the batch buffer. No investigation in 8.8 unless the user asks.
+
+### The last commit of 8.8
+1. **docs/BLK.md §8:**
+   * The table's caption names the local machine as now.
+   * A second table below it, "On CI's runner (GitHub's ubuntu-24.04, 4 cores, 16 GB)", as above, with the ublk column (the only ublk figures).
+   * One paragraph on what differs (cold reads, the CDC file, the import) and that the conclusions hold.
+   * The `bench_image` paragraph gains the runner's import and export figures.
+2. **spec/TECH_DEBT.md TD-MEMORY:** a "not yet explained" line for zen-ublk's 373 MiB peak, naming the suspects above.
+3. **The log** here (this check-in and the commit), then `cp` to `docs/MILESTONE-8.md`.
+4. **Commit and push:** `docs: the device benches on CI's runner (milestone 8 step 8)`. Then confirm CI is green on both runs and delete the spent check-in. PR #75 then waits on review and merge.
+* **Done:** BLK.md §8 has the runner's table (with ublk), the paragraph on what differs, and the runner's import and export figures; TD-MEMORY has the zen-ublk line. Committed with this log.
 
 ### The compact index (the design, for after the compaction)
 * **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):
