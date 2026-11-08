@@ -78,6 +78,25 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     5. Commit `docs: milestone 9 plan (@zen/sw)`, push, and open the PR.
   * Then run step 9.1's spike right away, since it changes nothing in the repo, and log its findings for the user's decision.
   * **Done:** restarted from main by fast-forward (aa57887); the two lines are in `docs/MILESTONE-8.md`; this file copied to `docs/MILESTONE-9.md`; DESIGN-3 §6 item 9 and the README updated.
+  * Committed c02e92c; PR #76 opened.
+* **Step 9.1, the spike** (Chromium 153, Playwright's build here; a Node server for `app.localhost` and `view.localhost`, which Chromium treats as secure contexts; the scratchpad only):
+
+  | Question | Answer |
+  |---|---|
+  | 1. A document the worker answers with `CSP: sandbox allow-scripts` (opaque origin): are its subresources the worker's? | **No.** Only the navigation reached the worker. Its stylesheet, classic and module scripts, image, iframe and `<audio>` all went to the server, so the page broke (no styles, no image, the server's HTML for the scripts). `navigator.serviceWorker` throws `SecurityError`. |
+  | 2. The same with `allow-same-origin` (control) | Every subresource reached the worker: script, module, style, image, `fetch`, iframe (and the iframe's script), audio. |
+  | 3. What an opaque document reaches | IndexedDB, `caches`, cookies, `localStorage` and the registration all throw `SecurityError`; a same-origin iframe can't be read; `fetch('/v1/info')` fails (CORS); a `BroadcastChannel` message from it never reached the worker. So the isolation would hold, but (1) makes it unusable. |
+  | 4. Media `Range` | Under the worker, `<audio>` sends `bytes=0-`, then `bytes=1310720-` for a seek to 30 s of 60. A 206 built from a stream is accepted and the seek lands (`seeked to 30.0 of 60.0`). |
+  | 5. The worker's environment | A module worker with static imports works. wasm-bindgen's glue (`init({module_or_path})`) instantiates zen-wasm in 21–25 ms. **Top-level `await` is refused** (registration fails: "ServiceWorker cannot be started"), so start-up is a promise awaited per fetch. `navigator.locks` and IndexedDB work. A 70 s streamed body (1 KiB a second) arrived whole, with the worker kept alive past the 30 s idle limit and not restarted. |
+  | 6. Lifecycle | A fetch to a running worker takes 2 ms. After CDP `ServiceWorker.stopAllWorkers`, the next fetch restarts it in 65 ms, or 97 ms with wasm initialised, and a navigation in 96 ms. **Before the first install, a navigation gets the server's answer**, so on the content origin the server must answer every path itself, sandboxed. |
+  | 7. Escapes from an opaque document | Moot after (1). For the model below: no script runs (inline, `onerror`, a `javascript:` link, an SVG's `onload` and `<script>`, with or without `script-src 'none'`), so content can't open blob or data URLs or navigate by script. |
+
+  * **The static model works:** `CSP: sandbox allow-same-origin; script-src 'none'; default-src 'self' data: blob:` keeps the content origin, so the worker controls the page and sees every subresource (the server saw none), with styles, images, iframes and seeking audio. With `script-src 'none'` the browser doesn't even fetch scripts. Without it, it fetches them and doesn't run them. Playwright can still read the page through CDP.
+  * **What this means for the models:**
+    * **S (scripts in an opaque origin, one content origin)** doesn't work in Chromium.
+    * **P-static (one content origin, no scripts)** works now and isolates the vault, since content can't run code on the origin. It serves static sites, documents, images and media, but not sites that need JavaScript.
+    * **P-sites (scripts allowed, `allow-same-origin`)** needs an origin per site, and content there can read that origin's vault. It's safe only if the device kept there can do no more than read that one site, which needs per-device scopes on the server (TD-AUTH-TOKEN-SCOPES, M11), plus wildcard DNS and TLS.
+  * **For the user's decision.**
 
 ## Steps (one PR each; each planned in detail before it starts)
 
