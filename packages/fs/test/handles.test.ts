@@ -9,6 +9,8 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import {
   bytes,
+  chunkHash,
+  chunkId,
   connect,
   memoryLocalStore,
   ROOT,
@@ -415,7 +417,15 @@ describe('small values', () => {
     for await (const [k, raw] of local.list(qs)) {
       if (k.length !== 13) continue;
       const e = decodeJson<{ v: number; ops: { op: string; index?: unknown }[] }>(raw);
-      for (const o of e.ops) if (o.op === 'write') o.index = ix;
+      // Earlier replicas kept the index in its array form.
+      const { n, ids: _ids, lens, hashes: _h, ...rest } = ix;
+      const legacy = {
+        ...rest,
+        chunks: Array.from({ length: n }, (_, i) => chunkId(ix, i).slice()),
+        ...(lens ? { lens: [...lens] } : {}),
+        hashes: Array.from({ length: n }, (_, i) => chunkHash(ix, i)!.slice()),
+      };
+      for (const o of e.ops) if (o.op === 'write') o.index = legacy;
       await local.put(qs, k, encodeJson(e));
       rewrote++;
     }

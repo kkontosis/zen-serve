@@ -150,7 +150,7 @@ for await (const batch of tree.changes(cursor, { waitMs: 25_000 })) { … }
   * `FileVersion` has `size`, `chunkCount`, `chunking`, and `chunks` (inline) or `pages`; `manifest` is version 1, 2 or 3.
   * Paged files need a server with the `fs_pages` feature (and `fs_cdc` for CDC); without it, a file past the inline limit gets 413.
 * **Sources and streams.**
-  * **Writing:** `writeFile` and `upload` take bytes, an iterable or async iterable of byte arrays, or a `ReadableStream`. They hold the commits in flight plus about 52 bytes per chunk for the index (`WrittenFile.index`).
+  * **Writing:** `writeFile` and `upload` take bytes, an iterable or async iterable of byte arrays, or a `ReadableStream`. They hold the commits in flight plus about 52 bytes per chunk for the index (`WrittenFile.index`): a `ChunkIndex` packs the ids (`n × 16` bytes), the hashes (`n × 32`) and, under CDC, the lengths (a `Uint32Array`) into one buffer each, read with `chunkId(ix, i)` and `chunkHash(ix, i)`. A 16 GiB file's index is about 24 MB.
   * **Known items:** a source may also hold `KnownChunk`s and `KnownPage`s, content of the base version taken over without its plaintext. Where one doesn't fall on a cut of the new content, the writer fetches its plaintext from the base and cuts it again, until the cuts line up.
   * **Reading:** `readStream(node, {version, offset, length, readAhead})` fetches windows of about 4 MiB, 3 ahead by default. `readFile` holds the whole file.
   * **Indexes:** `chunkIndex(node, version)` hashes through the stream when it isn't given the bytes; with `{hashes: false}` it reads only the pages.

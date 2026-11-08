@@ -191,7 +191,13 @@ describe.skipIf(!canMount)('zen-mount', () => {
     const data = new Uint8Array(200_000).map((_, i) => (i * 13) % 251);
     await t.writeFile(f, data);
     const p = join(x.mountpoint, 'slow.bin');
-    await eventually(() => stat(p));
+    // Wait for the write, not just the node: the mount may see the create
+    // first, and the kernel then keeps the empty file's size for
+    // `attrTimeout`, so a read right away would see nothing (CI, 639b6e2).
+    await eventually(async () => {
+      const st = await stat(p);
+      if (st.size !== data.length) throw new Error(`slow.bin is ${st.size} bytes so far`);
+    });
     const back = new Uint8Array(await readFile(p));
     expect(bytes.equal(back, data)).toBe(true);
     s.call = orig;

@@ -2,7 +2,7 @@
 // entries in store `zfs/…/queue`, keyed `e ‖ u64 seq ‖ 4 random bytes`, as
 // JSON with bytes in base64url and bigints as decimal text; plus the commit
 // in flight under `inflight`, kept until its outcome is known.
-import { bytes, type ChunkIndex, type PendingOp } from '@zen/client';
+import { bytes, type LegacyChunkIndex, type PendingOp } from '@zen/client';
 import type { Commit } from '@zen/wasm';
 
 /** A write op as queued: `after` names earlier entries whose write it also replaces. */
@@ -11,9 +11,10 @@ export type QWrite = Extract<PendingOp, { op: 'write' }> & {
   after?: string[];
   /**
    * The new content's whole index: only in entries queued before the index
-   * records (`records.ts`), still read; new entries leave it out.
+   * records (`records.ts`), in the array form; still read (made compact on
+   * load), and new entries leave it out.
    */
-  index?: ChunkIndex;
+  index?: LegacyChunkIndex;
 };
 
 export type QOp = Exclude<PendingOp, { op: 'write' }> | QWrite;

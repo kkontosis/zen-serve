@@ -15,6 +15,7 @@ import type {
   UploadRef,
 } from '@zen/wasm';
 import { concat, equal, hex, randomBytes } from './bytes.js';
+import { Bytes, chunkHash, chunkId, U32s } from './chunkindex.js';
 import { isCode, ZenError } from './errors.js';
 import { sendCommit } from './kv.js';
 import type {
@@ -575,7 +576,9 @@ export async function stage(
     !!prev &&
     sameKey(prev.fileKey) &&
     sameCut(prev.cdc ? 'cdc' : 'fixed', prev.chunkSize, prev.cdc);
-  const prevIds = prevOk ? new Set(prev!.chunks.map(hex)) : undefined;
+  const prevIds = prevOk
+    ? new Set(Array.from({ length: prev!.n }, (_, i) => hex(chunkId(prev!, i))))
+    : undefined;
   // Where a known item's plaintext comes from when it must be cut again.
   const fetchFrom: FileVersion | { fileKey?: Uint8Array; keyEpoch?: number } | undefined =
     base ?? (prev ? { fileKey: prev.fileKey, keyEpoch: prev.keyEpoch } : undefined);
@@ -583,11 +586,12 @@ export async function stage(
   // Reuse by SHA-256: equal bytes under the same key (any cut).
   const reuse = new Map<string, Uint8Array[]>();
   if (prev?.hashes && sameKey(prev.fileKey)) {
-    prev.hashes.forEach((h, i) => {
-      const list = reuse.get(hex(h)) ?? [];
-      list.push(prev.chunks[i]!);
-      reuse.set(hex(h), list);
-    });
+    for (let i = 0; i < prev.n; i++) {
+      const h = hex(chunkHash(prev, i)!);
+      const list = reuse.get(h) ?? [];
+      list.push(chunkId(prev, i));
+      reuse.set(h, list);
+    }
   }
 
   // Pages of `previous`, by their ids, to reuse; and where they end (CDC).
@@ -601,14 +605,17 @@ export async function stage(
     const refs = prev!.pages;
     let i = 0;
     for (const [p, ref] of refs.entries()) {
-      const count = 'count' in ref ? ref.count : Math.min(prev!.pageSize!, prev!.chunks.length - i);
-      const ids = prev!.chunks.slice(i, i + count);
-      i += count;
-      prevPages.set(hex(await sha256(concat(...ids))), ref);
-      if (chunking === 'cdc' && ids.length) {
+      const count = 'count' in ref ? ref.count : Math.min(prev!.pageSize!, prev!.n - i);
+      // The page's ids, contiguous in the index.
+      prevPages.set(hex(await sha256(prev!.ids.subarray(16 * i, 16 * (i + count)))), ref);
+      if (chunking === 'cdc' && count) {
         const nextRef = refs[p + 1];
-        prevEnds.set(hex(ids.at(-1)!), nextRef && 'count' in nextRef ? nextRef.count : 0);
+        prevEnds.set(
+          hex(chunkId(prev!, i + count - 1)),
+          nextRef && 'count' in nextRef ? nextRef.count : 0,
+        );
       }
+      i += count;
     }
   };
 
@@ -639,8 +646,16 @@ export async function stage(
   let n = open.length + pages.reduce((a, p) => a + ('count' in p ? p.count : pageSize), 0);
   // The whole index, while every chunk is seen (none taken over in a page unread).
   let indexing = !resume?.pages.length;
-  const idx = { ids: open.map((e) => e.id), lens: open.map((e) => e.len) };
-  const hashes: (Uint8Array | undefined)[] = open.map((e) => e.hash);
+  // The index of what's written, packed (about 52 bytes a chunk).
+  const idx = { ids: new Bytes(), lens: new U32s(), hashes: new Bytes() };
+  let allHashed = true;
+  const indexEntry = (e: TailEntry) => {
+    idx.ids.push(e.id);
+    idx.lens.push(e.len);
+    if (e.hash && allHashed) idx.hashes.push(e.hash);
+    else allHashed = false;
+  };
+  for (const e of open) indexEntry(e);
 
   let pending: ChunkPut[] = [];
   let pendingPages: PagePut[] = [];
@@ -805,11 +820,7 @@ export async function stage(
     open.push(e);
     size += e.len;
     n++;
-    if (indexing) {
-      idx.ids.push(e.id);
-      idx.lens.push(e.len);
-      hashes.push(e.hash);
-    }
+    if (indexing) indexEntry(e);
     await afterPush(e);
   };
 
@@ -871,7 +882,7 @@ export async function stage(
       lastId = undefined;
       if (base?.chunkCount) {
         lastId = hex((await tree.chunkIds(base, base.chunkCount - 1, base.chunkCount - 1))[0]!);
-      } else if (prev?.chunks.length) lastId = hex(prev.chunks.at(-1)!);
+      } else if (prev?.n) lastId = hex(chunkId(prev, prev.n - 1));
     }
     return lastId === hex(id);
   };
@@ -949,9 +960,9 @@ export async function stage(
     size += lay.bytes[p + 1]! - lay.bytes[p]!;
     if (indexing) {
       indexing = false;
-      idx.ids.length = 0;
-      idx.lens.length = 0;
-      hashes.length = 0;
+      idx.ids.clear();
+      idx.lens.clear();
+      idx.hashes.clear();
     }
     if (pages.length > maxPages) throw tooLarge(`a file of ${pages.length} pages`);
   };
@@ -1015,13 +1026,15 @@ export async function stage(
   if (sealedManifest.length + 16 * listed > mvb) throw tooLarge(`a file of ${n} chunks`);
   let index: ChunkIndex | undefined;
   if (indexing) {
-    index = {
-      ...(chunking === 'cdc' ? { cdc: cdc!, lens: idx.lens } : { chunkSize }),
-      chunks: idx.ids,
+    const built: ChunkIndex = {
+      ...(chunking === 'cdc' ? { cdc: cdc!, lens: idx.lens.take() } : { chunkSize }),
+      n: idx.lens.length,
+      ids: idx.ids.take(),
       ...keyOf,
     };
-    if (hashes.every((h) => h)) index.hashes = hashes as Uint8Array[];
-    if (paged) Object.assign(index, { pageSize, pages });
+    if (allHashed) built.hashes = idx.hashes.take();
+    if (paged) Object.assign(built, { pageSize, pages });
+    index = built;
   }
   Object.assign(upload, {
     node,

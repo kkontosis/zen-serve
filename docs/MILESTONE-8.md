@@ -2560,6 +2560,169 @@ Measurements (docs/STATS.md §7):
 5. **Confirm CI is green on both runs** (`fdb` included). Then PR #74 waits on review and merge.
 * **CI on 5d57b29:** every job green but `fdb`, on both runs. Both `fdb` jobs died in "Install FoundationDB (pinned)": `curl: (22) The requested URL returned error: 504`, five tries each, at 10:19 UTC, before any build or test. The download host timed out; nothing of this PR ran.
   * **Re-run once (11:45 UTC): both `fdb` jobs passed. CI is green on both runs of 5d57b29**, every job. Step 8.7 and milestone 8 are done; PR #74 waits on review and merge. Nothing is left to do here until a review, a merge or a new CI event.
+  * e8c76c6 (the log sync): green on both runs. The 12:50 check-in found nothing new, so check-ins stopped; the next GitHub event or a message brings this session back.
+  * **PR #74 merged** (the user). Step 8.7 and milestone 8 are done.
+* **Step 8.8** (milestone 8's loose ends, the user's choice before milestone 9): planned below ("Step 8.8 in detail").
+
+## Step 8.8 in detail: the client's memory under a large file, and the device benches
+
+**Context:** CI's 16 GiB run found the TypeScript client's own memory growing with the file: 0.5–1.0 GiB RSS at 4 GiB, 1.2–1.9 GiB at 16 GiB, with heap up to 762 MiB at a 100-byte insertion (STATS §7.3, TD-MEMORY "the client's heap grows with a file's size"). RAM is a first-class cost (OPS §6), so it gets the 8.6b treatment: the cause measured, then a fix by cause with a test and a negative control. Also, `devices-bench` (8.6's image benches) never ran to the end on CI: it hit its 45-minute limit, now 120 (2bde53c).
+
+**Survey (read so far):**
+* `ChunkIndex` (`packages/client/src/tree.ts:144`) keeps `chunks: Uint8Array[]` and `hashes?: Uint8Array[]`: two objects per chunk, about 920,000 at 16 GiB under CDC (459,627 chunks). At about 150–200 B of heap per small `Uint8Array`, that's roughly 150–180 MB, against CLIENT.md's "about 52 bytes per chunk for the index". `upload`/`writeFile` always return it (`writer.ts:1023` sets `hashes`), and the bench keeps `up` alive.
+* Decoded pages are objects too (TD-MEMORY "decoded pages as objects": a v2 page is 5,624 `Uint8Array`s, about 1 MB of heap). An edit of a 16 GiB file decodes the touched pages, and `chunkIndex(…, {hashes: false})` decodes every page (103 at 16 GiB, about 100 MB).
+* The page memo is bounded at 65,536 ids (about 12 MB).
+
+### Log
+* **Restarted from main** (820e2c3, PR #74's merge) by fast-forward; plan committed 950a8e8; PR #75 opened.
+* **Measured** (an uncommitted probe test: a CDC write under a session with the result kept, as the bench keeps it, then a `readStream` and a 100-byte `edit`; memory after two GCs at each point; heap snapshots at the start and after the write):
+
+  | After | 1 GiB | 2 GiB |
+  |---|---|---|
+  | The write (the result kept) | RSS 291, heap 36.9, external 34.8 MiB | RSS 304, heap 47.9, external 33.2 |
+  | The read | 320, 38.2, 34.9 | 334, 49.1, 33.4 |
+  | The edit | 326, 39.2, 34.9 | 338, 50.1, 33.3 |
+
+  * **What's live grows by about 11 MiB per GiB, all of it the returned `ChunkIndex`:** 28,765 ids and 28,765 hashes at 1 GiB, each a `Uint8Array` with its own `ArrayBuffer` (stores of exactly 16 and 32 B), held by `index.chunks` and `index.hashes`. That's about 390 B a chunk, against CLIENT.md's "about 52": 180 MB at 16 GiB, and 2.2 GB at CDC's 196 GiB capacity.
+  * **External memory is fixed:** one 35.9 MiB buffer, the wasm linear memory (1.4 MiB at the start), the same at 1 and 2 GiB.
+  * **The rest of the bench's 1.2–1.9 GiB is garbage, not live:** the bench samples peak RSS and `heapUsed` without collecting, and V8 lets the heap grow toward its limit before a full collection (OPS §6, "garbage counts until collected"). Reads and edits add about 1 MiB live.
+  * **So the fix is the index's form.** Decoded pages are bounded by the memo, and nothing else grows.
+* **Decided (the user): a compact `ChunkIndex`.** Ids in one `Uint8Array` of `n × 16`, hashes in one of `n × 32`, lengths in a `Uint32Array`, with small accessors: about 52 B a chunk. A breaking type change across `@zen/client` (`tree.ts`, `writer.ts`, `index.ts`) and `@zen/fs` (`records.ts`, `queue.ts`, `overlay.ts`, `replica.ts`), and two test files (`tree.test.ts`, `large.test.ts`). No stored data needs carrying over: the replica's legacy JSON index records may simply be dropped and rebuilt.
+* **Next, on "go":** implement it as designed below ("The compact index"), with the heap-size test and its control.
+
+* **On "go" (implemented):**
+  * **`packages/client/src/chunkindex.ts` (new):** `ChunkIndex { n, ids, lens?, hashes?, … }`, `chunkId`, `chunkHash`, `pack`, the growable `Bytes` and `U32s`, and `compactIndex` with `LegacyChunkIndex` (the array form). It's its own module, so `writer.ts` can import its values without importing `tree.ts` back.
+  * **`tree.ts`:** re-exports it; `chunkIndex()` packs.
+  * **`writer.ts`:** the index is built with `Bytes`/`U32s`, with hashes kept only while every entry has one. Reuse by hash and `previous`'s ids use views, and a page's digest input is the index's contiguous slice (no concat).
+  * **`@zen/fs`:**
+    * `records.ts`: the page and inline records encode from, and decode to, the packed form
+    * `indexFromRecords` builds packed buffers
+    * `QWrite.index` is typed `LegacyChunkIndex` and made compact on load
+    * the legacy JSON record is made compact when read
+    * the re-queue in `replica.ts` no longer carries an index (new entries leave it out, as its comment said)
+  * **Tests:** `large.test.ts` and `tree.test.ts` use `chunkId`/`chunkHash`. New `packages/client/test/chunkindex.test.ts`: the buffers' growth, views and `compactIndex`, and the memory test (about 36,000 chunks at `max_value_bytes` 8,192, heap plus buffers after two GCs, bound 120 B a chunk). It measured 53, 58 and 59 B a chunk. **Negative control** (`ZEN_INDEX_CONTROL=1`, the same index also held as one array per id and hash): 523 B a chunk, failing the bound.
+  * **Docs:** CLIENT.md §8 (the form, the helpers, about 24 MB at 16 GiB), STATS §7.3 (what the client keeps, and that the peaks are garbage), TD-MEMORY (the item moved to the bounded list).
+  * **Found by the full run:** `handles.test.ts`'s legacy queue-entry case stored the new packed index as "the earlier format". JSON turned its `Uint32Array` into a plain object, so the entry was neither form. It now stores the array form, as earlier replicas did.
+  * **Checks:** `npm run check`; the full `npx vitest run` (649 passed, 1 failed: the case above, then passing); the `@zen/fs`, fuse, `cdc`, `tree`, `large` and `chunkindex` suites (112 passed).
+  * **Re-measured** (the probe): after the write, heap 26.0 MiB at 1 and at 2 GiB (36.9 and 47.9 before); the index is now in array buffers, 1.5 and 2.9 MiB, about 1.4 MiB per GiB (11 before).
+  * Pushed a25bf53 (the code) and e1f5b85 (the docs). **CI green on both runs of e1f5b85.**
+  * **The red before it:** the pull_request run of 639b6e2 (the plan only) failed 3 tests in the `client` job, all in code this PR doesn't touch, each a first in the recent runs:
+    1. **mount.test.ts, "an operation that takes over 15 s finishes":** the read gave other bytes, in 150 ms with no fetch.
+       * **The cause, in the test:** it waited for `stat` to succeed, which happens once the mount sees the file's `create`, possibly before its write. The kernel then keeps the empty file's size for `attrTimeout` (1 s), so the read got nothing.
+       * **Reproduced** by forcing that order (a `stat` between the create and the write): the same failure, in 106 ms.
+       * **Fix:** wait until `stat` shows the file's full size. It passes with the order forced, and the mount suite passed 3 runs. No other wait in the file has this pattern.
+    2. **kanban, "two concurrent moves of one card":** runs `[2, 3]`, not `[1, 2]`, so both moves re-ran before either won.
+    3. **booking, "the scheduler leader killed before a reminder is due":** the other instance hadn't sent the reminder 15 s after the leader stopped.
+    * Neither reproduces here: 8 runs each under CPU load (and kanban 6 more without), all passing. In kanban only the expected server conflicts appeared (a temporary log in `kv.ts`'s retry, removed). Their causes are not found yet.
+    * Committed the mount fix, 0614124.
+    * **Diagnostics (the user's choice), so a next failure names its cause:**
+      * **Kanban:** `racing` records the error behind every re-run (through the fs's transaction `retry`, which every re-run passes, reads and commits alike), with its time, as the assertion's message.
+      * **Booking:**
+        * `dbAs` keeps each Db's warnings instead of discarding them (`warn: () => {}`), so a scheduler's errors were lost before.
+        * On the failover's timeout, the error names each scheduler's `running` and `leading`, its clock against the due time, its last warnings, and the `$sched` rows left.
+      * **Forced failures,** once each and then restored, show both messages:
+        * kanban: `db 1 at 10 ms: conflict: transaction conflict`
+        * booking: both schedulers' state and `rows left: 1 [0] ms from due`
+      * Both files passed 2 runs after.
+    * Pushed f23b384. **CI green on both runs of 0614124 and of f23b384** (push and pull_request), every job.
+  * **Left for 8.8: the `devices-bench` figures** (dispatch run 42521935996 on e1f5b85; its Bench step running since 20:50; the check-in at 21:50 UTC reads it):
+    1. **If it passed:** read the Bench step's figures (`bench_fuse`, `bench_file_fixed`, `bench_file_cdc`, `bench_image`) and compare them with BLK.md §8's local ones. If they differ much (more than about 1.5× on any throughput, RSS or time row), add a "CI's runner (4 cores, 16 GB)" column to BLK.md §8's table and one sentence naming the machine. Otherwise, one sentence saying the runner agrees.
+    2. **If it failed or hit its 120 minutes:** root-cause it from the job log before anything else (a bench's own failure, or the time limit, with how far it got).
+    3. Log the figures here, `cp` to `docs/MILESTONE-8.md`, commit `docs: the device benches on CI's runner (milestone 8 step 8)`, push, and confirm CI green on both runs.
+    4. Then PR #75 waits on review and merge, and step 8.8 is done.
+  * **The 21:50 check-in: `devices-bench` passed** (Bench step 20:50–21:35, 45 min, 5 of 5; `bench_ublk` ran too, which it can't here: no `/dev/ublk-control`). CI's runner: GitHub's ubuntu-24.04, 4 cores, 16 GB, at e1f5b85, one run each:
+
+    | ext4 on a 1 GiB image | volume, FUSE | volume, ublk | file, fixed | file, CDC |
+    |---|---|---|---|---|
+    | `mkfs.ext4` | 0.09 s | 0.08 s | 5.65 s | 71.0 s |
+    | Write 256 MiB, `conv=fsync` | 18.9 MiB/s | 14.6 MiB/s | 7.3 MiB/s | 0.2 MiB/s |
+    | Read 256 MiB, cold | 20.9 MiB/s | 15.0 MiB/s | 22.7 MiB/s | 6.6 MiB/s |
+    | 4 KiB `oflag=dsync` | 9.33 ms | 10.79 ms | 103 ms | 3,091 ms |
+    | Untar 245 files, `sync` | 0.25 s | 0.54 s | 0.44 s | 41.2 s |
+    | Stop | 0.05 s | 0.08 s | 12.9 s, 481 unsent | 28.8 s, 390 unsent |
+    | Peak RSS | 56.4 MiB | 372.8 MiB | 414.3 MiB | 635.7 MiB |
+    | Stored at the stop | 278.1 MiB | 278.1 MiB | 1,328 MiB | 21,003 MiB |
+
+    * `bench_image`: import 15.25 s (19.3 MiB/s of data), export 3.40 s (86.5 MiB/s), 262.1 MiB allocated, 271.4 MiB stored.
+    * **Against the local figures (BLK.md §8):**
+      * **Close** (within 1.5×): the volume's write, dsync and untar; the fixed file's rows; the CDC file's mkfs, dsync and stop; the export.
+      * **Apart:**
+        * the volume's cold read: 20.9 against 149 MiB/s, 7×
+        * the CDC file: write 0.2 against 0.8 MiB/s, read 6.6 against 16.4, and 21.0 GB stored against 10.2 (more versions superseded before the stop)
+        * the import: 19.3 against 37 MiB/s
+      * The runner's disk and loopback are slower for reads; the conclusions (a volume to run a filesystem, fixed chunks for an image file) hold.
+    * **zen-ublk's peak RSS, 373 MiB against FUSE's 56 under the same load,** is a first figure (never measured here) and unexplained. OPS §6 wants every figure explained, so it goes on TD-MEMORY's "not yet explained" list, with the likely suspects to check: the ublk queues' I/O buffers (queue depth × max I/O size per queue) and the batch buffer. No investigation in 8.8 unless the user asks.
+
+### The last commit of 8.8
+1. **docs/BLK.md §8:**
+   * The table's caption names the local machine as now.
+   * A second table below it, "On CI's runner (GitHub's ubuntu-24.04, 4 cores, 16 GB)", as above, with the ublk column (the only ublk figures).
+   * One paragraph on what differs (cold reads, the CDC file, the import) and that the conclusions hold.
+   * The `bench_image` paragraph gains the runner's import and export figures.
+2. **spec/TECH_DEBT.md TD-MEMORY:** a "not yet explained" line for zen-ublk's 373 MiB peak, naming the suspects above.
+3. **The log** here (this check-in and the commit), then `cp` to `docs/MILESTONE-8.md`.
+4. **Commit and push:** `docs: the device benches on CI's runner (milestone 8 step 8)`. Then confirm CI is green on both runs and delete the spent check-in. PR #75 then waits on review and merge.
+* **Done:** BLK.md §8 has the runner's table (with ublk), the paragraph on what differs, and the runner's import and export figures; TD-MEMORY has the zen-ublk line. Committed with this log.
+
+### The compact index (the design, for after the compaction)
+* **The type** (`packages/client/src/tree.ts`, exported from `index.ts`):
+  ```ts
+  interface ChunkIndex {
+    n: number;
+    ids: Uint8Array;         // n × 16, chunk i at [16i, 16i + 16)
+    lens?: Uint32Array;      // CDC: plaintext lengths
+    hashes?: Uint8Array;     // n × 32, when every chunk's plaintext was seen
+    chunkSize?, cdc?, fileKey?, keyEpoch?, pageSize?, pages?   // unchanged
+  }
+  ```
+  * Helpers beside it: `chunkId(ix, i)` and `chunkHash(ix, i)` (`subarray` views, no copies), and a builder that grows its buffers by doubling, for the writer, which doesn't know `n` beforehand.
+  * Where code needs an array for one page, it takes views.
+* **The writer** (`writer.ts`): build the index with the builder instead of `push`ing per chunk (`index.chunks`, `index.hashes`, `lens`, around `writer.ts:1023`). Reuse by hash then looks hashes up through a `Map` keyed by `hex` of a view, built once per `previous`; check how `previous`'s hashes are matched today and keep the same cost.
+* **The readers of an index:**
+  * `tree.ts`: `chunkIndex()` (builds one from pages), `WrittenFile.index`, `Upload.index`, the `previous` matching
+  * `@zen/fs`:
+    * `records.ts`: the per-page binary records, written from `Upload.index` and read back into an index
+    * `replica.ts`: `indexOf`
+    * `queue.ts` and `overlay.ts`: the legacy `QWrite.index` JSON
+  * The legacy JSON index records and `QWrite.index` can be dropped rather than converted: no stored data needs carrying over. Drop them only where that's simpler; otherwise convert on load.
+* **The test:** in `packages/client/test/` (or `cdc.test.ts`), an upload at a small `max_value_bytes` and CDC parameters giving about 100,000 chunks, with the result kept, and the heap after `gc()` (as `handles.test.ts` exposes it). The bound is about 100 B a chunk of growth. The old form (about 390 B) must fail it: the negative control is the array form kept on the side.
+* **Then:** `npm run check` and `npm run build`; the `cdc`, `tree`, `large` and `@zen/fs` suites; the full vitest run; the probe at 1 and 2 GiB re-run (`zzclientmem.test.ts`, kept in the scratchpad, copied into `packages/client/test/` to run and removed after), expecting about 1.5 MiB per GiB live instead of 11.
+* **Docs:** CLIENT.md §8 (the index's form and cost), STATS §7.3 (the client's rows, and a note that peak RSS without a GC is mostly garbage), TD-MEMORY (the item resolved). The log here and the `cp` to `docs/MILESTONE-8.md`.
+* **The devices-bench dispatch** (`files_gib` 1), then BLK.md §8 if its figures differ from the local ones.
+* **Commits:** `client: a compact chunk index (about 52 bytes a chunk)`, then `docs: …`; push to PR #75; CI green on both runs.
+
+### 1. Measure (no repo change)
+* **The run:** the client bench's CDC case (`-t "cdc: write"`) at 2 and 4 GiB here (the disk allows 4: 3 × N free), to get the growth per GiB. Node started with `--require memlog.cjs` from 8.6b (`memoryUsage` every 500 ms, heap snapshots at set RSS thresholds) through `NODE_OPTIONS` on vitest's fork.
+* **Snapshots:** after the write (`up` alive), after the reads, after the insertion; then group the large retainers by path (8.6b's script).
+* **Expected suspects, to confirm or rule out:** the returned `ChunkIndex`, decoded pages held beyond the memo, the upload state's tail, read windows.
+* **Logged here first:** the breakdown and the top retainers. The fix's design goes here before any code.
+
+### 2. Fix, by cause (the likely shape; anything that changes a public type goes to the user first)
+* **If it's the index:** a compact `ChunkIndex`. Ids in one `Uint8Array` of `n × 16`, hashes in one of `n × 32`, lengths in a `Uint32Array`, with accessors. That's about 52 B per chunk, as CLIENT.md says. It's an API change for `@zen/client`'s callers (`@zen/fs` `records.ts`, `indexOf`; kanban), so its shape goes to the user first. A smaller alternative: `WriteOptions.index: false` for callers that don't need it.
+* **If it's decoded pages:** a compact page form (one buffer of ids, lengths in a typed array), TD-MEMORY's own item, inside `tree.ts`'s page decoding and memo.
+* **Tests:** a heap-size test in `packages/client/test/` (an upload of a scaled file at small `max_value_bytes`, about 100,000 chunks; heap after GC through `--expose-gc` as `handles.test.ts` does, against a bound per chunk), with a negative control (the old form fails it).
+
+### 3. The device benches
+* **The run:** dispatch CI once (`workflow_dispatch`, `files_gib` small, e.g. 1, so `files-bench` is quick) for `devices-bench`'s figures with its 120 minutes.
+* **The figures:** compared with BLK.md §8's local ones. If they differ much, BLK.md §8 gets a runner column.
+
+### 4. Docs
+* STATS §7.3 (the client's rows re-measured), TD-MEMORY (resolved items moved), CLIENT.md §8 (the index's real cost), BLK.md §8 if the runner figures are added.
+* The log in both copies.
+
+### Branch, PR, commits
+* **First:**
+  1. restart from main (PR #74 merged): `git fetch origin main && git checkout -B claude/brave-knuth-gk03mm origin/main`, then `push --force-with-lease`
+  2. `cp` this file to `docs/MILESTONE-8.md` (bringing in the last log lines)
+  3. commit `docs: milestone 8 step 8 plan (the client's memory, the device benches)`
+  4. push and open the PR
+  5. run step 1, the measurement, right away: it changes nothing in the repo
+* **On "go":** the fix (`client: …`), its test, the docs.
+
+### Verification
+* `npm run check`, `npm run build`; the new test 3× and its negative control once; `cdc`, `tree`, `large` and the `@zen/fs` suites; then the full `npx vitest run`.
+* The client bench at 4 GiB re-run: the client's peak RSS against before.
+* CI green on both runs; `devices-bench` completing on the dispatch.
   * (Was: re-run the two failed `fdb` jobs once (`rerun_failed_jobs` on runs 42470900136 and 42470903701), as allowed for a job that died before any test body. If the download fails again, report it rather than re-running again: the fix would be a retry or a cache for the install step (`scripts/install-fdb.sh`). Then confirm green; PR #74 waits on review and merge.
 * **Done:** `renew` uses the `idempotent` form; `svc::node::tests::the_node_lease_survives_an_unknown_commit` (a store that applies a commit and answers `CommitUnknown` once) passes, and with the plain form fails (`Err("commit_unknown")`). clippy and fmt clean; the svc unit tests and `tests/dump.rs` and `tests/svc.rs` pass on embedded.
 

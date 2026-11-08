@@ -12,6 +12,7 @@ import {
   type ChangeBatch,
   type ChannelFactory,
   type ChunkIndex,
+  compactIndex,
   defaultChannel,
   defaultLocks,
   displayNames,
@@ -20,6 +21,7 @@ import {
   type FileVersion,
   IntegrityError,
   isCode,
+  type LegacyChunkIndex,
   type LockManagerLike,
   Owner,
   ROOT,
@@ -1128,7 +1130,7 @@ export class Replica {
         local: true,
         entry: e.key,
         replaces: op.replaces,
-        ...(op.index ? { index: op.index } : {}),
+        ...(op.index ? { index: compactIndex(op.index) } : {}),
       };
       this.locals.set(key, v);
     }
@@ -1373,7 +1375,7 @@ export class Replica {
     if (isLocal(v) && v.index) return v.index;
     if (!isLocal(v)) {
       const raw = await this.rec.get('index', bytes.concat(node, v.dot));
-      if (raw) return decodeJson<ChunkIndex>(raw);
+      if (raw) return compactIndex(decodeJson<LegacyChunkIndex>(raw));
     }
     const kept = await indexFromRecords(v, (k) => this.rec.get('index', k));
     if (kept) return kept;
@@ -1645,7 +1647,6 @@ export class Replica {
         ...(keep.pages.length ? { pages: keep.pages } : {}),
         // A manifest is bound to its tree and node, not its version.
         manifest: keep.sealedManifest,
-        ...(isLocal(keep) && keep.index ? { index: keep.index } : {}),
       };
       await this.enqueue([op], undefined, opts.wait);
     });

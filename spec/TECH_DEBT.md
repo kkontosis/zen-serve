@@ -180,15 +180,16 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * the client's page memo: `pageMemoIds`, 65,536 ids, about 12 MB, and `pageMemoPages`, 256 (step 6b)
   * pinned content fetched in windows of 256 chunks (step 6b); content fetched for reads isn't kept past `pendingBytes`
   * `readStream` read-ahead and pipelined uploads: a few windows or commits each
+  * **a written file's chunk index** (step 8): packed, about 52 B a chunk; it was about 390, and all of the client's live growth under a large file (11 MiB per GiB). `chunkindex.test.ts` bounds it at 120 B
   * **the server** (step 7): the embedded backend's page cache (`[storage] cache_bytes`, 256 MiB), commit bodies in flight (`limits.commit_buffer_bytes`, 64 MiB), 2 malloc arenas, and one copy of each value in a transaction. Measured: 587–637 MiB under one 4 GiB writer and 691–712 MiB under 16 (1.9–3.1 GiB before; docs/STATS.md §7.3)
 * **Not bounded, or not measured yet:**
   * **Decoded pages as objects:** a v2 page decodes to 5,624 separate `Uint8Array` ids (wasm's `decodeAnyPage`), about 1 MB of heap per 90 KB page, and every edit of a large file decodes and builds a few of them. A compact form (one buffer of ids, lengths in a typed array) would cut that about 10×.
   * **wasm linear memory** never shrinks: one large operation sets the floor for the process's life.
   * **zen-mount under an image workload:** after step 6b, the peak is what the benches show (docs/BLK.md §8); the JS heap's churn from page decoding is most of what is left. A large file through it peaks at 465 MiB writing and 296 MiB reading (STATS.md §7.3).
   * **The server, what's left:** a signed-in client that stalls a commit's body holds its share of `commit_buffer_bytes` until the connection drops (no body read timeout), so enough of them make the node's commits wait; relayed connections' windows (STATS.md §2.1); FoundationDB's client library, measured at 1,091 MiB in zen-serve under 16 writers (206–324 MiB under one; STATS.md §7.1), with no setting of ours. The cache default is a hedge: large-file throughput was the same from 64 MiB up, and metadata-heavy loads weren't measured.
-  * **The client's heap grows with a file's size:** 0.5–1.0 GiB RSS for a 4 GiB file, 1.2–1.9 GiB for 16 GiB (heap up to 762 MiB at an insertion; STATS.md §7.3). Not explained yet; the pages decoded as objects (above) and the upload's per-page bookkeeping are the suspects.
   * **The client's buffers under many uploads:** 3 commits of up to `max_commit_bytes` in flight per upload, so 16 uploads in one process held 1.4 GiB of buffers (STATS.md §7.3). A process-wide budget would bound it.
   * **The Loro kept state:** a document's whole snapshot is one record in memory (zendb.md §20).
+  * **zen-ublk under an image workload:** 373 MiB peak RSS on CI's runner, against 56 MiB for the FUSE frontend under the same load (docs/BLK.md §8; measured only there, since the development container has no ublk). Not explained yet. To check first: the ublk queues' I/O buffers (queue depth × the largest I/O, per queue) and the write batch's buffer.
   * **The browser:** IndexedDB-backed replicas under the same workloads.
 * **What it would take:** memory figures for every frontend and the server as part of each milestone's benches (milestone 8 step 7 was the first: STATS.md §7.3), a bound and a setting for each item above, a body read timeout (or a per-caller share of the budget), and the compact page form.
 

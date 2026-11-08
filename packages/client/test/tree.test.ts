@@ -3,6 +3,8 @@ import {
   bytes,
   CHUNK_SIZE,
   type ChangeBatch,
+  chunkHash,
+  chunkId,
   displayNames,
   memoryClockStore,
   type OpRecord,
@@ -285,7 +287,10 @@ describe('large files and limits', () => {
     const w2 = await t.writeFile(f, next, { ...fixed, previous: w1.index, replaces: [w1.dot] });
     expect(w2.uploaded).toBe(1);
     expect(w2.commits).toBe(1);
-    expect(w2.index!.chunks.filter((c, i) => equal(c, w1.index!.chunks[i]!)).length).toBe(10);
+    const kept = Array.from({ length: w2.index!.n }, (_, i) => i).filter((i) =>
+      equal(chunkId(w2.index!, i), chunkId(w1.index!, i)),
+    );
+    expect(kept.length).toBe(10);
     expect(equal(await b.tree(t.id).readFile(f), next)).toBe(true);
 
     // An index built from a version read back reuses as well.
@@ -459,7 +464,7 @@ describe('tree operations in transactions', () => {
     expect((await t.versions(f)).length).toBe(0);
     await a.transaction(async (tx) => {
       await t.writeIn(tx, [await t.writeOp(up)]);
-      tx.set(['file-index'], up.index!.hashes![0]!);
+      tx.set(['file-index'], chunkHash(up.index!, 0)!);
     });
     expect(equal(await t.readFile(f), data)).toBe(true);
     // The next write reuses unchanged chunks through `previous`.

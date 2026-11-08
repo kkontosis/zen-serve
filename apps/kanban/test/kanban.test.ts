@@ -104,10 +104,27 @@ async function placements(db: Db): Promise<Map<string, string[]>> {
 /**
  * Run `fn` with the transactions of `dbs` held at their end until each db
  * has run one (all their reads done), so they commit at the same moment and
- * conflict. Returns how many times each db ran a transaction function.
+ * conflict. Returns how many times each db ran a transaction function, and
+ * `why`: the error behind each re-run, for the assertion's message.
  */
-async function racing<R>(dbs: Db[], fn: () => Promise<R>): Promise<number[]> {
+async function racing<R>(dbs: Db[], fn: () => Promise<R>): Promise<number[] & { why: string[] }> {
   const runs = dbs.map(() => 0);
+  const why: string[] = [];
+  const t0 = Date.now();
+  // Every re-run, of the reads or of the commit, passes through `retry`.
+  const fss = [...new Set(dbs.map((d) => d.fs))];
+  const origTx = fss.map((f) => f.transaction.bind(f));
+  fss.forEach((f, i) => {
+    const who = dbs.findIndex((d) => d.fs === f);
+    f.transaction = ((g, o = {}) =>
+      origTx[i]!(g, {
+        ...o,
+        retry: (e) => {
+          why.push(`db ${who} at ${Date.now() - t0} ms: ${(e as Error).message}`);
+          return o.retry ? o.retry(e) : e instanceof ZenError && e.retryable;
+        },
+      })) as typeof f.transaction;
+  });
   let arrived = 0;
   let go!: () => void;
   const all = new Promise<void>((r) => {
@@ -131,8 +148,11 @@ async function racing<R>(dbs: Db[], fn: () => Promise<R>): Promise<number[]> {
     dbs.forEach((d, i) => {
       d.transaction = orig[i]! as Db['transaction'];
     });
+    fss.forEach((f, i) => {
+      f.transaction = origTx[i]!;
+    });
   }
-  return runs;
+  return Object.assign(runs, { why });
 }
 
 describe('the transactional board', () => {
@@ -167,7 +187,7 @@ describe('the transactional board', () => {
         Promise.all([moveCard(a, card.id, doing!.id, 0), moveCard(b, card.id, done!.id, 0)]),
       );
       // One conflicted and re-ran after the other committed: it is the one that stays.
-      expect([...runs].sort()).toEqual([1, 2]);
+      expect([...runs].sort(), runs.why.join('; ')).toEqual([1, 2]);
       const row = await b.table<Card>('cards').get(card.id);
       expect(row!.column).toBe(runs.indexOf(2) === 0 ? doing!.id : done!.id);
       expect((await placements(a)).get(card.id)).toEqual([row!.column]);
@@ -178,7 +198,7 @@ describe('the transactional board', () => {
     const runs = await racing([a, b], () =>
       Promise.all([moveCard(a, x.id, done!.id, 0), moveCard(b, y.id, done!.id, 0)]),
     );
-    expect([...runs].sort()).toEqual([1, 2]);
+    expect([...runs].sort(), runs.why.join('; ')).toEqual([1, 2]);
     const ids = (await columnCards(a, done!.id)).map((c) => c.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids.slice(0, 2).sort()).toEqual([x.id, y.id].sort());
