@@ -2539,3 +2539,10 @@ Measurements (docs/STATS.md §7):
 5. Copy this file to `docs/MILESTONE-8.md`.
 6. Commit `docs: the 16 GiB figures from CI's runner` and push.
 7. Confirm CI is green on both runs of it, and that it was on 2bde53c. Then PR #74 waits on review and merge.
+* Done: cc1abd2.
+* **CI on 2bde53c:** the pull_request run green; the push run's `client` job failed `handles.test.ts`'s memory bound (36.4 MiB past the middle, bound 32; it failed once before in 8.6 at 34.4).
+  * **Measured here:** 12–21 MiB in 6 runs (64 with the dirty bound off). Split after a full GC: the heap grows a steady 9 MiB over the second half, and `external` and array buffers swing ±10–15 MiB between runs.
+  * **What grows**, by heap snapshots at the second quarter and the end: 43,000 new `Uint8Array`s, held by the replica's local versions (`Replica.locals`: the queued entry's version lists the inline file's chunks so far, and its manifest again) and the page memo (65,536 ids at most). Both are bounded: the inline limit (about 4,400 chunks) and the memo's bound. Neither is a leak.
+  * **Ruled out:** pending records (0.1–0.2 MiB even with 10 ms puts: a spill waits for them); local versions piling up (with or without pruning them in `rebuild`, there's at most one more than the queued entries, even with 150 ms commits). The pruning and its test were reverted, since their control passed.
+  * **Fix:** the bound is 48 MiB, with these costs in its comment: above CI's 34–38, below the 64 with the bound off (the control still fails, at 64.0 MiB).
+
