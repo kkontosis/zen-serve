@@ -362,7 +362,7 @@ form 2, paged:   body = u32 page_size ‖ u32 m ‖ m × (page_id(16) ‖ page_d
 * **Inline:** the chunk list must equal the `chunks` of the `write` that carries the manifest.
 * **Paged:** the chunk list is split into pages (§11.6) of `page_size ≥ 1` ids each, every page full but the last, so `m = ceil(n / page_size)` (and `m = 0` when `n = 0`). Chunk `i` is in page `i / page_size` at slot `i % page_size`. The page ids must equal the `pages` of the `write`, in order. A reader checks each page against its `page_digest` and its expected count when it fetches it, so a page that was swapped, reordered or truncated is detected.
 * A decoder refuses any other `form`, a paged `m` other than `ceil(n / page_size)`, `page_size = 0` with `n > 0`, and trailing bytes.
-* At the defaults (`max_value_bytes` 90,000) a paged version holds about 1,870 pages of 5,624 chunks, about 640 GiB at 64 KiB per chunk.
+* At the defaults (`max_value_bytes` 90,000) a paged version holds about 1,870 pages of 5,624 chunks, about 640 GiB at 65,280 B per chunk (the clients' default fixed size).
 
 Version 3 (milestone 8), with chunks of variable length, as the chunker of §11.7 cuts them:
 
@@ -440,7 +440,7 @@ page_digest = BLAKE3.derive_key("zen/v1/fs-page", page)
 ```
 
 * A page id is 16 random bytes chosen by the client. A page is immutable: an id never holds other bytes (fs.md §4.1).
-* At the defaults a page holds up to 5,624 chunk ids, about 351 MiB at 64 KiB per chunk.
+* At the defaults a page holds up to 5,624 chunk ids, about 350 MiB at 65,280 B per chunk.
 
 **Form 2** (milestone 8) also gives each chunk's plaintext length, for version-3 manifests (§11.3):
 

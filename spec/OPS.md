@@ -94,7 +94,8 @@ From fastest-growing to slowest (rates and retention in STATS.md §2–3):
 6. **The embedded file never shrinks**: freed pages are reused, but the file keeps its peak size (`TD-STORE-COMPACTION`).
 7. **FoundationDB trace logs:** about 100 MB per `fdbserver` process.
 8. **Replication:** `double` and `triple` store every byte two or three times across nodes.
-9. **Relayed connections:** input waits in storage until a handler acks it, output until it is written. Each connection holds at most `window` plus `out_window` bytes, so a service holds at most `max_conns × (window + out_window)` per node (1,024 × 1.25 MiB, about 1.3 GB, by default), counted in the fs quota. It is freed as the bytes move: a handler that stops acking holds its connections' share until they time out.
+9. **Open upload sessions** (api.md §12.1): a session references every chunk and page put under it until it's closed or expires, 7 days by default (`upload_ttl_secs`) and at most 30 (`upload_max_ttl_secs`), with at most 64 open per user and fs. An abandoned upload holds its content that long, not one grace period. A user removed from the ACL keeps their sessions until they expire. A client that lost its upload state can list its sessions and close them (`Tree.uploads`, `closeUpload`).
+10. **Relayed connections:** input waits in storage until a handler acks it, output until it is written. Each connection holds at most `window` plus `out_window` bytes, so a service holds at most `max_conns × (window + out_window)` per node (1,024 × 1.25 MiB, about 1.3 GB, by default), counted in the fs quota. It is freed as the bytes move: a handler that stops acking holds its connections' share until they time out.
 
 **FoundationDB stops accepting writes when a disk is nearly full.** Everything stalls: reads and status calls time out (`fdbcli status` hangs), and transactions in flight end with `commit_unknown`. Free space and it recovers by itself within seconds. **Watch free disk, and alert well before 10 %.**
 
@@ -108,6 +109,9 @@ From fastest-growing to slowest (rates and retention in STATS.md §2–3):
 | A FoundationDB test cluster | ~300 MB data + ~110 MB trace logs |
 | `bench_file_cdc` (an ext4 image as a zen-fs file under CDC, `tests/devices.rs`) | **up to ~20 GB** while it runs: about 9 GB stored by the in-process server (every flush's new chunks, until their grace), the store's overhead, and zen-mount's cache dir. `bench_file_fixed` needs about a third of that. Free `target/debug` first (below) |
 | Each `scripts/install-fdb.sh` test install | 144–277 MB |
+| The large-file benches (STATS.md §7) at `ZEN_BENCH_GIB` = N | about **3 × N GiB** free under `$TMPDIR` (they refuse to start with less): the server's data dir holds about 1.1 × N, plus superseded content until its 5 s grace, plus the replica's or zen-mount's cache dir (up to 1.7 GB at 4 GiB). The client bench writes a second file of N and two of 1 GiB |
+
+* **Measure redb's file with `du`, not `ls`:** it grows sparse, and its apparent size was twice what it held.
 
 * **Use `CARGO_INCREMENTAL=0`**: incremental caches are large and rarely worth it with LTO-free debug builds of this size.
 * **Delete `target/debug/incremental`** when space runs low; it is the first thing to go.
@@ -169,6 +173,16 @@ Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are
 | Read-ahead windows of `readStream` | `readAhead` | 3 × 4 MiB |
 | Upload commits in flight | `WriteOptions.parallel` | 3 × `max_commit_bytes` |
 | Content kept on disk (not RAM) | `ReplicaOptions.cacheBytes`, `zen-mount --cache-size` | 1 GiB |
+| **zen-serve:** the embedded backend's page cache | `[storage] cache_bytes` | 256 MiB |
+| **zen-serve:** commit bodies read and held at once | `[limits] commit_buffer_bytes` | 64 MiB |
+| **zen-serve:** malloc arenas (glibc) | set at start-up; `MALLOC_ARENA_MAX` or `GLIBC_TUNABLES` overrides | 2 |
+
+**The server** (milestone 8 step 7 found it at 1.9–3.1 GiB under large uploads; now 0.6–0.7 GiB, STATS.md §7.3):
+* **A cache fills with writes too.** redb puts every page a commit writes into its read cache, so a steady upload fills it to `cache_bytes` whether or not anything reads those pages again. Size it for the metadata that's read, not for the data.
+* **glibc keeps freed memory per arena,** and each thread that allocates can get one: the blocking pool's threads ran commits, and 0.6–1 GiB was memory freed but kept. zen-serve caps the arenas at 2 before any thread starts, unless the environment sets them.
+* **Waiting requests are memory.** Embedded commits apply one at a time; the ones waiting held their bodies and decoded forms, which grew with clients × `parallel` × the commit size. A commit now takes its Content-Length from `commit_buffer_bytes` after it's authenticated and before its body is read, and holds it until it's answered. The budget is fair: a commit waits behind those queued before it, even if it would fit.
+* **A stalled body holds its share.** A signed-in client that sends a commit's headers and then stops holds its part of the budget until the connection drops (zen-serve has no body read timeout), so enough stalled commits can make the node's other commits wait (TD-MEMORY).
+* **Measuring the server:** `VmHWM` and `/proc/PID/smaps_rollup` (anonymous against file-backed) sampled each second; `MALLOC_ARENA_MAX=2` or a preloaded jemalloc to tell fragmentation from live memory; heaptrack, on a build with symbols (`CARGO_PROFILE_RELEASE_STRIP=false`, `DEBUG=line-tables-only`), for what is live at the peak and where it was allocated. heaptrack's wrapper doesn't pass `SIGTERM` on, so stop the server under it by its own PID.
 
 **Measuring:**
 * **Peak RSS:** `VmHWM` in `/proc/PID/status` (the device benches report it per daemon).
@@ -180,3 +194,15 @@ Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are
 * **Bounds go in tests:** each bound has a test that fails with it off (`packages/fs/test/memory.test.ts` and `handles.test.ts`, the page memo case in `cdc.test.ts`).
 
 Known hot spots, measured or not yet: TD-MEMORY (spec/TECH_DEBT.md).
+
+## 7. Large-file pitfalls
+
+* **CDC for content, fixed for images.** Content-defined cuts resync after an insertion within a chunk or two (STATS.md §7.2), but never in periodic data or long zero runs (cut at `max`): after a length-changing edit, everything after it is cut again. Disk images and sparse-heavy files belong under `chunking: fixed` (`fs.setPolicy`), whose in-place writes keep their blocks. A sparse file's zeros are written as content either way (TD-FS-SPARSE).
+* **A fixed-chunk insertion costs the rest of the file:** every later block shifts (half of a 1 GiB file re-uploaded in 25 s, STATS.md §7.1). Prefer CDC for files edited by insertion.
+* **Long uploads need a session.** Without one, content uploaded more than `chunk_grace_secs` before the write lands is collected, and the write or a resume fails (`unknown chunk in page`). `writeFile` and `upload` take `{session: true}`, and the replica's sender and Loro's file snapshots use one when the server has `upload_sessions`. The bench's 5 s grace made this certain; the default day only bounds it.
+* **Sessions hold storage** until they close or expire (§2.1).
+* **A cross-backend `migrate` or `import` changes the version scale,** so upload sessions (like leases) may read as expired on the target, and their uploads start over.
+* **A whole rewrite without index records reads the file once** to find what it can reuse. `edit`, `append` and a replica's file handle don't: they cost the pages they touch.
+* **zen-mount's `fsync` is durable on the device,** in its cache dir, not on the server: the server has the write once the queue drains, which a stop waits up to 10 s for. A volume (docs/BLK.md §8) is the frontend whose `fsync` reaches the server.
+* **The CDC capacity is about 196 GiB a version** (98 GiB at the fill rule's worst); the writer picks fixed chunks for a larger file whose size it knows, and otherwise fails `too_large` (TD-FS-CDC-HUGE).
+

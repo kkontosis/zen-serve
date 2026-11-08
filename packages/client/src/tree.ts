@@ -54,8 +54,7 @@ export const ROOT: Uint8Array = new Uint8Array(16);
 /** Deleted nodes live under TRASH until purged (fs.md §6). */
 export const TRASH: Uint8Array = new Uint8Array(16).fill(0xff);
 
-/** The plaintext chunk size clients use (fs.md §4.1). */
-export const CHUNK_SIZE = 65536;
+export { CHUNK_SIZE } from './writer.js';
 
 const MAX_GET_NODES = 1000;
 const MAX_GET_CHUNKS = 64;

@@ -36,8 +36,12 @@ import { zw } from './wasm.js';
 
 /** Per commit operation, as the server counts (api.md §6). */
 export const OP_OVERHEAD = 512;
-/** The plaintext chunk size of fixed chunks (fs.md §4.1). */
-const CHUNK_SIZE = 65536;
+/**
+ * The plaintext size of fixed chunks (fs.md §4.1): 64 KiB − 256, so a
+ * sealed chunk (48 bytes more) stays within 64 KiB on stores that round
+ * up to 4 KiB blocks, such as a disk cache of one file per chunk.
+ */
+export const CHUNK_SIZE = 65_280;
 /** Upload commits in flight by default. */
 const MAX_IN_FLIGHT = 3;
 /** A put's `ur` key and reference count, under an upload session (api.md §6). */

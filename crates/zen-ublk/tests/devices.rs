@@ -241,9 +241,51 @@ fn mount(dev: &str, at: &Path, opts: &str, c: &mut Cleanup) {
     c.mounts.push(at.to_path_buf());
 }
 
+/// The processes with a file or their working directory under `at`, from
+/// `/proc` (what makes a mount "busy").
+fn holders(at: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let pid = e.file_name().to_string_lossy().to_string();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+        let mut links: Vec<PathBuf> = std::fs::read_dir(e.path().join("fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|f| std::fs::read_link(f.path()).ok())
+            .collect();
+        links.extend(std::fs::read_link(e.path().join("cwd")).ok());
+        for l in links.into_iter().filter(|l| l.starts_with(at)) {
+            out.push(format!("{pid} ({}): {}", comm.trim(), l.display()));
+        }
+    }
+    out
+}
+
+/// Unmount `at`. A mount that is busy is retried for up to 5 s, with what
+/// holds it reported each time, so a failure names its cause.
 fn umount(at: &Path, c: &mut Cleanup) {
-    ok("umount", &[p(at)]);
-    c.mounts.retain(|m| m != at);
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let (code, out) = sh("umount", &[p(at)]);
+        if code == 0 {
+            if !seen.is_empty() {
+                eprintln!("umount {}: busy at first; held by {seen:?}", at.display());
+            }
+            c.mounts.retain(|m| m != at);
+            return;
+        }
+        assert!(out.contains("busy"), "umount {}: {out}", at.display());
+        seen.push(holders(at));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!(
+        "umount {}: still busy after 5 s; held by {seen:?}",
+        at.display()
+    );
 }
 
 fn detach(dev: &str, c: &mut Cleanup) {

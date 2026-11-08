@@ -84,6 +84,14 @@ checkpoint_keep = 1024
 # Ephemeral pub/sub (api.md §9.1): per device, per node.
 ephemeral_bytes_per_sec = 65536   # a message costs its data + 256 bytes; 0 = no limit
 ephemeral_burst_bytes = 1048576
+# Commit bodies this node reads and holds at once (spec/OPS.md §6); a commit
+# past it waits before its body is read. At least max_commit_bytes.
+commit_buffer_bytes = 67108864
+
+# The embedded backend's page cache (redb's read cache and write buffer).
+# Every page a commit writes goes into it, so a steady write fills it.
+[storage]
+cache_bytes = 268435456
 
 # Relayed services (spec/svc.md): zen-serve relays TCP connections to
 # handlers on member clients, blind. Every node needs the same table; only

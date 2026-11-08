@@ -135,7 +135,11 @@ describe('the memory bound', () => {
       `handles: RSS growth ${mib(peak)} MiB, ${mib(late)} from the second quarter to the last; ${spills} spills`,
     );
     expect(peak).toBeLessThan(160 << 20);
-    expect(late).toBeLessThan(32 << 20);
+    // Past the middle a few bounded costs still grow: the queued entry's
+    // local version lists the inline file's chunks so far, and the page memo
+    // fills toward its bound. With the allocator's noise that measured 2–21
+    // MiB here and 34–38 MiB on CI runners; with the dirty bound off, 64.
+    expect(late).toBeLessThan(48 << 20);
     // Each spill queued a write of its own.
     expect(spills).toBeGreaterThanOrEqual(30);
     expect((await r.tree.versions((await r.nodeAt('/big.bin'))!.id)).length).toBe(1);

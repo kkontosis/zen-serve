@@ -554,6 +554,158 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * `npm run check` and `npm run build` clean
     * the memory test passed 4 runs, beside the controls
     * the full `npx vitest run`: 646 passed, 15 skipped (the opt-in benches), none failed
+  * Pushed 2491d86 (the fix) and 95d303b (the docs); PR #73 retitled to cover the implementation.
+  * **CI green on both runs** of 95d303b (push and pull_request). PR #73 waits on review and merge; a check-in is set for 15:22 UTC.
+  * These two lines are only in this file; they reach `docs/MILESTONE-8.md` at the next restart from main.
+  * The check-in at 15:22 found nothing new, so check-ins stopped.
+  * **PR #73 merged.** Step 8.6b is done.
+  * **Next:** "plan 8.7", in another session (the user's word). 8.7's memory figures (the replica, zen-mount, the server) are required, per OPS.md §6 and TD-MEMORY.
+* **Step 8.7** (benches, docs, outcome): planned below ("Step 8.7 in detail").
+  * **First:**
+    1. restart from main (57b052e)
+    2. `cp` this file to `docs/MILESTONE-8.md` (bringing in the 8.6b log lines)
+    3. commit `docs: milestone 8 step 7 plan`
+    4. push and open the PR
+  * Then implement on "go".
+  * Plan committed (f68d66b), PR #74.
+  * **On "go":**
+    * Release zen-server built. FoundationDB 7.3.79 installed in `/opt/foundationdb`; its `--features fdb` build waits until the embedded benches finish, since it replaces the binary they run.
+    * Commit 23aa632 `test: large-file benches (milestone 8 step 7)`: `benchkit.ts` (shared), the client, replica and zen-mount benches, the Loro case, and ci.yml `files-bench`. Pushed.
+    * **Fixed in the benches during the 128 MiB smoke run:**
+      * The 16 writers are one device, so they share one `TreeClock`. Each session on its own clock gave `operation timestamp reused`.
+      * The resync count compares cut positions rather than hex-encoding every chunk: 196 s down to 3 s.
+  * **The client bench at 4 GiB** (embedded, release, this container):
+    * **CDC:**
+      * Write: 56 MiB/s in 550 commits. 114,722 chunks (mean 36.6 KiB), 26 pages; the largest upload state 566 KiB.
+      * `readStream`: 113 MiB/s at readAhead 3, 122 at 1.
+      * Random 4 KiB reads: median 1.1 ms, p99 7–8 ms.
+      * Append 1 MiB: 85 ms, 1 page and 1 chunk fetched, 29 chunks sent. 4 KiB overwrite: 218 ms. 100-byte insertion: 91 ms, 1 chunk and 1 page each.
+      * A resume at half after 12 s (grace 5 s) sent only the rest. Without a session: refused, 400.
+      * Pipelining at 1 GiB: 39.5 MiB/s with 1 in flight, 58.4 with 3.
+      * 16 writers: 68 MiB/s in all. The client peaked at 1.4 GiB: 16 × 3 commits in flight.
+      * The chunker: 389 MiB/s, mean 36.4 KiB, 195 GiB per version full and 97 GiB at the fill rule's worst. Insertions of 1–100 B changed 1 chunk 99.1 % of the time, 2 chunks 0.7 %, 5 chunks 0.2 %.
+    * **Fixed:**
+      * Write: 69 MiB/s. Reads: 112–127 MiB/s.
+      * **The run failed at the 100-byte insertion** (`unknown chunk in page`). The bench's fault: the edit re-uploads half of a 1 GiB file, about 9 s, and ran without a session against a grace of 5 s. The edits now pass `session: true` (uncommitted).
+    * **The server:** 2.2–4.1 GiB peak RSS (`VmHWM`) with one writer; redb's cache is 1 GiB by default.
+    * **The data dir grew** 8 GiB under CDC and 10 GiB under fixed, for 4 GiB.
+  * **A probe** (not committed): the allocated disk (`du -B1`) per GiB written, one world each.
+    * Fixed 64 KiB: 2.04 GiB. Fixed 64 KiB − 256 B: 1.05. Fixed 32 KiB: 2.07. CDC: 1.66.
+    * The apparent file size is twice the allocated size: redb grows its file sparse.
+    * **The cause:** redb's buddy allocator rounds each page allocation up to a power of two (`page_manager.rs` `ceil_log2`). A sealed 64 KiB chunk (65,584 B) needs 17 pages of 4 KiB, so it gets 32.
+    * The benches now report allocated bytes (uncommitted). STATS §1.2's "1.1–1.5×" was an estimate; it's wrong for large values.
+  * **The replica bench at 4 GiB:**
+    * write 9.2 MiB/s (the cache dir's fsync per record), with RSS at most 579 MiB, `dirtyBytes` 65 MiB and `pendingBytes` 39 MiB
+    * a 1-byte edit 4.4 s
+    * cold read 60 MiB/s
+    * pin 11.9 MiB/s, with RSS 810 MiB
+    * the server 2.2–3.1 GiB
+  * **Decided (the user):**
+    1. The default fixed chunk becomes 65,280 B (64 KiB − 256), kept even with the split below: about 6 % less in the replica's disk cache.
+    2. Fix the embedded store's large values in 8.7.
+    3. Investigate and fix the server's memory in 8.7.
+    4. No data compatibility is needed between revisions: the app isn't deployed.
+    * Planned below ("Step 8.7, continued").
+  * **On "go" (after the compaction):**
+    * **1. The embedded store splits large values** (`crates/zen-store/src/embedded.rs`):
+      * **Changes from the plan:**
+        * **A split value's tail stays in its `kv` record** (`0x01 ‖ u32 len ‖ u32 pieces ‖ tail`), and only whole pieces go to `parts`. The first form put the tail in `parts` too: it sat between two full pieces in key order, so it got a leaf of its own, and blocks (4,144 B) still took 2 pages (2.05×). A tail is shorter than a piece, so the record still fits one page.
+        * **The page size isn't set:** redb's `Builder::set_page_size` exists only in its own tests. `PAGE` is its default, 4 KiB, and the disk test catches drift.
+        * **The marker is `meta/store_format`**, so it can't meet a server `meta` name.
+      * **Measured** (`large_values_cost_their_size_on_disk`, allocated growth over the bytes stored): CDC lengths 1.062×, 65,584 B 1.049×, 65,328 B 1.050×, blocks of 4,144 B 1.075×.
+      * **Tests:**
+        * `conformance.rs` gains `large_values` (both backends): 236 lengths from 0 to 100,000 B, densely around one and two pages; points, ranges forward and reverse with limits, overwrites (small, 100,000, 9,000, empty), an older read version, a clear and a range clear over split and inline values, a key written again, and versionstamped values and keys past a page.
+        * `tests/embedded.rs`: the disk test; `no_pieces_left_behind` (exact piece counts through overwrites, clears, a range clear, a set and clear in one transaction, a versionstamped value over a split one, and 0 after clearing everything); `another_layout_is_refused` (no marker, and format 3).
+      * **Negative controls** (each run once, then restored):
+        * pieces 16 B larger: the disk test fails for every set (2.02–2.05×)
+        * old pieces kept on an overwrite: the pieces test fails
+        * no splitting: the disk test fails for CDC (1.49×), 65,584 B (2.01×) and blocks (2.00×), but not for 65,328 B (1.01×): a 65,280 B chunk fits 16 pages without the split. So the plan's "fails for every set" holds for three of the four.
+      * **Checks:** `cargo fmt --check`; clippy `--all-targets -D warnings` on the workspace (default and `--no-default-features`) and zen-store (`--all-features`); `cargo test -p zen-store`, and `-p zen-server -p zen-blk -p zen-ublk` (26 suites, all passing).
+      * Committed d51bfc3.
+    * **2. Fixed chunks of 65,280 B** (`@zen/client`):
+      * `CHUNK_SIZE` is defined once, in `writer.ts`, and re-exported from `tree.ts` (the other way round would make the two modules import each other's values).
+      * spec: fs.md §4.1 (the default named), formats.md §11.3 and §11.5 (about 640 GiB a version and about 350 MiB a page at 65,280 B), glossary "chunk". STATS waits for the docs commit.
+      * **Test:** `tree.test.ts`, "fixed chunks are 64 KiB − 256 by default, sealed within 64 KiB": 4 chunks sealed at most 65,536 B, the manifest's `chunkSize` 65,280. With 65,536 it fails ("expected 65584 to be less than or equal to 65536").
+      * The existing chunk-counting tests still hold: `tree.test.ts`'s 11-chunk file is 11 chunks at either size.
+      * **Checks:** `npm run check`, `npm run build`; the full `npx vitest run`: 647 passed, 22 skipped (the opt-in benches), none failed. Committed 4402e78.
+    * **3. The server's memory, measured** (release, embedded, this container; a probe not committed: one 4 GiB CDC write under a session and a `readStream`, or 16 writers of 256 MiB at once; the server's `VmHWM` per phase, and `smaps_rollup` every second):
+
+      | redb cache | Allocator | 1 writer: write | read | 16 writers |
+      |---|---|---|---|---|
+      | 1 GiB (the default) | glibc as is | 1,927 MiB | 2,668 MiB | 3,071 MiB |
+      | 1 GiB | `MALLOC_ARENA_MAX=2` | 1,349–1,401 | 1,613–1,667 | |
+      | 1 GiB | jemalloc (preloaded) | 1,750 | 1,815 | |
+      | 256 MiB | glibc as is | 1,362 | 1,358 | |
+      | 256 MiB | `MALLOC_ARENA_MAX=2` | 637 | 639 | 908 |
+      | 64 MiB | `MALLOC_ARENA_MAX=2` | 273 | 274 | |
+
+      * **Throughput doesn't depend on the cache here:** 61–65 MiB/s writing and 117–124 MiB/s reading at every size, and 69–72 MiB/s for the 16 writers.
+      * **All of it is anonymous memory** (the file-backed part is 10 MB).
+      * **Cause 1, redb's cache:** a commit's pages go into the read cache once written (`cached_file.rs` `flush_write_buffer`), so a steady write fills it to `cache_bytes`, 1 GiB by default, whether or not anything reads them again.
+      * **Cause 2, glibc's arenas:** about 0.6–1 GiB more is memory freed but kept per arena. Commits run on tokio's blocking pool, and its threads get arenas of their own. `MALLOC_ARENA_MAX=2` gives it back; jemalloc did less well at 1 GiB.
+      * **Cause 3, the commits in flight** (heaptrack, 16 writers at 2 GiB, cache 256 MiB; peak heap 630 MB):
+        * redb's pages: about 355 MB (the cache, and the write buffer of the commit being applied)
+        * request bodies being read: about 140 MB
+        * the decoded commits (zen-proto): about 140 MB
+        * the transaction's two copies (`overlay` and `ops`): about 59 MB
+        * Embedded commits apply one at a time, and up to 48 (16 × 3 in flight) wait their turn, each holding its body or its decoded form. So the server's memory grows with clients × `parallel` × the commit size, and nothing bounds it.
+      * **Decided (the user):**
+        1. **The allocator:** zen-serve calls `mallopt(M_ARENA_MAX, 2)` at start, before any thread (glibc only, no new dependency), unless `MALLOC_ARENA_MAX` or `GLIBC_TUNABLES` is set.
+        2. **The cache:** `[storage] cache_bytes`, 256 MiB by default (a hedge for metadata-heavy loads, which weren't measured; 64 MiB was as fast for large files).
+        3. **The commits:** one shared buffer per value in a transaction, plus a byte budget for commit bodies in flight.
+      * **Implemented:**
+        * `zen-store`: `Options.cache_bytes` (`DEFAULT_CACHE_BYTES` 256 MiB) → `Builder::set_cache_size`; `Op::Set` and the overlay share one `Arc<[u8]>`.
+        * `zen-server`:
+          * `[storage] cache_bytes` (at least 1 MiB), used by `open_store` and `migrate`
+          * `main` builds its runtime by hand, after `cap_malloc_arenas()`
+          * `limits.commit_buffer_bytes` (64 MiB; at least `max_commit_bytes`, below 4 GiB; not sent to clients)
+          * `commit::Budget`, an extractor that takes the request's Content-Length (or `max_commit_bytes` + 1 MB when absent, at most the budget) from a semaphore and holds it until the commit is answered, on `/v1/commit` and `/v1/log/append`
+      * **Change from the first form:** the budget was first a middleware on the route, before authentication. A test showed a request without a session is answered 401 before its body is read, so it held nothing, but it still queued for the budget. It's now an extractor after `Caller`, so only a signed-in caller waits for it or holds it.
+      * **Known, not changed:** a signed-in caller that stalls its bodies holds its share until the connection drops, so enough stalled commits can hold the whole budget and make other commits on that node wait. zen-serve has no body read timeout. OPS §6 and TD-MEMORY say so.
+      * **Tests:**
+        * `embedded::tests::a_set_value_is_buffered_once` (a test-only `buffered_bytes` counts each allocation once): 1 MiB + 3 B. With two copies: 2,097,158.
+        * `config` units: `storage_cache_bytes`, `commit_buffer_bytes_is_checked`.
+        * `tests/api.rs` `commits_past_the_buffer_budget_wait` (budget 1,000,000): a stalled body without a session is answered 401; a signed-in stalled body of 900,000 makes another 900,000 wait (still waiting after 1.5 s) while 50,000 goes through; once the stalled connection drops, the waiting one is answered. Without `Budget` on the handler it fails ("B waits while A holds the budget").
+        * The arena cap has no test (glibc doesn't report its arenas); the benches measure it.
+      * **Re-measured with the defaults** (no environment set): 1 writer 613 MiB writing (57.1 MiB/s) and 621 reading (116.7 MiB/s); 16 writers 712 MiB (64.9 MiB/s). Throughput is 8–10 % below the 1 GiB runs in this one run each; the benches re-run below.
+      * **Checks:** `cargo fmt --check`; clippy on the workspace and zen-server `--no-default-features`; `cargo test -p zen-store -p zen-server` (22 suites). Committed d6d066c.
+    * Pushed 509c8bd (the three commits and this log).
+    * **CI on 509c8bd: red, `rust`, `pure-rust` and `fdb` (both runs, but `rust` only on the pull_request run).** All three were `commits_past_the_buffer_budget_wait`, timing out at the small commit.
+      * **The cause is in the test:** the budget is a fair semaphore (tokio's), so a commit that would fit waits behind one queued before it. The test sent the 900,000-byte commit and the 50,000-byte one at once, and on CI the large one reached the budget first. Locally the small one happened to win.
+      * **Reproduced** by queueing a large one 300 ms before the small one: the same `Elapsed`.
+      * **Fix** (df2a690): the small one is sent and answered before the large one. Passed 5×; without `Budget` it still fails ("B waits while A holds the budget"). `Budget`'s comment says the budget is fair.
+    * **The older red, on the pull_request run of 23aa632:** `devices` failed `ublk_ext4_round_trip` at `umount` ("target is busy"), right after its files were written, synced and closed. That commit changed no Rust, and it doesn't reproduce here (no ublk). `umount` in the device tests now retries a busy mount for up to 5 s and reports what holds it from `/proc` (2ea6253), so a next occurrence names its cause. The FUSE device tests pass here with it.
+    * **CI on 2ea6253:** the pull_request run green. The push run's `client` job failed `writes.test.ts`'s v3 case (3 pages sent, bound 2); the dispatch run (files-bench) failed in the build steps of `files-bench` and `devices-bench`.
+      * **The v3 case:** reproduced 2 runs in 12. An edit near the start of a full page (102 entries, its capacity) gave it a 103rd chunk, so the writer cut a full page and a page of 1 (the fill rule allows it: 1 + 102 > 102); with the appended last page, 3. The writer is right and the bound was wrong. The test now checks that every page but the first and the last is taken over unchanged, and that exactly the new pages are sent (at most 3): 16 of 16 passed (48d729a).
+        * Its negative control (every flush a whole rewrite) passes too: a rewrite with `previous` reuses the unchanged pages as well (8.3), so pages can't tell the two apart. Chunks do, and `handles.test.ts`'s edit-cost test has that control.
+      * **The build steps:** `npm run build` builds the workspaces in the order package.json lists them, and `@zen/fuse` came before `@zen/fs`, which it imports. A fresh checkout failed (`Cannot find module '@zen/fs'`); locally an older `dist/` hid it, since 8.6's `devices-bench` step. Reproduced with the old order and every `dist/` removed; fuse is now listed after fs (49b64d3).
+    * **The zen-mount bench ran forever** (stopped after 40 min): it looked for `/big` by `node.name`, which a `TreeNode` doesn't have (`meta.name`), so its wait for the version never ended; zen-mount had sent everything at 22:57. tsc covered only `packages/fuse/src`. A `packages/fuse/tsconfig.test.json` now covers the tests, in `npm run check` and CI; with the old lookup it fails (TS2339). It also found one type error in `mount.test.ts` (fixed).
+    * **A leftover:** the heaptrack run's server (its stop signal reached heaptrack's wrapper, not the server) kept running with 1.1 GB until found; stopped by PID. It used 1.4 % CPU, so the figures taken beside it stand.
+    * **The client bench at 4 GiB, embedded, again** (`target/largebench-4g-2.log`; the CDC case re-run alone, since a clippy build overlapped its reads the first time):
+
+      | | CDC | Fixed |
+      |---|---|---|
+      | Write 4 GiB (session) | 51–54 MiB/s, 550 commits | 66.9 MiB/s, 546 commits |
+      | Data dir, allocated, for 4.0 GiB sent | +4,560–4,593 MiB (1.11×) | +4,428 MiB (1.08×) |
+      | `readStream`, readAhead 3 / 1 | 107.6 / 115.6 MiB/s | 121.1 / 121.8 MiB/s |
+      | 1,000 random 4 KiB reads, cold / warm | median 1.61 / 1.44 ms | 1.55 / 1.38 ms |
+      | Append 1 MiB | 137 ms | 318 ms |
+      | 4 KiB overwrite | 302 ms | 457 ms |
+      | 100-byte insertion | 250 ms (1 page, 1 chunk) | 24.7 s on 1 GiB (8,209 chunks, 512 MiB) |
+      | Resume at half, past the grace | 51.9 MiB/s, only the rest sent | 63.4 MiB/s |
+      | Pipelining 1 GiB, 1 / 3 in flight | 27.0 / 52.6 MiB/s | 35.1 / 63.0 MiB/s |
+      | Server peak | 587–637 MiB | 605–616 MiB |
+
+      * 16 writers of 256 MiB: 60.2 MiB/s in all; the server 691 MiB (3.1–4.1 GiB before); the client 2,076 MiB (1.4 GiB of buffers: 16 × 3 commits in flight).
+      * The chunker: 425.5 MiB/s, mean 36.5 KiB, 196 GiB a version full and 98 GiB at the fill rule's worst; 1–100 B insertions changed 1 chunk 98.1 %, 2 1.4 %, 3 0.2 %, 4 0.1 %, 6 0.2 %.
+      * **Against the first 4 GiB run:** the data dir went from 2× and 2.4× the bytes sent (8 and 10 GiB, with superseded content) to 1.11× and 1.08×; the server from 2.2–4.1 GiB to under 0.7. Writes are 5–10 % slower, and random 4 KiB reads 1.4–1.6 ms against 1.1: a split chunk is a lookup in each table, and the cache is a quarter of the size.
+    * **The replica bench at 4 GiB:** write 9.9 MiB/s (until queued and until on the server alike), RSS 564 MiB, `dirtyBytes` at most 65.0 MiB, `pendingBytes` 39.2 MiB, the cache dir at most 1,699 MiB; a 1-byte overwrite 385 ms (1 page and 1 chunk each way; 4.4 s in the first run); a cold read 58.2 MiB/s, RSS 541 MiB, 393 MiB kept; a pin 13.8 MiB/s, RSS 831 MiB, 4,102 MiB kept. The server 499–541 MiB (2.2–3.1 GiB before).
+    * **The zen-mount bench at 4 GiB** (after the fix): write 9.7 MiB/s until closed and 9.6 until on the server, zen-mount 465 MiB, the server 507 MiB, the cache dir at most 1,559 MiB, stop 0.2 s; a cold read on a fresh cache 39.9 MiB/s with zen-mount at 296 MiB; a 1-byte write and fsync 292 ms, stop with it sent 0.4 s.
+    * **The Loro case:** a 31 MiB snapshot compacts to a file in 618 ms and loads from it in 305 ms.
+    * **The resume control:** a resume whose source starts one byte late (same length) fails the bench at its read-back hash (`largebench.test.ts:273`).
+    * **FoundationDB at 1 GiB** (a release `--features fdb` build, a single-process cluster from `zen-serve init` here):
+      * **The first run failed** the 16-writer case with `version_mismatch: ACL version must be 2`: every world of the bench served the cluster's root keyspace, so the second world found the first one's ACL. The bench's fault: each FDB world now has a `key_prefix` of its own, and `ZEN_BENCH_FDB_DATA` names the cluster's data dir for the disk row (it measured the server's empty data dir).
+      * **The second run failed** "the same at 64 MiB without a session": it was written, not refused. It ran after two 1 GiB files were dropped, so about 57,000 chunks were ahead of its chunks in the collection queue, and FoundationDB's sweep rounds didn't reach them within the bench's 12 s. Not a server fault (content is kept longer, never shorter, than the grace). The check now runs in a world of its own.
 
 
 ## Steps (one PR each; each planned in detail before it starts)
@@ -1976,6 +2128,315 @@ The file benches found three things outside zen-ublk (see the 8.6 log). The user
 * **The benches:** `bench_file_fixed` and `bench_file_cdc` in release, as root. Clear the bench temp dirs between runs, and keep logs and snapshots under `target/` (snapshots can be GBs: delete them after analysis).
 * **CI:** green on both runs.
 
+## Step 8.7 in detail: benches, docs, outcome
+
+Step 8.7 is the milestone's last step. It measures what 8.1–8.6b built, at multi-GiB sizes. Memory is part of every figure, as OPS.md §6 and TD-MEMORY require: the client, the replica, zen-mount and the server. Then it writes the docs and the Outcome.
+
+There's no format change and no `spec:` commit. The code is the benches and a CI job, plus whatever the benches find wrong. A small, local fix goes in with a test and a negative control. Anything larger goes to the user first.
+
+**Survey:**
+* **The harness** (`packages/client/src/testing/server.ts`):
+  * `spawnServer`/`world()` give `pid` (for `/proc/PID/status`), `dataDir`, `limits`, and `extra` TOML. A `[storage]` table with `backend = "fdb"` and `cluster_file` selects FoundationDB.
+  * `ZEN_SERVE_BIN` picks the release binary.
+* **vitest uses `pool: 'forks'`,** so each file runs in its own process, and `/proc/self/status` `VmHWM` is that bench's alone.
+* **The opt-in bench pattern** (`integritybench.test.ts`, `loro/test/bench.test.ts`): `describe.skipIf(!process.env.ZEN_BENCH)`, and markdown table lines printed at the end. 8.0's 256 MiB probe wasn't committed.
+* **What gets measured:**
+  * `Tree.writeFile`/`upload` (`session`, `parallel`, `onProgress`, `resume`), `readStream` (`readAhead`), `read`, `edit`, `append`, `uploads`
+  * `@zen/fs`: `openReplica`, `FileHandle`, `status()` (`pendingBytes`, `cacheBytes`), `sealedStore(nodeDiskLocalStore(dir))` (zen-mount's store)
+  * zen-mount: `packages/fuse/dist/cli.js`, run as `mount.test.ts` runs it
+* **The TS client has no quota read,** so stored bytes are the data dir's size on disk after a sweep (`du`), beside the logical figure computed from the formats.
+* **CI:** `devices-bench` (`workflow_dispatch` only) is the template. No TS bench job exists.
+* **Here:** 27 GB of disk free, no FoundationDB installed (`scripts/install-fdb.sh`). STATS has §1–§6, so §7 is new.
+
+### 1. The client bench (`packages/client/test/largebench.test.ts`, new)
+
+**Running it:**
+* Started with `ZEN_BENCH=1 ZEN_SERVE_BIN=target/release/zen-serve npx vitest run packages/client/test/largebench.test.ts`.
+* The size is `ZEN_BENCH_GIB` (4 by default).
+* Before anything else it checks free disk under the temp dir. It refuses to start below 3 × the size, naming what it needs (8.6b's ENOSPC).
+
+**The source:**
+* AES-128-CTR keystream over zeros (`node:crypto`). It's random-looking, so it's not periodic and CDC resyncs, and it's fast.
+* It's seekable (counter = offset / 16), so a resume can restart the source at any offset.
+* Read-backs compare SHA-256 computed while streaming. No file is kept on disk.
+
+**The world:**
+* The release server with `chunk_grace_secs` 5 and `sweep_interval_secs` 1, so superseded content goes quickly and a resume happens past the grace.
+* One world per form: CDC (the default), then `fixed` (`setPolicy`). Each is stopped and its data deleted before the next.
+
+**Per form:**
+1. **Write:** `writeFile(…, {session: true})` from the stream.
+   * MiB/s and commits
+   * the last `UploadState`'s JSON size (it should stay compact)
+   * the client's peak RSS, and its `memoryUsage` split (sampled every 200 ms)
+   * the server's `VmHWM`
+   * stored bytes after a sweep
+2. **Cold read:** `readStream` of the whole file at `readAhead` 3, and again at 1, in MiB/s, with the hash checked.
+3. **Random reads:** 1,000 reads of 4 KiB at random offsets, median and p99 ms. First on a fresh `Tree` (cold page memo), then again (warm).
+4. **Append** 1 MiB (`tree.append`): ms, plus pages and chunks fetched and sent, counted through `session.call`, as `cdc.test.ts` counts them.
+5. **Edits:**
+   * **A 4 KiB overwrite and a 100-byte insertion at the middle** (`tree.edit`), counted the same way.
+   * **Fixed form:** the insertion shifts every later block, so it's measured on a separate 1 GiB file to bound the time. The docs say why CDC is the default.
+6. **Resume:**
+   1. A second file's source throws at half the size.
+   2. Wait 2 × the grace, with sweeps running.
+   3. Resume from the last reported state. It sends only the rest (the bytes counted), and the file reads back.
+   4. **Without a session:** the same at 64 MiB fails, showing what the session buys.
+7. **Pipelining:** a 1 GiB write at `parallel` 1 and at 3.
+
+**Once (in the CDC world):**
+8. **The server under many writers:** 16 clients, each with its own session, write size / 16 each at once. Aggregate MiB/s, and zen-serve's `VmHWM` (TD-MEMORY's open server figure).
+9. **The chunker at the defaults:**
+   * wasm `Chunker.push` in MiB/s
+   * the mean chunk length, giving CDC capacity at the defaults and in the half-full worst case of the fill rule
+   * **the resync distribution:** 1,000 random insertions of 1–100 bytes into 4 MiB random buffers, with a histogram of chunks changed, counted exactly as in `cdc.test.ts` (8.3's figures were at small parameters)
+
+**FoundationDB:**
+* `ZEN_BENCH_BACKEND=fdb` with `ZEN_BENCH_CLUSTER_FILE` adds the `[storage]` table.
+* Locally: run at 1 GiB, CDC only, with a release `--features fdb` server and a cluster from `install-fdb.sh` and `zen-serve init` (OPS §3).
+* If the cluster doesn't fit the disk, the log says so.
+
+**Output:** a table per form and backend, printed at the end.
+
+### 2. The replica bench (`packages/fs/test/bench.test.ts`, new)
+
+**The setup:**
+* The replica runs over `sealedStore(nodeDiskLocalStore(tmp))`, as zen-mount runs it, with the defaults: `dirtyBytes` 64 MiB, `pendingBytes` 32 MiB, `cacheBytes` 1 GiB, CDC.
+* The size is `ZEN_BENCH_GIB`.
+* The same source and disk check as the client bench.
+
+**What it measures:**
+1. **Write:** one `FileHandle`, 1 MiB writes, then close.
+   * MiB/s until the last write is queued, then the time until the queue drains (`idle()`), in MiB/s
+   * sampled every 50 ms: the peaks of RSS, `heapUsed`, `arrayBuffers`, `dirtyBytes` and `pendingBytes`
+   * the cache dir's size at its peak, since queued content stays local until sent
+2. **Edit:** a 1-byte overwrite at the middle through a handle. The flush time, plus pages and chunks sent.
+3. **Cold read:** on a second replica with a fresh cache dir, in 1 MiB reads. MiB/s, peak RSS, and `cacheBytes` kept at the end.
+4. **Pin:** a third replica pins the file. MiB/s and peak `pendingBytes`.
+
+### 3. The zen-mount bench (`packages/fuse/test/bench.test.ts`, new)
+
+* **Setup:** `ZEN_BENCH=1`, and FUSE available (`canMount`). zen-mount runs as a child, as `mount.test.ts` runs it, with `--cache-dir` and the defaults.
+* **Write:** the test writes a file of the size into the mount in 1 MiB writes, then fsyncs and closes it. It reports MiB/s, zen-mount's `VmHWM` (read before the stop), and the stop time (the drain).
+* **Read:** remount with a fresh cache dir and read the file back, hashed, in MiB/s, with `VmHWM`.
+* **Edit:** a 1-byte `pwrite` at the middle plus `fsync`, in ms.
+* 8.6b's image benches (BLK.md §8) cover zen-mount's other workload. These add a large single file.
+
+### 4. Loro (one case in `packages/loro/test/bench.test.ts`)
+
+* A document whose snapshot is about 16 MiB: the compaction to a file, and a load from it.
+* In ms, beside the inline figures.
+
+### 5. CI: a `files-bench` job, started by hand
+
+* **The trigger:** `workflow_dispatch` gains an input `files_gib` (default 16). The job runs only on dispatch, as `devices-bench` does.
+* **Disk:**
+  * It frees runner disk (`/usr/share/dotnet`, `/usr/local/lib/android`, `/opt/ghc`, the CodeQL cache) and prints `df`.
+  * It sets `TMPDIR` to the larger of `/` and `/mnt`, so the servers' data goes there.
+* **Build:** the release zen-server, the wasm, `npm ci`, `npm run build`, and FUSE (`fuse3`).
+* **Runs:**
+  * the client bench at `files_gib`
+  * the replica and zen-mount benches at 4 GiB, to bound the time
+  * `timeout-minutes: 150`
+* **Not gating:** it measures. It's started once on this PR's branch (`actions_run_trigger`), and its figures go in STATS with the runner named.
+
+### 6. Docs
+
+* **docs/STATS.md:**
+  * **§1.1:**
+    * rows for CDC content: per chunk at the measured mean, 20 B in a page, 56 B per page reference
+    * an upload session: its records, plus one `ur` key per chunk and page while it's open
+  * **§1.3:**
+    * CDC capacity, measured (the mean chunk, the fill rule's worst case)
+    * the v3 inline limit
+    * that fixed keeps 640 GiB, and when the writer picks it
+  * **§2:** a row for editing a large file (CDC: the touched pages; fixed: an insertion costs the rest of the file).
+  * **New §7, "Large files"** (measured):
+    * throughput: write, read, random reads, append, edits, resume and pipelining, for CDC and fixed, embedded and FDB, here and on the runner
+    * reuse after inserts: the resync distribution, plus periodic content and long zero runs (8.4, 8.6b)
+    * memory: the client, the replica, zen-mount and the server under 16 writers
+    * sessions: overhead and sweep rounds
+    * the Loro file snapshot
+* **spec/OPS.md:**
+  * **§2.1:** open upload sessions hold storage until they're closed or expire (7 days by default, at most 30), at most 64 per user and fs. A user removed from the ACL keeps theirs until they expire.
+  * **§2.2:** the large-file benches' disk needs.
+  * **A new §7, "Large-file pitfalls":**
+    * a cross-backend `migrate` or `import` changes the version scale, so upload sessions and leases may read as expired, and uploads start over (8.4's note)
+    * CDC re-cuts periodic content and long zero runs after a length-changing edit, so use `fixed` for disk images and sparse-heavy files (TD-FS-SPARSE)
+    * a whole rewrite without index records reads the file once
+    * zen-mount's fsync is durable on the device, not on the server
+  * **§6:** the measured figures linked from STATS §7.
+* **spec/TECH_DEBT.md:**
+  * TD-FS-LARGE-FILES fully resolved (its status names the 8.x commits)
+  * new TD-FS-CDC-HUGE: two-level pages for CDC files past the v3 capacity
+  * TD-MEMORY: the measured figures, with the server's no longer "no figure"
+  * a check that TD-FUSE-INTEGRITY and TD-LORO-LARGE-SNAPSHOT read as resolved
+* **docs/CLIENT.md §8–§9:** the figures linked, and what to set for large files (`parallel`, `readAhead`, sessions, `chunking`).
+* **docs/BLK.md §8 and docs/DB.md §20:** a link each to STATS §7.
+* **The milestone closes:**
+  * README: "Milestone 8: done"
+  * DESIGN-3 §6 item 8: "Done"
+  * `docs/MILESTONE-8.md`: the log, and an **Outcome** in milestone 6's form (what was built, the differences from the plan, tests, measurements)
+
+### Commits
+
+1. `test: large-file benches (milestone 8 step 7)`: the three bench files, the Loro case, and ci.yml
+2. any fix a bench finds, as its own commit with its test and control
+3. `docs: large files measured, and the milestone 8 outcome`
+
+### Verification
+
+* **Checks:** `npm run check` and `npm run build`. The full `npx vitest run` without `ZEN_BENCH` gives 646 passed and the skipped count up by the new benches, none failed.
+* **The benches,** each once here:
+  * client, replica and zen-mount at 4 GiB, embedded, with `target/debug` pruned first for the release build
+  * the client bench at 1 GiB on local FDB
+  * a run's temp dirs deleted after it (only this session's, checked not mounted)
+* **CI:** `files-bench` once, at 16 GiB.
+* **The benches' own checks:** hashes equal, the resume sends only the rest, an edit's counts.
+  * **Negative control:** a resume from an offset one byte off must fail the bench at its hash check.
+* **CI green on both runs** (push and pull_request).
+
+**Defaults chosen (overridable):**
+* **Sizes:** 4 GiB here (the disk), 16 GiB on the runner. FDB here at 1 GiB, CDC only.
+* **A 5 s grace in the bench worlds,** so superseded content goes and each resume runs past the grace with only a session keeping it.
+* **The fixed form's insertion on a 1 GiB file.**
+* **The CI job measures and doesn't gate.**
+* **Fixes the benches find:** small and local ones go in this PR with a test; anything larger goes to the user.
+
+## Step 8.7, continued: the embedded store's large values, fixed chunks, the server's memory
+
+The 4 GiB benches found three things in zen-serve itself:
+1. The embedded backend stores a large value at up to twice its size.
+2. 64 KiB fixed chunks land just past a power of two.
+3. The server peaks at 2–4 GiB RSS with one writer.
+
+The user chose to fix all three in this PR (#74), before the benches are re-run and the docs written. No data compatibility is needed, so the store's format changes without a migration.
+
+### 1. Large values in the embedded backend (`crates/zen-store/src/embedded.rs`)
+
+**The cause:**
+* redb (4.3) keeps an entry larger than its 4 KiB page in a leaf of its own.
+* The buddy allocator rounds that leaf up to a power of two of pages. A sealed 64 KiB chunk (65,584 B) needs 17 pages and gets 32.
+* CDC chunks of 8–88 KiB round up to 16 or 32 pages: 1.66× measured.
+* A sealed zen-blk block (4,144 B) is just past one page, so it gets 2 (computed: to be measured in the test).
+
+**The fix:** a value whose entry doesn't fit one page is split into pieces that each fill one leaf page exactly.
+* **Tables:**
+  * `kv`: key → tagged value. `0x00 ‖ bytes` is inline. `0x01 ‖ u32 len ‖ u32 pieces` is split.
+  * New `parts`: `u32be(len(key)) ‖ key ‖ u32be(i)` → piece `i`.
+  * The length prefix keeps one key's pieces contiguous and apart from every other key's.
+* **The piece size** is what fits a one-entry leaf: `4096 − 12 − len(parts key)`. The 12 bytes are redb's leaf header: 4 B, plus a `u32` key end and a `u32` value end per entry (`btree_base.rs` `LeafAccessor`).
+  * A value is split when its own entry wouldn't fit one page: `12 + len(key) + 1 + len(value) > 4096`.
+  * Smaller values stay inline and share leaves as now.
+  * So every piece but the last fills a page. The last one shares a leaf with small entries, and the record in `kv` is 9 B.
+  * The page size is set explicitly (`Builder::set_page_size(4096)`), so the arithmetic can't drift from redb's default.
+* **Reads:**
+  * `get` and range reads decode the tag. A split value is read from `parts` in the same read transaction, the `Snapshot` holding both tables.
+  * The piece count and total length are checked; a mismatch is `Error::Io`, naming the key.
+* **Writes:**
+  * In `commit_blocking`, `Set`, `VsKey` and `VsValue` go through one `put`, which:
+    1. reads the old record
+    2. removes its pieces if it was split
+    3. writes the new record and its pieces
+  * `Clear` removes the pieces likewise.
+  * `ClearRange` collects the split keys in its `retain_in` closure, which sees each value, and removes their pieces.
+  * `Add` decodes and writes inline (counters are 8 B).
+  * The meta version key is tagged like any value.
+* **A format marker:**
+  * `meta/format` = 2, written at create.
+  * `open` refuses a file that holds data but no marker: "zen.redb was written by an older zen-serve; start from an empty data_dir". That's cheaper than a silent misread, since no migration is needed.
+* **Unchanged:** the `Storage`/`Txn` trait and everything above it, the FoundationDB backend, and `export`/`import`. Those go through the trait, so dumps carry plain values.
+
+**Tests:**
+* **`conformance.rs`** (both backends; values up to 100,000 B, within FoundationDB's limit):
+  * sizes 0, 1, piece − 1, piece, piece + 1, 3 pieces and 100,000
+  * each through `get`, `get_range` forward and reverse with limits, and `snapshot_get`
+  * overwrites large → small → large
+  * `clear`, and a `clear_range` spanning split and inline values
+  * an old read version still seeing the large value it read, after an overwrite
+  * a versionstamped value past a page
+* **`tests/embedded.rs`:**
+  1. **Disk:**
+     * 1,500 random values in four sets: CDC-like lengths of 8,192–89,984 B, 65,584 B, 65,328 B and 4,144 B (blocks).
+     * Each set's allocated growth of the file (`st_blocks × 512`) must be at most 1.12 × its logical bytes. With the fix it's about 1.03–1.06×; today it's about 2× for the fixed sizes.
+  2. **No pieces left behind:** after overwrites (large → small, large → larger), clears and a clear range, a test-only count of `parts` entries (`Embedded::part_count`, under the `testing` feature) is what the live values need.
+  3. **An old file is refused:** a redb file with a `kv` table and a version key but no marker.
+* **Negative controls** (each run once, then restored):
+  * the piece size 16 B larger (each piece then spills into a second page): test 1 fails at about 2×
+  * no removal of the old pieces on an overwrite: test 2 fails
+  * splitting off: test 1 fails for every set
+
+### 2. Fixed chunks of 65,280 B (`@zen/client`)
+
+* **The change:**
+  * `CHUNK_SIZE` becomes 65,280 (64 KiB − 256), so a sealed chunk (65,328 B) is under 64 KiB on any store that rounds to 4 KiB blocks: the replica's disk cache (one file per record), and filesystems generally.
+  * One constant, exported from `tree.ts` and used by `writer.ts` (it's duplicated today).
+* **Existing versions** keep their chunk size through `previous`/`base`, as before. No data needs carrying over anyway.
+* **Updated:**
+  * tests that assume 65,536: those that don't pass `chunkSize` explicitly
+  * docs that say "64 KiB chunks": STATS §1.1 and §1.3, CLIENT.md, fs.md/formats.md where they give the default
+  * v2 capacity: 5,624 × 1,870 × 65,280 ≈ 638 GiB
+* **Test:** `tree.test.ts` asserts a default fixed write's `chunkSize` is 65,280 and every sealed chunk is at most 65,536 B. With 65,536 it fails.
+
+### 3. The server's memory
+
+**Measure first, as in 8.6b:** the client bench's CDC write at 4 GiB (`-t cdc`, with the write and the first read), with the server under:
+1. **As built:** `VmHWM`, plus `smaps_rollup` (anonymous against file-backed) every second.
+2. **`MALLOC_ARENA_MAX=2`:** if the peak falls sharply, the cause is glibc keeping freed memory per arena. Commits run on tokio's blocking pool, and each thread can get an arena.
+3. **jemalloc preloaded** (`LD_PRELOAD=libjemalloc.so.2`, installed here):
+   * `MALLOC_CONF=stats_print:true` gives live, resident and retained bytes at exit.
+   * If live bytes are large, `prof:true` with jeprof (or `heaptrack`, installable) names the allocation sites.
+4. **redb's cache** at 1 GiB (the default) against 256 MiB (a temporary build with the setting below).
+
+**Suspects from reading:**
+* redb's cache: 1 GiB for the read cache and write buffer together.
+* The embedded transaction copies every value twice: `overlay` and `ops` each own a `Vec`. That's on top of the request body and its decoded form, so a commit of 8 MB holds about 4 copies while it runs.
+* glibc arenas across the blocking pool's threads.
+* hyper's body buffers.
+
+**The fix, by what the measurement shows** (the findings and the design go in the log before any code; anything beyond the items below goes to the user first):
+* **`[storage] cache_bytes`** for the embedded backend, in any case (OPS §6: every cache gets a setting). It's `Options.cache_bytes` → `Builder::set_cache_size`. The default is the smallest that keeps the bench's write and read throughput within 10 % of 1 GiB's.
+* **One copy per value in a transaction,** if the copies show up: `ops` and `overlay` share one `Arc<[u8]>`.
+* **The allocator,** only if fragmentation shows: `mallopt(M_ARENA_MAX, …)` at start-up, or jemalloc as the server's global allocator (a new dependency). The user decides which.
+* **Tests:**
+  * a config test for `cache_bytes` (parsed, checked at least 1 MiB, reaching `Options`)
+  * for the copies, a unit test that a transaction's buffered bytes are counted once (a test-only `EmbeddedTxn::buffered_bytes`)
+  * RSS itself isn't asserted in a test (too noisy); the benches re-measure it
+
+### Then, as planned
+
+1. Re-run the client, replica and zen-mount benches at 4 GiB (embedded), and the client bench at 1 GiB on local FoundationDB (`--features fdb` release build, a cluster from `zen-serve init`).
+2. Run the negative control for a resume one byte off.
+3. Start `files-bench` once on CI, at 16 GiB.
+4. The docs, as "Step 8.7 in detail" §6, plus:
+   * STATS §1.2: measured multipliers before and after the split, for CDC, fixed and blocks
+   * OPS §2: measure redb's file with `du`, not `ls` (it's sparse)
+   * OPS §6: `[storage] cache_bytes` in the settings table
+   * TD-MEMORY: the server's figures and their cause
+   * spec/keyspace.md or OPS §1.2: the embedded store's two tables
+5. The Outcome.
+
+### Commits (after 23aa632)
+
+1. `test: the benches' edits under sessions; disk as allocated`
+2. `store: split large values across whole pages in the embedded backend`
+3. `client: fixed chunks of 64 KiB − 256 B`
+4. `server: …` (memory, by cause; `[storage] cache_bytes` at least)
+5. `docs: large files measured, and the milestone 8 outcome`
+
+### Verification
+
+* **Rust:**
+  * `cargo fmt --check`
+  * clippy `--all-targets -D warnings` on the workspace (default, `--no-default-features`, `--all-features`)
+  * `cargo test -p zen-store` (embedded; conformance on FoundationDB once, with the local cluster)
+  * `cargo test -p zen-server` (dump, fs, api)
+  * `cargo test -p zen-blk -p zen-ublk`
+* **JS:** `npm run check`, `npm run build`, then the full `npx vitest run`: 646 passed plus the new skips, none failed.
+* **The negative controls above.**
+* **The benches re-run:** the data dir's allocated growth near 1.05× of the bytes sent under fixed and CDC alike, and the server's peak against the figures above.
+* **CI:** green on both runs, `fdb` included (conformance on FoundationDB).
+
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes; vectors regenerate with only the intended diff.
 * **JS:** `scripts/build-wasm.sh`; `npm run check`; the touched suites 3×, then the full `npx vitest run`; `npx playwright test` when the browser is touched.
@@ -1987,3 +2448,118 @@ The file benches found three things outside zen-ublk (see the 8.6 log). The user
 * **CDC capacity** is smaller than v2's at the defaults (about 220 against 640 GiB). The writer falls back to fixed when the size is known; two-level pages are a TD.
 * **Disk here:** about 5 GB free limits the local bench to about 4 GiB. Larger runs are in the CI job started by hand.
 * **Memory bounds in Node** are measured by RSS, which is noisy, so the bounds have margin.
+
+## Outcome
+
+Done. Milestone 8 makes large files ordinary: a file of hundreds of GiB is written from any stream in bounded memory, resumed days later, edited or appended to at the cost of the pages it touches, and read back at disk-like speed. Content is cut by a keyed content-defined chunker by default, so an insertion re-uploads a chunk or two, and the server still can't predict where a known file would be cut. The milestone measured all of it at 4 and 16 GiB, and the measurements found and fixed three things in zen-serve itself: the embedded store's large values (2× on disk), the fixed chunk size (just past a power of two) and the server's memory (up to 3 GiB).
+
+What was built:
+* **The spec** (8.1, then each step's `spec:` commit):
+  * formats.md §11.3 (manifest version 3: chunk lengths, pages with byte spans and counts, the fill rule), §11.6 (page form 2), §11.7 (the keyed chunker, new), §12 (the policy's `chunking`)
+  * fs.md §4, §4.1 (variable chunks, upload sessions), §6, §10, §11.1 (the replica's handles); zendb.md §20 (Loro snapshots as files)
+  * api.md §2 (`fs_cdc`, `upload_sessions`, the upload limits), §6 (`upload` in a commit), §12.1 (upload sessions, new); keyspace.md §3.6 (`us`, `ur`, `ux`, `uu`)
+  * vectors: `fs.json` gains version-3 manifests, form-2 pages and the chunker
+* **zen-core and zen-wasm** (8.1): `ManifestV3` with a strict decoder, page form 2, `cdc::Chunker` (streaming, keyed under the fs's or the file's key), `FsPolicy.chunking`; bound in wasm with a `Chunker` class that keeps the key out of JS.
+* **The server** (8.2): form-2 pages counted per entry; upload sessions (open, renew, close, list, the commit field), each put referenced once per session, released by the sweeper in bounded rounds; the features and limits in `/v1/info`.
+* **`@zen/client`** (8.3): reading versions 1–3 by byte offsets; the CDC writer with reuse by hash, known chunks and pages, and the fill rule; `edit`, `append`, `editUpload`; up to 3 commits in flight with progress in order; `readStream` read-ahead; a compact resumable `UploadState`; sessions. Fixed chunks became 65,280 B (8.7).
+* **The replica and zen-mount** (8.4, 8.6, 8.6b): file handles over extents with at most 64 MiB in memory, flushed as edits; binary per-page index records; `Edit.zeros`; the `close({wait})` fix; `zen-mount --integrity` (TD-FUSE-INTEGRITY); the sender's uploads under sessions; no per-operation timeout in zen-mount; the records' backlog bounded (`pendingBytes`), the page memo bounded by ids, pinned content in windows, fetched content dropped past the bound.
+* **Loro** (8.5): a snapshot past half a commit is a zen-fs file in a tree of the document's own, named in the `$loro` row by its sealed manifest's hash (TD-LORO-LARGE-SNAPSHOT).
+* **zen-ublk** (8.6): `import` (resumable by seq, zeros skipped or discarded) and `export` (sparse, read-only) of raw images; a measured comparison of an image as a file and as a volume (docs/BLK.md §8).
+* **The benches** (8.7): the client, the replica, zen-mount and Loro at multi-GiB sizes, embedded and on FoundationDB, with memory for every process; CI's `files-bench` job started by hand.
+* **The store and the server** (8.7): the embedded backend splits a value larger than a page across whole pages (1.05–1.08× on disk, from up to 2×), behind a layout marker; `[storage] cache_bytes` (256 MiB), 2 malloc arenas, `limits.commit_buffer_bytes` (64 MiB), and one copy of each value in a transaction (the server at 0.6–0.7 GiB, from 1.9–3.1).
+* **The guides** (8.7): STATS §1.1–§1.3, §2 and a new §7; OPS §2, §6 and a new §7 (large-file pitfalls); operations.md §1 (the embedded file's layout); CLIENT.md §8–§9; BLK.md §2 and §8; DB.md (Loro); TECH_DEBT (TD-FS-LARGE-FILES resolved fully, TD-FUSE-INTEGRITY and TD-LORO-LARGE-SNAPSHOT resolved, TD-FS-CDC-HUGE, TD-FS-SPARSE, TD-BLK-SNAPSHOT-FILES and TD-MEMORY new).
+
+Differences from the plan above:
+* **v3 pages need not be full** (8.3, a `spec:` change to 8.1): with every page full but the last, an edit that changes the chunk count by one would shift every later page. Each page reference carries its `count`, and the fill rule keeps any two neighbours over a page, so capacity is at worst half.
+* **Repacking became the fill rule** and `edit`'s repack when pages would overflow, rather than a background repack; nothing fragments.
+* **Upload sessions** have a per-user index (`uu`) and no reference count in their record (8.2), so commits under one session don't conflict; every non-final release round rewrites the record, so a renew racing the release retries into `upload_gone`.
+* **A handle past its bound queues a write of its own** (8.4, the user's choice), so other devices can see a file partly written.
+* **Two causes of zen-mount's memory** (8.6b), both outside the handle: the records' write-behind and the page memo counted in pages. A step of its own.
+* **The replica's sender uploads under sessions** (8.6): found by the file benches, where a slow upload's early chunks were collected before its write landed.
+* **The benches found three server issues** (8.7), fixed in the milestone rather than left as debt: the embedded store's large values, the fixed chunk size and the server's memory (the user's choice each time, and of the allocator, the cache default and the commit budget).
+* **Capacity:** about 196 GiB a CDC version, measured, against the plan's estimate of 220 (the mean chunk is 36.5 KiB under the 88 KiB cap).
+* **Fixed along the way:** the `close({wait})` throw (8.4); `setPolicy` deciding "nothing changed" without `chunking` (8.1); a clock race in kanban's `deleteCard` (8.3); the devices test's server sharing the test's runtime (8.3), its lease (8.6), and a busy unmount now named (8.7); the dump tests under a concurrent version jump (8.4); eviction's keep set taken before the store was listed (8.6); the package build order and the fuse tests' typecheck (8.7).
+
+Tests (at step 7):
+* **Rust:**
+  * zen-core: `cdc` (6), version-3 manifests and form-2 pages (`tests/fs.rs`), the vectors read back.
+  * zen-store: the conformance case `large_values` (both backends), the embedded disk, pieces and layout tests, `a_set_value_is_buffered_once`.
+  * zen-server: 7 upload-session tests and the form-2 page test in `tests/fs.rs`, the dump round trip with a session, `/v1/info`, the commit budget (`tests/api.rs`), the config checks.
+  * zen-ublk: `tests/image.rs` (5) and `image_import_serve_export`.
+* **TypeScript:** `cdc.test.ts` (12), `handles.test.ts` (9), `memory.test.ts`, `sessions.test.ts`, the replica's `writes.test.ts` cases, the mount's integrity and timeout tests, the Loro file-snapshot cases (9), and the fixed chunk size in `tree.test.ts`. The full vitest run: 647 passed, 22 skipped (the opt-in benches).
+* **Negative controls,** each run once and logged per step: every new check failed with its mechanism off.
+
+Measurements (docs/STATS.md §7):
+* **Throughput, 4 GiB, embedded, here:** CDC writes 51–54 MiB/s and reads 108–116; fixed 67 and 121. 1,000 random 4 KiB reads at a median of 1.4–1.6 ms. An append, a 4 KiB overwrite and a 100-byte insertion into 4 GiB each cost one page and one chunk, in 137–302 ms (CDC). Pipelining doubles a single upload.
+* **Reuse:** 98.1 % of small insertions change one chunk.
+* **Disk:** 1.08–1.11× the bytes sent, every key included.
+* **Memory:** the server 0.6–0.7 GiB with one writer or 16; the replica 564 MiB writing 4 GiB; zen-mount 465 MiB.
+* **FoundationDB, 1 GiB, one process here:** writes 27–33 MiB/s, reads 80–116, edits about 1 s each (one page and one chunk); zen-serve 206–324 MiB with one writer and 1,091 MiB with 16 (FoundationDB's client library).
+* **CI's runner (4 cores, 16 GB) at 16 GiB:** CDC writes 51 MiB/s and reads 75, fixed 72 and 97; 1.05–1.08× on disk; every edit one page and one chunk; the server at most 726 MiB (16 writers). The client's own memory grows with the file (1.2–1.9 GiB at 16 GiB), a TD-MEMORY entry.
+
+### Remaining (decided: wait for the runner)
+1. At the check-in (~01:25 UTC), read the `files-bench` Bench step's tables from dispatch run 42428472910 (client at 16 GiB, replica and zen-mount at 4 GiB, on the runner).
+2. If it failed, root-cause it before anything else.
+3. Fill in STATS §7.1's runner paragraph and the Outcome's runner line. Log the figures here, then `cp` this file to `docs/MILESTONE-8.md`.
+4. Commit `docs: the 16 GiB figures from CI's runner`, push, and confirm CI green on both runs. PR #74 then waits on review and merge.
+
+**At the 01:25 check-in:** `files-bench` was still in its Bench step (started 00:16; the job's limit is 240 min). Another check-in is due in about 60 min.
+
+**Found:** `devices-bench` (8.6's image benches, dispatch only) was cancelled at its 45-minute job limit. Its Bench step ran from 00:12 to 00:54; `bench_file_cdc` alone took more than 20 minutes here.
+* **Fix** (`.github/workflows/ci.yml`): `timeout-minutes: 120`, its own commit `ci: devices-bench gets 120 minutes`. It rides in the push with the runner figures, so no extra dispatch is needed until its figures are wanted.
+* Done: 2bde53c, pushed.
+
+**At the 02:27 check-in, `files-bench` had passed** (dispatch run 42428472910 on 53ff0e4; the Bench step 00:16–01:43, 87 min; every bench's tests passed). The runner is GitHub's `ubuntu-latest`, 4 cores and 16 GB:
+* **Client, 16 GiB, embedded:**
+
+  | | CDC | Fixed |
+  |---|---|---|
+  | Write, under a session | 51.2 MiB/s, 2,196 commits | 71.7 MiB/s, 2,179 commits |
+  | The version | 459,627 chunks (mean 36.5 KiB), 103 pages | 263,173 chunks, 47 pages |
+  | Allocated on disk, for 16.0 GiB sent | +17.3 GiB (1.08×) | +16.9 GiB (1.05×) |
+  | `readStream`, readAhead 3 / 1 | 75.0 / 75.5 MiB/s | 96.9 / 98.5 MiB/s |
+  | 1,000 random 4 KiB reads, cold / warm | median 2.9 / 2.3 ms | 3.0 / 2.4 ms |
+  | Append 1 MiB / overwrite 4 KiB / insert 100 B | 110 ms / 1,558 ms / 345 ms, 1 page and 1 chunk each | 550 ms / 3,292 ms / 18.3 s on 1 GiB (8,209 chunks) |
+  | Resume at half, past the grace | 26.7 MiB/s, only the rest sent; without a session refused | 44.2 MiB/s; refused |
+  | 1 GiB, 1 / 3 in flight | 15.9 / 26.1 MiB/s | 28.1 / 38.5 MiB/s |
+  | Server peak | 601–622 MiB | 602–624 MiB |
+  | Largest upload state | 576 KiB | 707 KiB |
+
+  * 16 writers of 1 GiB: 49.9 MiB/s in all, the server 726 MiB, the client 3,597 MiB (1.45 GiB buffers).
+  * The chunker: 406 MiB/s; insertions changed 1 chunk 99.5 %, 2 0.3 %, 3 0.2 %.
+  * The client's own RSS grew with the file (1.2–1.9 GiB at 16 GiB, against 0.5–1.0 at 4 GiB; heap up to 762 MiB at the insertion). Not bounded by anything of ours yet: a TD-MEMORY line.
+* **Replica, 4 GiB:** write 13.0 MiB/s, RSS 571 MiB, `dirtyBytes` ≤ 65.0, `pendingBytes` ≤ 39.4, cache dir ≤ 1,811 MiB; a 1-byte edit 318 ms; a cold read 63.1 MiB/s (RSS 491); a pin 16.1 MiB/s (RSS 773); the server 558–564 MiB.
+* **zen-mount, 4 GiB:** write 11.2 MiB/s until closed and 11.1 until on the server, zen-mount 456 MiB, the server 496 MiB, cache dir ≤ 1,568 MiB, stop 0.6 s; a cold read 47.8 MiB/s (zen-mount 301 MiB); a 1-byte write and fsync 647 ms.
+
+**Done** (the steps below), committed with the figures:
+1. **STATS §7.1:** replace the runner placeholder sentence with a "CI's runner (4 cores, 16 GB), 16 GiB" table: the client rows above, the replica and zen-mount rows, and the 16-writer line.
+2. **STATS §7.3:** add a client row at 16 GiB (1.2–1.9 GiB RSS).
+3. **TD-MEMORY:** add a line on the client's RSS growing with a file's size (heap 762 MiB at an insertion into 16 GiB), not yet bounded or explained.
+4. **The Outcome:** replace "CI's runner at 16 GiB: in progress" with a summary line.
+5. Copy this file to `docs/MILESTONE-8.md`.
+6. Commit `docs: the 16 GiB figures from CI's runner` and push.
+7. Confirm CI is green on both runs of it, and that it was on 2bde53c. Then PR #74 waits on review and merge.
+* Done: cc1abd2.
+* **CI on 2bde53c:** the pull_request run green; the push run's `client` job failed `handles.test.ts`'s memory bound (36.4 MiB past the middle, bound 32; it failed once before in 8.6 at 34.4).
+  * **Measured here:** 12–21 MiB in 6 runs (64 with the dirty bound off). Split after a full GC: the heap grows a steady 9 MiB over the second half, and `external` and array buffers swing ±10–15 MiB between runs.
+  * **What grows**, by heap snapshots at the second quarter and the end: 43,000 new `Uint8Array`s, held by the replica's local versions (`Replica.locals`: the queued entry's version lists the inline file's chunks so far, and its manifest again) and the page memo (65,536 ids at most). Both are bounded: the inline limit (about 4,400 chunks) and the memo's bound. Neither is a leak.
+  * **Ruled out:** pending records (0.1–0.2 MiB even with 10 ms puts: a spill waits for them); local versions piling up (with or without pruning them in `rebuild`, there's at most one more than the queued entries, even with 150 ms commits). The pruning and its test were reverted, since their control passed.
+  * **Fix:** the bound is 48 MiB, with these costs in its comment: above CI's 34–38, below the 64 with the bound off (the control still fails, at 64.0 MiB).
+* Done: f0231aa. **CI on it:** the pull_request run green; the push run's `fdb` job failed `tests/dump.rs` `relay_keys_count_as_empty` while starting its server: `node lease: the commit may or may not have been applied` (FoundationDB's `commit_unknown`). cc1abd2's pull_request run was green; its push run was cancelled when f0231aa was pushed.
+  * **The cause, in the server, from milestone 5.5:** at start-up, `svc::listen::start` takes the node lease with `node::renew(st, true)` (`crates/zen-server/src/svc/node.rs`), whose `txn_loop!` is the plain form, so `commit_unknown` isn't retried. The dump binary's `migrate_copies_into_another_store` advances the shared cluster's version, which forces a recovery (OPS §3), and a commit in flight then ends `commit_unknown`. The test's harness started a server with `[[service]]` just then. The other start-up transactions already cope: `auth::challenge_key` uses the `idempotent` form (`auth.rs:458`), and `acl::load` only reads.
+  * **Why `idempotent` is right for `renew`:** the body blindly sets the lease to `read_version + NODE_LEASE_SECS × VERSIONS_PER_SEC`, so a re-run after an unknown commit just sets a later expiry. With `first` it returns true either way. Otherwise it reads the lease first, and an earlier commit that did apply left it in the future, so `held` is still right. The 1 s renewer gains the same retry.
+
+### Fix: the node lease retries an unknown commit (on approval)
+1. **`crates/zen-server/src/svc/node.rs`:** `txn_loop!(st.store, None, idempotent, |t| { … })` in `renew`, with a comment on why re-running is safe.
+2. **The test** (a unit test in `node.rs`, `#[cfg(test)]`): a store wrapper that commits the inner transaction, then answers `Error::CommitUnknown` for its first commit (as FoundationDB does when a recovery interrupts it). Over an `Embedded` store, in an `AppState` built as `upload.rs`'s unit test builds one (`AppState::new(Config::with_data_dir(..), store, AclState::default(), None, [0; 32])`), with one `[[service]]` so the node id is set.
+   * `node::renew(&st, true)` returns `Ok(true)`, and the lease key holds an expiry past the read version.
+   * Then `renew(&st, false)` (with the wrapper armed again) returns `Ok(true)`.
+   * **Negative control:** with the plain form it fails with `commit_unknown`.
+3. **Checks:** `cargo fmt --check`; clippy `-p zen-server --all-targets -D warnings`; `cargo test -p zen-server --lib svc` and `--test dump` (embedded).
+4. **Commit** `server: the node lease retries an unknown commit at start-up`; log it here; `cp` to `docs/MILESTONE-8.md`; push.
+5. **Confirm CI is green on both runs** (`fdb` included). Then PR #74 waits on review and merge.
+* **CI on 5d57b29:** every job green but `fdb`, on both runs. Both `fdb` jobs died in "Install FoundationDB (pinned)": `curl: (22) The requested URL returned error: 504`, five tries each, at 10:19 UTC, before any build or test. The download host timed out; nothing of this PR ran.
+  * **Re-run once (11:45 UTC): both `fdb` jobs passed. CI is green on both runs of 5d57b29**, every job. Step 8.7 and milestone 8 are done; PR #74 waits on review and merge. Nothing is left to do here until a review, a merge or a new CI event.
+  * (Was: re-run the two failed `fdb` jobs once (`rerun_failed_jobs` on runs 42470900136 and 42470903701), as allowed for a job that died before any test body. If the download fails again, report it rather than re-running again: the fix would be a retry or a cache for the install step (`scripts/install-fdb.sh`). Then confirm green; PR #74 waits on review and merge.
+* **Done:** `renew` uses the `idempotent` form; `svc::node::tests::the_node_lease_survives_an_unknown_commit` (a store that applies a commit and answers `CommitUnknown` once) passes, and with the plain form fails (`Err("commit_unknown")`). clippy and fmt clean; the svc unit tests and `tests/dump.rs` and `tests/svc.rs` pass on embedded.
+

@@ -33,6 +33,7 @@ cases!(
     watch_wakes_on_write,
     bank_transfers_keep_total,
     advance_version,
+    large_values,
 );
 
 /// Run every case, each on a fresh store from `make`.
@@ -330,4 +331,125 @@ pub async fn advance_version(s: Arc<dyn Storage>) {
     t.set(b"after", b"1");
     let stamp = t.commit().await.unwrap();
     assert!(crate::version_of(&stamp) > target);
+}
+
+/// The lengths [`large_values`] stores: every length around one and two
+/// pages (where a backend may split a value), and up to 100,000 bytes.
+fn large_lengths() -> Vec<usize> {
+    let mut l = vec![0, 1, 2000, 12_270, 50_001, 100_000];
+    l.extend(3990..4110);
+    l.extend(8060..8170);
+    l
+}
+
+/// Distinct bytes for value `i` of length `n`.
+fn pattern(i: usize, n: usize) -> Vec<u8> {
+    (0..n).map(|j| (j * 31 + i * 7 + j / 251) as u8).collect()
+}
+
+fn large_key(i: usize) -> Vec<u8> {
+    let mut k = b"L".to_vec();
+    k.extend_from_slice(&(i as u32).to_be_bytes());
+    k
+}
+
+/// Values of every length up to 100,000 bytes read back whole through
+/// points and ranges, across overwrites, clears and versionstamps, and an
+/// older read version keeps seeing what it read.
+pub async fn large_values(s: Arc<dyn Storage>) {
+    let lens = large_lengths();
+    let want: Vec<Vec<u8>> = lens
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| pattern(i, n))
+        .collect();
+    let mut t = s.begin(None).await.unwrap();
+    for (i, v) in want.iter().enumerate() {
+        t.set(&large_key(i), v);
+    }
+    t.commit().await.unwrap();
+    let mut t = s.begin(None).await.unwrap();
+    for (i, v) in want.iter().enumerate() {
+        assert_eq!(
+            t.get(&large_key(i)).await.unwrap().as_ref(),
+            Some(v),
+            "length {}",
+            lens[i]
+        );
+        assert_eq!(
+            t.snapshot_get(&large_key(i)).await.unwrap().as_ref(),
+            Some(v)
+        );
+    }
+    let all = t.get_range(b"L", b"M", 10_000, false).await.unwrap();
+    assert_eq!(all.len(), want.len());
+    for (i, (k, v)) in all.iter().enumerate() {
+        assert_eq!((k, v), (&large_key(i), &want[i]), "length {}", lens[i]);
+    }
+    let back = t.get_range(b"L", b"M", 7, true).await.unwrap();
+    assert_eq!(back.len(), 7);
+    for (j, (k, v)) in back.iter().enumerate() {
+        let i = want.len() - 1 - j;
+        assert_eq!((k, v), (&large_key(i), &want[i]));
+    }
+    let mid = t.get_range(&large_key(10), b"M", 5, false).await.unwrap();
+    assert_eq!(
+        mid.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        want[10..15]
+    );
+    t.commit().await.unwrap();
+
+    // Overwrites: large to small to larger, at an older read version too.
+    let k = large_key(lens.len() - 1);
+    let old = s.begin(None).await.unwrap();
+    for v in [
+        pattern(1, 3),
+        pattern(2, 100_000),
+        pattern(3, 9000),
+        Vec::new(),
+    ] {
+        put(&*s, &k, &v).await;
+        let mut t = s.begin(None).await.unwrap();
+        assert_eq!(t.get(&k).await.unwrap(), Some(v));
+    }
+    let mut old = old;
+    assert_eq!(old.snapshot_get(&k).await.unwrap().as_ref(), want.last());
+
+    // Clears: one key, then a range over split and inline values alike.
+    let mut t = s.begin(None).await.unwrap();
+    t.clear(&large_key(5));
+    t.clear_range(&large_key(20), &large_key(150));
+    t.commit().await.unwrap();
+    let mut t = s.begin(None).await.unwrap();
+    let left = t.get_range(b"L", b"M", 10_000, false).await.unwrap();
+    let kept: Vec<usize> = (0..want.len())
+        .filter(|&i| i != 5 && !(20..150).contains(&i))
+        .collect();
+    assert_eq!(left.len(), kept.len());
+    for (&i, (k, v)) in kept.iter().zip(&left) {
+        assert_eq!(k, &large_key(i));
+        if i + 1 != want.len() {
+            assert_eq!(v, &want[i], "length {}", lens[i]);
+        }
+    }
+    // A cleared key written again comes back as written.
+    put(&*s, &large_key(30), &pattern(9, 20_000)).await;
+    let mut t = s.begin(None).await.unwrap();
+    assert_eq!(
+        t.get(&large_key(30)).await.unwrap(),
+        Some(pattern(9, 20_000))
+    );
+
+    // Versionstamped values and keys past a page.
+    let (pre, suf) = (pattern(4, 5000), pattern(5, 3000));
+    let mut t = s.begin(None).await.unwrap();
+    t.set_versionstamped_value(b"Lv", &pre, &suf);
+    t.set_versionstamped_key(b"Lk/", b"", &pattern(6, 30_000));
+    let stamp = t.commit().await.unwrap();
+    let mut t = s.begin(None).await.unwrap();
+    let v = t.get(b"Lv").await.unwrap().unwrap();
+    assert_eq!(v, [&pre[..], &stamp, &suf].concat());
+    let mut lk = b"Lk/".to_vec();
+    lk.extend_from_slice(&stamp);
+    assert_eq!(t.get(&lk).await.unwrap(), Some(pattern(6, 30_000)));
 }

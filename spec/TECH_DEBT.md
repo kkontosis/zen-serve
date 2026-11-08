@@ -143,7 +143,14 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 
 ## TD-FS-LARGE-FILES
 
-* **Status:** resolved (milestone 5 steps 7f and 7g). Files past the inline limit are paged: immutable chunk-id pages, listed with their digests in a sealed version-2 manifest, about 640 GiB at the defaults (spec/formats.md §11.3–11.6, fs.md §4.1). The client writes them from any source, streams reads (`readStream`), reuses unchanged pages on appends and resumes uploads (docs/CLIENT.md §8). Per-file content keys are a policy of the fs (fs.md §4.2). The rest (upload sessions past `chunk_grace_secs`, repacking, multi-GiB measurements) is milestone 8 (docs/MILESTONE-8.md).
+* **Status:** resolved, fully, by milestone 8 (docs/MILESTONE-8.md). Milestone 5 steps 7f and 7g paged files past the inline limit (immutable chunk-id pages listed with their digests in a sealed version-2 manifest, about 640 GiB at the defaults) and made per-file keys a policy. Milestone 8 added the rest:
+  * content-defined chunks (manifest version 3, page form 2, the keyed chunker; spec/formats.md §11.3, §11.6, §11.7), the default policy, so an insertion re-uploads a chunk or two (step 1, 3)
+  * upload sessions past `chunk_grace_secs` (api.md §12.1; steps 2, 3), used by the replica's sender (step 6) and Loro (step 5)
+  * edits and appends that cost the pages they touch (`Tree.edit`), pipelined commits, `readStream` read-ahead, and a compact resumable upload state (step 3)
+  * the replica's file handles in bounded memory, edited by page, with binary per-page index records (step 4), and its memory bounds (step 6b)
+  * repacking as the fill rule (`edit` repacks when pages would overflow), instead of a background repack: pages are never left fragmented by appends
+  * multi-GiB measurements (docs/STATS.md §7), which found and fixed the embedded store's large values, the fixed chunk size and the server's memory (step 7)
+  * CDC files past about 196 GiB are TD-FS-CDC-HUGE.
 * **Context:** A file version's manifest and chunk list must fit one value: 32 B per chunk within `max_value_bytes` (90,000 by default), so a version holds at most ~2,800 chunks of 64 KiB, about **175 MiB** (docs/STATS.md §1.3). Raising `max_value_bytes` helps only up to FoundationDB's 100 KB value limit (~195 MiB).
 * **Why deferred:** The server-side CRDT filesystem (milestone 3.5) targets family-scale files; large media and disk images need a different version layout.
 * **What it would take:** Chunk lists split over several keys (e.g. `pack("tf", fs, tree, node, dot, i)` pages, or a tree of manifests), the write op carrying a list reference instead of the whole list, refcounting and GC over the pages, a matching formats.md change for the sealed manifest, and tests with multi-GiB synthetic files.
@@ -157,6 +164,13 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Why deferred:** A hole is a format change (manifests, readers, the writer, the replica), out of place in a step about zen-ublk.
 * **What it would take:** a zero-extent entry in v3 manifests and pages (a length with no chunk, formats.md §11.3 and §11.6), which readers fill with zeros and the server never references; the writer emitting one for whole zero chunks (detected when cutting); the replica's handle passing zero extents through (`Edit.zeros`) as holes; `SEEK_HOLE`/`SEEK_DATA` in zen-mount; vectors; and a leakage note (the server sees where the holes are and how long they are).
 
+## TD-FS-CDC-HUGE
+
+* **Status:** open
+* **Context:** A version-3 (content-defined) manifest lists its pages in one sealed value: 56 B per page within `max_value_bytes`, so 1,248 pages of up to 4,499 chunks, about **196 GiB** at the measured mean chunk (36.5 KiB), and 98 GiB at the fill rule's worst (docs/STATS.md §1.3). Version 2 (fixed chunks) reaches about 640 GiB, and the writer picks it for a larger file whose size it knows; a stream of unknown size past the CDC capacity fails `too_large`.
+* **Why deferred:** Files that size are rare in the target uses (family-scale media, disk images, which want fixed chunks anyway: spec/OPS.md §7), and two levels of pages are a format change across the writer, the reader, the replica's records and the server's GC.
+* **What it would take:** a manifest form whose pages list pages (`id ‖ digest ‖ u64 bytes ‖ u32 count` per child), so a version holds 1,248 × ~1,700 pages; the server counting references through both levels; the writer's fill rule and repack per level; `edit` touching one page per level; vectors and tests at small `max_value_bytes`.
+
 ## TD-MEMORY
 
 * **Status:** open, a standing list. RAM use is a first-class cost (spec/OPS.md §6), and this entry tracks where memory goes, what bounds it, and what isn't measured yet. Fixes go in by step; the list stays.
@@ -166,14 +180,17 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * the client's page memo: `pageMemoIds`, 65,536 ids, about 12 MB, and `pageMemoPages`, 256 (step 6b)
   * pinned content fetched in windows of 256 chunks (step 6b); content fetched for reads isn't kept past `pendingBytes`
   * `readStream` read-ahead and pipelined uploads: a few windows or commits each
+  * **the server** (step 7): the embedded backend's page cache (`[storage] cache_bytes`, 256 MiB), commit bodies in flight (`limits.commit_buffer_bytes`, 64 MiB), 2 malloc arenas, and one copy of each value in a transaction. Measured: 587–637 MiB under one 4 GiB writer and 691–712 MiB under 16 (1.9–3.1 GiB before; docs/STATS.md §7.3)
 * **Not bounded, or not measured yet:**
   * **Decoded pages as objects:** a v2 page decodes to 5,624 separate `Uint8Array` ids (wasm's `decodeAnyPage`), about 1 MB of heap per 90 KB page, and every edit of a large file decodes and builds a few of them. A compact form (one buffer of ids, lengths in a typed array) would cut that about 10×.
   * **wasm linear memory** never shrinks: one large operation sets the floor for the process's life.
-  * **zen-mount under an image workload:** after step 6b, the peak is what the benches show (docs/BLK.md §8); the JS heap's churn from page decoding is most of what is left.
-  * **The server:** commit buffers (up to `max_commit_bytes` per request in flight), relayed connections' windows (STATS.md §2.1), and the embedded store's caches. No figure yet for a server under many writers.
+  * **zen-mount under an image workload:** after step 6b, the peak is what the benches show (docs/BLK.md §8); the JS heap's churn from page decoding is most of what is left. A large file through it peaks at 465 MiB writing and 296 MiB reading (STATS.md §7.3).
+  * **The server, what's left:** a signed-in client that stalls a commit's body holds its share of `commit_buffer_bytes` until the connection drops (no body read timeout), so enough of them make the node's commits wait; relayed connections' windows (STATS.md §2.1); FoundationDB's client library, measured at 1,091 MiB in zen-serve under 16 writers (206–324 MiB under one; STATS.md §7.1), with no setting of ours. The cache default is a hedge: large-file throughput was the same from 64 MiB up, and metadata-heavy loads weren't measured.
+  * **The client's heap grows with a file's size:** 0.5–1.0 GiB RSS for a 4 GiB file, 1.2–1.9 GiB for 16 GiB (heap up to 762 MiB at an insertion; STATS.md §7.3). Not explained yet; the pages decoded as objects (above) and the upload's per-page bookkeeping are the suspects.
+  * **The client's buffers under many uploads:** 3 commits of up to `max_commit_bytes` in flight per upload, so 16 uploads in one process held 1.4 GiB of buffers (STATS.md §7.3). A process-wide budget would bound it.
   * **The Loro kept state:** a document's whole snapshot is one record in memory (zendb.md §20).
   * **The browser:** IndexedDB-backed replicas under the same workloads.
-* **What it would take:** memory figures for every frontend and the server as part of each milestone's benches (milestone 8 step 7 first), a bound and a setting for each item above, and the compact page form.
+* **What it would take:** memory figures for every frontend and the server as part of each milestone's benches (milestone 8 step 7 was the first: STATS.md §7.3), a bound and a setting for each item above, a body read timeout (or a per-caller share of the budget), and the compact page form.
 
 ## TD-STORE-COMPACTION
 

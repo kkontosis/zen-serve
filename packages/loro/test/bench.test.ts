@@ -73,4 +73,39 @@ describe.skipIf(!process.env.ZEN_BENCH)('zen-loro costs', () => {
     await da.close();
     fs2.close();
   });
+
+  it('a 16 MiB snapshot: the compaction to a file, and a load from it', async () => {
+    const open = (f: UnlockedFs) => Db.open(f, 'bench-big', { ...quiet, locks: null });
+    const da = await open(fs);
+    const a = await openLoro(da, 'big', { snapshotEvery: 1_000_000, snapshotBytes: 1 << 30 });
+    await a.ready;
+    // Random text in 64 KiB updates (one update must fit in a commit).
+    const piece = new Uint8Array(32 * 1024);
+    for (let i = 0; i < 256; i++) {
+      crypto.getRandomValues(piece);
+      a.doc.getText('t').insert(a.doc.getText('t').length, Buffer.from(piece).toString('hex'));
+      a.doc.commit();
+      await a.flush();
+    }
+    const size = a.doc.export({ mode: 'snapshot' }).length;
+    const t0 = performance.now();
+    await a.compact();
+    record(`Loro: compact a ${(size / 2 ** 20).toFixed(1)} MiB snapshot to a file`, [
+      performance.now() - t0,
+    ]);
+    const loads: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const d = await open(fs);
+      const t1 = performance.now();
+      const h = await openLoro(d, 'big');
+      await h.ready;
+      loads.push(performance.now() - t1);
+      if (h.doc.getText('t').length !== a.doc.getText('t').length) throw new Error('short load');
+      await h.close();
+      await d.close();
+    }
+    record(`Loro: open from a ${(size / 2 ** 20).toFixed(1)} MiB file snapshot`, loads);
+    await a.close();
+    await da.close();
+  });
 });

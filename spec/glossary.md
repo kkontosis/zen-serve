@@ -30,7 +30,7 @@
 | **move** | The tree operation: create, move, rename, delete (move to trash) and restore are all moves. |
 | **version** | One content value of a file node: chunk ids plus a sealed manifest. Concurrent writes leave several versions, called **siblings**. |
 | **dot** | A version's 12-byte id, `versionstamp ‖ u16(i)`, assigned by the server. |
-| **chunk** | An immutable sealed piece of file content (64 KiB of plaintext), with a random 16-byte id. |
+| **chunk** | An immutable sealed piece of file content (by default cut by content, 8 KiB to about 88 KiB, or at a fixed 65,280 B), with a random 16-byte id. |
 | **database** | A zen-db database: `(fs, ns)`, its rows, indexes and catalog under the KV path `("zen", "db", ns)` (zendb.md §2). |
 | **catalog** | A database's encrypted schema records: tables, indexes, schema version, migration log (zendb.md §3, G6). |
 | **private index** | A zen-db index stored as a prolly tree of sealed, content-addressed nodes; supports order and ranges (zendb.md §5.4). |
