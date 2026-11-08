@@ -9,7 +9,9 @@
 // with `cargo build --release -p zen-server` and `scripts/build-wasm.sh`.
 // `ZEN_BENCH_GIB` sets the file size (default 4). FoundationDB:
 // `ZEN_BENCH_BACKEND=fdb ZEN_BENCH_CLUSTER_FILE=/etc/foundationdb/fdb.cluster`
-// with a server built `--features fdb` (CDC only). Memory is the peak
+// with a server built `--features fdb` (CDC only; each world under a key
+// prefix of its own, and `ZEN_BENCH_FDB_DATA` the cluster's data dir, for
+// what it stores). Memory is the peak
 // resident set (`VmHWM`) of this process and of the server, per step.
 import type { CdcParams } from '@zen/wasm';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -62,7 +64,11 @@ async function openWorld(): Promise<{ w: World; ufs: UnlockedFs }> {
   const w = await world({
     limits: { chunk_grace_secs: GRACE, sweep_interval_secs: 1 },
     ...(FDB
-      ? { extra: `[storage]\nbackend = "fdb"\ncluster_file = ${JSON.stringify(cluster)}\n` }
+      ? {
+          extra:
+            `[storage]\nbackend = "fdb"\ncluster_file = ${JSON.stringify(cluster)}\n` +
+            `key_prefix = "bench/${bytes.hex(Tree.newId())}/"\n`,
+        }
       : {}),
   });
   const ufs = await w.session
@@ -149,7 +155,8 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
 
           // 1. Write N bytes under a session.
           const f = await t.create(ROOT, 'a');
-          const before = du(w.server.dataDir);
+          const store = FDB ? process.env.ZEN_BENCH_FDB_DATA : w.server.dataDir;
+          const before = store ? du(store) : Number.NaN;
           const wr = await measured(w, () => traffic(s, () => write(t, f, keystream(1, 0, N))));
           const [{ up, stateMost }, tw] = wr.result;
           const v = (await t.versions(f))[0]!;
@@ -165,7 +172,8 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
             'the version',
             `${v.chunkCount} chunks (mean ${(N / v.chunkCount / 1024).toFixed(1)} KiB), ` +
               `${v.pages.length} pages, manifest ${v.sealedManifest.length} B; ` +
-              `sent ${mib(tw.sent)} MiB; data dir +${mib(du(w.server.dataDir) - before)} MiB allocated; ` +
+              `sent ${mib(tw.sent)} MiB; ` +
+              (store ? `data dir +${mib(du(store) - before)} MiB allocated; ` : '') +
               `largest upload state ${(stateMost / 1024).toFixed(1)} KiB; ${up.uploaded} chunks uploaded`,
           );
           let parts: Part[] = [{ seed: 1, from: 0, to: N }];
@@ -278,24 +286,35 @@ describe.skipIf(!process.env.ZEN_BENCH)('large files through @zen/client', () =>
               `${mib(N - last!.size)} MiB left; state ${(stateBytes(last!) / 1024).toFixed(1)} KiB`,
           );
           await drop(t, b);
-          // Without a session, the first half is gone by then.
-          const c = await t.create(ROOT, 'c');
-          let plain: UploadState | undefined;
-          await expect(
-            t.upload(c, failing(4, 0, 64 * MiB, 32 * MiB), {
-              onProgress: (st) => {
-                plain = structuredClone(st);
-              },
-            }),
-          ).rejects.toThrow('source lost');
-          await sleep((2 * GRACE + 2) * 1000);
-          const refused = await t
-            .upload(c, keystream(4, plain!.size, 64 * MiB), { resume: plain })
-            .then(async (u) => t.send([await t.writeOp(u)]))
-            .then(
-              () => 'written',
-              (e: { status?: number; code?: string }) => `refused (${e.status} ${e.code})`,
-            );
+          // Without a session, the first half is gone by then. In a world of
+          // its own: the content dropped above (tens of thousands of chunks)
+          // is collected first, and on FoundationDB that takes longer than
+          // the wait.
+          const fresh = await openWorld();
+          let refused: string;
+          try {
+            if (form === 'fixed') await fresh.ufs.setPolicy({ chunking: 'fixed' });
+            const ft = fresh.ufs.tree(Tree.newId());
+            const c = await ft.create(ROOT, 'c');
+            let plain: UploadState | undefined;
+            await expect(
+              ft.upload(c, failing(4, 0, 64 * MiB, 32 * MiB), {
+                onProgress: (st) => {
+                  plain = structuredClone(st);
+                },
+              }),
+            ).rejects.toThrow('source lost');
+            await sleep((2 * GRACE + 2) * 1000);
+            refused = await ft
+              .upload(c, keystream(4, plain!.size, 64 * MiB), { resume: plain })
+              .then(async (u) => ft.send([await ft.writeOp(u)]))
+              .then(
+                () => 'written',
+                (e: { status?: number; code?: string }) => `refused (${e.status} ${e.code})`,
+              );
+          } finally {
+            await fresh.w.server.stop();
+          }
           expect(refused).toMatch(/^refused/);
           row(form, 'the same at 64 MiB without a session', refused);
 
