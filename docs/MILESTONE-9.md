@@ -104,6 +104,17 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * de60039 `spec:` api.md §10 (ranges, the content origin), a DESIGN-3 §0 note, and TECH_DEBT TD-SW-SCRIPTS (low priority, the four alternatives) and TD-SW-SESSION-HANDOVER.
     * **Changed from the plan:** the hand-over can't simply pass the app's session token. The server checks the origin only at sign-in, so a token would work, but a session's credential id is "the device" for fencing, idempotency and the fs op chain (auth.md §3), and the worker and the app would then share it. The TD describes a delegated session instead: a new endpoint and a `delegated` method, whose credential id is the worker's device fingerprint.
     * **Also in sw.md beyond the plan:** a root mount (`root`), 405 with `Allow`, and `If-None-Match: *`. Bodies error mid-stream rather than send wrong bytes.
+    * fecdd1b (the log) pushed, and PR #76 retitled.
+    * **CI on fecdd1b:** one run's `pure-rust` job failed `zen-server` `tests/svc.rs` `push_input` (1.160 s against its 1 s bound); the other run's `pure-rust` passed on the same commit, and every other job was green.
+      * **It isn't this PR's:** the PR changes only docs, and this is TD-TEST-OPEN-FAILURES item 2.
+      * **New:** it was the first push after the claim (the other nine took 7–61 ms), and no storage warning was printed, so it wasn't the reader's 1 s re-check.
+      * **Not reproduced here:** 15 idle runs, 12 under CPU load and 30 under disk load all passed the bound (worst 165 ms). Under the disk load, `leases_and_takeover` failed 2 of 30 times (a 300 ms lease expired before the claim), which CI hasn't shown.
+      * ba517e5 adds all this to the TD, and one PR comment says it.
+    * **CI green on both runs of ba517e5** (push and pull_request), every job. PR #76 waits on review and merge.
+    * **PR #76 merged** (the user). Step 9.1 is done.
+* **Step 9.2** (the server): planned below ("Step 9.2 in detail").
+  * On "go": restarted from main (a85090a) by fast-forward; this file copied to `docs/MILESTONE-9.md`; commit `docs: milestone 9 step 2 plan`; push; open the PR. Then implement on the next "go".
+    * **Decided (the user):** add timing of the first push's path (the append's commit, the lease watch firing, the push loop's turn) to `push_input`'s failure message, in step 9.2, as its own commit, checked by a forced failure. PR #76 stays docs only.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -135,6 +146,9 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * A push writes a new generation of files (path → meta and chunks, plaintext), then switches the current generation in one transaction, so every node serves the same set. The old generation is cleared in bounded rounds.
   * The keyspace in spec/keyspace.md; export and import carry it.
 * **Tests:** `tests/stream.rs` (Range forms, 416, `If-Range`, HEAD, a large file streamed), content-host routing, push and switch, and a node serving a pushed set. On both backends.
+* **`push_input`'s diagnostics** (TD-TEST-OPEN-FAILURES item 2, the user's choice), its own commit `test(server): push_input times the first push's path`:
+  * On failure the message names, for the slow push, when the append committed, when the lease bell's watch fired, and when the push loop's turn read the input. The server gets `test-utils` timestamps if one is needed.
+  * Checked by a forced failure (a delay injected at one step), which must name that step. Then removed.
 
 **9.3, `@zen/sw` core** (new `packages/sw`, worker-safe, testable in Node: Node 22 has `Request`, `Response` and web streams):
 * `handle(request, mounts, replicas) → Response`, exactly as spec/sw.md says: lookup, index pages, redirects, MIME, Range through `createReadStream`, HEAD, ETag/304, headers and errors.
@@ -305,6 +319,149 @@ The log in both plan copies; PR #76 retitled `docs, spec: milestone 9 plan, isol
 
 * Links between the spec files resolve (a grep for each anchor named).
 * CI green on both runs (docs only).
+
+## Step 9.2 in detail: the server
+
+Step 9.2 adds to zen-serve: streamed static files with single ranges, the content origin (spec/sw.md §1), the replicated static source (fs 0) with `zen-serve static push`, and `push_input`'s diagnostics. There's no client change.
+
+**Survey:**
+* **`crates/zen-server/src/statics.rs`** (188 lines):
+  * `load(st, rel)` reads a whole file, from `BUNDLED` (`include_dir!`) or `unencrypted_dir`.
+  * `serve(st, rel, headers, head)` sets the type (`mime_guess`), ETag, 304, `no-cache`, `nosniff`, `no-referrer`, the CSP and `Service-Worker-Allowed`.
+  * `fallback` routes `/unencrypted/*`, `/`, the aliases and the SPA fallback; GET and HEAD only.
+  * Mounted as the router's `.fallback` (`lib.rs:328`), so `/v1/*` routes match on any `Host` already.
+* **Origins** (`origin.rs`): the accepted set is `explicit(cfg, acl_origins, pins)`, that is `public_origins`, the pins when pinning is active, and the ACL's origins.
+* **Config:** flat, `deny_unknown_fields`.
+* **`/v1/info`** (`lib.rs:69`): `Info` in zen-proto; new fields take `#[serde(default)]`.
+* **Dump** exports every key but `meta` and the relay prefixes (`dump.rs` `private`), so static keys are data with no change.
+* **The `s*` key tags** are free; only `sess` is taken.
+* **No `tokio-util`:** bodies are streamed with `futures::stream` (already a dependency).
+* **The CLI** (`main.rs`) opens the store with `open_store(&cfg)`, as `export` and `import` do.
+* **Tests:**
+  * The test binaries build `zen-server` with `test-utils`, so `#[cfg(feature = "test-utils")]` hooks reach every test, as `svc::push::testing` does.
+  * `Harness::sign_in_at(user, origin, host)` signs any origin.
+  * The tests run on FDB with `ZEN_TEST_FDB`.
+
+### 1. `spec:` commit
+
+* **keyspace.md, new §3.11 "Static files (fs 0)":**
+  * `pack("sg")` → `u64` current generation
+  * `pack("sf", gen, path)` → `u8 1 ‖ u64 size ‖ sha256(32)`
+  * `pack("sc", gen, path, u32 i)` → chunk `i`, 65,536 bytes each but the last
+  * Data (exported).
+* **api.md:**
+  * §2: `info.content_origins: [text]` (absent when none).
+  * §10:
+    * the replicated source (`unencrypted_source = "replicated"`, served from the current generation, ETag `"s<hex sha256[0..16]>"`)
+    * a generation is replaced whole, and the one before it is kept until the next push, so downloads in flight finish
+    * `/_zen/config.json` (`{app_origins}`)
+* **operations.md:** `zen-serve static push -c CONFIG DIR` and `zen-serve static list -c CONFIG`.
+  * **What it pushes:** regular files, symlinks skipped with a warning, refused if the directory holds none, and paths checked as `statics.rs` `clean` checks them.
+  * **Embedded backend:** the store must be closed, so stop the server, as for `import`. On FDB it runs live from any machine with the cluster file.
+  * **What it prints:** files, bytes, and the generation.
+* **sw.md §1:** `[content] origins` and `dir` named exactly.
+
+### 2. Code, `server: …` commit
+
+* **Config** (`config.rs`):
+  * `unencrypted_source: "dir" | "replicated"` (default `dir`; `replicated` with `unencrypted_dir` set is refused).
+  * `[content] { origins: [text], dir: path }` (absent by default). Checked:
+    * each origin valid
+    * none in `public_origins`
+    * `public_origins` not empty, since they are the app origins enrollment trusts
+    * `dir` set
+* **`statics.rs`, a source abstraction:**
+  * `Source::{Bundled, Dir(root), Replicated}` → `open(rel) → Option<File {len, etag, body(range) → Body}>`.
+  * Dir files are read in 64 KiB pieces from a seek. Replicated chunks are read in batches of 16 per snapshot read. Bundled files are a slice.
+  * A chunk missing mid-stream (its generation cleared) errors the body.
+* **`statics.rs`, ranges:**
+  * `parse_range(header, len) → Full | Part(a, b) | Unsatisfiable`, as sw.md §6: one range only; `a-b`, `a-`, `-n`; `b` clamped; `-n` past the size means the whole file; several ranges or malformed ones mean the whole file.
+  * `If-Range` applies the range only when it equals the ETag.
+  * 206 with `Content-Range`, 416 with `bytes */len`, `Accept-Ranges: bytes` and `Content-Length` on every file response, and HEAD with the same headers.
+* **`statics.rs`, the content host:** a request whose `Host` is a content origin's host (and port), checked first in `fallback`:
+  * `/_zen/config.json`: `{app_origins: public_origins}`, `no-store`
+  * `/_zen/<rel>`: from `[content] dir`, with the server's `csp` (the trusted pages' policy), and `Service-Worker-Allowed: /` for `/_zen/sw.js`
+  * any other navigation (`Sec-Fetch-Mode: navigate`, or `Accept` with `text/html` when that header is absent): `dir/boot.html`, with the same trusted headers and `no-store`
+  * anything else: 503 `Zen-Reason: starting`, a short page under sw.md §4's headers (`SANDBOX_CSP` and the rest, one constant)
+  * `/unencrypted/*` and the aliases are not served there
+* **`origin.rs`:** content origins join `explicit`, so a device sign-in signing one is accepted.
+* **`/v1/info`:** `content_origins`.
+* **`static push` and `list`:** `statics::push(store, dir) → PushStats`. In order:
+  1. **The generation:** one past the highest present, whether current or left over by an interrupted push.
+  2. **The files:** each one's chunks, in transactions of at most 32 chunks (2 MiB), then its `sf` record.
+  3. **The switch:** one transaction sets `sg`.
+  4. **Clean-up:** one transaction clears every generation but the new one and the one before it.
+  * A test-only option stops before the switch, to simulate an interruption.
+  * `main.rs` adds `Static { Push, List }`.
+
+### 3. `test(server): push_input times the first push's path` (the user's choice)
+
+* **A recorder** (`svc::testing::trace`, under `test-utils`, always cheap): `(Instant, conn or lease, step)` events at:
+  * the reader's read (`conn.rs`)
+  * the append's commit
+  * the lease bell's watch firing (`push.rs`)
+  * the turn that reads the connection's input
+  * the frames sent
+* **On failure,** `push_input`'s message lists, for its slowest push, those events from the push's start to its arrival, in milliseconds. Other tests in the binary run alongside, so events are filtered by its connection and lease.
+* **Forced failure,** once: a test-only 1.2 s delay injected after the bell fires must show in the message as the gap before "turn read". Then removed.
+* **TD-TEST-OPEN-FAILURES item 2** says the message now names the step.
+
+### Tests (`tests/stream.rs` and a new `tests/statics.rs`; both backends where a store is involved)
+
+* **Ranges,** over the bundled, dir and replicated sources:
+  * `a-b`, `a-`, `-n`, `b` clamped, `-n` larger than the file, `0-0`, the last byte
+  * 416 past the end, and 416 on an empty file
+  * several ranges → 200; malformed (`bytes=x`, `items=0-1`) → 200
+  * `If-Range` matching (206) and not (200)
+  * HEAD with and without a range (headers, no body)
+  * 304 still works
+  * A 5 MiB dir file streams whole and by range, byte for byte.
+* **The content host:**
+  * with `Host: view…`: `/_zen/sw.js` (with `Service-Worker-Allowed: /`), `/_zen/config.json`, `/_zen/boot.html`
+  * a navigation to `/site/x` → the boot page (trusted CSP, `no-store`)
+  * a non-navigation → 503 `Zen-Reason: starting` with exactly sw.md §4's headers
+  * `/unencrypted/style.css` there → not served
+  * `/v1/info` there, listing `content_origins`
+  * the app host unchanged
+  * a device sign-in signing the content origin accepted, and one signing an unlisted origin refused
+  * config refusals: no `public_origins`, an overlap, an invalid origin, no `dir`
+* **Push:**
+  * push A, then served by path, by range, with `/`, an alias and the SPA fallback
+  * push B: A's files gone, B's served
+  * push C: A's generation cleared, B's kept (keys counted)
+  * an interrupted push leaves the current set served, and the next push uses a higher generation and clears the leftover
+  * symlinks skipped; an empty directory refused
+  * a chunk missing mid-stream errors the body
+  * export and import keep the set
+  * `static list` matches.
+* **Negative controls** (each run once, then restored):
+  * `parse_range` always `Full`: the range tests fail
+  * `If-Range` ignored: its test fails
+  * the content-host check off: the content tests fail
+  * the switch before the files: the interruption test fails
+  * the previous generation cleared too: "B kept" fails
+  * content origins not in `explicit`: the sign-in test fails
+
+### Docs (`docs:` commit)
+
+* docs/API.md (§10 and info), docs/SW.md not yet (9.5)
+* examples/zen-serve.toml: `[content]` and `unencrypted_source`, commented
+* spec/OPS.md: a pitfall, that `static push` needs the embedded server stopped
+* the log in both plan copies
+
+### Verification
+
+* `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`)
+* `cargo test -p zen-server` (the new and touched suites 3×), and once with `ZEN_TEST_FDB` on a local cluster if the disk allows; otherwise CI's `fdb` job
+* the negative controls above
+* CI green on both runs
+
+**Defaults chosen (overridable):**
+* **Keep the previous generation** until the next push, rather than clearing it at the switch.
+* **The content host serves `/v1`,** so the worker calls its own origin.
+* **The trusted pages use the server's `csp`.**
+* **`static push` talks to the store directly,** like `import`, not through an admin endpoint. On the embedded backend that means the server is stopped, so replicated is for clusters.
+* **An empty directory is refused.**
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes.
