@@ -6,7 +6,7 @@ Part 3 of the design, following `DESIGN.md` and `DESIGN-2.md`. Where they disagr
 
 * **CRDT:** Loro is the default.
 * **Web trust:** browser clients are only as trustworthy as the server at page-load time. Accepted and documented.
-* **Client:** library mode (`@zen/client`). No WebContainers. The service worker is an optional cache only.
+* **Client:** library mode (`@zen/client`). No WebContainers. The service worker is an optional cache only. *(Milestone 9: a service worker on a separate content origin also serves the members' fs content over HTTP, with no scripts allowed in what it serves (spec/sw.md). Code verification by a worker stays with milestone 11.)*
 * **Event signatures:** a hybrid-signed checkpoint every `sig_every` events, configurable per topic. `sig_every = 1` signs every event.
 * **Filesystems:** a configured set of filesystems (defaults: `/` and `/home/user`), mounted together on the client. Permissions apply per filesystem only. All of them live in the same FoundationDB keyspace, distinguished by an integer `fs_id` key prefix (§4.1).
 * **Static files:** served plaintext from `/unencrypted` (§4).
