@@ -6,7 +6,7 @@ Part 3 of the design, following `DESIGN.md` and `DESIGN-2.md`. Where they disagr
 
 * **CRDT:** Loro is the default.
 * **Web trust:** browser clients are only as trustworthy as the server at page-load time. Accepted and documented.
-* **Client:** library mode (`@zen/client`). No WebContainers. The service worker is an optional cache only.
+* **Client:** library mode (`@zen/client`). No WebContainers. The service worker is an optional cache only. *(Milestone 9: a service worker on a separate content origin also serves the members' fs content over HTTP, with no scripts allowed in what it serves (spec/sw.md). Code verification by a worker stays with milestone 11.)*
 * **Event signatures:** a hybrid-signed checkpoint every `sig_every` events, configurable per topic. `sig_every = 1` signs every event.
 * **Filesystems:** a configured set of filesystems (defaults: `/` and `/home/user`), mounted together on the client. Permissions apply per filesystem only. All of them live in the same FoundationDB keyspace, distinguished by an integer `fs_id` key prefix (§4.1).
 * **Static files:** served plaintext from `/unencrypted` (§4).
@@ -248,6 +248,6 @@ The server never sees names (namespaces, tables, columns, topics, paths), keys, 
 6. **Integrity and `zen-ublk`**: signed, hash-chained device checkpoints with client pins (fork consistency), event chains with topic heads (G26), filesystem tree checkpoints and a signed fs header, handler checkpoints for relayed services, the zen-db authenticated tier (one hash-chained state tree per namespace, its root vouched for by checkpoints, with no signature per commit), and `zen-ublk`, a block device over an fs with a Merkle block tree and a single-writer lease ([`docs/MILESTONE-6.md`](MILESTONE-6.md), [`docs/INTEGRITY.md`](INTEGRITY.md), [`docs/BLK.md`](BLK.md)). Done. (Ephemeral pub/sub shipped in milestone 2–3.)
 7. Later: `fips` suite, ORAM, more server CRDT types beyond zen-db rows (CRDT tables moved to 5).
 8. Large files, the rest: content-defined chunking (manifest version 3, instead of page repacking, which the layout as built never needs), upload sessions that keep a resume alive past `chunk_grace_secs`, pipelined and bounded-memory writes and edits that touch only the pages they change, multi-GiB measurements, `zen-mount --integrity`, Loro snapshots as files, and `zen-ublk import`/`export` ([`docs/MILESTONE-8.md`](MILESTONE-8.md)). Done; measured in [`docs/STATS.md`](STATS.md) §7. The paged layout and per-file keys moved forward into milestone 5 (step 7f/7g).
-9. Serving zen-fs over HTTP through a service worker, `@zen/sw` ([`docs/MILESTONE-9.md`](MILESTONE-9.md)).
+9. Serving zen-fs over HTTP through a service worker, `@zen/sw`: URLs mapped to fs nodes, streamed and decrypted responses with `Range`, MIME types and index pages, offline from the replica; a content origin that keeps fs content away from the keys (the isolation model measured first); `Range` in the server's static files, and `zen-serve static push` with a replicated fs 0 ([`docs/MILESTONE-9.md`](MILESTONE-9.md)). In progress.
 10. git over zen-serve, `git-remote-zen` ([`docs/MILESTONE-10.md`](MILESTONE-10.md)).
 11. An encrypted web-app platform: code-delivery trust, sharing, lifecycle ([`docs/MILESTONE-11.md`](MILESTONE-11.md)).

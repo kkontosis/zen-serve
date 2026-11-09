@@ -579,6 +579,8 @@ A receiver keeps the newest hlc it accepted per `(topic, sender, stream id)`, wh
 * `GET /unencrypted/*`, the root aliases, and the SPA fallback for `GET` with `Accept: text/html` (DESIGN-3 §4.2).
 * Responses carry a default `Content-Security-Policy` with `require-trusted-types-for 'script'` (G15), plus `X-Content-Type-Options: nosniff`.
 * When `cross_origin_isolation = true`, **every** response, `/v1` included, also carries COOP `same-origin`, COEP `require-corp` and CORP `same-origin`.
+* **Ranges** (milestone 9): files are streamed, and a single `Range` (`bytes=a-b`, `a-`, `-n`) gives 206 with `Content-Range`, an unsatisfiable one 416 with `Content-Range: bytes */len`, and `If-Range` applies it only when it equals the `ETag`. Several ranges, or malformed ones, get the whole file (200). Every file response carries `Accept-Ranges: bytes`, and HEAD the same headers with no body.
+* **The content origin** (milestone 9, sw.md §1): a request whose `Host` is a configured content origin gets only `/_zen/*` (the service worker, its bootstrap and enrollment pages, `config.json`) and `/v1/*`. Any other navigation gets the bootstrap page, anything else 503 with `Zen-Reason: starting`, and nothing from `/unencrypted`. The content origin is an accepted sign-in origin.
 
 ## 11. `POST /v1/admin/status`
 
