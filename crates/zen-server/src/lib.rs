@@ -18,6 +18,7 @@ pub mod cred;
 pub mod dump;
 pub mod eph;
 pub mod error;
+pub mod fs0;
 pub mod ids;
 pub mod integrity;
 pub mod keys;
@@ -123,6 +124,7 @@ async fn info(State(st): State<Shared>) -> Cbor<Info> {
             upload_ttl_secs: l.upload_ttl_secs,
             upload_max_ttl_secs: l.upload_max_ttl_secs,
         },
+        content_origins: st.cfg.content_origins().to_vec(),
         auth: Some(auth::info(&st).await),
     })
 }

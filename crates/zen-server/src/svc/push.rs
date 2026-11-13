@@ -102,7 +102,9 @@ async fn push(
     let mut log_left;
     let (mut w_lease, mut w_queue): (Option<Watch>, Option<Watch>) = (None, None);
     let mut first = true;
+    let tid = super::trace_push_id();
     loop {
+        super::trace(None, tid, "turn start");
         let caller = resolve(st, token).await?;
         check(st, &caller, fs, svc, lease).await?;
         // Watch first, then read: a change between the two still wakes us.
@@ -116,6 +118,7 @@ async fn push(
             return Ok(());
         }
 
+        super::trace(None, tid, "watches armed");
         // The connections to read this turn.
         let mut changed: Vec<Id> = again.drain().collect();
         let (now, newest) = log_tail(st, &log).await?;
@@ -154,6 +157,7 @@ async fn push(
                 _ => rv,
             });
         }
+        super::trace(None, tid, "log read");
         first = false;
         let mut seen = HashSet::new();
         changed.retain(|c| seen.insert(*c));
@@ -162,7 +166,9 @@ async fn push(
             let Some(h) = held.get_mut(&conn) else {
                 continue;
             };
-            match conn_turn(st, &caller, fs, svc, lease, &conn, h, id).await? {
+            let turn = conn_turn(st, &caller, fs, svc, lease, &conn, h, id).await?;
+            super::trace(Some(&conn), tid, "conn read");
+            match turn {
                 Turn::Gone => {
                     held.remove(&conn);
                 }
@@ -172,6 +178,7 @@ async fn push(
                             return Ok(());
                         }
                     }
+                    super::trace(Some(&conn), tid, "frames sent");
                     if left {
                         again.insert(conn);
                     }
@@ -194,6 +201,15 @@ async fn push(
                 _ = wq => (false, true),
             }
         };
+        super::trace(
+            None,
+            tid,
+            match (lease_rang, queue_rang) {
+                (true, _) => "lease bell fired",
+                (false, true) => "queue bell fired",
+                (false, false) => "no wait",
+            },
+        );
         if lease_rang {
             w_lease = None;
         }

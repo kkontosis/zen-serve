@@ -92,6 +92,10 @@ pub struct Info {
     pub time_ms: u64,
     /// Server limits.
     pub limits: Limits,
+    /// The content origins (spec/sw.md §1, api.md §10). Absent: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub content_origins: Vec<String>,
     /// Sign-in methods and origin policy (spec/auth.md). Absent from
     /// servers older than the multi-method sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]

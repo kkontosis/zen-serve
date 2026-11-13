@@ -337,3 +337,19 @@ cargo build -p zen-server --release --no-default-features --features pure   # no
 * The pure-Rust build needs no C compiler. With one installed, `blake3` still assembles its SIMD code; adding `--features pure` (zen-server's shorthand for blake3's `pure`) turns that off too, so that nothing calls a C compiler (FoundationDB's `libfdb_c` is a C library either way).
 * Passkey RS256 verification (auth.md §7) uses the `rsa` crate in both builds.
 * The two builds speak the same TLS and accept the same client certificates; only RSA server keys and the extra `secp384r1` group differ.
+
+## 9. Static files
+
+`/unencrypted` (api.md §10) is served from local disk by default (`unencrypted_dir`, or the bundled files). With several API nodes, `unencrypted_source = "replicated"` keeps the files in the store instead, so every node serves the same set:
+
+```sh
+zen-serve static push -c zen.toml ./site    # upload ./site as the new set
+zen-serve static list -c zen.toml           # the current set: generation, files, sizes, digests
+```
+
+* **What is pushed:** the regular files below the directory, by their relative paths, which must be paths `/unencrypted` can serve (UTF-8, no `\`, NUL, `.` or `..` segment). Symlinks and other special files are skipped with a warning. A directory with no regular file is refused.
+* **Atomic:** a push writes a new generation, then switches to it in one transaction (keyspace.md §3.11). An interrupted push changes nothing that is served; the next push clears what it left.
+* **It prints** the generation, the number of files and their bytes.
+* **The store must be reachable:** `static` opens it as `export` and `import` do. On the embedded backend that means the server is stopped (the store is a file only one process opens), so `replicated` is meant for FoundationDB, where `static push` runs while the servers serve, from any machine with the cluster file.
+* `unencrypted_source = "replicated"` with `unencrypted_dir` set is refused.
+

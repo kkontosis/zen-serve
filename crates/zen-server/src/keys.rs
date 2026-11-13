@@ -633,3 +633,30 @@ pub fn user_devices(user: &[u8]) -> Key {
 pub fn named_lease(fs: u32, name: &[u8]) -> Vec<u8> {
     Key::new().str("ls").int(fs.into()).bytes(name).finish()
 }
+
+// ---- static files, fs 0 (keyspace.md §3.11)
+
+/// `("sg")`: the current generation of the replicated static files.
+pub fn static_gen() -> Vec<u8> {
+    Key::new().str("sg").finish()
+}
+
+/// `("sf")` or `("sc")`, the files or the chunks of every generation; then
+/// `.int(gen)`.
+pub fn static_tag(tag: &str) -> Key {
+    Key::new().str(tag)
+}
+
+/// `("sf", gen, path)`: a file of a generation.
+pub fn static_file(generation: u64, path: &str) -> Vec<u8> {
+    Key::new()
+        .str("sf")
+        .int(generation as i64)
+        .str(path)
+        .finish()
+}
+
+/// `("sc", gen, path)`: a file's chunks, then `.int(i)`.
+pub fn static_chunks(generation: u64, path: &str) -> Key {
+    Key::new().str("sc").int(generation as i64).str(path)
+}

@@ -24,6 +24,13 @@ pub struct Config {
     /// Directory served at `/unencrypted`. Absent: the bundled defaults.
     #[serde(default)]
     pub unencrypted_dir: Option<PathBuf>,
+    /// Where `/unencrypted` is served from (api.md §10).
+    #[serde(default)]
+    pub unencrypted_source: UnencryptedSource,
+    /// The content origin of the service worker (spec/sw.md §1). Absent:
+    /// none.
+    #[serde(default)]
+    pub content: Option<ContentConfig>,
     /// Root paths aliased into `/unencrypted`.
     #[serde(default = "default_aliases")]
     pub aliases: Vec<String>,
@@ -65,6 +72,31 @@ pub struct Config {
     /// table; only `listen` may differ.
     #[serde(default)]
     pub service: Vec<ServiceConfig>,
+}
+
+/// `unencrypted_source` (api.md §10).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnencryptedSource {
+    /// `unencrypted_dir` on local disk, or the bundled files.
+    #[default]
+    Dir,
+    /// The store (keyspace.md §3.11), written by `zen-serve static push`,
+    /// so every node serves the same files.
+    Replicated,
+}
+
+/// `[content]`: the content origin (spec/sw.md §1, api.md §10).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentConfig {
+    /// The content origins, routed by the request's `Host`. They are also
+    /// accepted sign-in origins.
+    pub origins: Vec<String>,
+    /// Directory served at `/_zen/` on them: the service worker, its
+    /// bootstrap page (`boot.html`), the enrollment page, their scripts and
+    /// wasm.
+    pub dir: PathBuf,
 }
 
 /// Storage backend kind.
@@ -549,6 +581,8 @@ impl Config {
             public_origins: Vec::new(),
             fs: vec![FsConfig { id: 1 }, FsConfig { id: 2 }],
             unencrypted_dir: None,
+            unencrypted_source: UnencryptedSource::Dir,
+            content: None,
             aliases: default_aliases(),
             spa_fallback: true,
             csp: default_csp(),
@@ -563,6 +597,11 @@ impl Config {
             backup: BackupConfig::default(),
             service: Vec::new(),
         }
+    }
+
+    /// The content origins (`[content] origins`); empty when none.
+    pub fn content_origins(&self) -> &[String] {
+        self.content.as_ref().map_or(&[], |c| &c.origins)
     }
 
     /// The backend in effect.
@@ -651,6 +690,39 @@ impl Config {
                     "public_origins: {o:?} is not an origin (scheme://host[:port], lowercase, \
                      no trailing slash)"
                 ));
+            }
+        }
+        if self.unencrypted_source == UnencryptedSource::Replicated
+            && self.unencrypted_dir.is_some()
+        {
+            return Err(
+                "unencrypted_dir: not used with unencrypted_source = \"replicated\" (remove one)"
+                    .into(),
+            );
+        }
+        if let Some(c) = &self.content {
+            if c.origins.is_empty() {
+                return Err("content.origins: list at least one content origin".into());
+            }
+            if self.public_origins.is_empty() {
+                return Err(
+                    "content: needs public_origins, the app origins enrollment trusts (sw.md §8)"
+                        .into(),
+                );
+            }
+            for o in &c.origins {
+                if !zen_proto::valid_origin(o) {
+                    return Err(format!(
+                        "content.origins: {o:?} is not an origin (scheme://host[:port], \
+                         lowercase, no trailing slash)"
+                    ));
+                }
+                if self.public_origins.contains(o) {
+                    return Err(format!(
+                        "content.origins: {o:?} is also in public_origins; the content \
+                         origin must be an origin of its own (sw.md §1)"
+                    ));
+                }
             }
         }
         crate::password::check_params(self.auth.password_params())
@@ -783,6 +855,37 @@ mod tests {
         }
         let t = "data_dir = \"/tmp/x\"\npublic_origins = [\"https://a.example:8443\"]";
         assert!(Config::from_toml(t).is_ok());
+    }
+
+    #[test]
+    fn content_and_static_source_are_checked() {
+        let base = "data_dir = \"/tmp/x\"\npublic_origins = [\"https://app.example\"]\n";
+        let ok = format!(
+            "{base}unencrypted_source = \"replicated\"\n\
+             [content]\norigins = [\"https://view.example\"]\ndir = \"/srv/zen\"\n"
+        );
+        let c = Config::from_toml(&ok).unwrap();
+        assert_eq!(c.unencrypted_source, UnencryptedSource::Replicated);
+        assert_eq!(c.content_origins(), ["https://view.example".to_string()]);
+        let bad = [
+            // replicated and a directory
+            format!("{base}unencrypted_source = \"replicated\"\nunencrypted_dir = \"/srv/www\"\n"),
+            format!("{base}unencrypted_source = \"nfs\"\n"),
+            // no public_origins
+            "data_dir = \"/tmp/x\"\n[content]\norigins = [\"https://view.example\"]\ndir = \"/z\"\n"
+                .to_string(),
+            // the same origin as the app
+            format!("{base}[content]\norigins = [\"https://app.example\"]\ndir = \"/z\"\n"),
+            // not an origin
+            format!("{base}[content]\norigins = [\"https://view.example/\"]\ndir = \"/z\"\n"),
+            format!("{base}[content]\norigins = []\ndir = \"/z\"\n"),
+            // no dir
+            format!("{base}[content]\norigins = [\"https://view.example\"]\n"),
+            format!("{base}[content]\norigins = [\"https://view.example\"]\ndir = \"/z\"\ncsp = \"x\"\n"),
+        ];
+        for t in bad {
+            assert!(Config::from_toml(&t).is_err(), "{t}");
+        }
     }
 
     #[test]

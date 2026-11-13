@@ -465,6 +465,7 @@ impl Conn {
                         held = Some(Vec::new());
                     }
                     Ok(n) => {
+                        super::trace(Some(&self.conn), 0, "socket read");
                         idle_from = Instant::now();
                         // Gather more for a moment; not cancellable, so no
                         // input read is ever dropped.
@@ -485,6 +486,7 @@ impl Conn {
                             }
                         }
                         held = Some(buf[..len].to_vec());
+                        super::trace(Some(&self.conn), 0, "gathered");
                     }
                     // A reset or a failed read: the connection is over. On a
                     // WebSocket, the client's close is a reset (api.md §14.9).
@@ -530,6 +532,7 @@ impl Conn {
             if let Some(data) = held.take() {
                 match self.append(in_head, &data, eof).await {
                     Ok(Outcome::Done(c)) => {
+                        super::trace(Some(&self.conn), 0, "append committed");
                         in_head += data.len() as u64;
                         claimed |= c;
                         if fin && eof {

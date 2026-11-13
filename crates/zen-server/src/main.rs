@@ -121,6 +121,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// The replicated static files (`unencrypted_source = "replicated"`,
+    /// operations.md §9).
+    Static {
+        #[command(subcommand)]
+        cmd: StaticCmd,
+    },
     /// Copy an embedded store into the configured backend (servers stopped).
     Migrate {
         /// Path to zen-serve.toml (the target).
@@ -132,6 +138,25 @@ enum Cmd {
         /// Merge into a store that already holds data.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StaticCmd {
+    /// Upload a directory as the new set of static files, and switch every
+    /// node to it at once.
+    Push {
+        /// Path to zen-serve.toml.
+        #[arg(long, short)]
+        config: PathBuf,
+        /// The directory to upload.
+        dir: PathBuf,
+    },
+    /// List the current set.
+    List {
+        /// Path to zen-serve.toml.
+        #[arg(long, short)]
+        config: PathBuf,
     },
 }
 
@@ -171,6 +196,51 @@ enum BackupCmd {
         #[arg(long)]
         dest: String,
     },
+}
+
+/// `zen-serve static …`.
+async fn static_files(cmd: StaticCmd) {
+    use zen_server::config::UnencryptedSource;
+    use zen_server::fs0;
+    let (StaticCmd::Push { config, .. } | StaticCmd::List { config }) = &cmd;
+    let cfg = load(config);
+    if cfg.unencrypted_source != UnencryptedSource::Replicated {
+        eprintln!(
+            "zen-serve: note: {} has unencrypted_source = \"dir\"; servers using it serve \
+             unencrypted_dir, not these files",
+            config.display()
+        );
+    }
+    let store = zen_server::open_store(&cfg).unwrap_or_else(|e| fail(e));
+    match cmd {
+        StaticCmd::Push { dir, .. } => {
+            let p = fs0::push(store.as_ref(), &dir, fs0::PushOptions::default())
+                .await
+                .unwrap_or_else(|e| fail(e));
+            for s in &p.skipped {
+                eprintln!("zen-serve: skipped {s}: not a regular file or directory");
+            }
+            println!(
+                "pushed generation {}: {} files, {} bytes",
+                p.generation, p.files, p.bytes
+            );
+        }
+        StaticCmd::List { .. } => {
+            let l = fs0::list(store.as_ref())
+                .await
+                .unwrap_or_else(|e| fail(e.message));
+            match l.generation {
+                None => println!("no static files pushed"),
+                Some(g) => {
+                    println!("generation {g}: {} files", l.files.len());
+                    for (path, size, sha) in &l.files {
+                        let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+                        println!("{hex}  {size:>12}  {path}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -361,6 +431,7 @@ async fn cli() {
                 .await
                 .unwrap_or_else(|e| fail(e));
         }
+        Cmd::Static { cmd } => static_files(cmd).await,
         Cmd::Export { config, out } => {
             let cfg = load(&config);
             let store = zen_server::open_store(&cfg).unwrap_or_else(|e| fail(e));

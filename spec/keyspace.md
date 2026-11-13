@@ -248,3 +248,19 @@ changed(12) ‖ u8 flags ‖ parent(16) ‖ u64 move_hlc ‖ move_dev(32)
 * **Leases** follow the consume leases (§3.3, §3.5): never deleted, so tokens only grow. A release sets `expires_version` to 0.
 * `dk`, `dkh`, `dv`, `dvu` and `ls` are data (`export` copies them); `dkd` is a doorbell, never exported (like `meta`, §3.4).
 * The fs header key `pack("hdr", fs)` (§3.1) holds either form of the header (formats.md §12, §12.1).
+
+### 3.11 Static files (fs 0, api.md §10)
+
+The replicated source of `/unencrypted` (`unencrypted_source = "replicated"`), written by `zen-serve static push` (operations.md §9). It is plaintext: the "fs 0" of DESIGN-3 §4.2, which no `[[fs]]` may use. `gen` is an integer element; `path` is a file's path below `/unencrypted`, as served (UTF-8, `/`-separated, no empty, `.` or `..` segment), a string element; `i` is an integer element.
+
+| Key | Value |
+|---|---|
+| `pack("sg")` | `u64` big-endian: the current generation |
+| `pack("sf", gen, path)` | `u8 1 ‖ u64 size ‖ sha256(32)`: a file of generation `gen` (sizes big-endian) |
+| `pack("sc", gen, path, i)` | chunk `i` of that file: 65,536 bytes, the last one shorter; an empty file has none |
+
+* **A push** writes a whole new generation, one past the highest present in `sf` or `sc` (a push that was interrupted leaves its generation behind, and the next one skips it). It writes each file's chunks in transactions of at most 32, then the file's `sf`. Then one transaction sets `sg`: every node serves the new set from its next read on.
+* **Clean-up,** in the transaction after the switch, clears every generation but the new one and the one `sg` held before. Responses already streaming from the previous generation finish; a response still reading a generation that a later push clears ends early (an errored body, never other bytes).
+* **A read** gets `sg`, then the file's `sf`, then its chunks in batches, each batch a transaction of its own.
+* `sg`, `sf` and `sc` are data: `export` copies them.
+
