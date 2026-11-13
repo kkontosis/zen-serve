@@ -149,6 +149,12 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * The failure message lists the slowest push's steps from the test's write.
       * **Forced failure:** a 1.2 s delay after one lease bell showed as `7.2 ms lease bell fired` then `1208.2 ms turn start`. A delay on every bell first let the test's lease expire (`not_leader`), so the check used a single one. TD-TEST-OPEN-FAILURES item 2 now says the message names the step.
     * The `docs:` commit: docs/API.md (Static), examples/zen-serve.toml (`unencrypted_source` and `[content]`, commented), a new spec/OPS.md §8 (static-file and content-origin pitfalls), and this log.
+    * d0c4d00 (the `docs:` commit) pushed; PR #77 retitled `server: milestone 9 step 2: static ranges, the content origin, static push`.
+    * **CI on 8739728 (the log line, docs only): the pull-request run's `pure-rust` failed,** in zen-blk `a_crash_loses_only_unflushed_writes`. Its second flush got `lease_lost` under the test's 1.5 s lease. The push run on the same commit passed every job.
+      * **It isn't this PR's:** that commit is main plus one log line.
+      * **Not reproduced here** (`--no-default-features`): 5 idle runs and 6 under CPU load, all passed.
+      * One PR comment says so. TD-TEST-OPEN-FAILURES has a new item 7 for it, with the next step: time the renewals in its failure message.
+    * **CI green on both runs of d0c4d00** (push and pull_request), every job, `fdb` included (so the new static tests pass on FoundationDB). **Step 9.2 is done;** PR #77 waits on review and merge.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
