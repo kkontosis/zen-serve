@@ -26,6 +26,7 @@ const alias = {
   '@zen/fs': src('fs/src/index.ts'),
   '@zen/loro': src('loro/src/index.ts'),
   '@zen/svc': src('svc/src/index.ts'),
+  '@zen/sw': src('sw/src/index.ts'),
 };
 
 // WASM files a bundle fetches relative to its own URL (`new URL(…, import.meta.url)`).
