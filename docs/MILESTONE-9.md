@@ -116,6 +116,39 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * On "go": restarted from main (a85090a) by fast-forward; this file copied to `docs/MILESTONE-9.md`; commit `docs: milestone 9 step 2 plan`; push; open the PR. Then implement on the next "go".
     * **Decided (the user):** add timing of the first push's path (the append's commit, the lease watch firing, the push loop's turn) to `push_input`'s failure message, in step 9.2, as its own commit, checked by a forced failure. PR #76 stays docs only.
   * Committed 085eeb1 and pushed; PR #77 opened. **CI green on both runs of 085eeb1** (push and pull_request), every job. Next, on "go": implement as "Step 9.2 in detail" below, starting by copying this file to `docs/MILESTONE-9.md` (this log line included).
+  * 8739728 (the log line above) pushed.
+  * **On "go" (the implementation):**
+    * c48a522 `spec:` keyspace.md §3.11 (`sg`, `sf`, `sc`), api.md §2 (`content_origins`) and §10 (the sources and their ETags, the content origin's routes), operations.md §9 (`zen-serve static push` and `list`), sw.md §1 (`[content] origins` and `dir`).
+    * 8b588b4 `server:` as planned:
+      * `statics.rs`: streamed sources (bundled, a directory in 64 KiB pieces, the store in batches of 16 chunks), `parse_range`, `If-Range`, `Accept-Ranges` and `Content-Length` everywhere, HEAD, and the content host.
+      * `fs0.rs`: push, list, open and the chunk reads.
+      * `[content]` and `unencrypted_source` in the config, the content origins in `origin::explicit` and `/v1/info`, and `zen-serve static push|list`.
+    * **Changed from the plan:**
+      * The content host also mirrors the app host's answers for an unmatched `/v1` path (404, or 405 for other methods). Its other non-GET requests get the sandboxed 503 `starting`, as the spec says for "anything else".
+      * A path below the pushed directory that `/unencrypted` can't serve (not UTF-8, `\`) refuses the push rather than being skipped. Symlinks and special files are skipped with a warning.
+      * The bootstrap page missing from `[content] dir` gives the 503 `starting` (and a warning in the log), not 404.
+      * operations.md and OPS.md say: one push at a time.
+    * **Tests:** `tests/statics.rs`, 8 tests, and the config refusals (a unit test).
+      * Ranges on all three sources: every form, 416, an empty file, `If-Range`, HEAD, 304. A 5 MiB file streams whole and by a range across 80 chunks.
+      * Pushes: generations A to E, the previous one kept and older ones cleared, an interrupted push and its leftover, symlinks, an empty directory, `list`.
+      * A generation cleared mid-body errors the body.
+      * Export and import keep the set.
+      * The content origin's routes, and its sign-in.
+      * The whole zen-server suite passes; clippy is clean (default, `--no-default-features`, `--all-features`); fmt is clean. FDB is left to CI's `fdb` job, which runs these tests.
+    * **Negative controls,** each run once, then restored:
+      * `parse_range` always `Full`: `ranges_on_a_directory` fails.
+      * `If-Range` ignored: it fails at the `If-Range` check.
+      * The content-host check off: `the_content_origin_routes` fails.
+      * An interrupted push that had switched: `pushes_switch_generations_whole` serves "D", not "C".
+      * The previous generation cleared too: "the previous set is kept" fails.
+      * The content origins left out of `explicit`: `the_content_origin_signs_in` fails.
+      * The first try at the fourth control moved the switch before the files without removing the later one. It failed on "previous kept" instead, so it was redone as above.
+    * 4f20e27 `test(server):` push_input's diagnostics.
+      * A recorder, `svc::testing::trace`, under `test-utils`. It is off until a test starts it, and keeps the newest 100,000 events.
+      * It records the reader's read, gather and append commit, and the push loop's turn start, watches, log read, wake-up (which bell), connection read and frames sent.
+      * The failure message lists the slowest push's steps from the test's write.
+      * **Forced failure:** a 1.2 s delay after one lease bell showed as `7.2 ms lease bell fired` then `1208.2 ms turn start`. A delay on every bell first let the test's lease expire (`not_leader`), so the check used a single one. TD-TEST-OPEN-FAILURES item 2 now says the message names the step.
+    * The `docs:` commit: docs/API.md (Static), examples/zen-serve.toml (`unencrypted_source` and `[content]`, commented), a new spec/OPS.md §8 (static-file and content-origin pitfalls), and this log.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

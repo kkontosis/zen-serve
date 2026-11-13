@@ -206,3 +206,11 @@ Known hot spots, measured or not yet: TD-MEMORY (spec/TECH_DEBT.md).
 * **zen-mount's `fsync` is durable on the device,** in its cache dir, not on the server: the server has the write once the queue drains, which a stop waits up to 10 s for. A volume (docs/BLK.md §8) is the frontend whose `fsync` reaches the server.
 * **The CDC capacity is about 196 GiB a version** (98 GiB at the fill rule's worst); the writer picks fixed chunks for a larger file whose size it knows, and otherwise fails `too_large` (TD-FS-CDC-HUGE).
 
+## 8. Static-file and content-origin pitfalls
+
+* **`static push` on the embedded backend needs the server stopped:** it opens the store as `export` does, and only one process can (operations.md §9). `unencrypted_source = "replicated"` is for FoundationDB, where a push runs while every node serves.
+* **One push at a time.** Two at once pick the same new generation and mix their files.
+* **A push replaces the set; downloads started two pushes back end early** (an errored body, never other bytes): the generation before the current one is kept, older ones are cleared.
+* **The content origin is matched by `Host`,** with or without its default port. Behind a proxy, pass the client's `Host` through, or every request on the content host reaches the app's routes.
+* **The content origin needs its own `[content] dir`** with `boot.html` in it: without it, every navigation there gets the sandboxed 503 `starting`, and the worker is never registered.
+

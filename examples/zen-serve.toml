@@ -11,6 +11,9 @@ public_origins = []
 
 # Plaintext static files. Without this, the bundled defaults are served.
 # unencrypted_dir = "/srv/zen/unencrypted"
+# Or from the store, the same on every node: "replicated", filled with
+# `zen-serve static push` (spec/operations.md §9; not with unencrypted_dir).
+# unencrypted_source = "dir"
 aliases = ["favicon.ico", "robots.txt", "manifest.webmanifest"]
 spa_fallback = true
 
@@ -19,6 +22,15 @@ cross_origin_isolation = false
 
 # Extra origins allowed to call the API (G17). Empty: same-origin only.
 cors_origins = []
+
+# The service worker's content origin (spec/sw.md §1, api.md §10): its own
+# host, routed by the Host header, serving /_zen/ from `dir` and the API.
+# Needs public_origins (the app origins enrollment trusts), and none of
+# them may be a content origin. Content origins are accepted sign-in
+# origins.
+# [content]
+# origins = ["https://view.example.com"]
+# dir = "/srv/zen/sw"                        # sw.js, boot.html, enroll.html, …
 
 # Native TLS (spec/operations.md §8). Without [tls], plain HTTP: put the
 # server behind a TLS reverse proxy. The server key: ECDSA P-256/P-384,
