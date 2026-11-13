@@ -195,8 +195,10 @@ function splitPath(path: string): { parent: string; name: string } {
   return { parent: `/${segs.join('/')}`, name };
 }
 
-const typeOf = (n: TreeNode): NodeType =>
+/** A node's type: `dir` for the root, else its meta's (a file when it has none). */
+export const nodeType = (n: TreeNode): NodeType =>
   bytes.equal(n.id, ROOT) ? 'dir' : (n.meta?.type ?? 'file');
+const typeOf = nodeType;
 
 /** Open (or create) the replica of tree `treeId` on `opts.local`. */
 export function openReplica(
@@ -869,6 +871,22 @@ export class Replica {
     opts: { start?: number; end?: number } = {},
   ): Promise<ReadableStream<Uint8Array>> {
     const { e, v } = await this.file(path);
+    return this.streamOf(e, v, opts, path);
+  }
+
+  /**
+   * A stream of bytes `start..=end` of version `v` of entry `e`, as
+   * `createReadStream` but for a version the caller already holds (from
+   * `lookup` and `shown`), so a version that replaces it meanwhile isn't
+   * read instead. `v` absent: an empty file.
+   */
+  streamOf(
+    e: Entry,
+    v: ShownVersion | undefined,
+    opts: { start?: number; end?: number } = {},
+    path = bytes.hex(e.node.id),
+  ): ReadableStream<Uint8Array> {
+    if (typeOf(e.node) === 'dir') throw new ZenError(0, 'is_dir', `a directory: ${path}`);
     const start = opts.start ?? 0;
     const size = v?.size ?? 0;
     const end = Math.min(size, opts.end === undefined ? size : opts.end + 1);

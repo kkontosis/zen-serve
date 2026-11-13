@@ -1,5 +1,5 @@
 // @zen/fs: a local replica of a zen-serve filesystem tree (spec/fs.md §11,
-// docs/CLIENT.md). Worker-safe: no DOM or Node imports.
+// docs/CLIENT.md). Worker-safe: no DOM or Node imports (tsconfig.worker.json checks it).
 export { FileHandle, type OpenFlags, type OpenOptions } from './handle.js';
 export { isLocal, type LocalVersion, type ShownVersion } from './overlay.js';
 export {
@@ -8,6 +8,7 @@ export {
   type DirEntry,
   type Entry,
   type NodeType,
+  nodeType,
   openReplica,
   Replica,
   type ReplicaOptions,
