@@ -44,7 +44,7 @@ A mount names a directory of a tree:
   * `/` goes to the root mount's base, or is 404 without a root mount.
   * A first segment that names no mount: the root mount gets the whole path, or it is 404 without one.
 * **Lookup** is by display name, as the replica walks paths (fs.md §8 and §11), so a conflict copy is reachable under the name the replica shows for it.
-* **Files** are served as below (§5–§6).
+* **Files** are served as below (§5–§6). A file's path with a trailing `/` names nothing: 404.
 * **Directories:**
   * Without a trailing `/`: 301 to the same path with one, keeping the query, so relative links resolve.
   * With one: the first of the mount's `index` names that is a file is served.
@@ -53,6 +53,7 @@ A mount names a directory of a tree:
   * the directories first, then the rest, each group sorted by name (UTF-16 code units)
   * each name HTML-escaped, its link percent-encoded segment by segment, with a trailing `/` for a directory
   * a `../` link first, except at the mount's base
+  * no symlinks (they are 404)
 * **Symlinks** are 404.
 
 ## 4. Headers
