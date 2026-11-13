@@ -115,6 +115,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
 * **Step 9.2** (the server): planned below ("Step 9.2 in detail").
   * On "go": restarted from main (a85090a) by fast-forward; this file copied to `docs/MILESTONE-9.md`; commit `docs: milestone 9 step 2 plan`; push; open the PR. Then implement on the next "go".
     * **Decided (the user):** add timing of the first push's path (the append's commit, the lease watch firing, the push loop's turn) to `push_input`'s failure message, in step 9.2, as its own commit, checked by a forced failure. PR #76 stays docs only.
+  * Committed 085eeb1 and pushed; PR #77 opened. **CI green on both runs of 085eeb1** (push and pull_request), every job. Next, on "go": implement as "Step 9.2 in detail" below, starting by copying this file to `docs/MILESTONE-9.md` (this log line included).
 
 ## Steps (one PR each; each planned in detail before it starts)
 
