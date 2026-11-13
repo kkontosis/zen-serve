@@ -8,7 +8,7 @@ Built in milestone 9 (`@zen/sw`, docs/MILESTONE-9.md). The isolation model rests
 
 ## 1. The content origin
 
-* **One per deployment,** next to the app origin(s). It is configured on the server (`[content] origins`, operations in docs/SW.md) and routed by the request's `Host`. It needs `public_origins` set: they are the app origins enrollment trusts (§8).
+* **One per deployment,** next to the app origin(s). It is configured on the server: `[content] origins`, the content origins, and `[content] dir`, the directory the `/_zen/` files are served from (api.md §10; deploying, docs/SW.md) and routed by the request's `Host`. It needs `public_origins` set: they are the app origins enrollment trusts (§8).
 * **The server answers on it** only:
   * `/_zen/*`: fixed, trusted files. They are the worker (`/_zen/sw.js`, served with `Service-Worker-Allowed: /` and registered with scope `/`), the bootstrap page, the enrollment page, their scripts and wasm, and `/_zen/config.json` (§8).
   * `/v1/*`: the API, as on the app origin. The content origin is an accepted sign-in origin.

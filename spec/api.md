@@ -52,6 +52,7 @@ No authentication. Returns:
             max_groups_per_topic,
             crdt_max_skew_ms, crdt_horizon_secs, crdt_max_redo, crdt_max_depth,
             chunk_grace_secs, checkpoint_keep, upload_ttl_secs, upload_max_ttl_secs },
+  content_origins?: [text],          // the content origins (sw.md §1); absent: none
   auth?: { methods: [text], default?: text,      // sign-in methods (auth.md §2); a dormant mtls is left out (auth.md §10)
            origins?: { origins: [text], pinning: bool, host_fallback: bool },     // auth.md §5.5
            passkey?: { rp_id?: text,                    // auth.md §7.1; absent: no origin known yet
@@ -580,7 +581,15 @@ A receiver keeps the newest hlc it accepted per `(topic, sender, stream id)`, wh
 * Responses carry a default `Content-Security-Policy` with `require-trusted-types-for 'script'` (G15), plus `X-Content-Type-Options: nosniff`.
 * When `cross_origin_isolation = true`, **every** response, `/v1` included, also carries COOP `same-origin`, COEP `require-corp` and CORP `same-origin`.
 * **Ranges** (milestone 9): files are streamed, and a single `Range` (`bytes=a-b`, `a-`, `-n`) gives 206 with `Content-Range`, an unsatisfiable one 416 with `Content-Range: bytes */len`, and `If-Range` applies it only when it equals the `ETag`. Several ranges, or malformed ones, get the whole file (200). Every file response carries `Accept-Ranges: bytes`, and HEAD the same headers with no body.
-* **The content origin** (milestone 9, sw.md §1): a request whose `Host` is a configured content origin gets only `/_zen/*` (the service worker, its bootstrap and enrollment pages, `config.json`) and `/v1/*`. Any other navigation gets the bootstrap page, anything else 503 with `Zen-Reason: starting`, and nothing from `/unencrypted`. The content origin is an accepted sign-in origin.
+* **Sources** (`unencrypted_source`):
+  * `"dir"` (the default): `unencrypted_dir` on local disk, or, when it is absent, the files bundled into the binary. `ETag` is `"<hex size>-<hex mtime ns>"` for a directory file, `"b<hex hash>"` for a bundled one.
+  * `"replicated"`: the store's current generation (keyspace.md §3.11), written by `zen-serve static push` (operations.md §9), so every node serves the same files. `ETag` is `"s<hex sha256[0..16]>"` (the first 16 bytes of the file's SHA-256). A push replaces the generation whole; the one before is kept until the next push, so downloads in flight finish. Before the first push, nothing is served (404).
+* **The content origin** (milestone 9, sw.md §1): a request whose `Host` is a configured content origin (`[content] origins`, its scheme ignored) gets only `/_zen/*` and `/v1/*`, and nothing from `/unencrypted`:
+  * `GET /_zen/config.json`: `{"app_origins": [text]}` (JSON), the `public_origins` (sw.md §8), with `Cache-Control: no-store`.
+  * `GET /_zen/<path>`: a file of `[content] dir` (the service worker, its bootstrap and enrollment pages, their scripts and wasm), under the server's `csp`, with ranges as above. `/_zen/sw.js` also carries `Service-Worker-Allowed: /`.
+  * Any other navigation (`Sec-Fetch-Mode: navigate`, or, without that header, an `Accept` naming `text/html`): `<dir>/boot.html`, the bootstrap page, under the server's `csp`, with `Cache-Control: no-store`.
+  * Anything else: 503 with `Zen-Reason: starting`, a short HTML page under exactly sw.md §4's headers.
+  * The content origins are accepted sign-in origins (auth.md §5, with `public_origins`).
 
 ## 11. `POST /v1/admin/status`
 
