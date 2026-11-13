@@ -1460,8 +1460,59 @@ impl Pushed {
     }
 }
 
+/// The input path of `conn` while `[t0, t0 + d]`, from the recorder
+/// (`svc::testing::trace`): the reader's steps, and those of the push loops
+/// that pushed it, with the last step of each before `t0` for context.
+fn input_path(conn: &[u8], t0: Instant, d: Duration) -> String {
+    use zen_server::svc::testing::trace;
+    let conn: zen_server::svc::Id = conn.try_into().unwrap();
+    let ev = trace::events();
+    let loops: std::collections::HashSet<u64> = ev
+        .iter()
+        .filter(|e| e.conn == Some(conn) && e.push != 0)
+        .map(|e| e.push)
+        .collect();
+    let mine =
+        |e: &&trace::Event| e.conn == Some(conn) || (e.conn.is_none() && loops.contains(&e.push));
+    let mut before = std::collections::HashMap::new();
+    for e in ev.iter().filter(mine).filter(|e| e.at < t0) {
+        before.insert((e.push, e.conn.is_some()), e.clone());
+    }
+    let mut lines: Vec<trace::Event> = before.into_values().collect();
+    lines.extend(
+        ev.iter()
+            .filter(mine)
+            .filter(|e| e.at >= t0 && e.at <= t0 + d)
+            .cloned(),
+    );
+    lines.sort_by_key(|e| e.at);
+    let ms = |e: &trace::Event| {
+        if e.at >= t0 {
+            (e.at - t0).as_secs_f64() * 1e3
+        } else {
+            -((t0 - e.at).as_secs_f64() * 1e3)
+        }
+    };
+    let mut out: Vec<String> = lines
+        .iter()
+        .map(|e| {
+            let who = match e.push {
+                0 => "reader".to_string(),
+                p => format!("push loop {p}"),
+            };
+            format!("  {:>9.1} ms  {who}: {}", ms(e), e.step)
+        })
+        .collect();
+    out.push(format!(
+        "  {:>9.1} ms  test: received",
+        d.as_secs_f64() * 1e3
+    ));
+    out.join("\n")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn push_input() {
+    zen_server::svc::testing::trace::start();
     let (h, tok, addr) = setup(|_| {}).await;
     lease(&h, &tok, 1, None).await.unwrap();
     let mut ws = svc_sub(&h, &tok, 1).await;
@@ -1485,15 +1536,25 @@ async fn push_input() {
         let have = p.data[&c.conn].len();
         let got = p.until(&mut ws, &c.conn, 0, have + line.len()).await;
         assert!(got.ends_with(line.as_bytes()));
-        each.push(t0.elapsed());
+        each.push((t0, t0.elapsed()));
     }
-    let worst = each.iter().max().copied().unwrap_or_default();
-    println!("push latency, worst of 10: {worst:?}");
-    // All ten on failure: one stalled push, or every one slow (a loaded runner).
-    assert!(
-        worst < Duration::from_secs(1),
-        "pushed within 1 s: {each:?}"
-    );
+    let (slowest, worst) = each
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, d))| *d)
+        .map(|(i, (t0, d))| (i, (*t0, *d)))
+        .unwrap();
+    println!("push latency, worst of 10: {:?}", worst.1);
+    // All ten on failure: one stalled push, or every one slow (a loaded
+    // runner); and the slowest one's path, step by step
+    // (TD-TEST-OPEN-FAILURES item 2).
+    if worst.1 >= Duration::from_secs(1) {
+        let all: Vec<Duration> = each.iter().map(|(_, d)| *d).collect();
+        panic!(
+            "pushed within 1 s: {all:?}\nthe slowest, line {slowest}, from the test's write:\n{}",
+            input_path(&c.conn, worst.0, worst.1)
+        );
+    }
 
     peer.shutdown().await.unwrap();
     let f = next_push(&mut ws).await;

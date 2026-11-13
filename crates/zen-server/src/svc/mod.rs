@@ -609,3 +609,90 @@ pub fn unix_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// Record a step of a connection's input path, for tests (feature
+/// `test-utils`, `testing::trace`); nothing otherwise.
+#[inline]
+pub(crate) fn trace(conn: Option<&Id>, push: u64, step: &'static str) {
+    #[cfg(feature = "test-utils")]
+    testing::trace::record(conn, push, step);
+    #[cfg(not(feature = "test-utils"))]
+    let _ = (conn, push, step);
+}
+
+/// A push loop's id in the trace (0 without `test-utils`).
+#[inline]
+pub(crate) fn trace_push_id() -> u64 {
+    #[cfg(feature = "test-utils")]
+    return testing::trace::push_id();
+    #[cfg(not(feature = "test-utils"))]
+    0
+}
+
+/// Test hooks (feature `test-utils`).
+#[cfg(feature = "test-utils")]
+pub mod testing {
+    /// When each step of the input path ran: the reader's socket read and
+    /// its append, the push loop's wake-ups, turns and frames. Off until a
+    /// test calls [`trace::start`]; the newest 100,000 events are kept.
+    pub mod trace {
+        use super::super::Id;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Instant;
+
+        /// One step.
+        #[derive(Clone, Debug)]
+        pub struct Event {
+            /// When it ran.
+            pub at: Instant,
+            /// The connection it was for, if one.
+            pub conn: Option<Id>,
+            /// The push loop that ran it (0: the connection's reader).
+            pub push: u64,
+            /// What ran.
+            pub step: &'static str,
+        }
+
+        const CAP: usize = 100_000;
+        static ON: AtomicBool = AtomicBool::new(false);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        static EVENTS: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+
+        /// Start recording.
+        pub fn start() {
+            ON.store(true, Ordering::Relaxed);
+        }
+
+        /// The events recorded, oldest first.
+        pub fn events() -> Vec<Event> {
+            EVENTS
+                .lock()
+                .map(|e| e.iter().cloned().collect())
+                .unwrap_or_default()
+        }
+
+        pub(crate) fn push_id() -> u64 {
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        }
+
+        pub(crate) fn record(conn: Option<&Id>, push: u64, step: &'static str) {
+            if !ON.load(Ordering::Relaxed) {
+                return;
+            }
+            let e = Event {
+                at: Instant::now(),
+                conn: conn.copied(),
+                push,
+                step,
+            };
+            if let Ok(mut q) = EVENTS.lock() {
+                if q.len() >= CAP {
+                    q.pop_front();
+                }
+                q.push_back(e);
+            }
+        }
+    }
+}
