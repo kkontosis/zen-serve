@@ -183,6 +183,8 @@ await r.stat('/docs/a.txt');                      // {type, mode, size, mtimeMs,
 await r.readFile('/docs/a.txt');
 await r.read('/big.bin', offset, length);         // fetches only the chunks (and pages) it needs
 const s = await r.createReadStream('/big.bin', { start, end });
+const e = await r.lookup('/big.bin'), v = await r.shown(e);
+const t = r.streamOf(e, v, { start, end });       // that version, even if a newer one lands meanwhile
 await r.readlink('/link'); await r.getxattr('/x', 'user.k'); await r.listxattr('/x');
 await r.pin('/docs');                             // keep a folder's content offline, now and later
 r.onChange((ids) => …);                           // nodes that changed

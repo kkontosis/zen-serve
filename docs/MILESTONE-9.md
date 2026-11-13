@@ -164,6 +164,50 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     2. Copy this file to `docs/MILESTONE-9.md`, which brings in the log lines since 64d9e58.
     3. Commit `docs: milestone 9 step 3 plan (@zen/sw core)`, push, open the PR, and subscribe to it.
     4. Then implement on the next "go".
+  * Committed ecfed87 and pushed; PR #78 opened and subscribed.
+  * **On "go" (the implementation):**
+    * 53cb78b `spec:` sw.md as planned:
+      * §3: mounts and routing, and what a listing holds
+      * §4: the policy's text is the reference
+      * §6: no ETag for a local version (or a file with no version), and the body read by the version the ETag names
+      * §7: the error mapping, with anything else 500
+    * aca919d `fs:`:
+      * `Replica.streamOf(e, v, {start, end})`, which `createReadStream` now calls, and `nodeType` exported
+      * a test: the version given is read, from what was kept, offline, after a newer one lands
+      * `packages/fs/tsconfig.worker.json` (WebWorker lib, no DOM or Node types, through `@zen/client`'s `.d.ts`), in `npm run check` and CI. Checked by planting `document` and then `process` in an fs source: each fails it.
+      * **Changed from the plan:** the fs worker check went in this commit rather than the `sw:` one.
+    * 55fa162 `spec:` two cases the code settled: a file's path with a trailing `/` is 404, and listings leave out symlinks.
+    * 0289ded `sw:` the new `packages/sw`, as planned (mounts, range, mime, headers, pages, handle), wired into the workspaces, `check`, vitest, build-apps and CI.
+    * **Changed from the plan:**
+      * **The body is read before the response is made.** The first piece is read first, so an error there (offline, a chunk that fails to open) becomes the status, not a truncated 200. After that the body is pulled only as it is read (`highWaterMark` 0): at most one piece ahead of the reader.
+      * **`If-None-Match: *`** matches any file, with or without an ETag.
+      * **416** carries a short error page, as §7's errors do.
+      * `Site.onError` is told of each 500.
+    * 9c2e907 `test(server):` `SANDBOX_CSP` against sw.md §4's text, as `@zen/sw`'s constant is.
+    * **Tests:** 12 unit tests, 14 in handle.test.ts and 1 memory test.
+      * The duplicate-name fixture first assumed which of two `same.txt` nodes is shown as `same (2).txt`. fs.md §8 orders them by node id, which is random, so the first full run passed by chance; the test now reads both names from the replica.
+      * A real tampered chunk (a plaintext local store, the chunk's last byte flipped, the server unreachable) gives 502 `integrity`. It surfaces as a `ZenCryptoError`, as the "crypto errors not mapped" control shows.
+    * **Memory, changed from the plan:**
+      * The planned bound, a 64 MiB file raising live memory by less than 32 MiB, failed: 34–63 MiB through `handle` over five runs. A direct `createReadStream` gave 22–45 MiB on the same file, and the client's `Tree.readStream` alone 19–39 MiB.
+      * Before `highWaterMark` 0, `handle` added about 12 MiB over a direct read. With it, `handle` adds at most one piece, which the new test "the body is pulled" checks exactly (it counts the pulls).
+      * The replica's read peak is flat with the size: 59 MiB at 128 MiB, 71–73 at 256 and 68 at 512, so nothing accumulates. But it is 5–6 times the read-ahead.
+      * So `memory.test.ts` streams 256 MiB and bounds the peak at half the file, which shows it is never held whole. The replica's figure is a new TD-MEMORY item, with candidates for where it goes; step 9.5 measures the worker in the browser.
+    * **Negative controls,** each run once, then restored; each made its test fail:
+      * §4's headers left off error responses (8 tests failed)
+      * `If-Range` ignored
+      * a `..` segment allowed (the mounts and route refusals)
+      * listing names not escaped
+      * the body read by path rather than `streamOf` (the mid-request test)
+      * `parseRange` always the whole file
+      * the body pulled eagerly (`highWaterMark` 4)
+      * unexpected errors as 404
+      * `ZenCryptoError` not mapped (the real tampered chunk)
+      * `SANDBOX_CSP` drifted, in TypeScript and then in Rust
+    * **Checks:**
+      * `npm run check` passes, both worker checks included.
+      * `npx vitest run packages/sw packages/fs/test/replica.test.ts` passed 3 times.
+      * The server's `statics` unit tests pass; clippy (`--all-targets -D warnings`) and fmt are clean.
+    * The `docs:` commit: packages/sw/README.md, a docs/CLIENT.md line on `streamOf`, the TD-MEMORY item, and this log.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
