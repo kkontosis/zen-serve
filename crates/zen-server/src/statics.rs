@@ -630,7 +630,22 @@ pub async fn fallback(State(st): State<Shared>, req: Request) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{Range, clean, parse_range};
+    use super::{Range, SANDBOX_CSP, clean, parse_range};
+
+    /// The constant is spec/sw.md §4's text, its whitespace folded, as
+    /// `@zen/sw`'s is (packages/sw/test/unit.test.ts).
+    #[test]
+    fn sandbox_csp_is_the_spec() {
+        let md = include_str!("../../../spec/sw.md");
+        let section = &md[md.find("## 4. Headers").unwrap()..];
+        let start = section.find("```\n").unwrap() + 4;
+        let block = &section[start..start + section[start..].find("\n```").unwrap()];
+        let csp = block.split("\nX-Content-Type-Options:").next().unwrap();
+        let csp = csp.strip_prefix("Content-Security-Policy:").unwrap();
+        let folded = csp.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(folded.contains("script-src 'none'"));
+        assert_eq!(SANDBOX_CSP, folded);
+    }
 
     #[test]
     fn path_cleaning() {

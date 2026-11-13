@@ -179,7 +179,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * the replica's records waiting to be written: `pendingBytes`, 32 MiB (step 6b)
   * the client's page memo: `pageMemoIds`, 65,536 ids, about 12 MB, and `pageMemoPages`, 256 (step 6b)
   * pinned content fetched in windows of 256 chunks (step 6b); content fetched for reads isn't kept past `pendingBytes`
-  * `readStream` read-ahead and pipelined uploads: a few windows or commits each
+  * `readStream` read-ahead and pipelined uploads: a few windows or commits each (what a read holds live is more: below)
   * **a written file's chunk index** (step 8): packed, about 52 B a chunk; it was about 390, and all of the client's live growth under a large file (11 MiB per GiB). `chunkindex.test.ts` bounds it at 120 B
   * **the server** (step 7): the embedded backend's page cache (`[storage] cache_bytes`, 256 MiB), commit bodies in flight (`limits.commit_buffer_bytes`, 64 MiB), 2 malloc arenas, and one copy of each value in a transaction. Measured: 587–637 MiB under one 4 GiB writer and 691–712 MiB under 16 (1.9–3.1 GiB before; docs/STATS.md §7.3)
 * **Not bounded, or not measured yet:**
@@ -190,6 +190,11 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * **The client's buffers under many uploads:** 3 commits of up to `max_commit_bytes` in flight per upload, so 16 uploads in one process held 1.4 GiB of buffers (STATS.md §7.3). A process-wide budget would bound it.
   * **The Loro kept state:** a document's whole snapshot is one record in memory (zendb.md §20).
   * **zen-ublk under an image workload:** 373 MiB peak RSS on CI's runner, against 56 MiB for the FUSE frontend under the same load (docs/BLK.md §8; measured only there, since the development container has no ublk). Not explained yet. To check first: the ublk queues' I/O buffers (queue depth × the largest I/O, per queue) and the write batch's buffer.
+  * **A replica's streamed read holds 59–73 MiB live,** against a nominal read-ahead of 3 windows of 4 MiB (milestone 9 step 3). That is the JS heap plus array buffers after a full collection, sampled every 50 ms while `@zen/sw`'s `handle` streams 128, 256 and 512 MiB files from a replica on a disk store. It is flat with the size, so nothing accumulates, but it is 5–6 times the read-ahead.
+    * The client's `Tree.readStream` alone, on 64 MiB: 19–39 MiB at read-ahead 3, and 15–25 at 1. A replica's `createReadStream` there: 32–81 MiB. Single runs vary by 2×.
+    * `handle` itself adds at most one piece (a window, about 4 MiB) ahead of the reader (`handle.test.ts` "the body is pulled").
+    * Not known yet where it goes. Candidates: each window's sealed and plaintext copies, undici's buffered response bodies, the records being written (`pendingBytes`) and Node's write buffers, and wasm memory growing for a window's decryption.
+    * `packages/sw/test/memory.test.ts` bounds it at half the file (256 MiB). The service worker's memory is measured in the browser in step 9.5, where this matters most.
   * **The browser:** IndexedDB-backed replicas under the same workloads.
 * **What it would take:** memory figures for every frontend and the server as part of each milestone's benches (milestone 8 step 7 was the first: STATS.md §7.3), a bound and a setting for each item above, a body read timeout (or a per-caller share of the budget), and the compact page form.
 

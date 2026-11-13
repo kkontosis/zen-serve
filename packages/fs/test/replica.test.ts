@@ -212,6 +212,38 @@ describe('content on demand', () => {
     await r.close();
   });
 
+  it('streamOf reads the version given, though the path shows a newer one', async () => {
+    const { id, t } = freshTree();
+    const f = await t.create(ROOT, 'v.bin');
+    const one = blob(10 * 1984 + 3, 1);
+    await t.writeFile(f, one);
+    const { ufs, net } = await installation(w);
+    const r = await openReplica(ufs, id, solo());
+    await r.sync();
+    const e = await r.lookup('/v.bin');
+    const v1 = (await r.shown(e))!;
+    expect(await r.readFile('/v.bin')).toEqual(one); // kept from here on
+
+    const two = blob(4 * 1984, 2);
+    await t.writeFile(f, two);
+    await until(async () => expect((await r.stat('/v.bin')).size).toBe(two.length));
+    const read = async (s: ReadableStream<Uint8Array>) => {
+      const parts: Uint8Array[] = [];
+      for await (const p of s as unknown as AsyncIterable<Uint8Array>) parts.push(p);
+      return bytes.concat(...parts);
+    };
+    net.down = true; // from what the replica kept
+    expect(await read(r.streamOf(e, v1))).toEqual(one);
+    expect(await read(r.streamOf(e, v1, { start: 5000, end: 9000 }))).toEqual(
+      one.slice(5000, 9001),
+    );
+    net.down = false;
+    // The path shows the new version.
+    expect(await read(await r.createReadStream('/v.bin'))).toEqual(two);
+    expect(() => r.streamOf({ node: r.node(ROOT)! }, undefined)).toThrow(/is_dir/);
+    await r.close();
+  });
+
   it('eviction keeps the total under the limit and never drops pinned content', async () => {
     const { id, t } = freshTree();
     const p = await t.mkdir(ROOT, 'keep');

@@ -39,12 +39,21 @@ A mount names a directory of a tree:
   * a segment `.` or `..`
   * a decoded segment containing NUL or `/`
 * **The query string** is ignored.
+* **Mounts:** the first segment names a mount; the rest is the path below its `base`.
+  * `/<name>` (no trailing `/`) is the mount's base directory, so it gets the 301 below, to `/<name>/`.
+  * `/` goes to the root mount's base, or is 404 without a root mount.
+  * A first segment that names no mount: the root mount gets the whole path, or it is 404 without one.
 * **Lookup** is by display name, as the replica walks paths (fs.md §8 and §11), so a conflict copy is reachable under the name the replica shows for it.
-* **Files** are served as below (§5–§6).
+* **Files** are served as below (§5–§6). A file's path with a trailing `/` names nothing: 404.
 * **Directories:**
   * Without a trailing `/`: 301 to the same path with one, keeping the query, so relative links resolve.
   * With one: the first of the mount's `index` names that is a file is served.
-  * Failing that: a generated listing if `listing` is set, otherwise 404. A listing has the entries sorted, names HTML-escaped and links percent-encoded, and no scripts.
+  * Failing that: a generated listing if `listing` is set, otherwise 404.
+* **A listing** is a short HTML page with no scripts and no ETag, under §4's headers:
+  * the directories first, then the rest, each group sorted by name (UTF-16 code units)
+  * each name HTML-escaped, its link percent-encoded segment by segment, with a trailing `/` for a directory
+  * a `../` link first, except at the mount's base
+  * no symlinks (they are 404)
 * **Symlinks** are 404.
 
 ## 4. Headers
@@ -64,6 +73,7 @@ Cache-Control: no-store
 * **No script runs** in a page served this way: inline scripts, event handlers, `javascript:` URLs, and scripts in SVG documents are all refused, and with `script-src 'none'` scripts aren't even fetched (measured in step 9.1). So content can't read the origin's IndexedDB, where the worker's vault and replica live, though it keeps the origin. Keeping the origin is what keeps the page controlled by the worker.
 * **Allowed:** styles (inline too), images, media, fonts and frames from the content origin; links opening new tabs, which escape the sandbox but land on responses that carry it again; downloads.
 * **Refused:** forms, plugins, and any load from another origin. The last also keeps a page from telling a third party what is being read.
+* **The text above is the reference.** The server's constant (`statics.rs` `SANDBOX_CSP`, sent on the content origin's 503 `starting`, §1) and `@zen/sw`'s are both tested against it, its whitespace folded to single spaces, so the two can't drift apart.
 * **The policy is fixed.** A configurable policy would be one setting away from letting scripts run next to the vault (TD-SW-SCRIPTS).
 * `Cache-Control: no-store` keeps plaintext out of the HTTP cache.
 
@@ -107,6 +117,9 @@ Serving `text/javascript` is harmless here: §4 refuses to run it.
 
 * **The version served** is the node's current version, the newest by dot when there are siblings (fs.md §4).
 * **`ETag`:** strong, `"<hex node>.<hex dot>"` (node id and version dot, lowercase hex). A version's bytes never change, so the validator is strong.
+  * Only a version the server holds has one. A queued local version (fs.md §11), which a worker that doesn't write never shows, gets no `ETag`, so `If-None-Match` and `If-Range` never match it.
+  * An empty file with no version at all (created, never written) has no `ETag` either.
+* **The body** is that version's bytes, read by the version the `ETag` names, not by path again, so a version that replaces it during the request doesn't mix into the response.
 * **`If-None-Match`** listing that ETag, or `*`, gives 304 with the ETag and §4's headers.
 * **`Accept-Ranges: bytes`** on every file response.
 * **`Range`** (RFC 9110 §14):
@@ -132,6 +145,19 @@ Each error is a short static HTML page under §4's headers.
 | 503 | the worker's replica is still loading, or the request reached the server before the worker (§1) | `starting` |
 
 An error after the response has started (a chunk that fails to verify, or the network lost mid-file) errors the body stream, so the browser sees a truncated body, never wrong bytes.
+
+**The replica's errors** map to responses so:
+
+| Error (`@zen/fs`, `@zen/client`) | Response |
+|---|---|
+| `not_found`, `not_dir` | 404 |
+| `offline`, `network` | 503 `offline` |
+| `integrity` (`IntegrityError`), `format`, a chunk or page that fails to open (`ZenCryptoError`) | 502 `integrity` |
+| `closed` (the replica is restarting) | 503 `starting` |
+| the worker's start-up failing with `locked` or `starting` | 503 with that reason |
+| anything else | 500, with no reason |
+
+An unexpected error is 500, never 404, so it can't pass for a missing file.
 
 ## 8. Credentials and enrollment
 
