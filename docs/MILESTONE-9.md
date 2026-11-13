@@ -155,6 +155,15 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * **Not reproduced here** (`--no-default-features`): 5 idle runs and 6 under CPU load, all passed.
       * One PR comment says so. TD-TEST-OPEN-FAILURES has a new item 7 for it, with the next step: time the renewals in its failure message.
     * **CI green on both runs of d0c4d00** (push and pull_request), every job, `fdb` included (so the new static tests pass on FoundationDB). **Step 9.2 is done;** PR #77 waits on review and merge.
+    * 64d9e58 (this CI log and TD item 7) pushed: **CI green on both runs**, every job; PR #77 mergeable. This line reaches `docs/MILESTONE-9.md` at the restart from main.
+    * **Next, after PR #77 merges:** restart from main, plan step 9.3 (`@zen/sw` core: `handle(request, mounts, replicas) → Response` as spec/sw.md §2–§7, in a new worker-safe `packages/sw`, tested in Node) in detail here, commit the plan, open the PR, and implement on "go".
+    * **PR #77 merged** (the user). Step 9.2 is done. The PR's subscription ended with it.
+* **Step 9.3** (`@zen/sw` core): planned below ("Step 9.3 in detail").
+  * **On approval:**
+    1. Restart from main by fast-forward.
+    2. Copy this file to `docs/MILESTONE-9.md`, which brings in the log lines since 64d9e58.
+    3. Commit `docs: milestone 9 step 3 plan (@zen/sw core)`, push, open the PR, and subscribe to it.
+    4. Then implement on the next "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -502,6 +511,177 @@ Step 9.2 adds to zen-serve: streamed static files with single ranges, the conten
 * **The trusted pages use the server's `csp`.**
 * **`static push` talks to the store directly,** like `import`, not through an admin endpoint. On the embedded backend that means the server is stopped, so replicated is for clusters.
 * **An empty directory is refused.**
+
+## Step 9.3 in detail: `@zen/sw` core
+
+Step 9.3 adds a new package, `packages/sw` (`@zen/sw`). Its core is `handle(request, site) → Response`: spec/sw.md §2–§7 as code, over a `@zen/fs` replica.
+* It is worker-safe and typechecked as such, but runs no worker yet: the `sw.js` entry, enrollment and the browser come in 9.4.
+* It is tested in Node (Node 22 has `Request`, `Response` and web streams) against a real zen-serve.
+
+**Survey (read-only, this session):**
+* **`@zen/fs` `Replica`** (`packages/fs/src/replica.ts`):
+  * **Lookup:** `lookup(path) → Entry {node, sibling?}` walks shown names from the root, so conflict copies and display names resolve. It throws `not_found` / `not_dir`.
+  * **Listing:** `entries(dir) → Map<name, Entry>`.
+  * **The version:** `shown(e) → ShownVersion | undefined` gives the conflict copy's version, else the newest, with `.dot` (12 bytes) and `.size`. A queued local version has a zero dot (`isLocal`); the worker never writes, so it sees none.
+  * **Content type:** `stat(path).contentType` comes from the node meta's `zen.content_type` xattr (`CONTENT_TYPE`).
+  * **Streams:** `createReadStream(path, {start, end})` (with `end` inclusive) looks the path up again and reads `shown`. The version could change between the handler's lookup, which computes the ETag, and the read. Its stream rethrows `network` as `offline`.
+  * **`typeOf`** is private (line 198).
+* **Errors:**
+  * `ZenError` (`status`, `code`; `isCode`) covers `not_found`, `not_dir`, `is_dir`, `offline`, `network`, `format` and `closed`.
+  * `IntegrityError` has code `integrity`.
+  * A chunk that fails to open is a plain `Error` named `ZenCryptoError` (message `decrypt` or `format`), not a `ZenError`.
+* **Hex:** `bytes.hex` from `@zen/client`.
+* **Wiring a package** (the list is explicit everywhere, nothing is discovered):
+  * the root `package.json`: `workspaces` and the `check` chain
+  * `vitest.config.ts` aliases
+  * `scripts/build-apps.mjs` aliases
+  * `apps/tsconfig.json` paths, if apps import it
+  * the CI `client` job, whose tsc lines duplicate `check`
+* **Package model:** `packages/fs` has `package.json` (`exports` → `dist`, `build: tsc -p .`), `tsconfig.json` (extends `../client/tsconfig.json`, which has lib `ES2023, DOM, DOM.Iterable` and types `node`) and `tsconfig.test.json` (`paths` to the client's sources).
+* **No worker typecheck exists.** A `WebWorker` lib check that resolves `@zen/client` to its sources would fail:
+  * `passkey.ts` uses DOM-only WebAuthn types
+  * `wasm.ts` uses `process`
+  * Resolving `@zen/client` and `@zen/fs` to their built `.d.ts` instead (`exports` → `dist`, with `skipLibCheck`) checks only our own sources. CI already builds both before typechecking.
+* **Test harness:**
+  * `world()` (`packages/client/test/helpers.ts`) spawns the server, claims it and signs in.
+  * `installation(w)` and `watch(session)` come from `packages/fs/test/helpers.ts`; setting `net.down` makes the calls fail with `network`.
+  * `solo()` replica options, as in `packages/fs/test/replica.test.ts`.
+
+### 1. `spec:` commit (sw.md)
+
+* **§3,** made precise:
+  * A mount's own path without the slash (`/docs`) is its base directory, so it gets 301 to `/docs/`.
+  * `/` goes to the root mount, or is 404 without one.
+  * The first segment picks a mount by name. Otherwise the root mount gets the whole path, or 404 without one.
+* **§3, listings:**
+  * entries sorted by name, the directories first
+  * each name HTML-escaped, with its link percent-encoded per segment and a trailing `/` for a directory
+  * a `..` link except at a mount's base
+  * no ETag, under §4's headers
+* **§6, the ETag:** only a version the server holds gets one. A queued local version, which a worker that doesn't write never has, gets none, so `If-Range` never matches it.
+* **§7,** how the replica's errors map to responses:
+  * `not_found`, `not_dir` → 404
+  * `offline` and `network` → 503 `offline`
+  * `integrity`, `format` and a chunk that fails to open (`ZenCryptoError`) → 502 `integrity`
+  * `closed` (the replica is restarting) → 503 `starting`
+  * anything else → 500, with no reason, so an unexpected error never looks like a missing file
+* **§4:** the policy's text is the one that both the server's `SANDBOX_CSP` and `@zen/sw`'s constant are tested against (below).
+
+### 2. `fs:` commit (`@zen/fs`, small)
+
+* **`Replica.streamOf(e: Entry, v: ShownVersion | undefined, {start, end})`:** the stream `createReadStream` builds now, for a version the caller already holds. `createReadStream` then calls it, so its behaviour doesn't change. The handler reads exactly the version its ETag names.
+* **`typeOf`** is exported (as `nodeType(n)`).
+* **Test:** `streamOf` on a version the path no longer shows still reads that version's bytes, as long as the version is kept.
+
+### 3. `sw:` commit, the new `packages/sw`
+
+**Files:**
+* `package.json`: `@zen/sw`, deps `@zen/client` and `@zen/fs`, `exports` → `dist`, `build: tsc -p .`, `sideEffects: false`.
+* `tsconfig.json`, extending the client's.
+* `tsconfig.test.json`: `paths` to the client's and fs's sources, including tests.
+* **`tsconfig.worker.json`:**
+  * lib `ES2023, WebWorker`, types `[]`, `noEmit`, with only `src` included
+  * `@zen/client` and `@zen/fs` resolve through the workspace to their `dist`
+  * so it needs `npm run build -w @zen/client -w @zen/fs` first, as CI already does
+* **`packages/fs/tsconfig.worker.json`:** the same check for `@zen/fs`'s own sources, so its "worker-safe" comment is enforced.
+
+**Wired into:**
+* the root `workspaces` and `check`: `tsc -p packages/sw/tsconfig.test.json`, plus the two worker checks after a build of client and fs
+* the `vitest.config.ts` alias
+* the `build-apps.mjs` alias
+* the CI `client` job's tsc lines
+
+**`src/`:**
+* **`mounts.ts`:**
+  * the `Mount` type of §2
+  * `parseMounts(value: unknown): Mount[]`, which refuses:
+    * a name outside `[a-z0-9-]{1,63}`
+    * a repeated name
+    * more than one `root`
+    * a `base` that isn't absolute, or has an empty, `.` or `..` segment
+    * an `index` name with `/`
+    * a `fs` or `tree` of the wrong type
+  * `route(mounts, url) → {mount, path, trailing} | 400 | 404 | redirect`, as §3
+* **`range.ts`:** `parseRange(header, size)` as the server's `parse_range`, with the same table of cases in the tests.
+* **`mime.ts`:**
+  * the §5 table
+  * `validMediaType` (RFC 9110 `type "/" subtype *(OWS ";" OWS parameter)`, tokens and quoted strings)
+  * `contentType(name, xattr?)`
+* **`headers.ts`:** `SANDBOX_CSP` and the §4 header set, applied to every response.
+* **`pages.ts`:**
+  * the error pages: short static HTML, with the 503 `locked` page linking `/_zen/enroll.html`
+  * the listing page
+* **`handle.ts`:**
+  * **Signature:** `handle(req: Request, site: Site): Promise<Response>`.
+    * `Site = { mounts: readonly Mount[]; replica(m: Mount): Promise<Replica> }`.
+    * A `replica` that rejects with code `locked` or `starting` (9.4's start-up, faked in the tests here) gives that 503.
+  * **Methods:** GET and HEAD, else 405 with `Allow`.
+  * **Routing:** `route`, then `replica`, then `lookup(base + path)`.
+  * **Directories:** the 301 when the slash is missing; else the index; else the listing; else 404.
+  * **Symlinks:** 404.
+  * **Files:** `shown` and the ETag `"<hex node>.<hex dot>"`, then:
+    * `If-None-Match` (the ETag, a list, or `*`) → 304
+    * `If-Range`, then `parseRange` → 206 or 416, else 200
+    * `Content-Length`, `Accept-Ranges` and `Content-Type`
+    * HEAD opens no stream
+    * the body is `streamOf(e, v, {start, end})`
+  * **Errors:** mapped as §7 (step 1). An error once the body has started errors the stream (the replica's stream already does).
+* **`index.ts`:** exports `handle`, `parseMounts`, `Mount`, `Site`, `SANDBOX_CSP`, `parseRange` and `contentType`.
+
+### Tests (`packages/sw/test/`; vitest over a real server, as `packages/fs/test`)
+
+* **`unit.test.ts`** (no server):
+  * `parseRange`: the server's table of cases, plus random ranges against a model
+  * `validMediaType` and `contentType`: the table, case, unknown extensions, a bad xattr ignored
+  * `parseMounts`: each refusal
+  * `route`: the encodings and the 400s, the mount's own path, `/` with and without a root mount, a root mount's fallthrough
+  * **`SANDBOX_CSP` equals spec/sw.md §4's policy,** read from the file with its whitespace folded. A Rust unit test in `statics.rs` does the same for the server's constant, so the two can't drift apart.
+* **`handle.test.ts`** (one server):
+  * **The site:** a tree with an index page, nested directories, a name with spaces and `%`, a duplicate display name (`foo (2).txt`), a conflict copy (two devices write one file), a symlink, a `zen.content_type` xattr (good and bad), an empty file, and files of one chunk, several chunks and enough to have pages.
+  * **Per path:**
+    * the status and headers, with §4's set on every response (200, 206, 301, 304, 4xx, 5xx)
+    * the body against `readFile`
+  * **Ranges:** random ranges against a model, the edges, 416, `If-Range` matching and not, HEAD, 304.
+  * **Directories:** the redirect (keeping the query), the index, the listing (escaping, links, no script), 404 without either.
+  * **Errors:**
+    * **Offline:** `net.down` gives 503 `offline` for what isn't kept, and 200 for what is.
+    * **The site's replica rejecting** with `locked` gives 503 `locked`, and with `starting` gives 503 `starting`.
+    * **Integrity:** the test adversary can't corrupt chunks (it withholds and freezes; `adversary.rs`), so a wrapped replica throws instead:
+      * an `IntegrityError` from `lookup`, and a `ZenCryptoError` from `streamOf` before its first byte, each give 502 `integrity`
+      * a stream that errors after some bytes gives an errored body
+      * also once for real: a chunk kept in the replica's local store, tampered, gives 502
+    * **Methods:** 405.
+  * **A version replaced mid-request:** the ETag's version is the one streamed (`streamOf`).
+  * **Memory:** a 64 MiB file through `handle`, read whole, raises `heapUsed` + `arrayBuffers` by less than 32 MiB (OPS.md §6).
+* **Negative controls** (each run once, then restored):
+  * the §4 headers left off error responses
+  * `If-Range` ignored
+  * a `..` segment allowed
+  * listing names not escaped
+  * the read by path instead of `streamOf` (the mid-request test fails)
+  * `parseRange` always the whole file
+
+### Docs (`docs:` commit)
+
+* the log in both plan copies
+* a short README for packages/sw (what it is, what's next)
+* docs/CLIENT.md: a line on `streamOf`
+* The deploy guide (docs/SW.md) is 9.5.
+
+### Verification
+
+* `scripts/build-wasm.sh`; `npm run build -w @zen/client -w @zen/fs`
+* `npm run check`, which includes the two worker checks
+* `npx vitest run packages/sw packages/fs` 3×, then the full `npx vitest run` with `ZEN_APPS_BUILT=1`
+* the Rust test for `SANDBOX_CSP`
+* the negative controls above
+* CI green on both runs
+
+**Defaults chosen (overridable):**
+* **The worker typecheck goes through the built `.d.ts`,** not the client's sources, which have DOM- and Node-only code behind feature checks.
+* **`streamOf` in `@zen/fs`** rather than looking up and reading by path, to close the race between the ETag and the bytes.
+* **An unexpected error is 500,** not 404.
+* **Listings put directories first.**
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes.
