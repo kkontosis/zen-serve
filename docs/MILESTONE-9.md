@@ -208,6 +208,20 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * `npx vitest run packages/sw packages/fs/test/replica.test.ts` passed 3 times.
       * The server's `statics` unit tests pass; clippy (`--all-targets -D warnings`) and fmt are clean.
     * The `docs:` commit: packages/sw/README.md, a docs/CLIENT.md line on `streamOf`, the TD-MEMORY item, and this log.
+    * b41b289 (the `docs:` commit) pushed.
+    * **The full `npx vitest run`:** 648 passed, and 26 failed in 3 files that use the adversary (client and echo integrity, db authenticated), all with "built without test-utils". That was my mistake: the zen-serve binary had been rebuilt without `--features test-utils` before the run. After a rebuild with the feature (as CI builds it), the 3 files passed (30 tests).
+    * **CI green on both runs of b41b289** (push 43488579551 and pull_request 43488590850), every job. **Step 9.3 is done;** PR #78 waits on review and merge.
+    * **Open, for the user:** the replica's read path holds 59–73 MiB live while streaming, against a nominal 3 × 4 MiB read-ahead (TD-MEMORY). The choice is to investigate it now, as a step of its own before 9.4, or to measure it in the browser in 9.5 as planned (the default).
+    * **PR #78 merged** (the user, 21:51 UTC). Step 9.3 is done. The PR's subscription ended with it; its title and body were left as the plan's (plan mode was on).
+    * **Decided (the user): investigate the read path's memory now,** as step 9.3b, before 9.4 (planned below, "Step 9.3b in detail").
+* **Step 9.3b** (a streamed read's memory):
+  * **On approval:**
+    1. Restart from main by fast-forward, if the branch holds only merged history.
+    2. Copy this file to `docs/MILESTONE-9.md`, bringing in the log lines since b41b289.
+    3. Commit `docs: milestone 9 step 3b plan (a streamed read's memory)`, push, open the PR, and subscribe to it.
+    4. Run the spike right away, since it changes nothing in the repo. Then log its table here for the user's choice of fixes.
+  * **Done:** restarted from main by fast-forward (1494540, PR #78's merge); this file copied to `docs/MILESTONE-9.md`.
+    * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -726,6 +740,70 @@ Step 9.3 adds a new package, `packages/sw` (`@zen/sw`). Its core is `handle(requ
 * **`streamOf` in `@zen/fs`** rather than looking up and reading by path, to close the race between the ETag and the bytes.
 * **An unexpected error is 500,** not 404.
 * **Listings put directories first.**
+
+## Step 9.3b in detail: what a streamed read holds
+
+**Goal:** find where the 59–73 MiB live go while a replica streams a file, against a nominal 3 × 4 MiB read-ahead (TD-MEMORY, step 9.3's log). Then bound it, with a test that fails without the fix. The service worker streams every page and video through this path, so its memory is the worker's.
+
+**The path** (read-only survey, this session):
+* **`Tree.readStream`** (`packages/client/src/tree.ts:778`):
+  * Its `plan` loop runs while `queue.length <= ahead`, so `readAhead` 3 keeps up to **4** windows queued or in flight, not 3.
+  * Its `ReadableStream` has the default `highWaterMark` of 1, so it holds one more resolved window.
+* **Each window** (`readSpans`, `fetchChunks`, tree.ts:750 and 1053) is about 4 MiB of whole chunks. While it is fetched it holds:
+  1. the sealed response body of each `chunks/get` (64 chunks a request, `FETCH_PARALLEL` at once)
+  2. the decoded sealed chunks (`zw.decodeChunks`), also handed to the chunk cache
+  3. a Map of every plaintext chunk
+  4. a fresh 4 MiB buffer the plaintext is copied into
+* **The replica's chunk cache** (`packages/fs/src/store.ts` `Content`) keeps fetched sealed chunks as records waiting to be written, up to `pendingBytes`, then drops them.
+* **The replica's wrapper** (`createReadStream` and `streamOf`, replica.ts) is a pull stream with `highWaterMark` 1: one more window. `@zen/sw`'s `handle` adds one piece at most (step 9.3).
+
+Rough sum: 4 queued, plus 1 in each of the two streams, plus the consumer's, makes about 6 resolved windows (24 MiB). Add the transient copies of the windows being fetched (2–3 × 4 MiB each) and the pending records, and it comes to the measured range. The measurements below will confirm or refute this.
+
+### 1. Measure (a spike: the scratchpad only, nothing in the repo)
+
+* **The harness:**
+  * the 9.3 memory test's set-up (a world, a 256 MiB file, a replica on a disk store), copied to the scratchpad
+  * live bytes after a full collection (`gc` through `v8.setFlagsFromString`), sampled every 50 ms
+  * each case run 3 times, reporting the range
+* **Counters,** through test-only wrappers rather than source edits where possible: windows queued and in flight in `readStream`, and the bytes of each copy at the peak. Where a counter needs a source change, it goes in a scratch copy of the module, aliased in a scratch vitest config.
+* **The cases:**
+  1. `Tree.readStream` alone, at `readAhead` 0, 1 and 3, without the replica
+  2. the same with `<` in place of `<=` in `plan`
+  3. the same with `highWaterMark` 0 on its stream
+  4. `readSpans` without the Map: each chunk opened and copied straight into the window's buffer, its plaintext dropped at once
+  5. the replica on the disk store: as is, with `pendingBytes` 0, and with the cache's `put` a no-op
+  6. a heap snapshot (`v8.writeHeapSnapshot`) at a peak, to name the retainers of the largest array buffers, if 1–5 leave much unexplained
+  7. wasm memory (`WebAssembly.Memory` size of zen-wasm's instance) before and after, to check it isn't counted in the growth
+* **The outcome,** logged here: a table of each case, its live peak, and what it shows. Then fixes are proposed for the user to choose.
+
+### 2. Fix (on the user's choice of the fixes, a "go", and their own commits)
+
+The likely fixes, to be confirmed by the measurements:
+* `readStream` holds exactly `readAhead` windows: `<` in `plan`, and `highWaterMark` 0 on its stream and on the replica's wrapper.
+* `readSpans` opens each chunk into the window's buffer, with no Map of plaintext.
+* The defaults restated in CLIENT.md and OPS.md §6, with the measured figure.
+
+**Tests** (in the package each fix touches):
+* **Exact, deterministic:** a test that counts the windows `readStream` has fetched against those read, as 9.3's "the body is pulled" does, at `readAhead` 0, 1 and 3.
+* **Measured:** `packages/sw/test/memory.test.ts`'s bound tightened from half the file to the figure the fixes reach, with headroom for CI (the figure and the headroom set from the measurements).
+* **Negative controls:** `<=` restored, and `highWaterMark` 1 restored: each fails its test.
+
+### Docs
+
+* TD-MEMORY: the item updated with the findings, or resolved.
+* STATS.md: the read path's live memory, before and after.
+* The log in both plan copies.
+
+### Verification
+
+* `npm run check`
+* `npx vitest run packages/client packages/fs packages/sw` 3 times, then the full `npx vitest run` with `ZEN_APPS_BUILT=1` and zen-serve built with `--features test-utils`
+* CI green on both runs. The `files-bench` throughput (STATS.md) is re-checked with the dispatch run, since fewer windows ahead could slow reads.
+
+**Defaults chosen (overridable):**
+* **The spike first,** with the fixes chosen by the user from its figures, as step 9.1 was.
+* **The default read-ahead stays 3 windows,** made exact, rather than lowered.
+* **Its own PR,** with the restart from main and the plan commit first.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes.
