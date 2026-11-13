@@ -2,7 +2,8 @@
 //! name, the first-contact pin, and the `/v1/admin/origins/*` endpoints.
 //!
 //! Three sources make up the accepted set, as a union:
-//! * 7a `public_origins` in the config;
+//! * 7a `public_origins` in the config, and the content origins
+//!   (`[content] origins`, sw.md §1);
 //! * 7b the origin pinned at first contact (`[auth] origin_pinning`), only
 //!   while 7a is empty unless `origin_pinning_always` is set;
 //! * 7c the `origins` of the head ACL (`[auth] acl_origins`).
@@ -70,9 +71,11 @@ pub enum Verdict {
     Reject,
 }
 
-/// The explicit origins: 7a, then the pins when 7b is active, then 7c.
+/// The explicit origins: 7a (with the content origins, sw.md §1), then
+/// the pins when 7b is active, then 7c.
 pub fn explicit(cfg: &Config, acl_origins: &[String], pins: &[String]) -> Vec<String> {
     let mut out: Vec<String> = cfg.public_origins.clone();
+    out.extend(cfg.content_origins().iter().cloned());
     let pinned = if pinning_active(cfg) { pins } else { &[] };
     let acl = if cfg.auth.acl_origins {
         acl_origins
