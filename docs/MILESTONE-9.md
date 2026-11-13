@@ -221,6 +221,36 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. Commit `docs: milestone 9 step 3b plan (a streamed read's memory)`, push, open the PR, and subscribe to it.
     4. Run the spike right away, since it changes nothing in the repo. Then log its table here for the user's choice of fixes.
   * **Done:** restarted from main by fast-forward (1494540, PR #78's merge); this file copied to `docs/MILESTONE-9.md`.
+  * Committed 7ee78f2 and pushed; PR #79 opened and subscribed.
+  * **The spike** (the scratchpad only):
+    * **Set-up:** a 256 MiB file; each case run 3 times; the peak of the JS heap plus array buffers over the base, after a full collection, sampled every 50 ms. The harness had its own vitest config in the scratchpad. The one source change (`highWaterMark` 0) was a temporary patch, restored after the run.
+    * **First finding: most of the figure was buffers already freed but not yet swept.**
+      * A heap snapshot at a sampled +32.9 MiB (read-ahead 0) held one live 4 MiB window buffer beyond the base. The rest of the base was zen-wasm's linear memory (30.9 MiB, which never grew in any case) and module source text.
+      * V8 frees ArrayBuffer backing stores on a concurrent sweeper after a collection, so `process.memoryUsage().arrayBuffers` read right after `gc()` still counts them.
+      * With `--no-concurrent-array-buffer-sweeping`, the same cases measure live memory:
+
+      | Case | As 9.3 measured (sweeping deferred) | Live (sweeping synchronous) |
+      |---|---|---|
+      | `Tree.readStream`, read-ahead 0 / 1 / 2 / 3 | 27–32 / 37–48 / 59–61 / 47–74 MiB | 5–7 / 9–12 / 13 / 13–17 MiB |
+      | the same, its stream at `highWaterMark` 0 (read-ahead 0 / 2 / 3) | | 5–9 / 13–14 / 15–17 MiB: no change |
+      | a replica's `createReadStream`, `pendingBytes` 0 / 4 MiB / default 32 MiB | – / 54–82 / 87–117 MiB | 17 / 22–24 / 47–51 MiB |
+      | `@zen/sw` `handle`, `pendingBytes` 4 MiB / default | | 13.5–19 / 44–45 MiB |
+      | `handle` reading content already kept (`pendingBytes` 4 MiB) | | 5–8 MiB |
+
+    * **What is live:**
+      * **The tree:** about 4 MiB per window, plus a few MiB. Read-ahead 3 holds 4 windows: `plan` runs while `queue.length <= ahead`. Read-ahead 2 measures what an exact 3 would hold.
+      * **The replica adds about its `pendingBytes`:** the fetched sealed chunks it keeps, waiting to be written to the local store (`Content.cache.put`, store.ts). At the default 32 MiB that is the largest item, about 30 MiB of the 47–51.
+      * **`handle`** adds nothing measurable (13.5–19 against the replica's 22–24 at 4 MiB). Its "at most one piece" is 9.3's exact test.
+      * **The freed-but-unswept buffers** are real memory until the sweeper runs: 2–4 times the live figure at a sample. OPS.md §6 says "Garbage counts until collected" for the heap; this is the same for array buffers, and the browser's V8 sweeps the same way.
+    * **Proposed fixes, for the user to choose:**
+      1. **`readStream` holds exactly `readAhead` windows** (`<` in `plan`), saving one window (4 MiB). It gets a test that counts the windows fetched against those read, at read-ahead 0, 1 and 3, plus a negative control (`<=` restored).
+      2. **Memory tests measure live memory:** `--no-concurrent-array-buffer-sweeping` in `packages/sw/test/memory.test.ts`. With it, the planned bound works again: under 32 MiB through `handle` at `pendingBytes` 4 MiB (13.5–19 measured), on 256 MiB. The half-the-file bound goes.
+      3. **The service worker's replica uses a small `pendingBytes`** (8 MiB), set in its start-up in step 9.4, since a viewer mostly reads. The default stays 32 MiB, chosen in milestone 8 for zen-mount's writes. Nothing changes now but a line in sw.md §8.
+      4. **Docs:**
+         * OPS.md §6: the measuring note (array buffers after `gc()` include ones not yet swept; use the flag for live figures), and that a replica's reads hold up to `pendingBytes` of fetched content
+         * TD-MEMORY: the item rewritten with these figures and resolved
+         * STATS.md: the table
+      * **Not proposed:** `highWaterMark` 0 on the tree's stream (no change measured), and a smaller default read-ahead (13–17 MiB at 3 is reasonable, and STATS.md shows 1 was as fast only on loopback).
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
