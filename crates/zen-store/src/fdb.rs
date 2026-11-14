@@ -41,8 +41,78 @@ pub fn set_tls(tls: Tls) -> bool {
     TLS.set(Some(tls)).is_ok()
 }
 
+/// The running network's guard: dropping it stops the network and joins its
+/// thread, which `foundationdb` requires before the process exits.
+static NETWORK: Mutex<Option<foundationdb::api::NetworkAutoStop>> = Mutex::new(None);
+
+/// Set (to anything) to have [`stop_network`] say on stderr that it ran, for
+/// the exit-path test (`tests/fdb_exit.rs`).
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
+const EXIT_TRACE: &str = "ZEN_TEST_FDB_EXIT_TRACE";
+
+/// Stops the network, if it runs, before the process's exit goes on: left
+/// running, its thread can fault while the process tears down. Never blocks
+/// on the guard: if its lock is held or poisoned, the network is left as it
+/// is.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
+fn stop_network() {
+    let _ = std::panic::catch_unwind(|| {
+        let Ok(mut guard) = NETWORK.try_lock() else {
+            return;
+        };
+        if let Some(stop) = guard.take() {
+            drop(stop);
+            if std::env::var_os(EXIT_TRACE).is_some() {
+                eprintln!("zen-store: the FoundationDB network stopped");
+            }
+        }
+    });
+}
+
+/// When the network stops: as the main thread's `exit()` begins.
+///
+/// * glibc's `exit()` runs the calling thread's thread-local destructors
+///   before any `atexit` handler or static destructor. A constructor that
+///   runs before `main` registers [`stop_network`] as one on the main thread,
+///   so every exit from it stops the network first: `main` returning (the
+///   server, the CLI, the test harness) and `std::process::exit` there.
+/// * An `atexit` hook isn't enough: libfdb_c's network thread registers
+///   destructors of its own as it runs, which then run before the hook, and
+///   `fdb_stop_network` faults on what they destroyed (milestone 9 step 3c).
+/// * Not covered: an exit from another thread, and an abort (which
+///   `foundationdb` allows). Then the network runs on, as it did before.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod at_exit {
+    use std::ffi::{c_int, c_void};
+
+    unsafe extern "C" {
+        /// glibc: run `dtor(obj)` when this thread exits, `exit()` included.
+        fn __cxa_thread_atexit_impl(
+            dtor: unsafe extern "C" fn(*mut c_void),
+            obj: *mut c_void,
+            dso: *mut c_void,
+        ) -> c_int;
+    }
+
+    unsafe extern "C" fn on_exit(_: *mut c_void) {
+        super::stop_network();
+    }
+
+    extern "C" fn register() {
+        // SAFETY: a plain function and no object; a null `dso` means the
+        // main program, which is never unloaded.
+        unsafe { __cxa_thread_atexit_impl(on_exit, std::ptr::null_mut(), std::ptr::null_mut()) };
+    }
+
+    /// Runs on the main thread before `main`.
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static REGISTER: extern "C" fn() = register;
+}
+
 /// Start the FoundationDB client network thread once per process. It runs
-/// until the process exits. Called by [`Fdb::open`].
+/// until the process exits, which stops it first (`at_exit`). Called by
+/// [`Fdb::open`].
 pub fn network() -> Result<()> {
     static BOOTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     BOOTED
@@ -55,10 +125,10 @@ pub fn network() -> Result<()> {
                     b = b.set_option(N::TLSKeyPath(t.key.clone()))?;
                     b = b.set_option(N::TLSCaPath(t.ca.clone()))?;
                 }
-                // SAFETY: runs once per process (guarded by the OnceLock); the
-                // network is never stopped, so the guard is leaked on purpose.
+                // SAFETY: runs once per process (guarded by the OnceLock), and
+                // the guard is dropped as the process exits (`at_exit`).
                 let guard = unsafe { b.boot()? };
-                std::mem::forget(guard);
+                *NETWORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
                 Ok(())
             };
             start().map_err(|e| format!("start the FoundationDB client: {}", e.message()))
