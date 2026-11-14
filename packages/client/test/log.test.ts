@@ -310,6 +310,70 @@ describe('leaders', () => {
     expect(la.isLeader).toBe(true);
     await la.stop();
   });
+
+  /**
+   * Hold the next of the admin session's lease calls for 200 ms; resolves
+   * once it is in flight. Returns the count of lease calls and an undo.
+   */
+  function holdNextLease(): { inFlight: Promise<void>; calls: () => number; undo: () => void } {
+    const s = w.session as Session;
+    const orig = s.call;
+    let n = 0;
+    let held = false;
+    let started!: () => void;
+    const inFlight = new Promise<void>((r) => {
+      started = r;
+    });
+    s.call = (async (path: string, ...rest: unknown[]) => {
+      if (path === '/v1/consume/lease') {
+        n++;
+        if (!held) {
+          held = true;
+          started();
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+      return (orig as (...a: unknown[]) => unknown).call(s, path, ...rest);
+    }) as Session['call'];
+    return { inFlight, calls: () => n, undo: () => (s.call = orig) };
+  }
+
+  /** Whether `lb` takes the lease within `ms`. */
+  async function takes(lb: { acquire(): Promise<boolean> }, ms: number): Promise<boolean> {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await lb.acquire()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  }
+
+  for (const how of ['forget', 'stop'] as const) {
+    it(`${how} while a renewal is in flight: the late lease isn't kept`, async () => {
+      const ttlMs = 1000;
+      const name = `late-${how}`;
+      const la = await ufs.topic('late').leader(name, { ttlMs });
+      const lb = await bobFs.topic('late').leader(name, { ttlMs });
+      expect(await la.acquire()).toBe(true);
+      const h = holdNextLease();
+      try {
+        await h.inFlight; // the next renewal is on its way
+        if (how === 'forget') la.forget();
+        else await la.stop();
+        const after = h.calls();
+        // Released at once after stop; lapsed within a TTL after forget.
+        expect(await takes(lb, 3 * ttlMs)).toBe(true);
+        expect(la.isLeader).toBe(false);
+        // No renewal since, beyond the one in flight.
+        await new Promise((r) => setTimeout(r, ttlMs));
+        expect(h.calls() - after).toBe(0);
+        expect(lb.isLeader).toBe(true);
+      } finally {
+        h.undo();
+        await lb.stop();
+      }
+    });
+  }
 });
 
 describe('the session clock', () => {

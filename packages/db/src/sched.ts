@@ -171,7 +171,7 @@ export class Scheduler {
     const l = this.leader;
     this.leader = undefined;
     if (!l) return;
-    if (opts.release === false) l.consumer.forget();
+    if (opts.release === false) l.forget();
     else await l.stop().catch(() => {});
   }
 

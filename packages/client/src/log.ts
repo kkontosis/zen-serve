@@ -861,7 +861,9 @@ export interface LeaderOptions {
 /**
  * Leader election through a `sequential` group's lease (api.md §8.2,
  * DESIGN-3 §3). `acquire` or `campaign` takes the lease; it is renewed every
- * `renewMs` until `stop` releases it.
+ * `renewMs` until `stop` releases it, or `forget` drops it unreleased.
+ * A lease call still in flight when either runs doesn't take the lease
+ * back: its lease is released (after `stop`) or dropped (after `forget`).
  *
  * **Fencing.** `token` is the fencing token: it increases with each new
  * holder, and the server checks it in the same storage transaction as any
@@ -886,6 +888,10 @@ export class Leader {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private lost = false;
   private stopped = false;
+  /** Bumped by `stop` and `forget`: a lease call begun before one doesn't count. */
+  private gen = 0;
+  /** The last of them was `stop`: a late lease is released, not just dropped. */
+  private releasing = false;
 
   constructor(
     /** The group whose lease is the leadership. */
@@ -910,16 +916,28 @@ export class Leader {
   /** Try once to take the lease. Returns whether this client is now the leader. */
   async acquire(): Promise<boolean> {
     if (this.isLeader) return true;
+    const gen = this.gen;
     try {
       await this.consumer.lease({ ttlMs: this.ttlMs });
     } catch (e) {
       if (isCode(e, 'not_leader')) return false;
       throw e;
     }
+    if (gen !== this.gen) {
+      await this.late();
+      return false;
+    }
     this.lost = false;
     this.stopped = false;
+    this.releasing = false;
     this.schedule();
     return true;
+  }
+
+  /** A lease that landed after `stop` or `forget`: give it up as they did. */
+  private async late(): Promise<void> {
+    if (this.releasing) await this.consumer.release().catch(() => {});
+    else this.consumer.forget();
   }
 
   /** Take the lease, retrying every `ttlMs / 3` until it is free (or `signal` aborts). */
@@ -942,11 +960,17 @@ export class Leader {
   async renew(): Promise<boolean> {
     if (!this.isLeader) return false;
     const held = this.token;
+    const gen = this.gen;
     try {
       await this.consumer.lease({ ttlMs: this.ttlMs });
+      if (gen !== this.gen) {
+        await this.late();
+        return false;
+      }
       this.schedule();
       return true;
     } catch (e) {
+      if (gen !== this.gen) return false;
       const err = e instanceof ZenError ? e : new ZenError(0, 'network', String(e));
       if (isCode(err, 'not_leader')) {
         this.loseWith(err);
@@ -983,12 +1007,26 @@ export class Leader {
 
   /** Stop renewing and release the lease. */
   async stop(): Promise<void> {
+    this.gen++;
     this.stopped = true;
+    this.releasing = true;
     clearTimeout(this.timer);
     try {
       await this.consumer.release();
     } catch (e) {
       if (!isCode(e, 'not_leader')) throw e;
     }
+  }
+
+  /**
+   * Stop renewing and drop the lease without releasing it, as a crash
+   * would: another client takes it once it lapses.
+   */
+  forget(): void {
+    this.gen++;
+    this.stopped = true;
+    this.releasing = false;
+    clearTimeout(this.timer);
+    this.consumer.forget();
   }
 }
