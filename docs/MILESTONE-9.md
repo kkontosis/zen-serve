@@ -312,6 +312,25 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
         * the client, fs and sw suites: 268 passed
         * the read-ahead test 3 times, the memory test 10 times
         * biome, tsc, and the fs worker check
+      * a980626 (the `docs:` commit) pushed; PR #79 retitled `fs, client, sw: milestone 9 step 3b: …`.
+      * **CI on fce68fd** (the plan commit, before the fix): the push run's `client` failed in the same `streamOf` test with `offline`. That is the write-behind bug, fixed in d16013d.
+      * **The full local suite on a980626:** `npm run check` passed. 682 tests passed and 1 failed: booking's "the scheduler leader killed before a reminder is due", the failure milestone 8 left open ("Their causes are not found yet").
+        * **Its message** (milestone 8's diagnostics): the killed leader not running; the other running but not leading, 14.7 s past due, no warnings; 2 rows left.
+        * **The root cause, in `@zen/client` and `@zen/db`, not this step's code:**
+          * `Scheduler.stop({release: false})` (which simulates a crash) called only `consumer.forget()`.
+          * A renewal in flight at that moment succeeded afterwards. `Consumer.lease()` stores the token whatever happened meanwhile, and `Leader.renew()` scheduled the next renewal because `stopped` was never set.
+          * So the "dead" leader renewed every `ttl/3` for good, and the other scheduler's `acquire()` kept returning false.
+        * **Reproduced** in the scratchpad, every time: with one renewal held 200 ms and `forget()` called during it, the leader was leader again and made 10 lease calls in 3.5 s, and the other never won.
+        * **Decided (the user): fix it in PR #79.**
+        * 0015af3 `client, db:` a lease that lands after a leader's stop or forget isn't kept.
+          * `Leader.forget()` stops renewing as `stop()` does.
+          * A generation counter, bumped by both, makes `acquire` and `renew` give up a lease that lands afterwards: released after `stop`, dropped after `forget`.
+          * The scheduler uses `forget`.
+        * **Tests:** `log.test.ts` holds a renewal in flight across `forget`, and across `stop`. The other device must take the lease within 3 TTLs, and no renewal may follow. 3 runs passed.
+        * **Negative controls:**
+          * without the check in `renew`, the `forget` case fails. The `stop` case is also covered by the server, which refuses a released token.
+          * `forget` reduced to `consumer.forget()`: both cases fail.
+        * **After the fix:** the db suite passed (236 tests), and the booking failover passed 8 of 8 runs under CPU load.
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
