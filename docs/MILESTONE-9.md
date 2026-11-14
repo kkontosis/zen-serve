@@ -208,6 +208,130 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * `npx vitest run packages/sw packages/fs/test/replica.test.ts` passed 3 times.
       * The server's `statics` unit tests pass; clippy (`--all-targets -D warnings`) and fmt are clean.
     * The `docs:` commit: packages/sw/README.md, a docs/CLIENT.md line on `streamOf`, the TD-MEMORY item, and this log.
+    * b41b289 (the `docs:` commit) pushed.
+    * **The full `npx vitest run`:** 648 passed, and 26 failed in 3 files that use the adversary (client and echo integrity, db authenticated), all with "built without test-utils". That was my mistake: the zen-serve binary had been rebuilt without `--features test-utils` before the run. After a rebuild with the feature (as CI builds it), the 3 files passed (30 tests).
+    * **CI green on both runs of b41b289** (push 43488579551 and pull_request 43488590850), every job. **Step 9.3 is done;** PR #78 waits on review and merge.
+    * **Open, for the user:** the replica's read path holds 59–73 MiB live while streaming, against a nominal 3 × 4 MiB read-ahead (TD-MEMORY). The choice is to investigate it now, as a step of its own before 9.4, or to measure it in the browser in 9.5 as planned (the default).
+    * **PR #78 merged** (the user, 21:51 UTC). Step 9.3 is done. The PR's subscription ended with it; its title and body were left as the plan's (plan mode was on).
+    * **Decided (the user): investigate the read path's memory now,** as step 9.3b, before 9.4 (planned below, "Step 9.3b in detail").
+* **Step 9.3b** (a streamed read's memory):
+  * **On approval:**
+    1. Restart from main by fast-forward, if the branch holds only merged history.
+    2. Copy this file to `docs/MILESTONE-9.md`, bringing in the log lines since b41b289.
+    3. Commit `docs: milestone 9 step 3b plan (a streamed read's memory)`, push, open the PR, and subscribe to it.
+    4. Run the spike right away, since it changes nothing in the repo. Then log its table here for the user's choice of fixes.
+  * **Done:** restarted from main by fast-forward (1494540, PR #78's merge); this file copied to `docs/MILESTONE-9.md`.
+  * Committed 7ee78f2 and pushed; PR #79 opened and subscribed.
+  * **The spike** (the scratchpad only):
+    * **Set-up:** a 256 MiB file; each case run 3 times; the peak of the JS heap plus array buffers over the base, after a full collection, sampled every 50 ms. The harness had its own vitest config in the scratchpad. The one source change (`highWaterMark` 0) was a temporary patch, restored after the run.
+    * **First finding: most of the figure was buffers already freed but not yet swept.**
+      * A heap snapshot at a sampled +32.9 MiB (read-ahead 0) held one live 4 MiB window buffer beyond the base. The rest of the base was zen-wasm's linear memory (30.9 MiB, which never grew in any case) and module source text.
+      * V8 frees ArrayBuffer backing stores on a concurrent sweeper after a collection, so `process.memoryUsage().arrayBuffers` read right after `gc()` still counts them.
+      * With `--no-concurrent-array-buffer-sweeping`, the same cases measure live memory:
+
+      | Case | As 9.3 measured (sweeping deferred) | Live (sweeping synchronous) |
+      |---|---|---|
+      | `Tree.readStream`, read-ahead 0 / 1 / 2 / 3 | 27–32 / 37–48 / 59–61 / 47–74 MiB | 5–7 / 9–12 / 13 / 13–17 MiB |
+      | the same, its stream at `highWaterMark` 0 (read-ahead 0 / 2 / 3) | | 5–9 / 13–14 / 15–17 MiB: no change |
+      | a replica's `createReadStream`, `pendingBytes` 0 / 4 MiB / default 32 MiB | – / 54–82 / 87–117 MiB | 17 / 22–24 / 47–51 MiB |
+      | `@zen/sw` `handle`, `pendingBytes` 4 MiB / default | | 13.5–19 / 44–45 MiB |
+      | `handle` reading content already kept (`pendingBytes` 4 MiB) | | 5–8 MiB |
+
+    * **What is live:**
+      * **The tree:** about 4 MiB per window, plus a few MiB. Read-ahead 3 holds 4 windows: `plan` runs while `queue.length <= ahead`. Read-ahead 2 measures what an exact 3 would hold.
+      * **The replica adds about its `pendingBytes`:** the fetched sealed chunks it keeps, waiting to be written to the local store (`Content.cache.put`, store.ts). At the default 32 MiB that is the largest item, about 30 MiB of the 47–51.
+      * **`handle`** adds nothing measurable (13.5–19 against the replica's 22–24 at 4 MiB). Its "at most one piece" is 9.3's exact test.
+      * **The freed-but-unswept buffers** are real memory until the sweeper runs: 2–4 times the live figure at a sample. OPS.md §6 says "Garbage counts until collected" for the heap; this is the same for array buffers, and the browser's V8 sweeps the same way.
+    * **Proposed fixes, for the user to choose:**
+      1. **`readStream` holds exactly `readAhead` windows** (`<` in `plan`), saving one window (4 MiB). It gets a test that counts the windows fetched against those read, at read-ahead 0, 1 and 3, plus a negative control (`<=` restored).
+      2. **Memory tests measure live memory:** `--no-concurrent-array-buffer-sweeping` in `packages/sw/test/memory.test.ts`. With it, the planned bound works again: under 32 MiB through `handle` at `pendingBytes` 4 MiB (13.5–19 measured), on 256 MiB. The half-the-file bound goes.
+      3. **The service worker's replica uses a small `pendingBytes`** (8 MiB), set in its start-up in step 9.4, since a viewer mostly reads. The default stays 32 MiB, chosen in milestone 8 for zen-mount's writes. Nothing changes now but a line in sw.md §8.
+      4. **Docs:**
+         * OPS.md §6: the measuring note (array buffers after `gc()` include ones not yet swept; use the flag for live figures), and that a replica's reads hold up to `pendingBytes` of fetched content
+         * TD-MEMORY: the item rewritten with these figures and resolved
+         * STATS.md: the table
+      * **Not proposed:** `highWaterMark` 0 on the tree's stream (no change measured), and a smaller default read-ahead (13–17 MiB at 3 is reasonable, and STATS.md shows 1 was as fast only on loopback).
+    * Committed a76c457 and pushed. **CI green on both runs of a76c457.**
+    * **CI on 7ee78f2: the push run's `client` job failed,** in step 9.3's test `streamOf reads the version given, though the path shows a newer one`, with `offline`. Its pull-request run passed, and so have the five other runs of the test since 9.3.
+      * **The root cause, a bug in `@zen/fs` since milestone 8 step 6b:**
+        * `Records.flush()` (`packages/fs/src/store.ts`) takes the batch and clears `pending` at once, then writes the batch to the sealed store one record at a time.
+        * Until each write lands, `get()` finds the record neither in `pending` nor in the store, and `list()` leaves it out too.
+        * So for up to a batch's write time, a record just written reads as absent, whatever its kind (chunks, pages, versions, nodes, pins, the queue).
+      * **In the test:** `readFile` kept the old version's chunks as pending records. The flush timer (100 ms) fired during the `until` that waits for the new version, and the sealed writes (AES-GCM through WebCrypto) were still running when the network was switched off. The read missed the chunks and went to the network: `offline`.
+      * **Elsewhere, the same window** means a wasted fetch when online. Offline, it gives a false `offline`. A `list` during a flush (eviction, pins) can also miss records.
+      * **The fix, in its own commit on PR #79** (`fs: records being written stay readable until written`):
+        * A `writing` map holds each in-flight record until its store write lands; it is dropped there only if a newer `set` hasn't replaced it.
+        * `get()` reads `pending`, then `writing`, then the store. `list()` overlays `writing` before `pending`.
+        * The test (store.test or replica.test) uses a sealed store whose `put` waits on a gate. A record is put and flushed; while the write is held, `get` and `list` must return it, and a delete in flight must read as absent. A negative control (the `writing` lookup removed) must fail it.
+        * The 9.3 test then passes 20 times in a row locally under CPU load.
+    * **Decided (the user): all four proposed fixes** (the exact read-ahead, live-memory tests, the worker's `pendingBytes`, the docs), plus the write-behind fix above.
+    * **On "go", the commits on PR #79, in order:**
+      1. `fs: records being written stay readable until written`: the `writing` map, its test with a gated store, the negative control, and the 9.3 test 20 times under load.
+      2. `client: readStream holds exactly readAhead windows`:
+         * `<` in `plan` (tree.ts:787)
+         * a test in packages/client counting the windows fetched (`chunks/get` calls, through `watch`-style wrapping of the session) against those read, at read-ahead 0, 1 and 3, before the first read and after each
+         * the negative control: `<=` restored
+         * CLIENT.md's `readAhead` line made exact
+      3. `test(sw): measure live memory`:
+         * `setFlagsFromString('--no-concurrent-array-buffer-sweeping')` at the top of `packages/sw/test/memory.test.ts`
+         * the replica at `pendingBytes` 4 MiB, and the bound back to under 32 MiB on 256 MiB (measured 13.5–19)
+         * its header comment rewritten
+         * run 5 times locally, and the negative control: the replica's read through `readFile` (the whole file) must fail it
+      4. `spec:` sw.md §8: the worker's replica opens with `pendingBytes` 8 MiB, since a viewer mostly reads (OPS.md §6).
+      5. `docs:`
+         * OPS.md §6: under **Measuring**, array buffers right after `gc()` include ones not yet swept, so use `--no-concurrent-array-buffer-sweeping` for live figures, and that garbage is real memory until it is swept. Under the settings, a replica's reads also hold up to `pendingBytes` of fetched content.
+         * TD-MEMORY: the item rewritten with the live figures and marked resolved (the bound and the tests)
+         * STATS.md: the table
+         * the log
+    * **Verification:** `npm run check`; `npx vitest run packages/client packages/fs packages/sw` 3 times; the full `npx vitest run` with `ZEN_APPS_BUILT=1` and zen-serve built with `--features test-utils`; CI green on both runs.
+    * Committed fce68fd (the fixes chosen) and pushed.
+    * **On "go" (the implementation):**
+      * d16013d `fs:` records being written stay readable until written.
+        * A `writing` map holds each record a flush took until its store write lands or fails, unless a later flush took the key since. `get` reads it after `pending`, and `list` overlays it.
+        * `store.test.ts` holds the store's writes at a gate. Its 4 tests: a put being written, a delete being written, a newer value over one still being written, and a failed write.
+        * **Negative controls:** `writing` not read (all 4 tests fail); no check that a later flush took the key (the "newer value" test fails).
+        * **The CI failure reproduced:** the 9.3 `streamOf` test under CPU load (4 busy processes on 4 cores) failed 9 of 20 runs with the old `store.ts`, with CI's error, and 0 of 20 with the fix.
+      * 2f4ee06 `client:` `readStream` holds exactly `readAhead` windows ahead of the reader.
+        * **Changed from the plan: the spike's off-by-one was wrong.** `plan` fills the queue while `queue.length <= ahead` and `pull` then takes one window for the reader, so the `<=` is right. A `<` would fetch nothing at read-ahead 0.
+        * **The extra window was the stream's default `highWaterMark` of 1:** it pulled a window into its buffer before anything was read. The replica's wrapper did the same over it.
+        * So both now have `highWaterMark` 0. That is what was chosen (exactly `readAhead` windows, one fewer), through a different line.
+        * `readahead.test.ts` (new, default limits, a file of 7 windows) counts the windows fetched (`fetchChunks` calls) at read-ahead 0, 1 and 3. Before any read: none. After read `i`: `min(i + readAhead, windows)`. Before the fix it failed with 1 fetched before any read, which is its negative control.
+        * The replica's `streamOf` test checks that no chunk is fetched before a read. With the wrapper's `highWaterMark` 0 removed, it fails (1 fetch).
+        * CLIENT.md's `readStream` line now says what it holds.
+      * 560ea2c `test(sw):` the memory test measures live memory (`--no-concurrent-array-buffer-sweeping`).
+        * **Changed from the plan: the bound is 48 MiB, not 32.** The test measured 20.8–35.5 MiB over 14 runs; one run, 35.5, failed 32. The harness had given 19–20 MiB on the fixed code.
+        * At the peaks, mid-file: heap 1.4–1.6 MiB, array buffers 20–26.5 MiB, `pendingBytes` 4 MiB. That is the window read and 3 ahead, the copies of those being fetched, and up to 4 MiB of records plus one window's chunks put below that bound.
+        * **Negative control:** `handle` reading the whole file (`readFile`) gave +276 MiB and failed it.
+      * 63b7964 `spec:` sw.md §8: the worker's replica opens with `pendingBytes` 8 MiB.
+      * The `docs:` commit:
+        * STATS.md §7.3: the live table
+        * OPS.md §6: the measuring note on array buffers and the flag; the `pendingBytes` row says reads hold up to it too, and gives the worker's 8 MiB
+        * TD-MEMORY: the streamed-read item moved under "Bounded", with its test
+        * this log
+      * **Checks:**
+        * the client, fs and sw suites: 268 passed
+        * the read-ahead test 3 times, the memory test 10 times
+        * biome, tsc, and the fs worker check
+      * a980626 (the `docs:` commit) pushed; PR #79 retitled `fs, client, sw: milestone 9 step 3b: …`.
+      * **CI on fce68fd** (the plan commit, before the fix): the push run's `client` failed in the same `streamOf` test with `offline`. That is the write-behind bug, fixed in d16013d.
+      * **The full local suite on a980626:** `npm run check` passed. 682 tests passed and 1 failed: booking's "the scheduler leader killed before a reminder is due", the failure milestone 8 left open ("Their causes are not found yet").
+        * **Its message** (milestone 8's diagnostics): the killed leader not running; the other running but not leading, 14.7 s past due, no warnings; 2 rows left.
+        * **The root cause, in `@zen/client` and `@zen/db`, not this step's code:**
+          * `Scheduler.stop({release: false})` (which simulates a crash) called only `consumer.forget()`.
+          * A renewal in flight at that moment succeeded afterwards. `Consumer.lease()` stores the token whatever happened meanwhile, and `Leader.renew()` scheduled the next renewal because `stopped` was never set.
+          * So the "dead" leader renewed every `ttl/3` for good, and the other scheduler's `acquire()` kept returning false.
+        * **Reproduced** in the scratchpad, every time: with one renewal held 200 ms and `forget()` called during it, the leader was leader again and made 10 lease calls in 3.5 s, and the other never won.
+        * **Decided (the user): fix it in PR #79.**
+        * 0015af3 `client, db:` a lease that lands after a leader's stop or forget isn't kept.
+          * `Leader.forget()` stops renewing as `stop()` does.
+          * A generation counter, bumped by both, makes `acquire` and `renew` give up a lease that lands afterwards: released after `stop`, dropped after `forget`.
+          * The scheduler uses `forget`.
+        * **Tests:** `log.test.ts` holds a renewal in flight across `forget`, and across `stop`. The other device must take the lease within 3 TTLs, and no renewal may follow. 3 runs passed.
+        * **Negative controls:**
+          * without the check in `renew`, the `forget` case fails. The `stop` case is also covered by the server, which refuses a released token.
+          * `forget` reduced to `consumer.forget()`: both cases fail.
+        * **After the fix:** the db suite passed (236 tests), and the booking failover passed 8 of 8 runs under CPU load.
+    * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -726,6 +850,70 @@ Step 9.3 adds a new package, `packages/sw` (`@zen/sw`). Its core is `handle(requ
 * **`streamOf` in `@zen/fs`** rather than looking up and reading by path, to close the race between the ETag and the bytes.
 * **An unexpected error is 500,** not 404.
 * **Listings put directories first.**
+
+## Step 9.3b in detail: what a streamed read holds
+
+**Goal:** find where the 59–73 MiB live go while a replica streams a file, against a nominal 3 × 4 MiB read-ahead (TD-MEMORY, step 9.3's log). Then bound it, with a test that fails without the fix. The service worker streams every page and video through this path, so its memory is the worker's.
+
+**The path** (read-only survey, this session):
+* **`Tree.readStream`** (`packages/client/src/tree.ts:778`):
+  * Its `plan` loop runs while `queue.length <= ahead`, so `readAhead` 3 keeps up to **4** windows queued or in flight, not 3.
+  * Its `ReadableStream` has the default `highWaterMark` of 1, so it holds one more resolved window.
+* **Each window** (`readSpans`, `fetchChunks`, tree.ts:750 and 1053) is about 4 MiB of whole chunks. While it is fetched it holds:
+  1. the sealed response body of each `chunks/get` (64 chunks a request, `FETCH_PARALLEL` at once)
+  2. the decoded sealed chunks (`zw.decodeChunks`), also handed to the chunk cache
+  3. a Map of every plaintext chunk
+  4. a fresh 4 MiB buffer the plaintext is copied into
+* **The replica's chunk cache** (`packages/fs/src/store.ts` `Content`) keeps fetched sealed chunks as records waiting to be written, up to `pendingBytes`, then drops them.
+* **The replica's wrapper** (`createReadStream` and `streamOf`, replica.ts) is a pull stream with `highWaterMark` 1: one more window. `@zen/sw`'s `handle` adds one piece at most (step 9.3).
+
+Rough sum: 4 queued, plus 1 in each of the two streams, plus the consumer's, makes about 6 resolved windows (24 MiB). Add the transient copies of the windows being fetched (2–3 × 4 MiB each) and the pending records, and it comes to the measured range. The measurements below will confirm or refute this.
+
+### 1. Measure (a spike: the scratchpad only, nothing in the repo)
+
+* **The harness:**
+  * the 9.3 memory test's set-up (a world, a 256 MiB file, a replica on a disk store), copied to the scratchpad
+  * live bytes after a full collection (`gc` through `v8.setFlagsFromString`), sampled every 50 ms
+  * each case run 3 times, reporting the range
+* **Counters,** through test-only wrappers rather than source edits where possible: windows queued and in flight in `readStream`, and the bytes of each copy at the peak. Where a counter needs a source change, it goes in a scratch copy of the module, aliased in a scratch vitest config.
+* **The cases:**
+  1. `Tree.readStream` alone, at `readAhead` 0, 1 and 3, without the replica
+  2. the same with `<` in place of `<=` in `plan`
+  3. the same with `highWaterMark` 0 on its stream
+  4. `readSpans` without the Map: each chunk opened and copied straight into the window's buffer, its plaintext dropped at once
+  5. the replica on the disk store: as is, with `pendingBytes` 0, and with the cache's `put` a no-op
+  6. a heap snapshot (`v8.writeHeapSnapshot`) at a peak, to name the retainers of the largest array buffers, if 1–5 leave much unexplained
+  7. wasm memory (`WebAssembly.Memory` size of zen-wasm's instance) before and after, to check it isn't counted in the growth
+* **The outcome,** logged here: a table of each case, its live peak, and what it shows. Then fixes are proposed for the user to choose.
+
+### 2. Fix (on the user's choice of the fixes, a "go", and their own commits)
+
+The likely fixes, to be confirmed by the measurements:
+* `readStream` holds exactly `readAhead` windows: `<` in `plan`, and `highWaterMark` 0 on its stream and on the replica's wrapper.
+* `readSpans` opens each chunk into the window's buffer, with no Map of plaintext.
+* The defaults restated in CLIENT.md and OPS.md §6, with the measured figure.
+
+**Tests** (in the package each fix touches):
+* **Exact, deterministic:** a test that counts the windows `readStream` has fetched against those read, as 9.3's "the body is pulled" does, at `readAhead` 0, 1 and 3.
+* **Measured:** `packages/sw/test/memory.test.ts`'s bound tightened from half the file to the figure the fixes reach, with headroom for CI (the figure and the headroom set from the measurements).
+* **Negative controls:** `<=` restored, and `highWaterMark` 1 restored: each fails its test.
+
+### Docs
+
+* TD-MEMORY: the item updated with the findings, or resolved.
+* STATS.md: the read path's live memory, before and after.
+* The log in both plan copies.
+
+### Verification
+
+* `npm run check`
+* `npx vitest run packages/client packages/fs packages/sw` 3 times, then the full `npx vitest run` with `ZEN_APPS_BUILT=1` and zen-serve built with `--features test-utils`
+* CI green on both runs. The `files-bench` throughput (STATS.md) is re-checked with the dispatch run, since fewer windows ahead could slow reads.
+
+**Defaults chosen (overridable):**
+* **The spike first,** with the fixes chosen by the user from its figures, as step 9.1 was.
+* **The default read-ahead stays 3 windows,** made exact, rather than lowered.
+* **Its own PR,** with the restart from main and the plan commit first.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests; FDB once for server changes.

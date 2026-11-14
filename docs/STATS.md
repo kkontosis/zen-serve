@@ -464,6 +464,17 @@ Peak resident set, with the defaults:
 | The replica, a cold read / a pin | 541 / 831 MiB | fetched content dropped past `pendingBytes`; pins fetched in windows |
 | zen-mount, writing 4 GiB / reading it back | **465 / 296 MiB**; its cache dir at most 1.5 GiB on disk | the replica's bounds |
 
+**A streamed read, live** (milestone 9 step 3b): a 256 MiB file, the JS heap plus array buffers over the base, after a full collection with array buffers swept at once (`--no-concurrent-array-buffer-sweeping`), sampled every 50 ms. Before that flag, the same reads measured 2 to 4 times as much: freed buffers V8's concurrent sweeper hadn't released yet, real memory until it does.
+
+| What | Live, at most |
+|---|---|
+| `Tree.readStream`, read-ahead 0 / 1 / 2 / 3 (before the read-ahead fix) | 5–7 / 9–12 / 13 / 13–17 MiB |
+| `Tree.readStream`, read-ahead 3, nothing pulled before a read (after) | 16–17 MiB |
+| A replica's `createReadStream`, `pendingBytes` 0 / 4 MiB / 32 MiB (the default) | 17 / 22–24 / 47–51 MiB |
+| `@zen/sw` `handle`, `pendingBytes` 4 MiB: fetching / content already kept | 20.8–35.5 / 5–8 MiB |
+
+A read holds the window read, `readAhead` windows ahead (4 MiB each), the transient copies of those being fetched (the response, the sealed chunks, the plaintext), and up to `pendingBytes` of fetched content waiting to be written to the local store. That last is the largest item at the default. zen-wasm's linear memory stayed at 30.9 MiB throughout.
+
 **What the server's memory was** (measured with a probe, the server's `VmHWM`, `smaps_rollup` each second, and heaptrack; spec/OPS.md §6):
 
 | redb cache | Allocator | 1 writer: write | read | 16 writers |

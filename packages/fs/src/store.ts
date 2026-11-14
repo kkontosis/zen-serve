@@ -42,6 +42,11 @@ export function replicaStores(fs: number, tree: Uint8Array): string[] {
 /** Write-behind access to one replica's stores. */
 export class Records {
   private readonly pending = new Map<string, Pending>();
+  /**
+   * Records taken by a flush whose store write hasn't landed yet: still
+   * read from here, so a record never reads as absent while it is written.
+   */
+  private readonly writing = new Map<string, Pending>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private flushing: Promise<void> = Promise.resolve();
   /** Bytes of values pending or in a batch not yet written. */
@@ -65,7 +70,8 @@ export class Records {
   }
 
   async get(kind: Kind, key: Uint8Array): Promise<Uint8Array | undefined> {
-    const p = this.pending.get(`${kind}:${bytes.hex(key)}`);
+    const k = `${kind}:${bytes.hex(key)}`;
+    const p = this.pending.get(k) ?? this.writing.get(k);
     if (p) return p.value;
     return this.sealed.get(this.name(kind), key);
   }
@@ -107,7 +113,7 @@ export class Records {
   async list(kind: Kind): Promise<Map<string, Uint8Array>> {
     const out = new Map<string, Uint8Array>();
     for await (const [k, v] of this.sealed.list(this.name(kind))) out.set(bytes.hex(k), v);
-    for (const p of this.pending.values()) {
+    for (const p of [...this.writing.values(), ...this.pending.values()]) {
       if (p.kind !== kind) continue;
       if (p.value) out.set(bytes.hex(p.key), p.value);
       else out.delete(bytes.hex(p.key));
@@ -128,24 +134,30 @@ export class Records {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    const batch = [...this.pending.values()];
+    const batch = [...this.pending.entries()];
+    for (const [k, p] of batch) this.writing.set(k, p);
     this.pending.clear();
+    // Written (or given up): read from the store, unless a later flush took the key since.
+    const landed = (k: string, p: Pending) => {
+      if (this.writing.get(k) === p) this.writing.delete(k);
+      this.backlog -= sizeOf(p);
+    };
     this.flushing = this.flushing
       .catch(() => {})
       .then(async () => {
         let i = 0;
         try {
           for (; i < batch.length; i++) {
-            const p = batch[i]!;
+            const [k, p] = batch[i]!;
             const store = this.name(p.kind);
             if (p.value) await this.sealed.put(store, p.key, p.value);
             else await this.sealed.delete(store, [p.key]);
-            this.backlog -= sizeOf(p);
+            landed(k, p);
             this.wake();
           }
         } finally {
           // A failed write: what is left of the batch isn't waiting any more.
-          for (; i < batch.length; i++) this.backlog -= sizeOf(batch[i]);
+          for (; i < batch.length; i++) landed(...batch[i]!);
           this.wake();
         }
       });

@@ -772,8 +772,9 @@ export class Tree {
 
   /**
    * A version's bytes as a stream, fetched lazily in windows of about
-   * 4 MiB (whole chunks), `readAhead` windows ahead (default 3), so memory
-   * stays at a few windows. Cancel it to stop fetching.
+   * 4 MiB (whole chunks): nothing until the first read, then the window
+   * read and `readAhead` more (default 3), so memory stays at a few
+   * windows. Cancel it to stop fetching.
    */
   readStream(node: Uint8Array, opts: ReadStreamOptions = {}): ReadableStream<Uint8Array> {
     let v: FileVersion | undefined;
@@ -795,26 +796,30 @@ export class Tree {
         queue.push(p);
       }
     };
-    return new ReadableStream<Uint8Array>({
-      pull: async (ctl) => {
-        if (!started) {
-          started = true;
-          v = await this.pickVersion(node, opts.version);
-          end = v ? Math.min(v.size, opts.length === undefined ? v.size : next + opts.length) : 0;
-        }
-        if (v) await plan();
-        const p = queue.shift();
-        if (!p) {
-          ctl.close();
-          return;
-        }
-        ctl.enqueue(await p);
+    return new ReadableStream<Uint8Array>(
+      {
+        pull: async (ctl) => {
+          if (!started) {
+            started = true;
+            v = await this.pickVersion(node, opts.version);
+            end = v ? Math.min(v.size, opts.length === undefined ? v.size : next + opts.length) : 0;
+          }
+          if (v) await plan();
+          const p = queue.shift();
+          if (!p) {
+            ctl.close();
+            return;
+          }
+          ctl.enqueue(await p);
+        },
+        cancel: () => {
+          cancelled = true;
+          queue.length = 0;
+        },
       },
-      cancel: () => {
-        cancelled = true;
-        queue.length = 0;
-      },
-    });
+      // Pulled only when read: a buffered window would be one more ahead.
+      { highWaterMark: 0 },
+    );
   }
 
   private readonly layouts = new WeakMap<object, Layout>();

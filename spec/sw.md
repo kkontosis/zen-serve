@@ -176,7 +176,7 @@ The worker signs in as a **device of the member**, registered in the signed ACL 
 7. The enrollment page shows the app origin and the mounts and asks the user to confirm. Then it stores the device (`saveDevice`) and the mounts, registers the worker, and closes.
 8. **A member who isn't an admin:** the page shows the device's fingerprint for an admin to add. Until then the worker can't sign in, and serves only what its replica keeps: nothing, on a fresh origin. A handed-over session would remove this step (TD-SW-SESSION-HANDOVER).
 
-**On every start** (the browser stops idle workers and starts them on the next request): the worker initialises the wasm, then `vault.signIn` (the device), `vault.unlock(fs, {local})` for each mounted fs, and `openReplica` for each mounted tree. Requests wait for that start. Offline, `signIn` and `unlock` succeed from what the vault and the kept header hold (CLIENT.md §10), and the replica serves what it keeps.
+**On every start** (the browser stops idle workers and starts them on the next request): the worker initialises the wasm, then `vault.signIn` (the device), `vault.unlock(fs, {local})` for each mounted fs, and `openReplica` for each mounted tree, with `pendingBytes` of 8 MiB: a viewer mostly reads, and a replica's reads hold up to `pendingBytes` of fetched content waiting to be written (OPS.md §6). Requests wait for that start. Offline, `signIn` and `unlock` succeed from what the vault and the kept header hold (CLIENT.md §10), and the replica serves what it keeps.
 
 **Revoking:** an admin removes the device's certificate from the ACL, and a member removes its keyslots. Clearing the content origin's site data removes the device and the replica from that browser.
 

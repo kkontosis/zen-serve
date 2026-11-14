@@ -238,8 +238,13 @@ describe('content on demand', () => {
       one.slice(5000, 9001),
     );
     net.down = false;
-    // The path shows the new version.
-    expect(await read(await r.createReadStream('/v.bin'))).toEqual(two);
+    // The path shows the new version. Nothing is fetched before the first read.
+    net.reset();
+    const later = await r.createReadStream('/v.bin');
+    await new Promise((ok) => setTimeout(ok, 100));
+    expect(net.count('/v1/fs/chunks/get')).toBe(0);
+    expect(await read(later)).toEqual(two);
+    expect(net.count('/v1/fs/chunks/get')).toBeGreaterThan(0);
     expect(() => r.streamOf({ node: r.node(ROOT)! }, undefined)).toThrow(/is_dir/);
     await r.close();
   });

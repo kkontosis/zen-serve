@@ -1,9 +1,10 @@
 // A response is streamed (spec/sw.md §6): a large file through handle()
-// is never held whole (OPS.md §6). What the replica's read holds meanwhile
-// (its read-ahead, the fetches and the records being written) was measured
-// at 59–73 MiB live for 128 to 512 MiB, so the bound is half the file
-// (TECH_DEBT TD-MEMORY). That handle adds at most one piece to it is
-// handle.test.ts's "the body is pulled" test.
+// holds about the replica's read-ahead and its records waiting to be
+// written, whatever the file's size (OPS.md §6). Live memory is measured
+// with array buffers swept at each collection: by default V8 frees them on
+// a concurrent sweeper, so right after gc() they still count, at 2 to 4
+// times the live figure (milestone 9 step 3b). That handle adds at most one
+// piece is handle.test.ts's "the body is pulled" test.
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,9 +33,10 @@ afterAll(async () => {
 });
 
 setFlagsFromString('--expose-gc');
+setFlagsFromString('--no-concurrent-array-buffer-sweeping');
 const gc = runInNewContext('gc') as () => void;
 
-/** Live bytes: the heap and array buffers, after a full collection. */
+/** Live bytes: the heap and array buffers, after a full collection (and its sweep). */
 function live(): number {
   gc();
   const m = process.memoryUsage();
@@ -54,7 +56,7 @@ async function* source(n: number): AsyncGenerator<Uint8Array> {
 }
 
 describe('memory (OPS.md §6)', () => {
-  it('a 256 MiB file through handle is never held whole', async () => {
+  it('a 256 MiB file through handle holds less than 48 MiB live', async () => {
     const id = Tree.newId();
     const t = admin.tree(id);
     const f = await t.create(ROOT, 'big.bin');
@@ -101,6 +103,9 @@ describe('memory (OPS.md §6)', () => {
     expect(got).toBe(SIZE);
     expect(wrong).toBe(0);
     console.log(`handle: 256 MiB streamed, live memory +${(most / MiB).toFixed(1)} MiB at most`);
-    expect(most).toBeLessThan(SIZE / 2);
+    // Measured 20.8–35.5 MiB over 14 runs: the window read and 3 ahead (4 MiB
+    // each), the copies of those being fetched, and up to 4 MiB of records
+    // waiting to be written plus one window's chunks put below that bound.
+    expect(most).toBeLessThan(48 * MiB);
   }, 120_000);
 });
