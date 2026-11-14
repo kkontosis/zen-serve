@@ -16,6 +16,10 @@ Built in milestone 9 (`@zen/sw`, docs/MILESTONE-9.md). The isolation model rests
   * a navigation (`Sec-Fetch-Mode: navigate`) gets the bootstrap page, which registers the worker and then reloads the same URL
   * anything else gets 503 with `Zen-Reason: starting`, under §4's headers
   * nothing from `/unencrypted` is served on the content origin
+* **The worker's lifecycle:**
+  * It takes over at once: `install` keeps the worker's wasm in Cache Storage (`zen-sw-<build>`, so a stopped worker starts offline) and calls `skipWaiting()`; `activate` drops the caches of other builds and calls `clients.claim()`. An updated `/_zen/sw.js` takes over the same way, at the browser's next update check (`registration.update()`, or a navigation more than a day after the last check).
+  * The bootstrap page registers `/_zen/sw.js` (`{type: "module", scope: "/"}`) and reloads the URL once the page is controlled, so the worker answers it. If the page is already controlled, the worker answered it, so the bootstrap page only reloads.
+  * A message `{type: "zen-restart"}` from a page of the content origin (the enrollment page, §8) makes the worker drop what it started, so the next request starts it again with the new device and mounts.
 * **The bootstrap and enrollment pages run scripts,** under a strict policy: `script-src 'self'`, Trusted Types, `frame-ancestors 'none'`. They reflect no input into the page. Content can navigate to them but can't run code in them.
 
 ## 2. Mounts
@@ -140,9 +144,9 @@ Each error is a short static HTML page under §4's headers.
 | 404 | no such node, a symlink, a directory without an index or listing, or no mount | |
 | 405 | a method other than GET or HEAD | |
 | 502 | a chunk or page of the version fails to verify (formats.md §11) | `integrity` |
-| 503 | no device yet, or unlocking failed; the page links to `/_zen/enroll.html` | `locked` |
+| 503 | the vault holds no device, its sign-in is refused (401: not in the ACL yet, or removed), or no keyslot of a mounted fs opens with it; the page links to `/_zen/enroll.html` | `locked` |
 | 503 | the content isn't kept and the server can't be reached | `offline` |
-| 503 | the worker's replica is still loading, or the request reached the server before the worker (§1) | `starting` |
+| 503 | the worker's start (§8) hasn't finished 15 s after the request came, or the request reached the server before the worker (§1) | `starting` |
 
 An error after the response has started (a chunk that fails to verify, or the network lost mid-file) errors the body stream, so the browser sees a truncated body, never wrong bytes.
 
@@ -163,20 +167,24 @@ An unexpected error is 500, never 404, so it can't pass for a missing file.
 
 The worker signs in as a **device of the member**, registered in the signed ACL (auth.md §6), and unlocks each mounted fs with a device keyslot (formats.md §6). Both are set up once, from the app origin, which holds the member's keys.
 
-**Enrollment:**
+**Enrollment** is a conversation between the enrollment page on the content origin and the app, by `postMessage`. Nothing changes on the server until the user confirms on the content origin.
 1. The app opens `https://<content origin>/_zen/enroll.html` as a popup.
-2. The enrollment page makes a device key. It keeps the seed in the content origin's vault (`vault/default`, a sealed store with the device layer: CLIENT.md §10). It then posts `{type: "zen-enroll-hello", devicePublic}` to `window.opener`, with `targetOrigin` set to each app origin it trusts.
-3. **The app origins trusted** are listed in `/_zen/config.json` (`{app_origins: [text]}`), which the server writes from `public_origins`, minus the content origins.
-4. **Each side checks `event.origin`.** The enrollment page accepts messages only from a trusted app origin. The app accepts them only from its configured content origin.
-5. **The app's session,** signed in and unlocked:
-   * certifies the key (`approveDevice`, api.md §15.2)
-   * adds a device keyslot on each fs it mounts (`fs.addDevice`)
-   * if its user is an admin, adds the certificate to the member's ACL entry, an admin-signed ACL change (formats.md §9)
-6. The app answers `{type: "zen-enroll-done", cert, identityPublic, mounts}`.
-7. The enrollment page shows the app origin and the mounts and asks the user to confirm. Then it stores the device (`saveDevice`) and the mounts, registers the worker, and closes.
-8. **A member who isn't an admin:** the page shows the device's fingerprint for an admin to add. Until then the worker can't sign in, and serves only what its replica keeps: nothing, on a fresh origin. A handed-over session would remove this step (TD-SW-SESSION-HANDOVER).
+2. The enrollment page reads `/_zen/config.json` (`{app_origins: [text]}`), the app origins it trusts. The server writes it from `public_origins`, minus the content origins.
+3. **The device key:** the page makes one (`newDevice`) and keeps it in memory only, so a page closed or refused leaves no device. It posts `{type: "zen-enroll-hello", devicePublic, fp}` to `window.opener`, once for each trusted app origin as `targetOrigin`, so only a trusted origin can receive it.
+4. **The offer:** the app answers `{type: "zen-enroll-offer", mounts}` (§2's form; `tree` as bytes).
+5. **The confirmation:** the page shows the offering origin (the message's `event.origin`), the mounts and the device's fingerprint, and asks the user to confirm. It answers `{type: "zen-enroll-accept"}`, or `{type: "zen-enroll-failed", reason: "declined"}` and closes.
+6. **The app's session,** signed in and holding the member's signing identity:
+   * certifies the key and registers it (`approveDevice`, api.md §15.2)
+   * adds a device keyslot on each fs the mounts name (`fs.addDevice`)
+   * with an admin's identity, adds the certificate to the member's ACL entry, an admin-signed ACL change (formats.md §9)
+   * answers `{type: "zen-enroll-done", cert, identityPublic}`, or `{type: "zen-enroll-failed", reason}` if any of these failed
+7. **Kept:** the page stores the device (`saveDevice`, in the vault `vault/default` of the content origin's sealed store, with the device layer: CLIENT.md §10), drops any stored session (it was the previous device's), and stores the mounts (store `sw`, key `mounts`: the mounts as JSON, `tree` in hex). It registers the worker, sends it `zen-restart` (§1), answers `{type: "zen-enroll-saved"}` and closes.
+* **The checks on each message:** the page accepts messages only from `window.opener`, from a trusted app origin, and after the first offer only from that offer's origin. The app accepts them only from its popup and the content origin. A message of another type, from another source or origin, or out of order is ignored. The mounts are checked as §2 says (`parseMounts`) before they are shown.
+* **The app side needs the member's signing identity** to certify the key, and an admin's for the ACL change. A browser session signed in with a password holds neither (TD-SW-IDENTITY).
+* **A member who isn't an admin:** the app leaves the ACL alone, and the page shows the device's fingerprint for an admin to add. Until then the device's sign-in is refused (§7 `locked`), and the worker serves nothing. A handed-over session would remove this step (TD-SW-SESSION-HANDOVER).
+* **Re-enrolling** replaces the device, the stored session and the mounts. A replica of a tree no mount names any more stays in the store until the site data is cleared.
 
-**On every start** (the browser stops idle workers and starts them on the next request): the worker initialises the wasm, then `vault.signIn` (the device), `vault.unlock(fs, {local})` for each mounted fs, and `openReplica` for each mounted tree, with `pendingBytes` of 8 MiB: a viewer mostly reads, and a replica's reads hold up to `pendingBytes` of fetched content waiting to be written (OPS.md §6). Requests wait for that start. Offline, `signIn` and `unlock` succeed from what the vault and the kept header hold (CLIENT.md §10), and the replica serves what it keeps.
+**On every start** (the browser stops idle workers and starts them on the next request): the worker initialises the wasm, then `vault.signIn` (the device), `vault.unlock(fs, {local})` for each mounted fs, and, on the first request for a mount, `openReplica` for its tree (one replica per tree, shared by the mounts that name it), with `pendingBytes` of 8 MiB: a viewer mostly reads, and a replica's reads hold up to `pendingBytes` of fetched content waiting to be written (OPS.md §6). Requests wait for that start (up to 15 s, §7). A start that fails (`locked`, `offline`) is tried again on the next request. Offline, `signIn` and `unlock` succeed from what the vault and the kept header hold (CLIENT.md §10), and the replica serves what it keeps.
 
 **Revoking:** an admin removes the device's certificate from the ACL, and a member removes its keyslots. Clearing the content origin's site data removes the device and the replica from that browser.
 

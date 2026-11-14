@@ -1,0 +1,26 @@
+body {
+  font:
+    16px / 1.5 system-ui,
+    sans-serif;
+  margin: 0;
+  padding: 16px;
+  color: #1b1b1b;
+  background: #fff;
+}
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+}
+code {
+  word-break: break-all;
+}
+button {
+  font: inherit;
+  padding: 0.4rem 1rem;
+}
+@media (prefers-color-scheme: dark) {
+  body {
+    color: #eee;
+    background: #161616;
+  }
+}

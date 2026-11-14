@@ -277,6 +277,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** spec/zendb.md §9.2 says that where `SharedWorker` exists, the owner is a shared worker instead of a tab. zen-db elects a tab.
 * **Why deferred:** It needs the tab proxy (TD-DB-TAB-PROXY) first, plus a worker bundle with the wasm module.
 * **What it would take:** A worker entry point that opens the `Db` and serves the proxy protocol, a page-side client that prefers it when `SharedWorker` exists, key handling (unlock material passed to the worker once), and browser tests.
+* **Note (milestone 9):** `@zen/sw`'s service worker isn't this owner. It lives on the content origin (spec/sw.md §1), whose storage and locks are separate from the app origin's, so it can't own the app's `Db`. Its pieces carry over: a module worker bundle with the wasm beside it (scripts/build-sw.mjs), a start shared by every request, and the vault on a worker's wake. An app-origin owner is still a separate worker.
 
 
 ## TD-LORO-LARGE-SNAPSHOT
@@ -504,3 +505,13 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * Offline reads of kept content work throughout.
   * Revoking means logging the session out, as any session, plus removing the keyslots.
 * **What it would take:** the endpoint and the `delegated` method (spec in auth.md and api.md, limits, `[auth]` switch), a refresh flow from the app (for example on each visit to the app), the worker preferring the device when it can sign in with it, and tests: a member who isn't an admin views at once, and after expiry falls back to kept content and then to the device.
+
+## TD-SW-IDENTITY
+
+* **Status:** open.
+* **Context:** enrolling the content origin's worker (spec/sw.md §8) certifies its device key with the member's signing identity, and adds it to the ACL with an admin's. The app side, `enrollViewer` (`@zen/sw`), takes both from its caller. A browser app signed in with a password or a passkey holds neither: `signInPassword` makes a session, not an identity, and the example apps keep none. So in milestone 9 only a caller that already holds the identity seed can enroll a viewer (the tests do), and no example app has an "enable viewing" button.
+* **Options:**
+  1. **An identity in the app origin's vault:** the app keeps the member's identity seed in its own sealed store (the device layer), unlocked by the device key, as a worker does with its device. Simple, but a script running on the app origin can then sign as the member.
+  2. **A passkey-wrapped identity:** the identity seed sealed under a passkey's PRF output (TD-AUTH-WEBAUTHN-PRF-KEYSLOT), unwrapped only for the enrollment, with a user gesture.
+  3. **Delegation:** no identity at enrollment at all, but a session handed to the worker (TD-SW-SESSION-HANDOVER), with an admin adding the device later.
+* **What it would take:** for 1 or 2, the stored form (CLIENT.md §10), a recovery path when the device or passkey is lost, and an "enable viewing" button in one example app with a Playwright test. For 3, that TD.
