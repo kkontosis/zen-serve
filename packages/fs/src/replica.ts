@@ -897,18 +897,22 @@ export class Replica {
       length: end - start,
     });
     const reader = inner.getReader();
-    return new ReadableStream<Uint8Array>({
-      pull: async (ctl) => {
-        try {
-          const r = await reader.read();
-          if (r.done) ctl.close();
-          else ctl.enqueue(r.value);
-        } catch (err) {
-          ctl.error(isCode(err, 'network') ? offline(path) : err);
-        }
+    return new ReadableStream<Uint8Array>(
+      {
+        pull: async (ctl) => {
+          try {
+            const r = await reader.read();
+            if (r.done) ctl.close();
+            else ctl.enqueue(r.value);
+          } catch (err) {
+            ctl.error(isCode(err, 'network') ? offline(path) : err);
+          }
+        },
+        cancel: (why) => reader.cancel(why),
       },
-      cancel: (why) => reader.cancel(why),
-    });
+      // Pulled only when read, as the tree's stream is (no window more ahead).
+      { highWaterMark: 0 },
+    );
   }
 
   /** A symlink's target. */
