@@ -251,6 +251,39 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
          * TD-MEMORY: the item rewritten with these figures and resolved
          * STATS.md: the table
       * **Not proposed:** `highWaterMark` 0 on the tree's stream (no change measured), and a smaller default read-ahead (13–17 MiB at 3 is reasonable, and STATS.md shows 1 was as fast only on loopback).
+    * Committed a76c457 and pushed. **CI green on both runs of a76c457.**
+    * **CI on 7ee78f2: the push run's `client` job failed,** in step 9.3's test `streamOf reads the version given, though the path shows a newer one`, with `offline`. Its pull-request run passed, and so have the five other runs of the test since 9.3.
+      * **The root cause, a bug in `@zen/fs` since milestone 8 step 6b:**
+        * `Records.flush()` (`packages/fs/src/store.ts`) takes the batch and clears `pending` at once, then writes the batch to the sealed store one record at a time.
+        * Until each write lands, `get()` finds the record neither in `pending` nor in the store, and `list()` leaves it out too.
+        * So for up to a batch's write time, a record just written reads as absent, whatever its kind (chunks, pages, versions, nodes, pins, the queue).
+      * **In the test:** `readFile` kept the old version's chunks as pending records. The flush timer (100 ms) fired during the `until` that waits for the new version, and the sealed writes (AES-GCM through WebCrypto) were still running when the network was switched off. The read missed the chunks and went to the network: `offline`.
+      * **Elsewhere, the same window** means a wasted fetch when online. Offline, it gives a false `offline`. A `list` during a flush (eviction, pins) can also miss records.
+      * **The fix, in its own commit on PR #79** (`fs: records being written stay readable until written`):
+        * A `writing` map holds each in-flight record until its store write lands; it is dropped there only if a newer `set` hasn't replaced it.
+        * `get()` reads `pending`, then `writing`, then the store. `list()` overlays `writing` before `pending`.
+        * The test (store.test or replica.test) uses a sealed store whose `put` waits on a gate. A record is put and flushed; while the write is held, `get` and `list` must return it, and a delete in flight must read as absent. A negative control (the `writing` lookup removed) must fail it.
+        * The 9.3 test then passes 20 times in a row locally under CPU load.
+    * **Decided (the user): all four proposed fixes** (the exact read-ahead, live-memory tests, the worker's `pendingBytes`, the docs), plus the write-behind fix above.
+    * **On "go", the commits on PR #79, in order:**
+      1. `fs: records being written stay readable until written`: the `writing` map, its test with a gated store, the negative control, and the 9.3 test 20 times under load.
+      2. `client: readStream holds exactly readAhead windows`:
+         * `<` in `plan` (tree.ts:787)
+         * a test in packages/client counting the windows fetched (`chunks/get` calls, through `watch`-style wrapping of the session) against those read, at read-ahead 0, 1 and 3, before the first read and after each
+         * the negative control: `<=` restored
+         * CLIENT.md's `readAhead` line made exact
+      3. `test(sw): measure live memory`:
+         * `setFlagsFromString('--no-concurrent-array-buffer-sweeping')` at the top of `packages/sw/test/memory.test.ts`
+         * the replica at `pendingBytes` 4 MiB, and the bound back to under 32 MiB on 256 MiB (measured 13.5–19)
+         * its header comment rewritten
+         * run 5 times locally, and the negative control: the replica's read through `readFile` (the whole file) must fail it
+      4. `spec:` sw.md §8: the worker's replica opens with `pendingBytes` 8 MiB, since a viewer mostly reads (OPS.md §6).
+      5. `docs:`
+         * OPS.md §6: under **Measuring**, array buffers right after `gc()` include ones not yet swept, so use `--no-concurrent-array-buffer-sweeping` for live figures, and that garbage is real memory until it is swept. Under the settings, a replica's reads also hold up to `pendingBytes` of fetched content.
+         * TD-MEMORY: the item rewritten with the live figures and marked resolved (the bound and the tests)
+         * STATS.md: the table
+         * the log
+    * **Verification:** `npm run check`; `npx vitest run packages/client packages/fs packages/sw` 3 times; the full `npx vitest run` with `ZEN_APPS_BUILT=1` and zen-serve built with `--features test-utils`; CI green on both runs.
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
