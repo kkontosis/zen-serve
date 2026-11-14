@@ -478,6 +478,34 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     2. Copy this file to `docs/MILESTONE-9.md`, bringing in the log lines since cffc7fb.
     3. Commit `docs: milestone 9 step 5 plan (benches, docs/SW.md, the outcome)`, push, open the PR, and subscribe.
     4. Implement on the user's next "go" (approval of this plan isn't one).
+  * Restarted from main by fast-forward (0ab46d4); committed 7102489 (the plan) and pushed; PR #82 opened and subscribed.
+  * **CI on 7102489: the `client` job failed** (run 43625811685), in `packages/fs/test/handles.test.ts` "small values > zeros: a file extended by truncate holds no buffer for them": `too_large: a file of 113 pages exceeds what one manifest holds`. Every other test passed (694).
+    * **Not this PR's code:** 7102489 is main plus the plan.
+    * **The root cause, an assumption in the test (milestone 8 step 4) and in two docs: that a run of zeros is cut at `max`.**
+      * In a run of zeros the gear hash is `h = G[0]·(2^k − 1)` after `k` bytes, a constant once `k ≥ 64` (`crates/zen-core/src/cdc.rs`, `push`). So every chunk of the run is cut at one length `L` that the chunker key decides.
+      * `L` is `max` unless:
+        * one of the first 64 values meets the strict mask (`avgBits + 2` bits, below `avg`)
+        * or the constant meets either mask
+      * Simulated over random keys (`G[0]` uniform), a zero run is cut short of `max`:
+        * at the test's parameters (min 256, avg 2^10, max 8,128): 1.85 % of keys, about 1 run in 54 (1.50 % below `avg`, 0.36 % at `avg`)
+        * at the defaults: 0.058 %, 1 in 1,738
+      * The test's fs key is random per run. With `L ≤ 1,465` bytes, its 64 MiB of zeros needs more than 112 pages of 409 chunks, past what a manifest holds under its `max_value_bytes` 8,192. This run drew such a key.
+    * **Proposed fix, its own commit on PR #82:** `test(fs): the zeros test runs on fixed chunks`.
+      * **The test runs on fs 2,** the small-values world's `chunking: 'fixed'` fs (`setup(2)`). What it checks (no buffer for the zeros, `dirtyBytes` 4 then 8 then 0, the bytes read back) doesn't depend on the chunking. Sparse files belong under fixed chunks anyway (OPS.md §7).
+      * A comment says why it isn't CDC.
+      * **Docs** (same commit):
+        * STATS.md §7.2 and OPS.md §7: zero runs are cut at one length the key decides, `max` for all but about 1 key in 1,700 at the defaults, and shorter otherwise, so a large sparse CDC file can hold up to `max/min` times the chunks.
+        * MILESTONE-8.md's log stays as written.
+    * **The mechanism shown on the real chunker first** (the scratchpad): 1,000 fresh fs keys, each with `sealKeys().chunker(CDC)` over 64 KiB of zeros. The fraction cut short of `max` should be near 1.85 %, and any key cut at or under 1,465 bytes must make 64 MiB of zeros exceed the manifest (the writer's page count computed from the lengths).
+    * **Checks:** `npx vitest run packages/fs/test/handles.test.ts` 10 times; `npm run check`; biome.
+    * **The PR comment** on the failing check: what failed, why it isn't the plan's change, the root cause, and that the fix follows on this PR. Then push, and CI green on both runs.
+    * The rest of 9.5 still waits on the user's "go".
+    * **Done** (the user approved the fix):
+      * **The mechanism, on the real chunker** (`zw.fileChunker` under 10,000 random keys, 64 KiB of zeros, the test's parameters):
+        * 187 keys (1.87 %) cut the run short of `max`, each at one constant length: 257–320 bytes, or 1,024.
+        * At the longest of these, 64 MiB of zeros needs 161 pages of 409 chunks, against 21 at `max`. A manifest under `max_value_bytes` 8,192 holds 112, so every such key fails the old test.
+      * `test(fs):` the zeros test runs on fs 2 (fixed chunks), with a comment saying why. STATS.md §7.2 and OPS.md §7 now say how zero runs are cut.
+      * **Checks:** `handles.test.ts` 10 times, 9 of 9 passing each time; `npm run check` passes; biome is clean.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

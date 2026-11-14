@@ -447,8 +447,13 @@ describe('small values', () => {
     await again.close();
   });
 
+  // On fixed chunks: under CDC a run of zeros is cut at one length the fs's
+  // chunker key decides (the gear hash is constant after 64 zero bytes), `max`
+  // for most keys but as short as `min + 1` for about 1 in 54 at these
+  // parameters, and 64 MiB of zeros then needs more pages than a manifest
+  // holds under this world's `max_value_bytes` (STATS.md §7.2).
   it('zeros: a file extended by truncate holds no buffer for them', async () => {
-    const { t, r } = await setup();
+    const { t, r } = await setup(2);
     const h = await r.open('/z.bin', 'w');
     await h.write(bytes.utf8('head'), 0);
     await h.truncate(64 << 20);
