@@ -468,6 +468,16 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * `npx playwright test --project sw` 3 times: 8 passed each time; then every project once: 25 passed
       * Locally, Playwright runs through a scratchpad config that sets `executablePath` to the installed Chromium, since the pinned Playwright expects another build; CI installs its own.
     * The `docs:` commit: packages/sw/README.md (the worker, the build, the content dir), CLIENT.md (viewing in a browser, `enrollViewer`), the TD-DB-SHAREDWORKER note, and this log.
+    * cffc7fb (the `docs:` commit) pushed; PR #81 retitled `sw: milestone 9 step 4: the worker in the browser`.
+    * **CI green on both runs of cffc7fb** (push 43619002158 and pull_request 43619009275), every job. The `client` job's Chromium step ran the `sw` project with the others (25 passed). There a stopped worker answered in 60–65 ms. **Step 9.4 is done;** PR #81 waits on review and merge.
+    * **Next, after PR #81 merges:** restart from main, plan step 9.5 (benches, docs/SW.md, the outcome) in detail here, commit the plan, open the PR, and implement on "go".
+    * **PR #81 merged** (the user, 18:11 UTC). Step 9.4 is done; its subscription ended with it, and no check-in is pending.
+* **Step 9.5** (benches, docs/SW.md, the outcome): planned below ("Step 9.5 in detail").
+  * **On approval:**
+    1. Restart from main by fast-forward (0ab46d4, PR #81's merge).
+    2. Copy this file to `docs/MILESTONE-9.md`, bringing in the log lines since cffc7fb.
+    3. Commit `docs: milestone 9 step 5 plan (benches, docs/SW.md, the outcome)`, push, open the PR, and subscribe.
+    4. Implement on the user's next "go" (approval of this plan isn't one).
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -1162,6 +1172,101 @@ The worker, the bootstrap and enrollment pages, and the app-side helper, built f
 3. Copy this file to `docs/MILESTONE-9.md`.
 4. Commit `docs: milestone 9 step 4 plan (the worker in the browser)`, push, open the PR, and subscribe.
 5. Implement on the user's "go" (approval of this plan isn't one).
+
+## Step 9.5 in detail: benches, docs/SW.md, the outcome
+
+The last step: measure the worker in Chromium, write the deployment guide, and close the milestone. There's no new feature. If a bench finds a fault, it is logged, and the user chooses whether to fix it here (as 8.7's benches did) or record it as debt.
+
+**Survey (read-only, this session):**
+* **Benches so far** are vitest files, opt-in (`ZEN_BENCH=1`, `ZEN_BENCH_GIB`, `ZEN_SERVE_BIN` for the release server), with helpers in `packages/client/test/benchkit.ts`: `keystream`, `digest`, `rate`, `quantile`, `peakRss`, `Peaks`. CI's `files-bench` job runs them when started by hand. It builds the release server, the wasm and the packages, but doesn't install Playwright.
+* **The browser world** (`packages/sw/e2e/world.ts`, 9.4) writes its site from memory (`Tree.writeFile`). `writeFile` also takes a stream (`FileSource`), as the large bench's `keystream` sources are written.
+* **What 9.4's tests show about measuring in a content page:** it runs no scripts, so listeners and timers never fire. `page.evaluate` still runs over CDP, and its promises resolve, so a `fetch` and a body reader can be timed inside one `evaluate` with `performance.now()`. Media is polled from Node.
+* **The worker's memory:** Playwright's `newCDPSession` takes a page or frame, not a worker. The worker's target is reached through `browser.newBrowserCDPSession()` (`Target.getTargets`, then `Target.attachToTarget`).
+* **STATS.md §7** holds the large-file figures; §7.3 has the Node figure for a streamed read through `handle` (20.8–35.5 MiB live at `pendingBytes` 4 MiB).
+* **Docs that are stale or pending:**
+  * GAPS G15 says "CSP and Trusted Types stay open", but the server's `default_csp` (`config.rs:562`) sends `require-trusted-types-for 'script'`.
+  * DESIGN-3 §6 item 9 and the README still say "in progress".
+  * MILESTONE-9.md has no Outcome yet.
+  * There's no deployment guide. TLS is native (`[tls] cert`/`key`, operations.md §8) or a reverse proxy (§8.3), with no ACME (TD-TLS-ACME).
+
+### 1. `test(sw):` the bench, `packages/sw/e2e/bench.spec.ts`
+
+* **Opt-in:** skipped unless `ZEN_BENCH=1`, so CI's Chromium step lists it as skipped, as vitest does its benches. The size comes from `ZEN_BENCH_GIB` (1 GiB by default here).
+* **Its world:** `startSwWorld` takes an option for extra files. The bench uses it for:
+  * a `keystream` file of N bytes, written as a stream under an upload session
+  * a 10-minute WAV (26 MiB) for seeking
+  * the small site, unchanged
+* **What it measures,** each repeated (median and range over the repeats), in one enrolled context:
+
+  | What | How |
+  |---|---|
+  | **Throughput, cold** (content not kept) | One `evaluate`: `fetch` the file and read the body to the end, counting bytes and timing with `performance.now()`. Then a few spot ranges are checked against `keystream` (it is seekable), so the bytes are right. |
+  | **Throughput, again** | The same read repeated. It shows what the replica kept (at `pendingBytes` 8 MiB, little of a large file). |
+  | **The same file through `Tree.readStream`** (Node, same server) | For the comparison next to it, at the default read-ahead |
+  | **Time to the first byte, warm** | 20 small fetches from a page, running worker |
+  | **Cold: a stopped worker** | 10 times: CDP `ServiceWorker.stopAllWorkers`, then the navigation's time (as 9.4's test 6). This includes the wasm from the cache, the vault's session resumed, the fs unlocked and the replica loaded from IndexedDB. |
+  | **The first start after enrollment** | The first request's time, on an empty replica (it catches up with the server) |
+  | **Seeks by `Range`** | 50 random 64 KiB ranges of the large file: time to the first byte and to the end, cold. Then the same ranges again (kept). |
+  | **`<audio>` seeks** | 10 seeks to random points of the WAV: time from setting `currentTime` until `seeking` is false (polled from Node, so a few ms of resolution, stated) |
+  | **The worker's memory** | Below |
+
+* **The worker's memory,** sampled every 100 ms during the cold read, after `HeapProfiler.collectGarbage`:
+  * **First choice:** CDP on the worker's target, `Runtime.getHeapUsage`: the JS heap, plus array-buffer backing stores where this Chromium reports them (`backingStorageSize`).
+  * **If it doesn't report backing stores,** the renderer processes' resident set is reported instead (pids from `SystemInfo.getProcessInfo`, `VmRSS` from `/proc`), as a coarse upper bound. The log and STATS say which was used.
+  * The figure sits next to STATS §7.3's Node figure for `handle`.
+* **What it asserts:** only correctness (the byte counts, the spot ranges, statuses and `fromServiceWorker`), never a time. It measures; it doesn't gate.
+* **Locally:** run with the scratchpad config (`executablePath`), as in 9.4.
+
+### 2. CI: `files-bench` runs it
+
+* `npx playwright install --with-deps chromium`, then `ZEN_BENCH=1 ZEN_BENCH_GIB=4 npx playwright test --project sw packages/sw/e2e/bench.spec.ts`, after the vitest benches. It runs with the release server (`ZEN_SERVE_BIN`), as the others do.
+* One dispatch run, with its figures in STATS beside the local ones.
+
+### 3. `docs:` the guides and the outcome
+
+* **docs/SW.md, new: "Viewing an encrypted site in a browser":**
+  1. **What it is:** a content origin, the worker, mounts, and why no scripts run (the spike, TD-SW-SCRIPTS).
+  2. **DNS:** a second host name (for example `view.example.org`) on the same server and port.
+  3. **TLS:**
+     * Service workers need a secure context: HTTPS, except `localhost`.
+     * **Native TLS:** one certificate whose names cover both hosts.
+     * **Or a reverse proxy,** which must pass `Host` through and must not add or strip the headers sw.md §4 sets.
+     * No ACME yet: renewing needs a restart (TD-TLS-ACME).
+  4. **The config:** `public_origins` (the app origins), `[content] origins` and `dir`, with an example; the checks it refuses.
+  5. **Building and installing the content dir:**
+     * `node scripts/build-sw.mjs --out DIR`, then copy it to `[content] dir`.
+     * An update: bump `BUILD`. The new worker takes over on its next check.
+  6. **Enrolling a viewer:**
+     * `enrollViewer` from an app, which needs the member's signing identity (TD-SW-IDENTITY).
+     * An admin's enrollment adds the device to the ACL. Otherwise an admin adds it later (TD-SW-SESSION-HANDOVER).
+     * Re-enrolling; revoking.
+  7. **What is served:** mounts and URLs, ranges and media, offline, the error pages (`locked`, `offline`, `starting`), with pointers to sw.md.
+  8. **Costs:** the benches' figures (STATS).
+  9. **Limits:** Chromium only tested, no scripts, one content origin.
+  10. **Troubleshooting:** a pointer to OPS §8, plus anything new the benches find.
+* **The other docs:**
+  * STATS.md: a new §7.6 (the service worker) with the bench's tables, local and CI
+  * OPS.md §8: pitfalls the benches or the guide turn up, if any
+  * CLIENT.md and API.md: a link to SW.md
+  * GAPS G15: CSP and Trusted Types are sent by default (`default_csp`); the content origin runs no content scripts (milestone 9)
+  * TECH_DEBT: TD-MEMORY gets the worker's figure. TD-SW-* links to SW.md.
+  * README: "Milestone 9: done", with the outcome's link and STATS §7.6
+  * DESIGN-3 §6 item 9: "Done"
+  * docs/MILESTONE-9.md: the **Outcome** (as milestone 8's: what was built, differences from the plan, tests, measurements, what stays open), and this log
+
+### Verification
+
+* `npm run check`; biome
+* `ZEN_BENCH=1 npx playwright test --project sw packages/sw/e2e/bench.spec.ts` twice here, with the release server; `npx playwright test --project sw` once without `ZEN_BENCH` (the bench skipped, the 8 tests passing)
+* **Negative control:** the worker passing requests to the network (as 9.4's control 2) must fail the bench's `fromServiceWorker` check
+* The links in the new and changed docs resolve (a grep for each anchor named)
+* CI green on both runs; the `files-bench` dispatch run green, its figures logged
+
+**Defaults chosen (overridable):**
+* **The bench is a Playwright spec, opt-in,** run by CI's `files-bench` job started by hand. It isn't a gate.
+* **1 GiB here, 4 GiB on CI.**
+* **Memory from CDP's heap usage on the worker's target,** with process RSS as the fallback.
+* **A fault found by a bench** is the user's choice: fixed here, or recorded as debt.
 
 ## Step 9.3b in detail: what a streamed read holds
 
