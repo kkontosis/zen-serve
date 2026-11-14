@@ -167,7 +167,7 @@ Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are
 | What | Setting | Default |
 |---|---|---|
 | A file handle's written bytes in memory | `ReplicaOptions.dirtyBytes`, `zen-mount --dirty-size` | 64 MiB |
-| Records waiting to be written to the local store | `ReplicaOptions.pendingBytes`, `zen-mount --pending-size` | 32 MiB |
+| Records waiting to be written to the local store, written or fetched (a read holds up to this much of what it fetched) | `ReplicaOptions.pendingBytes`, `zen-mount --pending-size` | 32 MiB; the service worker's replica 8 MiB (sw.md §8) |
 | Chunk ids in decoded pages kept per tree | `TreeOptions.pageMemoIds` (`ReplicaOptions.pageMemoIds`, `zen-mount --page-memo`) | 65,536 (about 12 MB) |
 | Decoded pages kept per tree | `TreeOptions.pageMemoPages` | 256 |
 | Read-ahead windows of `readStream` | `readAhead` | 3 × 4 MiB |
@@ -191,6 +191,7 @@ Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are
   * `NODE_OPTIONS="--require memlog.cjs"`, a preload that logs `memoryUsage()` every 500 ms and calls `v8.writeHeapSnapshot()` past given RSS thresholds
   * then group the snapshot's large objects by their retainer path
   * A snapshot forces a full GC first, so what it shows is live. A big gap between it and `heapUsed` is garbage.
+* **Array buffers after `gc()`** still count the ones just freed: V8 releases their memory on a concurrent sweeper, later. A streamed read measured 2 to 4 times its live figure that way (milestone 9 step 3b). For live figures, set `--no-concurrent-array-buffer-sweeping` (`v8.setFlagsFromString`, as `packages/sw/test/memory.test.ts` does); the difference is still memory the process holds until the sweep.
 * **Bounds go in tests:** each bound has a test that fails with it off (`packages/fs/test/memory.test.ts` and `handles.test.ts`, the page memo case in `cdc.test.ts`).
 
 Known hot spots, measured or not yet: TD-MEMORY (spec/TECH_DEBT.md).

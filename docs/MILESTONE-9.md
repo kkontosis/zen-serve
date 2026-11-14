@@ -284,6 +284,34 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
          * STATS.md: the table
          * the log
     * **Verification:** `npm run check`; `npx vitest run packages/client packages/fs packages/sw` 3 times; the full `npx vitest run` with `ZEN_APPS_BUILT=1` and zen-serve built with `--features test-utils`; CI green on both runs.
+    * Committed fce68fd (the fixes chosen) and pushed.
+    * **On "go" (the implementation):**
+      * d16013d `fs:` records being written stay readable until written.
+        * A `writing` map holds each record a flush took until its store write lands or fails, unless a later flush took the key since. `get` reads it after `pending`, and `list` overlays it.
+        * `store.test.ts` holds the store's writes at a gate. Its 4 tests: a put being written, a delete being written, a newer value over one still being written, and a failed write.
+        * **Negative controls:** `writing` not read (all 4 tests fail); no check that a later flush took the key (the "newer value" test fails).
+        * **The CI failure reproduced:** the 9.3 `streamOf` test under CPU load (4 busy processes on 4 cores) failed 9 of 20 runs with the old `store.ts`, with CI's error, and 0 of 20 with the fix.
+      * 2f4ee06 `client:` `readStream` holds exactly `readAhead` windows ahead of the reader.
+        * **Changed from the plan: the spike's off-by-one was wrong.** `plan` fills the queue while `queue.length <= ahead` and `pull` then takes one window for the reader, so the `<=` is right. A `<` would fetch nothing at read-ahead 0.
+        * **The extra window was the stream's default `highWaterMark` of 1:** it pulled a window into its buffer before anything was read. The replica's wrapper did the same over it.
+        * So both now have `highWaterMark` 0. That is what was chosen (exactly `readAhead` windows, one fewer), through a different line.
+        * `readahead.test.ts` (new, default limits, a file of 7 windows) counts the windows fetched (`fetchChunks` calls) at read-ahead 0, 1 and 3. Before any read: none. After read `i`: `min(i + readAhead, windows)`. Before the fix it failed with 1 fetched before any read, which is its negative control.
+        * The replica's `streamOf` test checks that no chunk is fetched before a read. With the wrapper's `highWaterMark` 0 removed, it fails (1 fetch).
+        * CLIENT.md's `readStream` line now says what it holds.
+      * 560ea2c `test(sw):` the memory test measures live memory (`--no-concurrent-array-buffer-sweeping`).
+        * **Changed from the plan: the bound is 48 MiB, not 32.** The test measured 20.8–35.5 MiB over 14 runs; one run, 35.5, failed 32. The harness had given 19–20 MiB on the fixed code.
+        * At the peaks, mid-file: heap 1.4–1.6 MiB, array buffers 20–26.5 MiB, `pendingBytes` 4 MiB. That is the window read and 3 ahead, the copies of those being fetched, and up to 4 MiB of records plus one window's chunks put below that bound.
+        * **Negative control:** `handle` reading the whole file (`readFile`) gave +276 MiB and failed it.
+      * 63b7964 `spec:` sw.md §8: the worker's replica opens with `pendingBytes` 8 MiB.
+      * The `docs:` commit:
+        * STATS.md §7.3: the live table
+        * OPS.md §6: the measuring note on array buffers and the flag; the `pendingBytes` row says reads hold up to it too, and gives the worker's 8 MiB
+        * TD-MEMORY: the streamed-read item moved under "Bounded", with its test
+        * this log
+      * **Checks:**
+        * the client, fs and sw suites: 268 passed
+        * the read-ahead test 3 times, the memory test 10 times
+        * biome, tsc, and the fs worker check
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
