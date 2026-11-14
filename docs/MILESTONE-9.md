@@ -348,6 +348,29 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * **So it doesn't reproduce here.** Without `fdbserver`, the network thread only retries a connection, and a real cluster's traffic (CI) is what it was doing when it crashed. The check is CI's `fdb` job, plus the exit-path test, which shows the hook stops the network.
   * **PR #79 merged** (the user, 09:19 UTC). Step 9.3b is done; its subscription ended with it.
   * **The user's "go"** (after the compaction, before the merge) is for 9.3c. So on approval: the "On approval" steps of "Step 9.3c in detail" (restart from main, copy this file, the plan commit, the PR and its subscription), and then the implementation straight after, with no further "go".
+  * **Done:** restarted from main by fast-forward (ab643c3, PR #79's merge); committed b0e98c6 (the plan); PR #80 opened and subscribed.
+  * **The implementation:**
+    * **The planned `atexit` hook crashed every time.** With it, `tests/fdb_exit.rs`'s child (a test harness) printed `test result: ok` and then died with SIGSEGV, 4 of 4 runs: CI's symptom exactly. Without it, the child exited 0.
+      * gdb: the main thread faulted inside `fdb_stop_network`, called from the hook, jumping into freed memory (`main_arena`).
+      * Breaking on `__cxa_atexit` showed why. libfdb_c's network thread registers C++ static destructors as it runs, some after the hook. Exit handlers run newest first, so those destructors ran before the hook, and `fdb_stop_network` then used what they had destroyed.
+      * **The same explains CI's crash:** without a hook, the network thread is still running while those destructors run.
+    * **Changed from the plan: the stop runs as the main thread's `exit()` begins.**
+      * glibc's `exit()` runs the calling thread's thread-local destructors before any `atexit` handler or static destructor.
+      * A constructor in `.init_array` (before `main`, on the main thread) registers the stop with `__cxa_thread_atexit_impl`. This covers `main` returning (zen-serve, the CLI, the test harness) and `std::process::exit` on the main thread, still with no change at the call sites.
+      * Not covered: an exit from another thread, and an abort. Then the network runs on, as before.
+      * It is glibc-only (`target_os = "linux", target_env = "gnu"`); elsewhere the guard is kept and never dropped, as before.
+      * No `libc` dependency was needed.
+    * e03d6ab `store:` the guard kept in `NETWORK`, `stop_network` (`try_lock`, `catch_unwind`), and the `at_exit` module. `tests/fdb_exit.rs` runs a child (the test binary itself) that exits with 4 reads in flight on an unreachable cluster. It checks that the child exits 0 within 10 s and prints the hook's line (under `ZEN_TEST_FDB_EXIT_TRACE`).
+    * **Checks:**
+      * the test 3 times, then 50 times under CPU load: all passed
+      * the spike's binary over the fixed `zen-store` (release): 200 runs, `main` returning and `std::process::exit`, all exited 0 and each printed "stopped"
+      * the constructor is linked into `zen-serve` (`--features fdb,test-utils`) and into `zen-server`'s `svc` test binary (`nm`)
+      * zen-store's tests with `fdb` pass
+      * fmt; clippy `-D warnings` for zen-store and zen-server with and without `fdb`, and the workspace with `--all-features`
+    * **Negative controls:**
+      * the constructor's registration skipped: the test fails ("the exit hook didn't stop the network")
+      * the `atexit` hook (the plan's fix): the test fails (SIGSEGV), as above
+    * The `docs:` commit: TD-TEST-OPEN-FAILURES item 8, resolved, and this log.
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
