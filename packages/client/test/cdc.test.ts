@@ -20,6 +20,8 @@ import { type World, world } from './helpers.js';
 const { equal, concat } = bytes;
 const CDC: CdcParams = { min: 256, avgBits: 10, max: 8128 };
 const PS = 409; // pageCapacity2(8192)
+/** An edit re-cuts less than this share of a file's chunks (see `editCost`). */
+const RESYNC_SHARE = 10;
 
 let w: World;
 let ufs: UnlockedFs;
@@ -32,6 +34,49 @@ afterAll(() => w?.server.stop());
 const tree = (id = Tree.newId(), fs = ufs) => fs.tree(id, { cdc: CDC });
 let names = 0;
 const name = () => `f${names++}`;
+
+/** The chunks of some content as the fs's chunker cuts them: each one's range and bytes (hex). */
+function cutsOf(d: Uint8Array): { start: number; end: number; hex: string }[] {
+  const ch = ufs.sealKeys().chunker(CDC);
+  const out: { start: number; end: number; hex: string }[] = [];
+  let p = 0;
+  const add = (c: number) => {
+    out.push({ start: p, end: c, hex: bytes.hex(d.subarray(p, c)) });
+    p = c;
+  };
+  for (const c of ch.push(d)) add(c);
+  ch.finish();
+  ch.free();
+  if (p < d.length) add(d.length);
+  return out;
+}
+
+/**
+ * What an edit of `before` (removing `remove` bytes at `offset`, giving
+ * `after`) costs, exactly:
+ * * `changed`: the chunks of `after` that `before` doesn't hold, which are
+ *   sealed and uploaded;
+ * * `fetched`: the chunks of `before` that keep some of their bytes but
+ *   aren't chunks of `after`. Each is fetched once: those the edit cuts into
+ *   (writer.ts `editSource`), and those re-cut after it until the cuts land
+ *   on a chunk boundary of `before` (`stage`, which reuses a known chunk
+ *   only there).
+ *
+ * How many chunks it takes the cuts to resync is random, with no bound.
+ */
+function editCost(before: Uint8Array, after: Uint8Array, offset: number, remove: number) {
+  const old = cutsOf(before);
+  const neu = cutsOf(after);
+  const oldSet = new Set(old.map((c) => c.hex));
+  const neuSet = new Set(neu.map((c) => c.hex));
+  const removed = (c: { start: number; end: number }) =>
+    offset <= c.start && c.end <= offset + remove;
+  return {
+    chunks: old.length,
+    changed: neu.filter((c) => !oldSet.has(c.hex)).length,
+    fetched: old.filter((c) => !removed(c) && !neuSet.has(c.hex)).length,
+  };
+}
 
 function random(n: number): Uint8Array {
   const out = new Uint8Array(n);
@@ -139,31 +184,16 @@ describe('content-defined chunks (version 3)', () => {
     const f = await t.create(ROOT, name());
     const data = random(1_200_000);
     await t.writeFile(f, data);
-    // The chunks of some content, as the chunker cuts them (by their bytes).
-    const cuts = (d: Uint8Array) => {
-      const ch = ufs.sealKeys().chunker(CDC);
-      const out: string[] = [];
-      let p = 0;
-      for (const c of ch.push(d)) {
-        out.push(bytes.hex(d.subarray(p, c)));
-        p = c;
-      }
-      ch.finish();
-      ch.free();
-      if (p < d.length) out.push(bytes.hex(d.subarray(p)));
-      return out;
-    };
     for (const at of [600_000, 10, 1_199_000]) {
       const prev = await t.versions(f);
       const v = prev[0]!;
       const idx = await t.chunkIndex(f, v);
       const before = await t.readFile(f);
       const next = concat(before.subarray(0, at), random(100), before.subarray(at));
-      const old = new Set(cuts(before));
-      const changed = cuts(next).filter((c) => !old.has(c)).length;
-      // The cuts resync within a few chunks (one in most cases).
+      const { changed, chunks } = editCost(before, next, at, 0);
+      // The cuts resync after a few chunks (one in most cases): never the whole file.
       expect(changed).toBeGreaterThanOrEqual(1);
-      expect(changed).toBeLessThanOrEqual(12);
+      expect(changed).toBeLessThan(chunks / RESYNC_SHARE);
       const w2 = await t.writeFile(f, next, { previous: idx, replaces: [v.dot] });
       expect(w2.uploaded).toBe(changed);
       expect(w2.pagesUploaded).toBeLessThanOrEqual(2);
@@ -208,13 +238,16 @@ describe('content-defined chunks (version 3)', () => {
       const r = await calls(w.session, () =>
         fresh.edit(f, undefined, [{ offset, remove, insert }]),
       );
+      const before = model;
       apply(offset, remove, insert);
-      // The touched page, and the chunks until the cuts resync (a few, at
-      // most about 12 in a probe of 300 insertions): never the whole file.
+      // Exactly the chunks it cuts into or re-cuts until the cuts resync, and
+      // the touched page: never the whole file.
+      const cost = editCost(before, model, offset, remove);
       expect(r.count.get('/v1/fs/pages/get')).toBeLessThanOrEqual(2);
-      expect(r.count.get('/v1/fs/chunks/get') ?? 0).toBeLessThanOrEqual(14);
+      expect(r.count.get('/v1/fs/chunks/get') ?? 0).toBe(cost.fetched);
+      expect(cost.fetched).toBeLessThan(cost.chunks / RESYNC_SHARE);
       expect(r.result.pagesUploaded).toBeLessThanOrEqual(2);
-      expect(r.result.uploaded).toBeLessThanOrEqual(14 + Math.ceil(insert.length / CDC.min));
+      expect(r.result.uploaded).toBe(cost.changed);
       expect(equal(await tree(t.id).readFile(f), model)).toBe(true);
     }
     const m = v3((await t.versions(f))[0]!.manifest);
