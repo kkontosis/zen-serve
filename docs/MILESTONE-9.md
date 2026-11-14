@@ -331,6 +331,23 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
           * without the check in `renew`, the `forget` case fails. The `stop` case is also covered by the server, which refuses a released token.
           * `forget` reduced to `consumer.forget()`: both cases fail.
         * **After the fix:** the db suite passed (236 tests), and the booking failover passed 8 of 8 runs under CPU load.
+      * 6af94bc (this log) pushed; PR #79's title and body updated.
+      * **The full `npx vitest run` on 6af94bc:** 685 passed, none failed.
+      * **CI on a980626: the `fdb` job failed after its tests had passed.**
+        * All 33 of `zen-server` `tests/svc.rs` passed on FoundationDB, then the test binary exited with SIGSEGV after `test result: ok`.
+        * **Not this PR's:** 9.3b changes no Rust code.
+        * **Likely cause:** `zen-store` `fdb::network()` boots the FDB client network and leaks the guard, so it is never stopped. FoundationDB's C API asks for `fdb_stop_network` before exit; without it, the network thread can crash during teardown. It can't be reproduced here: the container has `libfdb_c` but no `fdbserver`.
+        * One PR comment says so, with a proposed patch for a separate PR: the guard kept in a static and dropped by an `atexit` hook. The one re-run waits for the run to finish (GitHub refused it while the run was going).
+      * **CI green on both runs of 6af94bc** (push 43538512728 and pull_request 43538520023), every job, `fdb` included. The FDB exit crash didn't recur: once in this step's four `fdb` runs. With the head green, the old run wasn't re-run.
+      * **Step 9.3b is done;** PR #79 waits on review and merge.
+      * **Open, for the user:** the FDB client's exit crash (a small `zen-store` fix as its own PR, proposed in the PR #79 comment), and step 9.4's plan after PR #79 merges.
+      * **Decided (the user): the FDB exit fix first, as step 9.3c, then 9.4.** Planned below ("Step 9.3c in detail").
+* **Step 9.3c** (the FDB client network stops before exit):
+  * **The spike** (the scratchpad only, before PR #79 merged): a scratch binary over the real `zen-store` (`Fdb::open` on a cluster file naming 127.0.0.1:1, where nothing listens; 8 tasks looping on transactions; exiting after 0–400 ms).
+    * It ran 400 times: 200 idle, 100 under CPU load (4 busy processes on 4 cores) returning from `main`, and 100 under load calling `std::process::exit`, as the test harness does. **Every run exited 0.**
+    * **So it doesn't reproduce here.** Without `fdbserver`, the network thread only retries a connection, and a real cluster's traffic (CI) is what it was doing when it crashed. The check is CI's `fdb` job, plus the exit-path test, which shows the hook stops the network.
+  * **PR #79 merged** (the user, 09:19 UTC). Step 9.3b is done; its subscription ended with it.
+  * **The user's "go"** (after the compaction, before the merge) is for 9.3c. So on approval: the "On approval" steps of "Step 9.3c in detail" (restart from main, copy this file, the plan commit, the PR and its subscription), and then the implementation straight after, with no further "go".
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
@@ -850,6 +867,69 @@ Step 9.3 adds a new package, `packages/sw` (`@zen/sw`). Its core is `handle(requ
 * **`streamOf` in `@zen/fs`** rather than looking up and reading by path, to close the race between the ETag and the bytes.
 * **An unexpected error is 500,** not 404.
 * **Listings put directories first.**
+
+## Step 9.3c in detail: the FDB client network stops before exit
+
+**Context:**
+* CI's `fdb` job on a980626 (PR #79): `zen-server` `tests/svc.rs` passed all 33 tests, then the binary exited with SIGSEGV. It happened once in step 9.3b's four `fdb` runs.
+* `zen-store` `fdb::network()` (`crates/zen-store/src/fdb.rs:46`) boots the FoundationDB client network once per process and `mem::forget`s the guard, "never stopped".
+* `foundationdb` 0.11's `boot()` says: "You *MUST* ensure `drop` is called on the returned object before the program exits. This is not required if the program is aborted."
+* Dropping the guard (`NetworkAutoStop`, `api.rs:318`) calls `fdb_stop_network` and joins the network thread. Without it, the thread runs on while the process tears down, and can fault.
+* This affects every process with the `fdb` feature: the test binaries, and zen-serve with its CLI (`export`, `import`, `static push`), which open the store through `Fdb::open` (`fdb.rs:95`).
+
+**Decided (the user):** fix it as its own PR after PR #79 merges, then plan 9.4.
+
+### 1. A spike (the scratchpad only): reproduce it here
+
+This container has `libfdb_c` (`/usr/lib/libfdb_c.so`) but no `fdbserver`, so the network can boot but nothing can answer it.
+* A scratch Rust binary (a copy of the boot code with the same crate version, in the scratchpad) boots the network and opens a `Database` on a cluster file naming an address nothing listens on, so the client keeps the network thread busy reconnecting.
+* It starts a few transactions on tokio tasks and exits while they wait, 200 times in a loop, counting non-zero exits and signals.
+* **If it crashes there,** that loop is the before/after check (both counts logged).
+* **If it never crashes,** the check is CI's `fdb` job (one crash in four runs), plus the exit-path test below. The log says so.
+
+### 2. `store:` commit (`crates/zen-store`)
+
+* **The guard is kept, not leaked:**
+  * `static NETWORK: Mutex<Option<NetworkAutoStop>>` holds it.
+  * Right after `boot()`, an `extern "C" fn stop_network()` is registered with `libc::atexit`. It takes the guard and drops it, which stops the network and joins its thread before the process's exit finishes.
+  * `atexit` runs on `exit()`: `main` returning (zen-serve, the CLI, the test harness) and `std::process::exit`. An abort skips it, which the crate allows.
+* **`libc = "0.2"`** becomes an optional dependency of zen-store under the `fdb` feature. The workspace already has 0.2.190 through zen-server and zen-ublk.
+* **The comment** on `network()` drops "never stopped" and states the exit hook.
+* A lock that is poisoned or held at exit: the hook uses `try_lock`, and if it can't take the guard it leaves it, as today, rather than hang the exit.
+
+### Tests
+
+* **The exit path,** runnable here with no server: an integration test in zen-store (`tests/fdb_exit.rs`, under the `fdb` feature) runs a child process (the test binary itself, re-invoked with an env var). The child:
+  * boots the network
+  * opens a `Database` on an unreachable cluster file
+  * starts a read
+  * returns from `main`
+* The parent checks the child exited 0, with no signal, within 10 s, and that it printed the hook's "stopped" line, which the hook writes to stderr only under that test's env var.
+* **Negative control:** with the hook not registered, the "stopped" line is missing and the test fails. If the spike found a local crash, the exit status fails it too.
+* **CI:** the `fdb` job runs `cargo test -p zen-store -p zen-server --features fdb` against a real cluster, every test binary exiting through the hook.
+
+### Docs
+
+* The log in both plan copies.
+* TD-TEST-OPEN-FAILURES: a short resolved item (the crash, its cause and the fix), so a recurrence is recognised.
+
+### Verification
+
+* `cargo fmt --check`; clippy `--all-targets -D warnings` for zen-store and zen-server with and without `--features fdb`
+* `cargo test -p zen-store --features fdb --test fdb_exit` 3 times; the spike's loop if it reproduces
+* CI green on both runs, `fdb` included
+
+**Defaults chosen (overridable):**
+* **`atexit`** rather than threading an explicit shutdown through zen-serve's main and the CLI: it covers every exit that runs exit handlers, the test harness's included, with no change at the call sites.
+* **`try_lock` at exit,** never blocking.
+
+### On approval (after PR #79 merges)
+
+1. Restart from main by fast-forward.
+2. Copy this file to `docs/MILESTONE-9.md`.
+3. Commit `docs: milestone 9 step 3c plan (the FDB network stops before exit)`, push, open the PR, and subscribe.
+4. ~~Run the spike right away (the scratchpad only) and log it.~~ Done before the merge (no local crash in 400 runs; logged above).
+5. Implement (the user's "go" is given): the `store:` commit, `tests/fdb_exit.rs` with its negative control, the TD item and the log; then fmt, clippy and the tests as under Verification, push, and CI green on both runs.
 
 ## Step 9.3b in detail: what a streamed read holds
 
