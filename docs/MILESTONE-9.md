@@ -371,6 +371,46 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * the constructor's registration skipped: the test fails ("the exit hook didn't stop the network")
       * the `atexit` hook (the plan's fix): the test fails (SIGSEGV), as above
     * The `docs:` commit: TD-TEST-OPEN-FAILURES item 8, resolved, and this log.
+    * 491b7f2 (the `docs:` commit) pushed; PR #80's body updated.
+    * **CI on 491b7f2:** `fdb` green on both runs (push 43581003864, pull_request 43580999326), so every FDB test binary now exits cleanly there. `rust`, `pure-rust` and `devices` are green on both.
+    * **The push run's `client` failed:** `packages/client/test/cdc.test.ts`, "an edit fetches and uploads only the pages it touches", `expected 19 to be less than or equal to 14` (line 215, `chunks/get` calls for one of its three edits).
+      * **Not this PR's code:** the `client` job builds without `fdb`, so nothing this PR changes runs in it.
+      * **The root cause, a bound that isn't one** (milestone 8 step 3's test):
+        * After an edit, `stage` (`packages/client/src/writer.ts`, `knownChunk`) fetches each following base chunk while the chunker is mid-chunk, until a cut lands on a base chunk's boundary. How many it takes is random, with a tail and no hard bound.
+        * The test's 14 (and the neighbouring insertion test's `changed ≤ 12`) is the largest count seen in a probe of 300 insertions at the test's small parameters (min 256, average 1 KiB, max 8,128), not a bound.
+        * Each run uses fresh random data and a fresh chunker key, so a run past the probe's maximum is expected now and then. This was such a run.
+      * **The fix, exact counts** (as the insertion test already does for `uploaded`):
+        * **Fetches:** `stage` fetches a known chunk only when `cutter.pending > 0`, so a fetched chunk is never reused whole. `editSource` fetches the chunks an edit cuts into, once each (its memo). So the `chunks/get` calls of an edit are exactly the base chunks that keep some of their bytes (not wholly removed) and aren't chunks of the new version. Both are computed from the two models with the test's `cuts()`, matched by bytes.
+        * **Uploads:** `uploaded` must equal the new version's chunks that weren't in the base.
+        * **The coarse bound kept:** at most a tenth of the file's chunks, so "never the whole file" still holds. Its chance of failing is measured first.
+        * **The insertion test's `≤ 12`** becomes the same coarse bound; its exact `uploaded === changed` stays.
+      * **The measurement first** (the scratchpad): 2,000 edits of each of the three kinds at the test's parameters, giving the histogram of chunks fetched, to show the tail and pick the coarse bound with a negligible chance of failing.
+      * **The negative controls:** `knownChunk` fetching every known chunk (no reuse at a boundary), and `editSource`'s memo removed (a chunk cut on both sides fetched twice): each must fail the exact count.
+      * **The PR comment** on the failing check: what failed, why it isn't this PR's code, and the fix's place (the user's choice below).
+      * The insertion test keeps its 3 insertions; the edit test keeps its 3 edits and its random rounds.
+      * **Decided (the user): the fix goes in PR #80.** On approval:
+        1. One PR comment on the failing check: what failed, why it isn't the FDB change, and that the fix follows on this PR.
+        2. The measurement (the scratchpad), logged here.
+        3. `test(client): cdc.test.ts counts an edit's fetches and uploads exactly`, with the two negative controls.
+        4. `npx vitest run packages/client/test/cdc.test.ts` 10 times; `npm run check`.
+        5. The log, copied to `docs/MILESTONE-9.md`; the `docs:` commit; push; PR #80's body; CI green on both runs.
+      * **Done:**
+        * The PR comment (issuecomment 6875757398).
+        * **The measurement** (the scratchpad): 2,000 edits of each of the test's kinds, in 300 KB of random data, cut with the fs's chunker at the test's parameters, counted as `editCost` counts:
+
+          | Edit | Chunks fetched: max (p99) | Chunks uploaded: max (p99) |
+          |---|---|---|
+          | a 100-byte overwrite | 10 (6) | 10 (6) |
+          | a 3,000-byte insertion | 15 (9) | 17 (11) |
+          | a 4,000-byte deletion | **19** (9) | 18 (8) |
+
+          * A deletion went past 14 fetches about once in a thousand: the test's bound failed now and then, and 19 is CI's figure.
+          * The tail roughly halves with each chunk, so the coarse bound (a tenth of the file's chunks: about 200 for 2 MB, 117 for 1.2 MB) won't be reached.
+        * 7b99eda `test(client):` `cdc.test.ts` has `cutsOf` and `editCost`. The edit test expects exactly `editCost`'s `fetched` (`chunks/get` calls) and `changed` (`uploaded`), and the insertion test's `≤ 12` becomes the coarse bound.
+        * **Negative controls,** each run once, then restored:
+          * `knownChunk` never reusing a chunk at a boundary: `expected 409 to be 1`
+          * `editSource`'s memo off: `expected 2 to be 1` (the 100-byte overwrite fell inside one chunk, fetched for both sides)
+        * **Checks:** `cdc.test.ts` 10 times, all 14 passed each time; `npm run check` passes; biome is clean.
     * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
 
 ## Steps (one PR each; each planned in detail before it starts)
