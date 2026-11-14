@@ -229,6 +229,27 @@ r.onError((e, entries) => …);                     // writes the server refused
 * The `zen.` xattr names are reserved (`zen.content_type` holds the media type, `stat().contentType`).
 * `Tree.seal(node, data, {sink})` (sealed chunks and pages go to the sink, nothing is sent) and `Tree.writeOpOf(upload, replaces)` are the client pieces under this; `PendingOp` move and meta ops may carry the `hlc` taken when queued (a rebase ticks a fresh one), and a `FileSource` may hold known chunks of the previous version.
 
+### Viewing in a browser (`@zen/sw`)
+
+A service worker on a separate content origin serves a mounted directory of a tree over HTTP, decrypted, offline from its replica, with no scripts (spec/sw.md). The app enrolls it once, as a device of the member:
+
+```ts
+import { enrollViewer } from '@zen/sw';
+
+const { fp, inAcl } = await enrollViewer({
+  session,                     // signed in
+  identity,                    // the member's SigningIdentity: certifies the worker's device key
+  admin: identity,             // an admin's: adds the device to the ACL (without it, an admin adds `fp` later)
+  fs: [ufs],                   // the unlocked fs the mounts name: each gets a device keyslot
+  mounts: [{ name: 'docs', fs: 1, tree, base: '/site' }],
+  contentOrigin: 'https://view.example.com',
+});
+```
+
+* It opens `/_zen/enroll.html` on the content origin as a popup. The user confirms there, and nothing changes on the server before that. It rejects with `enroll_failed` when declined, when the popup is closed or blocked, or when a step fails.
+* A browser session signed in with a password holds no identity, so it can't enroll (TECH_DEBT TD-SW-IDENTITY).
+* Building and deploying the content origin's files: packages/sw/README.md.
+
 ## 9. zen-mount
 
 `zen-mount` (packages/fuse) mounts one tree of an fs as a local directory, through FUSE, on a local replica (`@zen/fs`, §8).

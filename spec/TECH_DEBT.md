@@ -277,6 +277,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Context:** spec/zendb.md §9.2 says that where `SharedWorker` exists, the owner is a shared worker instead of a tab. zen-db elects a tab.
 * **Why deferred:** It needs the tab proxy (TD-DB-TAB-PROXY) first, plus a worker bundle with the wasm module.
 * **What it would take:** A worker entry point that opens the `Db` and serves the proxy protocol, a page-side client that prefers it when `SharedWorker` exists, key handling (unlock material passed to the worker once), and browser tests.
+* **Note (milestone 9):** `@zen/sw`'s service worker isn't this owner. It lives on the content origin (spec/sw.md §1), whose storage and locks are separate from the app origin's, so it can't own the app's `Db`. Its pieces carry over: a module worker bundle with the wasm beside it (scripts/build-sw.mjs), a start shared by every request, and the vault on a worker's wake. An app-origin owner is still a separate worker.
 
 
 ## TD-LORO-LARGE-SNAPSHOT

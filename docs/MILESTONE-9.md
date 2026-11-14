@@ -419,7 +419,55 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Decided (the user's "go", with the plan's defaults): `enrollViewer` takes the identity from its caller.** Only the test page enrolls in M9, and TD-SW-IDENTITY records the other options (an identity in the app origin's vault, a passkey-wrapped identity, delegation).
   * Restarted from main by fast-forward (9ba5325, PR #80's merge). The check-in had already fired, so there was nothing to cancel.
   * **On approval:** copy this file to `docs/MILESTONE-9.md`; commit `docs: milestone 9 step 4 plan (the worker in the browser)`; push; open the PR and subscribe. Then implement straight away (the user's "go" is given): the `spec:`, `sw:`, Playwright and `docs:` commits as "Step 9.4 in detail" says, with its verification and negative controls.
-    * **Next, after step 9.3b:** restart from main, plan step 9.4 (the worker in the browser) in detail here, commit the plan, open the PR, and implement on "go".
+  * Committed 668fde5 (the plan) and pushed; PR #81 opened and subscribed.
+  * **The implementation** (the user's "go" after the compaction):
+    * 22ca7f2 `spec:` sw.md §1 (the lifecycle: `skipWaiting`, `clients.claim`, the wasm kept in Cache Storage, the bootstrap page's reload, `zen-restart`), §7 (when `locked` and `starting` apply) and §8 (enrollment's messages, their checks, where the device and mounts are kept, re-enrolling). TECH_DEBT: TD-SW-IDENTITY.
+    * **Changed from the plan:**
+      * **Enrollment is a conversation, and nothing changes on the server until the user confirms.** The plan had the app certify the device before the page asked the user, so a declined enrollment would leave a certificate and keyslots behind. Now: `hello` (the page's device key), `offer` (the mounts), the user's confirmation, `accept`, then the app's `approveDevice`, `addDevice` and ACL change, `done`, and `saved`. `failed` ends it from either side.
+      * **No pending device record:** the page keeps the new key in memory only, so a page closed or refused leaves nothing.
+      * **The page checks the certificate** (`verifyDeviceCert`): it must be for its own device key, by the identity named.
+      * **A replica opens on its mount's first request,** not at the start, and catches up with the server before it serves (below).
+      * **The worker keeps its wasm in Cache Storage at install** (`zen-sw-<build>`). Without it a stopped worker couldn't start offline: initWasm fetches the wasm from the server at every start. The offline test found it (a 500).
+    * 9ab0245 `sw:`
+      * `start.ts`: `startSite`, one start per worker instance (the wasm, the vault's sign-in, each mounted fs unlocked); a failed start answers `locked`, `offline` or `starting` on every path and is tried again; `restart`; `onError`.
+      * `enroll.ts`: `enrollPage` and `enrollViewer`, with each message checked for its source, origin and order.
+      * `web/`: the module worker, the bootstrap and enrollment pages (no inline scripts, `textContent` only, a Trusted Types policy for the registration, which is a script-URL sink).
+      * `scripts/build-sw.mjs` into `packages/sw/content/` (ignored by git and biome).
+      * The worker check covers `web/sw.ts` (checked by planting `document` there: it fails); `tsconfig.web.json` checks the pages with the DOM lib. Both are in `npm run check` and CI.
+    * **Found while testing, and fixed:**
+      * **A fresh replica served before catching up:** `openReplica` returns once its local state is loaded, and the owner's feed catches up afterwards, so the first request on a new worker got 404 for files the server had. The start now waits up to 2 s to win the owner election, then `sync()`s; offline, it serves what it keeps.
+      * **The wasm wasn't loaded on the enrollment page** before `newDevice` (`enrollPage` now calls `initWasm`).
+      * **A start's 500 wasn't reported:** the error site didn't pass `onError` on. The worker now logs every 500 to its console.
+      * **The bootstrap page could reload forever** under a worker that passes requests through (seen under a negative control). It now reloads a URL at most once in 10 s per tab.
+    * **Node tests** (`test/enroll.test.ts`, 10, over fake windows that deliver by target origin, structured-cloned, with the sender's origin and window):
+      * an enrollment kept, the device signing in, the mounts kept, and `startSite` serving the site
+      * declined: the ACL unchanged and no device kept
+      * without an admin: certified, not in the ACL, so `locked`
+      * the page ignoring other origins, other windows, bad mounts, messages out of order, and a certificate for another device
+      * the app ignoring other origins and windows, and rejecting when the popup closes
+      * `locked` with nothing enrolled; offline from what was read (503 `offline` for the rest); the device removed from the ACL with a session kept: `locked`; a hanging server: 503 `starting` after the timeout; `restart` picking up new mounts
+    * 67daf86 `test(sw):` the Playwright project `sw` (`packages/sw/e2e/`).
+      * One zen-serve on port P: the app origin `http://localhost:P` (the test app in `unencrypted_dir`) and the content origin `http://view.localhost:P` (a copy of the content dir). fs 1 holds a site: an index with a stylesheet and an image, nested directories, a page with scripts, and a 72 s WAV of 3 MiB.
+      * The test app signs in with the admin's seeds (passed through `page.evaluate`) and calls `enrollViewer`; the test clicks Confirm in the popup.
+      * **The 8 tests:** the first visit (the server's bootstrap page, then the worker's 503 `locked`); enrollment, every response of the page from the worker, and an untrusted origin's offer and `done` ignored with no device kept; §4's headers on 200, 206, 304, 404 and a 301; the sandbox (no inline, external, `onerror` or `javascript:` script runs, the external script isn't fetched, the image from another origin isn't loaded, same-origin style and image are); seeking (`<audio>` gets 206 from the worker and lands at the middle, and Range fetches give the model's bytes, `If-Range` included); a stopped worker answering again 3 times; an update taking over; offline with the server and the worker stopped.
+      * **A finding about the tests themselves:** a content page runs no scripts, so listeners that a test adds there never fire. The audio test polls the element, and the update test messages the worker from the trusted `/_zen/boot.html`, which it also controls.
+      * **A stopped worker answered in 100–137 ms** (CDP `ServiceWorker.stopAllWorkers`, then a navigation): the wasm from the cache, the vault's session resumed, the fs unlocked and the replica loaded. Step 9.5 measures it properly.
+      * The global setup builds the content dir, so CI's `client` job runs the project with the others.
+    * **Negative controls,** each run once, then restored; each made its test fail:
+      1. the page's origin check removed: the untrusted offer is shown (test 2)
+      2. the worker passing every request to the network: test 2 (the bootstrap page, not `Locked`) and the sandbox test (the bootstrap page reloading, before the loop guard)
+      3. no `skipWaiting`: the update never takes over (test 7, timeout)
+      4. the vault cleared after the first start: 503 after the stop (test 6)
+      5. no catch-up `sync`: 4 Node tests get 404
+      6. the page's certificate check removed: the Node refusal test
+      7. the app's origin check removed: the Node app-side test
+      8. the wasm not kept at install: 500 offline (test 8)
+    * **Checks:**
+      * `npm run check` passes
+      * `npx vitest run packages/sw` 3 times: 37 passed each time
+      * `npx playwright test --project sw` 3 times: 8 passed each time; then every project once: 25 passed
+      * Locally, Playwright runs through a scratchpad config that sets `executablePath` to the installed Chromium, since the pinned Playwright expects another build; CI installs its own.
+    * The `docs:` commit: packages/sw/README.md (the worker, the build, the content dir), CLIENT.md (viewing in a browser, `enrollViewer`), the TD-DB-SHAREDWORKER note, and this log.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
