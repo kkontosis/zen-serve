@@ -443,7 +443,7 @@ The chunker at the defaults (min 8,192, average 2^15, max 89,936 at `max_value_b
 |---|---|---|---|---|---|
 | Insertions | **98.1 %** | 1.4 % | 0.2 % | 0.1 % | 0.2 % |
 
-Normalized cutting depends on the position within a chunk, so an insertion can move a cut, and a few chunks can follow before the cuts line up again. **Content-defined cuts never resync in periodic data** (bytes repeating with a short period) or long runs of zeros, which are cut at `max`: after a length-changing edit, everything after it is cut again. Use `chunking: fixed` for disk images and sparse-heavy files (spec/OPS.md §7).
+Normalized cutting depends on the position within a chunk, so an insertion can move a cut, and a few chunks can follow before the cuts line up again. **Content-defined cuts never resync in periodic data** (bytes repeating with a short period) or long runs of zeros: after a length-changing edit, everything after it is cut again. A run of zeros is cut at one length the chunker key decides, since the gear hash is constant after 64 zero bytes. That length is `max` for most keys, and shorter, down to `min + 1`, for about 1 key in 1,700 at the defaults (simulated; 1 in 54 at `min` 256, average 2^10, `max` 8,128; measured over 10,000 keys of the real chunker: 1.87 %). So a sparse file under CDC can hold up to `max/min` times the chunks. Use `chunking: fixed` for disk images and sparse-heavy files (spec/OPS.md §7).
 
 ### 7.3 Memory
 
