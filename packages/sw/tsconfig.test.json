@@ -6,8 +6,9 @@
     "paths": {
       "@zen/client": ["../client/src/index.ts"],
       "@zen/client/node": ["../client/src/node.ts"],
-      "@zen/fs": ["../fs/src/index.ts"]
+      "@zen/fs": ["../fs/src/index.ts"],
+      "@zen/sw": ["./src/index.ts"]
     }
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "e2e"]
 }
