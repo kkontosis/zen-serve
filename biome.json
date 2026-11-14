@@ -9,6 +9,7 @@
       "!packages/zen-wasm/pkg",
       "!packages/svc-wasm/pkg",
       "!**/dist",
+      "!packages/sw/content",
       "!**/node_modules"
     ]
   },

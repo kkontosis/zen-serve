@@ -8,3 +8,4 @@ packages/*/dist/
 test-results/
 playwright-report/
 /apps/dist/
+/packages/sw/content/
