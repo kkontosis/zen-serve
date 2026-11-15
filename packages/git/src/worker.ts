@@ -38,10 +38,18 @@ const RENEW_MS = 3_000;
  * Run `work` while renewing the group's lease: the client renews it only
  * between deliveries, and a repack of many packs outlasts the lease.
  */
-async function keepingLease<T>(h: ConsumerHandle | undefined, work: () => Promise<T>): Promise<T> {
+async function keepingLease<T>(
+  h: ConsumerHandle | undefined,
+  work: () => Promise<T>,
+  log?: (line: string) => void,
+): Promise<T> {
   const timer = setInterval(() => void h?.group?.lease().catch(() => {}), RENEW_MS);
   try {
     return await work();
+  } catch (e) {
+    // The consumer retries some errors (a conflict) without reporting them.
+    log?.(`handler error: ${(e as { code?: string }).code ?? ''} ${errText(e)}`);
+    throw e;
   } finally {
     clearInterval(timer);
   }
@@ -50,6 +58,7 @@ async function keepingLease<T>(h: ConsumerHandle | undefined, work: () => Promis
 /** Run until `signal` aborts; then stop the consumers, releasing their leases. */
 export async function runWorker(o: WorkerOptions): Promise<void> {
   const log = o.log ?? ((l: string) => process.stderr.write(`${l}\n`));
+  const debug = !!process.env.ZEN_GIT_DEBUG;
   const z = await signIn(o.server, o.fs, undefined, { scheduler: true });
   const handles: ConsumerHandle[] = [];
   const onError = (e: unknown) => log(`error: ${errText(e)}`);
@@ -58,27 +67,36 @@ export async function runWorker(o: WorkerOptions): Promise<void> {
     repackH = z.db.consumeManual(
       { group: 'repack', topic: repackTopic(z.db), mode: 'sequential', onError },
       (msg: Delivered<Value>) =>
-        keepingLease(repackH, async () => {
-          const body = msg.body as Map<Value, Value>;
-          const repo = body.get(1) as string;
-          if (msg.type === REPACK_EVENT) {
-            const t0 = performance.now();
-            const r = await repack(z.db, z.fs, repo, {
-              graceMs: o.graceMs ?? GRACE_MS,
-              ...(o.afterUpload ? { afterUpload: o.afterUpload } : {}),
-            });
-            const s = ((performance.now() - t0) / 1000).toFixed(2);
-            if (!r.ok) log(`${repo}: repack refused (${r.why})`);
-            else if (r.rolled) {
-              const mb = ((r.size ?? 0) / 1e6).toFixed(2);
-              log(`${repo}: ${r.rolled} packs → 1, ${mb} MB, ${s} s; ${r.left} live`);
+        keepingLease(
+          repackH,
+          async () => {
+            const body = msg.body as Map<Value, Value>;
+            const repo = body.get(1) as string;
+            if (msg.type === REPACK_EVENT) {
+              const t0 = performance.now();
+              const r = await repack(z.db, z.fs, repo, {
+                graceMs: o.graceMs ?? GRACE_MS,
+                ...(debug
+                  ? {
+                      onRetry: (e: unknown) => log(`${repo}: files' commit retried: ${errText(e)}`),
+                    }
+                  : {}),
+                ...(o.afterUpload ? { afterUpload: o.afterUpload } : {}),
+              });
+              const s = ((performance.now() - t0) / 1000).toFixed(2);
+              if (!r.ok) log(`${repo}: repack refused (${r.why})`);
+              else if (r.rolled) {
+                const mb = ((r.size ?? 0) / 1e6).toFixed(2);
+                log(`${repo}: ${r.rolled} packs → 1, ${mb} MB, ${s} s; ${r.left} live`);
+              }
+            } else if (msg.type === GC_EVENT) {
+              const n = await collect(z.db, z.fs, body);
+              if (n) log(`${repo}: gc removed ${n} packs`);
             }
-          } else if (msg.type === GC_EVENT) {
-            const n = await collect(z.db, z.fs, body);
-            if (n) log(`${repo}: gc removed ${n} packs`);
-          }
-          await msg.ack();
-        }),
+            await msg.ack();
+          },
+          debug ? log : undefined,
+        ),
     );
     handles.push(repackH);
     for (const [repo, dir] of o.publish ?? []) {

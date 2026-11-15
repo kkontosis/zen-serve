@@ -34,6 +34,8 @@ const READ_ONLY = [{ rights: ['read' as const] }];
 /** Pushes in the many-pushes test; the bench sets more (`ZEN_GIT_BENCH_PUSHES`). */
 const BENCH = Number(process.env.ZEN_GIT_BENCH_PUSHES ?? 0);
 const PUSHES = BENCH || 300;
+/** The worker's member: alice (the pushers' own device) unless the bench says. */
+const WORKER = process.env.ZEN_GIT_BENCH_WORKER ?? 'alice';
 
 let t: GitWorld;
 let pub: string;
@@ -413,14 +415,11 @@ describe('zen-git worker', () => {
     expect((await allPacks(adb, 'kill')).length).toBe(REPACK_AT + 1);
 
     // The message, never acknowledged, goes to the next worker once the lease lapses.
-    worker = t.spawnZenGit('alice', [
-      'worker',
-      t.fsUrl,
-      '--grace',
-      '3s',
-      '--publish',
-      `pubrepo=${join(pub, 'git')}`,
-    ]);
+    worker = t.spawnZenGit(
+      WORKER,
+      ['worker', t.fsUrl, '--grace', '3s', '--publish', `pubrepo=${join(pub, 'git')}`],
+      BENCH ? { ZEN_GIT_DEBUG: '1' } : {},
+    );
     await until(
       async () =>
         (await readState(adb, 'kill')).packs.length <= REPACK_AT &&
@@ -497,6 +496,12 @@ describe('zen-git worker', () => {
           `live packs at most ${maxLive}, now ${live.length}; readState ${Math.min(...readMs).toFixed(0)}–${Math.max(...readMs).toFixed(0)} ms`,
           `live bytes ${bytes} against one git repack -a -d ${one} (${(bytes / one).toFixed(2)}×); before it: ${full.replace(/\n/g, ' ')}`,
           ...repacks.slice(-5),
+          ...(() => {
+            const other = worker!.lines.filter(
+              (x) => !repacks.includes(x) && !x.includes('gc removed'),
+            );
+            return [`other worker lines: ${other.length}`, ...other.slice(-12)];
+          })(),
         ].join('\n'),
       );
     }

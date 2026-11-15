@@ -386,6 +386,8 @@ export interface RepackOptions {
   tmp?: string;
   /** Test only: called after the upload, before the transaction. */
   afterUpload?: () => void | Promise<void>;
+  /** Called on each retry of the files' commit (diagnostics). */
+  onRetry?: (e: unknown) => void;
 }
 
 export type RepackResult =
@@ -466,7 +468,7 @@ export async function repack(
     // gc is scheduled now, so a job that stops before the rows' commit
     // leaves nothing for good. Tree operations serialize at the tree's
     // header (fs.md §7), so this commit is kept short and retried alone.
-    const filed = await filesCommit(db, async (tx) => {
+    const filed = await filesCommit(db, o.onRetry, async (tx) => {
       const packs = tx.table<PackRow>('packs');
       const have = await packs.get([repo, hash]);
       if (have) return have.state !== 'pending';
@@ -524,12 +526,17 @@ export async function repack(
  * the slow work before it: the tree's header serializes every commit that
  * touches the tree, pushes included (fs.md §7).
  */
-async function filesCommit<T>(db: Db, fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
+async function filesCommit<T>(
+  db: Db,
+  onRetry: ((e: unknown) => void) | undefined,
+  fn: (tx: DbTransaction) => Promise<T>,
+): Promise<T> {
   for (let attempt = 0, wait = 20; ; attempt++, wait = Math.min(wait * 2, 1000)) {
     try {
       return await db.transaction(fn);
     } catch (e) {
       if (!isCode(e, 'conflict') || attempt >= 30) throw e;
+      onRetry?.(e);
       await new Promise((r) => setTimeout(r, wait * (0.5 + Math.random())));
     }
   }
