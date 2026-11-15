@@ -97,6 +97,15 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
       * **Its `client` job failed** in the kanban race test, "two concurrent moves of one card", with runs `[1, 3]` against `[1, 2]`. The code isn't this PR's, and it is the race's third failure (milestone 8 saw `[2, 3]`).
     * **The diagnostic narrows the cause:** one recorded re-run, but three runs. Every re-run inside `kv.ts`'s loop calls `retry`, so the extra run must be another transaction on that `Db` during the race, which `racing`'s instance patch counts. The proposed patch: count only the race's own transactions (an `AsyncLocalStorage` context), and list the others in `why` with their call site. It went to the PR as a comment and is not applied here. The failed job gets its one re-run once the dispatch's benches finish.
     * **On 26.04, a second zen-mount failure** (run 43732312501, on 2a5075b): `EACCES` unlinking a conflict file (`mount.test.ts:242`). It is added to `TD-CI-UBUNTU-2604`.
+  * Pushed f40f48f, the log above.
+  * **CI green on both runs of f40f48f**, every job: push 43733509068 and pull_request 43733515896. PR #84 is mergeable (clean). **Step 10.1 is done**, apart from the two items below.
+  * **Left, once plan mode ends:**
+    1. When dispatch run 43732595233's benches (`files-bench`, `devices-bench`) finish, re-run its failed `client` job once (`rerun_failed_jobs`). That is the one re-run the comment on PR #84 announced.
+       * If it passes, log it.
+       * If it fails again in the kanban race, that is a second failure on this PR's head. Tell the user, and ask whether to apply the proposed `racing` patch (an `AsyncLocalStorage` context; other transactions listed in `why`) here or in its own PR.
+       * Read the benches' figures too, if they ran to the end: `files-bench` (STATS §7.6, CI's runner) and `devices-bench` (BLK.md §8's CI table). Note any that differ from the last ones by more than 1.5×, without new docs in this PR.
+    2. Copy this file to `docs/MILESTONE-10.md` (`cp`), commit `docs: step 10.1 done (CI on f40f48f), the log`, push, and confirm CI green on both runs.
+    3. Then PR #84 waits on review and merge, and step 10.2 (the git spike and spec/git.md) is planned in detail on the user's word.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
