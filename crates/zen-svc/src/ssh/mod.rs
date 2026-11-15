@@ -3,8 +3,9 @@
 //! included, so another handler can restore it and continue the live
 //! session at any point.
 //!
-//! * Key exchange `mlkem768x25519-sha256` and `curve25519-sha256`, host
-//!   key `ssh-ed25519`, ciphers `chacha20-poly1305@openssh.com` and
+//! * Key exchange `mlkem768x25519-sha256`, `sntrup761x25519-sha512` and
+//!   `curve25519-sha256`, host keys `ssh-mldsa44-ed25519` and
+//!   `ssh-ed25519`, ciphers `chacha20-poly1305@openssh.com` and
 //!   `aes256-gcm@openssh.com`; strict kex and EXT_INFO.
 //! * `publickey` authentication, decided by the application
 //!   ([`Event::Authorize`], [`Conn::authorize`]).
@@ -31,7 +32,7 @@ pub use auth::Authorize;
 pub use channel::{ChannelInfo, Request};
 pub use cipher::Cipher;
 pub use kex::Kex;
-pub use keys::{HostKey, PublicKey};
+pub use keys::{HostAlg, HostKey, PublicKey};
 
 use cipher::{Dir, Keys, PacketError};
 use kex::{Chosen, HashInput};
@@ -96,7 +97,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Options {
         Options {
-            kex: vec![Kex::MlKem768X25519, Kex::Curve25519],
+            kex: Kex::ALL.to_vec(),
             ciphers: vec![Cipher::Chacha20Poly1305, Cipher::Aes256Gcm],
             software: "zen".into(),
             window: 98_304,
@@ -107,26 +108,37 @@ impl Default for Options {
 }
 
 struct Inner {
-    host: HostKey,
+    /// One or two, the hybrid first.
+    hosts: Vec<HostKey>,
     opts: Options,
 }
 
-/// A host key and the SSH settings, shared by connections.
+/// The host keys and the SSH settings, shared by connections.
 #[derive(Clone)]
 pub struct Config(Arc<Inner>);
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("host", &self.0.host)
+            .field("hosts", &self.0.hosts)
             .field("opts", &self.0.opts)
             .finish()
     }
 }
 
 impl Config {
-    pub fn new(host_key: HostKey, opts: Options) -> Result<Config, Error> {
+    /// `host_keys`: one or two, at most one of each algorithm; a client is
+    /// offered the hybrid first.
+    pub fn new(host_keys: Vec<HostKey>, opts: Options) -> Result<Config, Error> {
         let bad = |e: &str| Err(Error::Config(e.into()));
+        let mut hosts = host_keys;
+        hosts.sort_by_key(|k| k.alg().code());
+        if hosts.is_empty() {
+            return bad("no host key");
+        }
+        if hosts.windows(2).any(|w| w[0].alg() == w[1].alg()) {
+            return bad("two host keys of one algorithm");
+        }
         if opts.kex.is_empty() {
             return bad("no key-exchange method");
         }
@@ -143,15 +155,17 @@ impl Config {
         if opts.rekey_bytes == 0 || opts.rekey_secs == 0 {
             return bad("rekey limits must be positive");
         }
-        Ok(Config(Arc::new(Inner {
-            host: host_key,
-            opts,
-        })))
+        Ok(Config(Arc::new(Inner { hosts, opts })))
     }
 
-    /// The host key.
-    pub fn host_key(&self) -> &HostKey {
-        &self.0.host
+    /// The host keys, the hybrid first.
+    pub fn host_keys(&self) -> &[HostKey] {
+        &self.0.hosts
+    }
+
+    /// The host key of `alg`, if held.
+    pub fn host_key(&self, alg: HostAlg) -> Option<&HostKey> {
+        self.0.hosts.iter().find(|k| k.alg() == alg)
     }
 
     fn opts(&self) -> &Options {
@@ -291,6 +305,8 @@ pub struct Conn {
     vc: Option<Vec<u8>>,
     lines: u32,
     sid: Option<Vec<u8>>,
+    /// The host-key algorithm, fixed by the first negotiation.
+    hk: Option<HostAlg>,
     strict: bool,
     tx: Dir,
     rx: Dir,
@@ -331,6 +347,7 @@ impl Conn {
             vc: None,
             lines: 0,
             sid: None,
+            hk: None,
             strict: false,
             tx: Dir::default(),
             rx: Dir::default(),
@@ -571,9 +588,24 @@ impl Conn {
         self.send(Writer::new(MSG_UNIMPLEMENTED).u32(seq).finish());
     }
 
+    /// The host-key algorithms to offer: all held, until the first
+    /// negotiation fixes one.
+    fn host_algs(&self) -> Vec<HostAlg> {
+        match self.hk {
+            Some(h) => vec![h],
+            None => self.cfg.host_keys().iter().map(HostKey::alg).collect(),
+        }
+    }
+
     fn send_kexinit(&mut self) {
         let o = self.cfg.opts();
-        let p = kex::kexinit(&o.kex, &o.ciphers, true, self.sid.is_none());
+        let p = kex::kexinit(
+            &o.kex,
+            &self.host_algs(),
+            &o.ciphers,
+            true,
+            self.sid.is_none(),
+        );
         self.send_now(&p);
         self.kex = Some(KexState {
             ours: Some(p),
@@ -599,9 +631,10 @@ impl Conn {
             }
         }
         let o = self.cfg.opts();
-        let Some(chosen) = kex::negotiate(&prop, &o.kex, &o.ciphers) else {
+        let Some(chosen) = kex::negotiate(&prop, &o.kex, &self.host_algs(), &o.ciphers) else {
             return fail(reason::KEY_EXCHANGE_FAILED, "no algorithm in common");
         };
+        self.hk = Some(chosen.hk);
         if self.kex.is_none() {
             self.send_kexinit();
         }
@@ -631,21 +664,28 @@ impl Conn {
         let Ok((q_s, k_enc)) = kex::server_reply(chosen.kex, q_c) else {
             return fail(reason::KEY_EXCHANGE_FAILED, "a bad key-exchange value");
         };
-        let k_s = self.cfg.host_key().blob();
-        let h = kex::exchange_hash(&HashInput {
-            v_c: self.vc.as_deref().expect("a version"),
-            v_s: &self.vs,
-            i_c: theirs,
-            i_s: ours,
-            k_s: &k_s,
-            q_c,
-            q_s: &q_s,
-            k: &k_enc,
-        });
+        let host = self
+            .cfg
+            .host_key(chosen.hk)
+            .expect("negotiated among those held");
+        let k_s = host.blob();
+        let h = kex::exchange_hash(
+            chosen.kex,
+            &HashInput {
+                v_c: self.vc.as_deref().expect("a version"),
+                v_s: &self.vs,
+                i_c: theirs,
+                i_s: ours,
+                k_s: &k_s,
+                q_c,
+                q_s: &q_s,
+                k: &k_enc,
+            },
+        );
         let first = self.sid.is_none();
         let ext_info = first && kex::parse_kexinit(theirs)?.kex.contains(&kex::EXT_INFO_C);
         let sid = self.sid.get_or_insert_with(|| h.to_vec()).clone();
-        let sig = self.cfg.host_key().sign(&h);
+        let sig = host.sign(&h);
         let reply = Writer::new(kex::MSG_KEX_REPLY)
             .string(&k_s)
             .string(&q_s)
@@ -654,10 +694,10 @@ impl Conn {
         self.send_now(&reply);
         self.send_now(&[kex::MSG_NEWKEYS]);
         self.tx.set_keys(
-            Some(kex::keys(&k_enc, &h, &sid, chosen.s2c, false)),
+            Some(kex::keys(chosen.kex, &k_enc, &h, &sid, chosen.s2c, false)),
             self.strict,
         );
-        self.rx_next = Some(kex::keys(&k_enc, &h, &sid, chosen.c2s, true));
+        self.rx_next = Some(kex::keys(chosen.kex, &k_enc, &h, &sid, chosen.c2s, true));
         let k = self.kex.as_mut().expect("a key exchange");
         k.replied = true;
         k.ours = None;
@@ -666,7 +706,7 @@ impl Conn {
             let e = Writer::new(MSG_EXT_INFO)
                 .u32(1)
                 .string(b"server-sig-algs")
-                .string(b"ssh-ed25519,rsa-sha2-256,rsa-sha2-512")
+                .string(b"ssh-mldsa44-ed25519,ssh-ed25519,rsa-sha2-256,rsa-sha2-512")
                 .finish();
             self.send_now(&e);
         }
@@ -721,9 +761,10 @@ impl Conn {
                     // A wrong guess would make in-order reading skip a
                     // packet; leave that to in-order reading.
                     let o = self.cfg.opts();
+                    let host = self.host_algs();
                     let ok = kex::parse_kexinit(&p)
                         .ok()
-                        .and_then(|prop| kex::negotiate(&prop, &o.kex, &o.ciphers))
+                        .and_then(|prop| kex::negotiate(&prop, &o.kex, &host, &o.ciphers))
                         .is_some_and(|c| !c.wrong_guess);
                     if !ok {
                         return Ok(());
@@ -830,9 +871,14 @@ impl Conn {
         self.auth.user.as_deref()
     }
 
-    /// The session id, after the first key exchange.
+    /// The session id (32 or 64 bytes), after the first key exchange.
     pub fn session_id(&self) -> Option<&[u8]> {
         self.sid.as_deref()
+    }
+
+    /// The host-key algorithm, once the first KEXINITs are negotiated.
+    pub fn host_alg(&self) -> Option<HostAlg> {
+        self.hk
     }
 
     /// A key exchange is in progress.

@@ -5,8 +5,8 @@ use super::channel::{self, Channel, Request};
 use super::cipher::{Cipher, Dir, Keys};
 use super::kex::{self, Chosen, Kex};
 use super::{
-    Config, Conn, ENDED, Error, HELD_BYTES, HELD_MSGS, KexState, PEER_ENDED, PublicKey, QUEUE_MAX,
-    QUEUE_PIECES, UNREAD_MAX,
+    Config, Conn, ENDED, Error, HELD_BYTES, HELD_MSGS, HostAlg, KexState, PEER_ENDED, PublicKey,
+    QUEUE_MAX, QUEUE_PIECES, UNREAD_MAX,
 };
 use crate::cbor::{Fields, encode, text, zeroize_value};
 use ciborium::Value;
@@ -105,6 +105,9 @@ impl Conn {
         if let Some(sid) = &self.sid {
             m.push((text("sid"), bytes(sid)));
         }
+        if let Some(hk) = self.hk {
+            m.push((text("hk"), uint(hk.code())));
+        }
         m.push((text("strict"), Value::Bool(self.strict)));
         m.push((text("tx"), dir_value(&self.tx)));
         m.push((text("rx"), dir_value(&self.rx)));
@@ -166,8 +169,21 @@ impl Conn {
             return Err(Error::BadState("lines"));
         }
         let sid = opt_bytes(&mut m, "sid")?;
-        if sid.as_ref().is_some_and(|s| s.len() != 32) {
-            return Err(Error::BadState("a session id that isn't 32 bytes"));
+        if sid.as_ref().is_some_and(|s| s.len() != 32 && s.len() != 64) {
+            return Err(Error::BadState("a session id that isn't 32 or 64 bytes"));
+        }
+        let hk = match m.opt("hk") {
+            Some(Value::Integer(h)) => Some(
+                u64::try_from(h)
+                    .ok()
+                    .and_then(HostAlg::from_code)
+                    .ok_or(Error::BadState("unknown hk"))?,
+            ),
+            Some(_) => return Err(Error::BadState("hk")),
+            None => None,
+        };
+        if hk.is_some_and(|h| config.host_key(h).is_none()) {
+            return Err(Error::BadState("a host key this service doesn't hold"));
         }
         let strict = boolean(&mut m, "strict")?;
         let tx = dir(m.take("tx")?)?;
@@ -177,7 +193,7 @@ impl Conn {
             None => None,
         };
         let kex = match m.opt("kex") {
-            Some(v) => Some(kex_state(v)?),
+            Some(v) => Some(kex_state(v, hk)?),
             None => None,
         };
         let kex_at = m.uint("kex_at")?;
@@ -215,7 +231,9 @@ impl Conn {
             || queued > QUEUE_MAX
             || pieces > QUEUE_PIECES
             || held.len() > HELD_MSGS + 1
-            || held_bytes > HELD_BYTES + 1024
+            // Reading stops at the bound, so one message may pass it: at
+            // most a USERAUTH_PK_OK with a hybrid key (about 1.4 KB).
+            || held_bytes > HELD_BYTES + 2048
         {
             return Err(Error::BadState("over a bound"));
         }
@@ -233,12 +251,17 @@ impl Conn {
         if (vc.is_none() && sid.is_some()) || (sid.is_none() && kex.is_none()) {
             return Err(Error::BadState("a key exchange out of order"));
         }
+        let negotiated = kex.as_ref().is_some_and(|k| k.chosen.is_some());
+        if hk.is_none() && (sid.is_some() || negotiated) {
+            return Err(Error::BadState("no hk"));
+        }
         Ok(Conn {
             cfg: config.clone(),
             vs,
             vc,
             lines,
             sid,
+            hk,
             strict,
             tx,
             rx,
@@ -303,7 +326,9 @@ fn dir(v: Value) -> Result<Dir, Error> {
     Ok(d)
 }
 
-fn kex_state(v: Value) -> Result<KexState, Error> {
+/// `hk`: the connection's host-key algorithm, which a negotiated key
+/// exchange uses.
+fn kex_state(v: Value, hk: Option<HostAlg>) -> Result<KexState, Error> {
     let mut m = Fields::new(v)?;
     let ours = opt_bytes(&mut m, "ours")?;
     let theirs = opt_bytes(&mut m, "theirs")?;
@@ -318,6 +343,7 @@ fn kex_state(v: Value) -> Result<KexState, Error> {
             let a = u64::try_from(a).map_err(|_| Error::BadState("alg"))?;
             Some(Chosen {
                 kex: Kex::from_code(a).ok_or(Error::BadState("unknown kex"))?,
+                hk: hk.ok_or(Error::BadState("no hk"))?,
                 c2s: Cipher::from_code(m.uint("c2s")?).ok_or(Error::BadState("unknown cipher"))?,
                 s2c: Cipher::from_code(m.uint("s2c")?).ok_or(Error::BadState("unknown cipher"))?,
                 wrong_guess: false,

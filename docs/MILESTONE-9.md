@@ -593,6 +593,10 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
         3. Copy this file to `docs/MILESTONE-9.md`.
         4. One `docs:` commit, then push and confirm CI green on both runs.
         5. PR #83 then waits on review and merge.
+      * Done: 2d60822 (STATS §7.6's CI table, TD-SW-THROUGHPUT's runner figures, the log) pushed.
+      * **CI green on both runs of 2d60822** (push 43700383145 and pull_request 43700388589), every job; PR #83 mergeable (clean). **Step 9.5 is done, and with it milestone 9;** PR #83 waits on review and merge. This line reaches `docs/MILESTONE-9.md` with the next step's restart from main.
+      * **PR #83 merged** (the user, 10:08 UTC). **Milestone 9 is done.** The PR's subscription ended with it, and the pending check-in was cancelled.
+      * **Next, on the user's word:** restart from main, bring these last lines into `docs/MILESTONE-9.md`, and plan the next milestone (DESIGN-3 §6 item 10, docs/MILESTONE-10.md).
 
 ## Steps (one PR each; each planned in detail before it starts)
 

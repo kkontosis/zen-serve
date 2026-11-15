@@ -191,13 +191,23 @@ fn event_value(e: &Event) -> js_sys::Object {
     o
 }
 
-/// The host key's line for `known_hosts` (`ssh-ed25519 AAAA…`), from its
-/// OpenSSH PEM. Throws `key`.
+/// The host key's line for `known_hosts` (`ssh-ed25519 AAAA…` or
+/// `ssh-mldsa44-ed25519 AAAA…`), from its OpenSSH PEM. Throws `key`.
 #[wasm_bindgen(js_name = sshHostKeyLine)]
 pub fn ssh_host_key_line(pem: &str) -> Result<String, JsValue> {
     ssh::HostKey::from_openssh(pem)
         .map(|k| k.public_line())
         .map_err(|e| js_err(&e))
+}
+
+/// A new random host key of `algorithm` (`ssh-ed25519` or
+/// `ssh-mldsa44-ed25519`), as an unencrypted OpenSSH PEM, which
+/// `SshConfig` and OpenSSH read. Throws `config` for another algorithm.
+#[wasm_bindgen(js_name = sshGenerateHostKey)]
+pub fn ssh_generate_host_key(algorithm: &str) -> Result<String, JsValue> {
+    let alg = ssh::HostAlg::from_name(algorithm)
+        .ok_or_else(|| config_err(format!("an unknown host-key algorithm {algorithm}")))?;
+    Ok(ssh::HostKey::generate(alg).to_openssh().to_string())
 }
 
 /// A public key from a line of `authorized_keys` (without options) or a
@@ -209,30 +219,53 @@ pub fn ssh_public_key(line: &str) -> Result<JsValue, JsValue> {
         .map_err(|e| js_err(&e))
 }
 
-/// A host key and the SSH settings, shared by connections.
+/// The host keys and the SSH settings, shared by connections.
 #[wasm_bindgen]
 pub struct SshConfig(ssh::Config);
 
 #[wasm_bindgen]
 impl SshConfig {
-    /// `hostKeyPem`: an unencrypted OpenSSH Ed25519 key, as `ssh-keygen -t
-    /// ed25519 -N ''` writes it. Throws `key` or `config`.
+    /// `hostKeyPem`: an unencrypted OpenSSH key, as `ssh-keygen -t ed25519
+    /// -N ''` or (OpenSSH 10.6 and later) `ssh-keygen -t mldsa44-ed25519
+    /// -N ''` writes it; or an array of one of each. Throws `key` or
+    /// `config`.
     #[wasm_bindgen(constructor)]
     pub fn new(
-        host_key_pem: &str,
+        #[wasm_bindgen(unchecked_param_type = "string | string[]")] host_key_pem: JsValue,
         #[wasm_bindgen(unchecked_optional_param_type = "SshOptions")] opts: Option<js_sys::Object>,
     ) -> Result<SshConfig, JsValue> {
-        let host = ssh::HostKey::from_openssh(host_key_pem).map_err(|e| js_err(&e))?;
+        let pems: Vec<String> = if let Some(p) = host_key_pem.as_string() {
+            vec![p]
+        } else if let Ok(a) = host_key_pem.dyn_into::<js_sys::Array>() {
+            a.iter()
+                .map(|p| {
+                    p.as_string()
+                        .ok_or_else(|| config_err("hostKey: not a string"))
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            return Err(config_err("hostKey: a PEM or an array of PEMs"));
+        };
+        let hosts = pems
+            .iter()
+            .map(|p| ssh::HostKey::from_openssh(p).map_err(|e| js_err(&e)))
+            .collect::<Result<Vec<_>, _>>()?;
         let o = options(opts.map(JsValue::from).unwrap_or(JsValue::UNDEFINED))?;
-        ssh::Config::new(host, o)
+        ssh::Config::new(hosts, o)
             .map(SshConfig)
             .map_err(|e| js_err(&e))
     }
 
-    /// The host key's line for `known_hosts`.
+    /// The first host key's line for `known_hosts`: the hybrid's, if held.
     #[wasm_bindgen(getter, js_name = hostKeyLine)]
     pub fn host_key_line(&self) -> String {
-        self.0.host_key().public_line()
+        self.0.host_keys()[0].public_line()
+    }
+
+    /// Every host key's line for `known_hosts`, the hybrid first.
+    #[wasm_bindgen(getter, js_name = hostKeyLines)]
+    pub fn host_key_lines(&self) -> Vec<String> {
+        self.0.host_keys().iter().map(|k| k.public_line()).collect()
     }
 }
 
@@ -281,12 +314,7 @@ fn options(v: JsValue) -> Result<ssh::Options, JsValue> {
     if let Some(ks) = names("kex")? {
         o.kex = ks
             .iter()
-            .map(|n| {
-                [Kex::MlKem768X25519, Kex::Curve25519]
-                    .into_iter()
-                    .find(|k| k.name() == n)
-                    .ok_or_else(|| config_err(format!("kex: unknown {n}")))
-            })
+            .map(|n| Kex::from_name(n).ok_or_else(|| config_err(format!("kex: unknown {n}"))))
             .collect::<Result<_, _>>()?;
     }
     if let Some(cs) = names("ciphers")? {

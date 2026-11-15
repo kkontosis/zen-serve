@@ -22,8 +22,14 @@ import { loadSvcWasm, type SvcWasm, type WasmSource } from './wasm.js';
 
 /** Options of `ssh()`. */
 export interface SshLayerOptions {
-  /** The host key: OpenSSH PEM, Ed25519, unencrypted (`ssh-keygen -t ed25519 -N ''`). */
-  hostKey: string;
+  /**
+   * The host key, or one of each kind: unencrypted OpenSSH PEM, Ed25519
+   * (`ssh-keygen -t ed25519 -N ''`) or the post-quantum hybrid
+   * `ssh-mldsa44-ed25519` (`ssh-keygen -t mldsa44-ed25519 -N ''`,
+   * OpenSSH 10.6 and later). With both, the hybrid is offered first and
+   * each client takes its own first choice (svc.md §7.2).
+   */
+  hostKey: string | string[];
   /**
    * The window each channel is offered. Default: (the service's `window`
    * − 64 KiB) / 10, so the 10 channels' data in flight fits the relay's
@@ -34,7 +40,10 @@ export interface SshLayerOptions {
   rekeyBytes?: number;
   /** Seconds since the last key exchange before the server rekeys (default 3,600). */
   rekeySecs?: number;
-  /** Key-exchange methods, preferred first (default `mlkem768x25519-sha256`, `curve25519-sha256`). */
+  /**
+   * Key-exchange methods, preferred first, by any of their names (default
+   * `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `curve25519-sha256`).
+   */
   kex?: string[];
   /** Ciphers, preferred first (default `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`). */
   ciphers?: string[];
@@ -44,7 +53,7 @@ export interface SshLayerOptions {
 
 /** A user's public key. */
 export interface SshKey {
-  /** `ssh-ed25519` or `ssh-rsa`. */
+  /** `ssh-ed25519`, `ssh-mldsa44-ed25519` or `ssh-rsa`. */
   readonly algorithm: string;
   /** `SHA256:…`, as `ssh-keygen -l` prints it. */
   readonly fingerprint: string;

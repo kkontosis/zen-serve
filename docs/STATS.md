@@ -119,7 +119,7 @@ Of that, `fdbserver` is 99 MB, `libfdb_c.so` 24 MB and `fdbcli` 27 MB; the backu
 |---|---|
 | `zen_wasm_bg.wasm` (release, LTO, no wasm-opt) | **2.42 MB**, 645 KB gzipped at milestone 5.5 step 8 (2.14 MB at milestone 5, 1.86 MB at milestone 4; the growth is zen-db's keyed primitives, CRDT rows and paged files, then the svc seals and request codecs) |
 | WASM JS glue and declarations | 311 KB and 109 KB |
-| `zen_svc_wasm_bg.wasm` (`@zen/svc-wasm`, the TLS and SSH engines: rustls, the RustCrypto provider and zen-svc's SSH; release, no wasm-opt), loaded only by services that use `tls()` or `ssh()` | **1.23 MB**, 465 KB gzipped at milestone 5.5 step 10 (1.05 MB and 403 KB with the TLS engine alone, step 8); glue 44 KB, declarations 15 KB |
+| `zen_svc_wasm_bg.wasm` (`@zen/svc-wasm`, the TLS and SSH engines: rustls, the RustCrypto provider and zen-svc's SSH; release, no wasm-opt), loaded only by services that use `tls()` or `ssh()` | **1.36 MB**, 503 KB gzipped at milestone 10 step 10.1, with sntrup761 and ML-DSA-44 (1.23 MB and 465 KB at milestone 5.5 step 10; 1.05 MB and 403 KB with the TLS engine alone, step 8); glue 46 KB, declarations 16 KB |
 | `@zen/client` npm package (compiled TS) | 112 KB packed, 475 KB unpacked |
 | `@zen/db` | 171 KB packed, 783 KB unpacked |
 | `@zen/fs` | 46 KB packed, 217 KB unpacked |
@@ -262,9 +262,25 @@ Reading it:
 * **A step is a few round trips.** A line goes from the socket into storage (a commit), is pushed to the handler, runs in a step (the handler's transaction, a commit), and with `resume: true` its output is released by a reveal (an HTTP request) before the server writes it. `resume: false` skips the reveal and saves about 2 ms. The layers add their engines' work: TLS about half a millisecond, SSH two. `tcp-auth` adds the WebSocket hop.
 * **Throughput** is one step in flight per connection, each taking what input arrived since the last one (at most `window`). TLS and SSH halve it: their engines run in WASM, and each step restores the engine from its sealed state. A large IMAP FETCH writes 256 KiB a step without waiting for input, which is why it is faster than the mirrors.
 * **The takeover pause** is the lease's TTL plus a claim: the successor claims within a few milliseconds of the lease lapsing, and the peer sees a pause, not an error. A shorter TTL takes over faster and renews more often (every second by default).
+* **A key exchange** costs the engine 0.2 to 1.4 ms in Rust and 2.5 to 8 ms through the WASM in Node (the table below). The post-quantum key exchanges and the hybrid host key are a few milliseconds per connection and rekey, against a step latency near 20 ms.
 * **An idle connection** costs the server a task, its socket and buffers (the input reader keeps a 32 KiB buffer), and its records in storage; the handler keeps its keys and cursors. It costs no steps: nothing runs until input or a wake-up comes.
 * **Debug builds** are slower: the debug server with development WASM measured 22.6 ms for a raw step, and 2.7, 0.8 and 1.1 MB/s for the three mirrors.
 * As with §5.4, these are single-client figures on one machine: they show what a step costs, not a server under load.
+
+**SSH key exchanges** (milestone 10 step 10.1; 4 cores, Intel Xeon at 2.1 GHz). *Rust*: one key exchange against the crate's test client in one process, the engine restored from its state at every step, mean of 200 (`cargo test --release -p zen-svc --test ssh handshake_cost -- --ignored --nocapture`); "with the client" adds the test client's own work. *Node*: the engine through `@zen/svc-wasm` (release), restored at every read, against OpenSSH 10.6p1 running `true`, median of 30 connections (the engine's time for the whole connection: the key exchange, two `publickey` steps, the channel).
+
+| Key exchange | Host key | Rust, engine ms | Rust, with the client ms | Node (WASM), engine ms per connection |
+|---|---|---|---|---|
+| `mlkem768x25519-sha256` | `ssh-ed25519` | 0.3 | 0.9 to 1.2 | 3.1 |
+| `mlkem768x25519-sha256` | `ssh-mldsa44-ed25519` | 0.7 | 1.5 | 4.4 to 6.7 |
+| `sntrup761x25519-sha512` | `ssh-ed25519` | 0.9 | 18.0 | 4.6 to 5.2 |
+| `sntrup761x25519-sha512` | `ssh-mldsa44-ed25519` | 1.3 | 18.4 | 7.1 to 8.0 |
+| `curve25519-sha256` | `ssh-ed25519` | 0.2 | 0.7 | 2.5 to 2.7 |
+| `curve25519-sha256` | `ssh-mldsa44-ed25519` | 0.6 | 1.3 | 3.6 to 3.8 |
+
+* **The hybrid host key adds about 0.4 ms** in Rust (one ML-DSA-44 signature, hedged, with its rejection sampling's spread) and 1 to 4 ms through the WASM.
+* **sntrup761x25519 adds about 0.7 ms** on the server, which only encapsulates. The client's key generation is the expensive part: about 17 ms in `sntrup-kem`, which only the test client uses; OpenSSH's C takes far less. OpenSSH's whole `ssh … true` took 99 to 126 ms here, most of it the client's own start-up.
+* **The state stays small**: at most 432 bytes after any step of these key exchanges, since the KEMs' public values are consumed within the step that receives them (svc.md §7.2).
 
 ### 5.6 Device checkpoints in the native client (measured)
 

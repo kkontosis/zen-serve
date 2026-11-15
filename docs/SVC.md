@@ -78,7 +78,7 @@ const h = serve(db, {
   * `raw()`, the default: bytes.
   * `tls({cert, key})`: TLS 1.3 and 1.2, terminated in the handler. The handler sees plaintext through the same `RawStep`.
   * `starttls(…)`: plain first, then TLS after `c.startTls()`, as SMTP's STARTTLS.
-  * `ssh({hostKey})`: an SSH server. The handler sees authentication questions and channels (`SshStep`).
+  * `ssh({hostKey})`: an SSH server, post-quantum by default for clients from OpenSSH 9.0 on (the key exchanges `mlkem768x25519-sha256` and `sntrup761x25519-sha512`), with an Ed25519 host key, the hybrid `ssh-mldsa44-ed25519`, or both. The handler sees authentication questions and channels (`SshStep`).
 * **Waking.** A handler runs when input arrives. To speak without input (IMAP IDLE telling a client of new mail), a step registers keys with `c.wakeOn(key)`, and the app calls `h.wake(key)` when something changes. An idle connection costs no steps.
 * **Where it runs.** In a Node worker (`signInWorker`, as the apps' `workers/`) or in a browser tab: of a browser's tabs, the one that owns the database serves. Run two or more handlers for a service: they share its connections, and each is the other's successor.
 * **Errors.** A handler that throws closes its connection and calls `onError`. A conflict re-runs the handler, so it must not have effects outside `tx`.
@@ -87,7 +87,7 @@ const h = serve(db, {
 
 Every secret a handler needs lives in the fs, sealed like any row, and is read by the handler before `serve()`:
 * **TLS certificates and keys** (`tls()`, `starttls()`): PEM, ECDSA P-256/P-384 or Ed25519. The apps keep them in a `certs` table.
-* **SSH host keys** (`ssh()`): OpenSSH's Ed25519 PEM. Users' public keys are rows the handler checks (`sshPublicKey` gives the fingerprint).
+* **SSH host keys** (`ssh()`): unencrypted OpenSSH PEMs, Ed25519 (`ssh-keygen -t ed25519 -N ''`) or the post-quantum hybrid `ssh-mldsa44-ed25519` (`ssh-keygen -t mldsa44-ed25519 -N ''` with OpenSSH 10.6 or later, or `sshGenerateHostKey('ssh-mldsa44-ed25519')` from `@zen/svc-wasm` anywhere), one or one of each. Users' public keys are rows the handler checks (`sshPublicKey` gives the fingerprint); hybrid user keys work like the others.
 * **The inbox seed** of a sealed inbox: 32 random bytes. The service's `inbox` setting is its public key (`zw.inboxPublic(seed)`).
 * **Protocol passwords**, such as IMAP's app passwords: the mail app stores their hashes in a table.
 

@@ -6,14 +6,17 @@
 //!
 //! These tests need OpenSSH's `ssh` and `ssh-keygen` (`ZEN_TEST_SSH` names
 //! another `ssh`; its `ssh-keygen` is taken from the same directory).
-//! `curve25519-sha256` is used here; the hybrid is in `openssh_pq.rs`.
+//! `curve25519-sha256` is used here, and `sntrup761x25519-sha512` under
+//! the name OpenSSH has had since 9.0; `mlkem768x25519-sha256` and the
+//! `ssh-mldsa44-ed25519` keys are in `openssh_pq.rs`.
 
 mod sshcommon;
 
 use sshcommon::*;
-use zen_svc::ssh::{Cipher, Error, Options, reason};
+use zen_svc::ssh::{Cipher, Error, HostAlg, Options, reason};
 
 const KEX: &str = "KexAlgorithms=curve25519-sha256";
+const SNTRUP: &str = "KexAlgorithms=sntrup761x25519-sha512@openssh.com";
 
 fn setup(name: &str) -> (Tmp, std::path::PathBuf, zen_svc::ssh::PublicKey) {
     let t = tmp(name);
@@ -217,6 +220,9 @@ fn keys_match_ssh_keygen() {
             .to_owned()
     };
     assert_eq!(public.fingerprint(), fp(&f.with_extension("pub")));
+    // And the reverse: OpenSSH reads the PEM `to_openssh` writes.
+    let ours = zen_svc::ssh::HostKey::from_seed(&[5; 32]);
+    assert!(keygen_reads(&t.0, "ours", &ours).starts_with(&ours.public_line()));
     let (rf, rsa) = user_key(&t.0, "rsa", &["-t", "rsa", "-b", "2048"]);
     assert_eq!(rsa.fingerprint(), fp(&rf.with_extension("pub")));
     assert_eq!(rsa.algorithm(), "ssh-rsa");
@@ -266,4 +272,79 @@ fn strict_kex_refuses_an_injected_packet() {
         })
     );
     assert!(r.stderr.contains("strict kex"), "{}", r.stderr);
+}
+
+#[test]
+fn sntrup761_exec_with_each_cipher() {
+    let (t, key, public) = setup("sntrup");
+    for (name, cipher) in [
+        ("chacha20-poly1305@openssh.com", Cipher::Chacha20Poly1305),
+        ("aes256-gcm@openssh.com", Cipher::Aes256Gcm),
+    ] {
+        let (port, h) = serve_one(config(Options::default()), App::new(vec![public.clone()]));
+        let r = ssh(
+            &t.0,
+            port,
+            &key,
+            &[SNTRUP, &format!("Ciphers={name}")],
+            &["echo sntrup"],
+            b"",
+        );
+        let stats = h.join().unwrap();
+        assert_eq!(r.code, Some(0), "{name}: {r:?} {stats:?}");
+        assert_eq!(r.stdout, b"sntrup\n");
+        assert_eq!(stats.ciphers, Some((cipher, cipher)));
+        // SHA-512's exchange hash is the session id.
+        assert_eq!(stats.sid_len, Some(64));
+    }
+}
+
+#[test]
+fn sntrup761_cat_with_rekeys_both_ways() {
+    let (t, key, public) = setup("sntrupcat");
+    let opts = Options {
+        rekey_bytes: 512 << 10,
+        ..Options::default()
+    };
+    let (port, h) = serve_one(config(opts), App::new(vec![public]));
+    let data = random(1 << 20);
+    let r = ssh(
+        &t.0,
+        port,
+        &key,
+        &[SNTRUP, "RekeyLimit=256K"],
+        &["cat"],
+        &data,
+    );
+    let stats = h.join().unwrap();
+    assert_eq!(r.code, Some(0), "{} {stats:?}", r.stderr);
+    assert_eq!(sha256(&r.stdout), sha256(&data));
+    assert!(stats.kexes >= 4, "{stats:?}");
+    assert_eq!(stats.sid_len, Some(64));
+}
+
+#[test]
+fn the_default_key_exchange_is_post_quantum() {
+    // No KexAlgorithms: OpenSSH 9.0 to 9.8 prefer sntrup761x25519 (a
+    // 64-byte session id), 9.9 and later mlkem768x25519 (32 bytes).
+    let (t, key, public) = setup("default");
+    let (port, h) = serve_one(config(Options::default()), App::new(vec![public]));
+    let r = ssh(&t.0, port, &key, &[], &["echo default"], b"");
+    let stats = h.join().unwrap();
+    assert_eq!(r.code, Some(0), "{r:?} {stats:?}");
+    let want = if ssh_version() >= (9, 9) { 32 } else { 64 };
+    assert_eq!(stats.sid_len, Some(want), "{:?}", ssh_version());
+}
+
+#[test]
+fn both_host_keys_held() {
+    // With both keys in known_hosts, OpenSSH takes Ed25519: before 10.6 it
+    // doesn't know the hybrid, and 10.6 lists the hybrid last by default.
+    let (t, key, public) = setup("bothhk");
+    let cfg = config_keys(vec![host_key(), hybrid_host_key()], Options::default());
+    let (port, h) = serve_one(cfg, App::new(vec![public]));
+    let r = ssh(&t.0, port, &key, &[KEX], &["echo both"], b"");
+    let stats = h.join().unwrap();
+    assert_eq!(r.code, Some(0), "{r:?} {stats:?}");
+    assert_eq!(stats.host_alg, Some(HostAlg::Ed25519));
 }

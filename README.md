@@ -53,6 +53,7 @@ Building blocks:
 * Milestone 6 (integrity: signed checkpoints, the authenticated tier, and `zen-ublk`, [`docs/MILESTONE-6.md`](docs/MILESTONE-6.md), outcome at its end, [`docs/INTEGRITY.md`](docs/INTEGRITY.md), [`docs/BLK.md`](docs/BLK.md)): done.
 * Milestone 8 (large files, the rest: content-defined chunking, upload sessions, multi-GiB writes and edits, [`docs/MILESTONE-8.md`](docs/MILESTONE-8.md), outcome at its end, measured in [`docs/STATS.md`](docs/STATS.md) §7): done.
 * Milestone 9 (`@zen/sw`: serving zen-fs over HTTP through a service worker, [`docs/MILESTONE-9.md`](docs/MILESTONE-9.md), outcome at its end; deploying it: [`docs/SW.md`](docs/SW.md); measured in [`docs/STATS.md`](docs/STATS.md) §7.6): done.
+* Milestone 10 (git over zen-serve: `git-remote-zen`, a local git server, a relayed git service, and post-quantum SSH, [`docs/MILESTONE-10.md`](docs/MILESTONE-10.md)): in progress.
 
 ## Building
 

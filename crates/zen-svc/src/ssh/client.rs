@@ -1,12 +1,12 @@
 //! A minimal SSH client on the engine's own parts, for tests
-//! (`test-utils`): the version exchange, both key exchanges (and rekeys
-//! from either side), both ciphers, and messages built and parsed by hand.
-//! It checks the host key's signature; interoperability is tested against
-//! OpenSSH.
+//! (`test-utils`): the version exchange, the three key exchanges (and
+//! rekeys from either side), both host-key kinds, both ciphers, and
+//! messages built and parsed by hand. It checks the host key's signature;
+//! interoperability is tested against OpenSSH.
 
 use super::cipher::{Cipher, Dir, Keys};
 use super::kex::{self, ClientKex, HashInput, Kex};
-use super::keys::HostKey;
+use super::keys::{HostAlg, HostKey};
 use super::wire::{Reader, Writer};
 use super::{MSG_EXT_INFO, PublicKey};
 
@@ -19,6 +19,8 @@ pub struct ClientOptions {
     pub strict: bool,
     /// The host key to expect.
     pub host: Option<PublicKey>,
+    /// The host-key algorithms offered, preferred first.
+    pub host_algs: Vec<HostAlg>,
     /// Guess wrong in the first KEXINIT: list an unknown method first, set
     /// `first_kex_packet_follows`, and send a guessed packet the server
     /// must ignore.
@@ -32,6 +34,7 @@ impl ClientOptions {
             cipher,
             strict: true,
             host: None,
+            host_algs: vec![HostAlg::MlDsa44Ed25519, HostAlg::Ed25519],
             wrong_guess: false,
         }
     }
@@ -58,6 +61,10 @@ pub struct Client {
     pub kexes: u32,
     /// The server's EXT_INFO, if it sent one.
     pub ext_info: Option<Vec<u8>>,
+    /// The host-key algorithm of each key exchange, in order.
+    pub host_algs_used: Vec<HostAlg>,
+    /// The host-key algorithms of the server's latest KEXINIT.
+    pub server_host_algs: Vec<String>,
 }
 
 impl Client {
@@ -80,6 +87,8 @@ impl Client {
             held: Vec::new(),
             kexes: 0,
             ext_info: None,
+            host_algs_used: Vec::new(),
+            server_host_algs: Vec::new(),
         };
         c.out.extend_from_slice(&c.vc);
         c.out.extend_from_slice(b"\r\n");
@@ -131,6 +140,7 @@ impl Client {
     fn kexinit(&mut self) {
         let p = kex::kexinit(
             &[self.opts.kex],
+            &self.opts.host_algs,
             &[self.opts.cipher],
             false,
             self.sid.is_none(),
@@ -147,7 +157,7 @@ impl Client {
                 names.retain(|n| *n != kex::STRICT_C);
             }
             if guess {
-                names.insert(0, "sntrup761x25519-sha512");
+                names.insert(0, "unknown-kex@zen.test");
             }
             let mut rest = r.rest().to_vec();
             if guess {
@@ -198,10 +208,11 @@ impl Client {
                     if self.ours.is_none() {
                         self.kexinit();
                     }
+                    let prop = kex::parse_kexinit(&p).map_err(|_| "client: a bad KEXINIT")?;
                     if self.sid.is_none() {
-                        let prop = kex::parse_kexinit(&p).map_err(|_| "client: a bad KEXINIT")?;
                         self.strict = self.opts.strict && prop.kex.contains(&kex::STRICT_S);
                     }
+                    self.server_host_algs = prop.host_key.iter().map(|n| n.to_string()).collect();
                     self.theirs = Some(p);
                     let (kx, q_c) = ClientKex::start(self.opts.kex);
                     self.send(&Writer::new(kex::MSG_KEX_INIT).string(&q_c).finish());
@@ -236,32 +247,61 @@ impl Client {
             self.ours.take().ok_or("no KEXINIT")?,
             self.theirs.take().ok_or("no KEXINIT")?,
         );
-        let h = kex::exchange_hash(&HashInput {
-            v_c: &self.vc,
-            v_s: self.vs.as_deref().ok_or("no version")?,
-            i_c: &ours,
-            i_s: &theirs,
-            k_s,
-            q_c: &q_c,
-            q_s,
-            k: &k,
-        });
+        let h = kex::exchange_hash(
+            self.opts.kex,
+            &HashInput {
+                v_c: &self.vc,
+                v_s: self.vs.as_deref().ok_or("no version")?,
+                i_c: &ours,
+                i_s: &theirs,
+                k_s,
+                q_c: &q_c,
+                q_s,
+                k: &k,
+            },
+        );
         let host = PublicKey::from_blob(k_s).map_err(|e| format!("client: host key: {e}"))?;
         if let Some(want) = &self.opts.host
             && *want != host
         {
             return Err("client: an unexpected host key".into());
         }
-        if !host.verify("ssh-ed25519", &h, sig) {
+        // RFC 4253 §7.1: the client's first choice the server offered.
+        let alg = self
+            .opts
+            .host_algs
+            .iter()
+            .copied()
+            .find(|a| self.server_host_algs.iter().any(|n| n == a.name()))
+            .ok_or("client: no host-key algorithm in common")?;
+        if host.algorithm() != alg.name() {
+            return Err("client: a host key of another algorithm".into());
+        }
+        if !host.verify(alg.name(), &h, sig) {
             return Err("client: a bad host key signature".into());
         }
+        self.host_algs_used.push(alg);
         let sid = self.sid.get_or_insert_with(|| h.to_vec()).clone();
         self.send(&[kex::MSG_NEWKEYS]);
         self.tx.set_keys(
-            Some(kex::keys(&k, &h, &sid, self.opts.cipher, true)),
+            Some(kex::keys(
+                self.opts.kex,
+                &k,
+                &h,
+                &sid,
+                self.opts.cipher,
+                true,
+            )),
             self.strict,
         );
-        self.rx_next = Some(kex::keys(&k, &h, &sid, self.opts.cipher, false));
+        self.rx_next = Some(kex::keys(
+            self.opts.kex,
+            &k,
+            &h,
+            &sid,
+            self.opts.cipher,
+            false,
+        ));
         for m in std::mem::take(&mut self.held) {
             self.send(&m);
         }
@@ -290,18 +330,19 @@ pub mod msg {
             .finish()
     }
 
-    /// A `publickey` request with an Ed25519 user key, signed or not.
+    /// A `publickey` request with a user key of either kind, signed or not.
     pub fn userauth_ed25519(sid: &[u8], user: &str, key: &HostKey, signed: bool) -> Vec<u8> {
         let blob = key.blob();
+        let alg = key.alg().name();
         let mut w = Writer::new(50);
         w.string(user.as_bytes())
             .string(b"ssh-connection")
             .string(b"publickey")
             .bool(signed)
-            .string(b"ssh-ed25519")
+            .string(alg.as_bytes())
             .string(&blob);
         if signed {
-            w.string(&key.sign(&signed_data(sid, user, "ssh-ed25519", &blob)));
+            w.string(&key.sign(&signed_data(sid, user, alg, &blob)));
         }
         w.finish()
     }
