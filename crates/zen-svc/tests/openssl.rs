@@ -258,8 +258,12 @@ fn s_client_tls12_every_suite_and_group() {
             assert_eq!(server.received, b"hello\nworld\n", "{suite} {group}");
             assert!(c.stdout.contains("hello\nworld\n"), "{}", c.stdout);
             assert!(c.stdout.contains("Extended master secret: yes"));
+            // OpenSSL 3.0 prints "Server Temp Key", later versions "Peer
+            // Temp Key".
             assert!(
-                c.stdout.contains(&format!("Server Temp Key: {temp}")),
+                ["Server", "Peer"]
+                    .iter()
+                    .any(|w| c.stdout.contains(&format!("{w} Temp Key: {temp}"))),
                 "{}",
                 c.stdout
             );
