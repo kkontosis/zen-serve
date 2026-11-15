@@ -36,6 +36,7 @@ Building blocks:
 | [`packages/fs`](packages/fs) | `@zen/fs`: a local replica of a filesystem tree (the node table, content on demand, offline writes), under `zen-mount` too ([`docs/CLIENT.md`](docs/CLIENT.md) §8) |
 | [`packages/loro`](packages/loro) | `@zen/loro`: [Loro](https://loro.dev) documents kept on a topic, with snapshots and offline edits ([`docs/DB.md`](docs/DB.md) §20) |
 | [`packages/svc`](packages/svc) | `@zen/svc`: handlers of relayed TCP services, each step in one transaction with the handler's writes, raw, behind `tls()` or behind `ssh()` ([`spec/svc.md`](spec/svc.md), [`docs/CLIENT.md`](docs/CLIENT.md) §11) |
+| [`packages/git`](packages/git) | `@zen/git`: `git-remote-zen` (`git clone zen://<host>/<fs>/<repo>`) and `zen-git`: git repositories in an encrypted fs, a push as one transaction ([`spec/git.md`](spec/git.md), [`docs/GIT.md`](docs/GIT.md)) |
 | [`apps/`](apps/) | Five example web apps (kanban, chat, booking, checkout, ledger), `hello`, `echo` (a relayed line service over raw TCP, TLS, SSH and `tcp-auth`) and `mail` (inbound SMTP, IMAP with IDLE, and an inbox page), on `@zen/db`, `@zen/fs`, `@zen/loro` and `@zen/svc` ([`docs/EXAMPLES.md`](docs/EXAMPLES.md), [`apps/README.md`](apps/README.md)) |
 | [`packages/fuse`](packages/fuse) | `zen-mount`: mounts a zen-serve filesystem as a local directory (FUSE) |
 | [`scripts/install-fdb.sh`](scripts/install-fdb.sh) | Installs the pinned FoundationDB release (sha256-checked) |
