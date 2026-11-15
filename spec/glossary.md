@@ -45,3 +45,7 @@
 | **reveal** | Sending an output record's key after its commit is known, so the server can write it (svc.md §5). |
 | **takeover** | Another handler continuing a live connection from its last committed step after the holder's lease ends (svc.md §6). |
 | **resumable** | A connection a step has marked safe to take over; fresh connections are always requeued, others are aborted (svc.md §6). |
+| **pack** | A git packfile: compressed objects with deltas, plus its `.idx`. In zen, a self-contained pack written once as two files of a repo's tree (git.md §2.2). |
+| **ref** | A git branch or tag name pointing at an oid. In zen, a row of the `git` database's `refs` table, changed by compare-and-set (git.md §3, §4). |
+| **remote helper** | A program git runs for a URL scheme it doesn't know: `git-remote-zen` for `zen://` (git.md §7). |
+| **mirror** | A local bare repository synced from zen and served by git's own `upload-pack` and `receive-pack`, whose `pre-receive` hook does the push's transaction (git.md §6). |

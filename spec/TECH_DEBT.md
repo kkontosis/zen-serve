@@ -539,3 +539,17 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * `chunks/get` fetched from a page
   * `zw.decodeChunks` timed in the worker
   Then a fix for the largest, with the bench as its check.
+
+## TD-GIT-SCOPE
+
+* **Status:** open
+* **Context:** Git over zen-serve (git.md) supports clone, fetch (shallow and partial ones too), push (`--force`, `--force-with-lease`, `--atomic`), deletes, tags, HEAD, and sha1 and sha256 repos. It doesn't support push options (`git push -o`), signed pushes (`--signed`), Git LFS, submodules as one unit, symbolic refs other than HEAD, or changing HEAD by a push (git.md §12).
+* **Why deferred:** None is needed to keep code in zen and push to it from stock git. Push options and signed pushes need `receive-pack` configuration and a place in the push's event; LFS needs a server of its own for large objects.
+* **What it would take:** Push options: `receive.advertisePushOptions`, and the options in the event (git.md §4). Signed pushes: `receive.certNonceSeed` per mirror, and the push certificate kept with the refs. LFS: an LFS endpoint in the local server storing objects as files of the repo's tree.
+
+## TD-GIT-REF-POLICY
+
+* **Status:** open
+* **Context:** Branch protection, force-push rules and protected tags are cooperative (git.md §10). The local server and the relayed service's handlers enforce a repo's rules for pushes through them, but a member with fs `write` can write any ref with a client of their own: refs are sealed rows, so the server can't read them to check a rule.
+* **Why deferred:** Enforcing them needs a party that can read refs and that every push must pass through. The server can't read them, and a handler as the only writer would take fs `write` away from members.
+* **What it would take:** Either a protected ref's row signed by a party the rules name (members' clients then refuse refs without a valid signature, which detects a rogue push rather than preventing it), or one fs per protection level, with only the handler holding `write` on the protected one.

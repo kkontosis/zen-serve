@@ -100,6 +100,7 @@ Every KDF context, AAD domain and signature purpose uses a unique label from thi
 | `zen/v1/sig/password-session` | password-derived key | sign-in challenge (formats.md §7.5, §10) |
 | `zen/v1/sig/db-root` | device | reserved: authenticated zen-db roots ride in device checkpoints (zendb.md §14, formats.md §14) |
 | `zen/v1/sig/fs-header` | admin identity | signed fs header (formats.md §12.1) |
+| `zen/v1/sig/git-ssh-key` | user identity | a member's SSH key in the relayed git service's `ssh_keys` table (git.md §8.2) |
 | `zen/v1/sig/app-bundle` | release key | reserved: a signed app bundle checked by a bootstrap service worker (milestone 11) |
 
 Signing with a purpose not in this table is an error.
