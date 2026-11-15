@@ -6,13 +6,16 @@
 // the hook as dist/zen-git.mjs, beside itself.
 //
 //   node scripts/build-zen-git.mjs
-import { chmod } from 'node:fs/promises';
+import { chmod, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = join(root, 'packages/git/dist');
+
+// The chunk's name is its hash: old ones would pile up.
+await rm(dist, { recursive: true, force: true });
 
 await build({
   entryPoints: {
