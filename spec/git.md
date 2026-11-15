@@ -51,7 +51,7 @@ Every repo of an fs is in one zen-db database of that fs, `ns = "git"` (zendb.md
 |---|---|---|
 | `repos` | `name` | `format` (`"sha1"` or `"sha256"`), `head` (a ref name, HEAD's target), `tree` (16 bytes), `next_seq` (u64), `created_ms`, `creator` (device id) |
 | `refs` | `[repo, ref]` | `oid` (bytes), `device` (the pusher's device id), `time_ms`, `seq` (the push's, below) |
-| `packs` | `[repo, hash]` | `seq` (u64), `size` (bytes), `objects` (count), `nodes` (`[pack, idx]` node ids), `state` (`"live"` or `"replaced"`), `replaced_ms`, `by` (the hash of the pack that replaced it), `of` (a repack's pack only: the hashes it rolled up, §9) |
+| `packs` | `[repo, hash]` | `seq` (u64), `size` (bytes), `objects` (count), `nodes` (`[pack, idx]` node ids), `state` (`"live"`, `"replaced"`, or `"pending"`: a repack's pack between its two commits, §9), `replaced_ms`, `by` (the hash of the pack that replaced it), `of` (a repack's pack only: the hashes it rolled up, §9) |
 
 * `refs` has a private index `by_repo` on `repo`, and `packs` a private index `live` on `[repo, state, seq]` (zendb.md §5.4). So one repo's refs are read without reading the others', and its live packs are one range read in `seq` order, without its replaced ones.
 * **The packs table is the pack manifest:** a repo with thousands of pushes lists its packs with that one range read, and repacks (§9) keep the live ones few. There is no other listing.
@@ -70,6 +70,7 @@ A push is cut as one pack (or none) and applied in one transaction:
    2. Each ref's current oid must equal the push's old value (the mirror's, which `receive-pack` gives the hook): absent for a new ref. If one differs, another push landed since the sync, and the hook refuses every ref it was given (`fetch first`).
    3. Write the pack's two files into the repo's tree, and put its `packs` row with `seq = next_seq`. Put the `repos` row with `next_seq + 1`.
       * **A known pack is skipped:** when the repo has a `packs` row of that hash, `live` or `replaced`, no files and no row are written (the refs still move). A replaced pack's objects are in a live pack, so the push adds nothing, and no two nodes get one name.
+      * **A `pending` row of that hash** (a repack's files of the same objects, §9) is made `live` with this push's `seq`: its files are already written.
    4. Put each updated `refs` row, or delete it for a deleted ref.
    5. Emit one event to the topic `("git", repo, "pushes")` (zendb.md §11.1):
       ```
@@ -162,14 +163,13 @@ Built in 10.4 (`zen-git worker`, `zen-git repack`).
   2. `git cat-file --batch-all-objects --batch-check` lists every object, which `git pack-objects --stdout` packs, never thin. Then `git index-pack` checks it and writes its `.idx`.
   3. Its object count must equal the number of distinct objects of the rolled-up packs, or the job stops with an error and changes nothing.
   4. Its two files go up under an upload session (§4 step 2).
-* **Its transaction** (refs don't change):
-  1. Read the rolled-up packs' rows. Every one must still be `live`, or the job is refused (`the packs changed`), with nothing changed; the uploaded files are dropped.
-  2. Mark each `replaced`, with `replaced_ms` (now) and `by` (the new hash).
-  3. Write the new pack's files and put its row: `live`, `seq` = the highest rolled-up `seq`, `of` = the rolled-up hashes. If a row of its hash exists already (the same objects, pushed), only the marks are written.
-  4. Schedule a `gc` message (zendb.md §12.4, `tx.schedule`) to `("git", "repack")`, due after the grace (24 h by default): `{1: repo, 2: [hash], 3: [node]}`, the replaced packs' hashes and their files' nodes.
-  5. Commit. A push committed meanwhile doesn't conflict with it, since the job reads only the rows it replaces.
-* **Gc:** at the `gc` message the job moves the listed nodes to the tree's `TRASH` (fs.md §6), which the sweeper purges after its horizon, and deletes the listed rows that are still `replaced`, in one transaction. Until then, a fetch that listed the replaced packs before the repack still finds them; after it, such a fetch re-reads the state (§5).
-* **A job that stops** (a crash, a kill) after its upload changes nothing: its upload session's chunks are released when the session ends (api.md §12.1). Its message, not acknowledged, is redelivered to the next job once the lease lapses.
+* **Two commits** (refs don't change). Every commit with tree operations serializes at the tree's header (fs.md §7), pushes included, so the one that writes the files is kept short and the one that changes many rows has no tree operations. Under a steady stream of pushes, a single commit doing both kept losing to them (the bench, docs/MILESTONE-10.md step 10.4).
+  1. **The files' commit:** if the repo has no row of the new hash, write the new pack's files and put its row as `pending` (`seq` = the highest rolled-up `seq`, `of` = the rolled-up hashes), and schedule a `gc` message for it after the grace (zendb.md §12.4, `tx.schedule`). A conflict retries this commit alone, not the build. A `pending` row there already means another job is repacking: the job is refused (`the packs changed`).
+  2. **The rows' commit:** read the rolled-up packs' rows. Every one must still be `live`, or the job is refused (`the packs changed`), with nothing changed but the `pending` row, which its gc removes. Mark each `replaced`, with `replaced_ms` (now) and `by` (the new hash). Make the new row `live`. Schedule a `gc` message to `("git", "repack")`, due after the grace (24 h by default): `{1: repo, 2: [hash]}`, the replaced packs' hashes.
+  3. A push committed meanwhile doesn't conflict with the rows' commit, since it has no tree operations and reads only the rows it replaces.
+* **Gc:** at a `gc` message the job takes the listed rows that are still `replaced` or `pending`, moves their files' nodes to the tree's `TRASH` (fs.md §6), which the sweeper purges after its horizon, and deletes those rows, in one transaction. A `live` row is left alone, so the gc a files' commit schedules does nothing once its rows' commit landed. Until then, a fetch that listed the replaced packs before the repack still finds them; after it, such a fetch re-reads the state (§5).
+* **A job that stops** (a crash, a kill) after its upload changes nothing: its upload session's chunks are released when the session ends (api.md §12.1). One that stops between its two commits leaves a `pending` row, which no reader lists and its gc removes. Its message, not acknowledged, is redelivered to the next job once the lease lapses.
+* **The lease:** the client renews a group's lease only between deliveries, so the job renews it every 3 s while it works; a large roll-up outlasts the 10 s lease.
 * **The scheduler** (zendb.md §12.4) delivers the `gc` message. It runs in the job's database, and leads through the topic `("zen", "db", "git", "sched")`, so the job's member needs rights there (§10).
 * In the spike, 585 small packs rolled up into one in 0.94 s (`git repack --geometric=2`).
 
