@@ -69,7 +69,8 @@ describe('read-ahead', () => {
     const maxChunk = 90_000;
     for (const offset of [0, 5 * MiB + 12_345]) {
       const parts: Uint8Array[] = [];
-      for await (const p of ufs.tree(id).readStream(f, { offset })) parts.push(p);
+      const reader = ufs.tree(id).readStream(f, { offset }).getReader();
+      for (let x = await reader.read(); !x.done; x = await reader.read()) parts.push(x.value);
       let want = 64 << 10;
       for (const [i, p] of parts.entries()) {
         const last = i === parts.length - 1;
