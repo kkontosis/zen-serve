@@ -430,6 +430,27 @@ describe('zen-git worker', () => {
     const m = freshMirror();
     const read: Uint8Array[] = [];
     const fs = counting(afs, read);
+    // Bench: the repack group's committed cursor, polled.
+    const cursors: { at: number; c: string }[] = [];
+    let polling = !!BENCH;
+    const poll = (async () => {
+      if (!polling) return;
+      const topic = adb.topic('git', 'repack');
+      const c = await topic.group(topic.keysAt(topic.fs.keys.epoch).groupId('repack'), {
+        mode: 'sequential',
+      });
+      while (polling) {
+        try {
+          cursors.push({
+            at: Date.now(),
+            c: Buffer.from((await c.cursor()).cursor).toString('hex'),
+          });
+        } catch (e) {
+          cursors.push({ at: Date.now(), c: `error ${(e as Error).message}` });
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    })();
     const t0 = performance.now();
     let maxLive = 0;
     const readMs: number[] = [];
@@ -444,6 +465,19 @@ describe('zen-git worker', () => {
       if (i === 9) await syncRepo(m, { db: adb, fs }, 'many');
     }
     const pushS = (performance.now() - t0) / 1000;
+    polling = false;
+    await poll;
+    if (BENCH) {
+      let best = { n: 0, i: 0 };
+      for (let i = 0, n = 1; i < cursors.length; i++, n++) {
+        if (i > 0 && cursors[i]!.c !== cursors[i - 1]!.c) n = 1;
+        if (n > best.n) best = { n, i };
+      }
+      const c = cursors[best.i];
+      console.log(
+        `bench: cursor polls ${cursors.length}; the longest unchanged ${best.n} polls (${best.n * 2} s), at ${c?.c} until ${c?.at}`,
+      );
+    }
     await until(
       async () => (await readState(adb, 'many')).packs.length <= REPACK_AT,
       120_000,
@@ -534,7 +568,7 @@ describe('zen-git worker', () => {
             const inside = all.filter((x) => at(x) >= from && at(x) <= to);
             return [
               `trace: ${tr.length} handled, the largest gap ${gap} ms, with ${inside.length} lines:`,
-              ...inside.slice(0, 30),
+              ...inside.slice(0, 60),
             ].join('\n');
           })(),
         ].join('\n'),

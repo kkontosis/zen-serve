@@ -65,8 +65,10 @@ export async function runWorker(o: WorkerOptions): Promise<void> {
         try {
           const r = await f.apply(this, args);
           const n = Array.isArray(r) ? ` ${r.length} events` : '';
-          if (Date.now() - t0 > 500 || name === 'lease')
-            log(`trace: ${t0} ${name}${n} ${Date.now() - t0} ms`);
+          const g = Buffer.from((this as { group: Uint8Array }).group)
+            .toString('hex')
+            .slice(0, 6);
+          log(`trace: ${t0} ${name} ${g}${n} ${Date.now() - t0} ms`);
           return r;
         } catch (e) {
           log(`trace: ${t0} ${name} failed after ${Date.now() - t0} ms: ${errText(e)}`);
@@ -87,6 +89,7 @@ export async function runWorker(o: WorkerOptions): Promise<void> {
           const body = msg.body as Map<Value, Value>;
           const repo = body.get(1) as string;
           const h0 = performance.now();
+          if (trace) log(`trace: ${Date.now()} start ${msg.type} ${repo}`);
           let saw = '';
           if (msg.type === REPACK_EVENT) {
             const t0 = performance.now();
