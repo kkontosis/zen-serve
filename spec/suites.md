@@ -29,3 +29,23 @@ Every stored object records a one-byte suite id right after `format_version`. A 
 | Signature | ML-DSA-87 + ECDSA P-384 |
 
 This suite is realistic only for native clients using a FIPS-validated module (e.g. `aws-lc-rs` in FIPS mode). Readers must currently reject suite id 2.
+
+## Post-quantum status
+
+Which surfaces resist a large quantum computer, and with what. A **hybrid** pairs a post-quantum algorithm with a classical one, so an attacker must break both; "harvest now, decrypt later" means traffic recorded today and decrypted once such a computer exists.
+
+| Surface | Protected by | Post-quantum |
+|---|---|---|
+| Keys at rest: keyslots, device and inbox keys | X-Wing (ML-KEM-768 + X25519, suite 1) | yes, hybrid |
+| Identities and signatures: devices, ACL, ops, method 6's password key | Ed25519 + ML-DSA-65 (suite 1) | yes, hybrid; both must verify |
+| Sign-in: methods 1 (device keys) and 6 (password-derived keys) | the identity's hybrid signature (auth.md §11) | yes |
+| TLS key exchange, native TLS (operations.md §8) | `X25519MLKEM768` | yes, hybrid, for clients that offer it (current browsers, Node, zen clients); others fall back to `X25519` |
+| SSH key exchange (svc.md §7.2) | `mlkem768x25519-sha256`, `sntrup761x25519-sha512` | yes, hybrid, for OpenSSH 9.0 and later; older clients get `curve25519-sha256` |
+| SSH host keys and user keys (svc.md §7.2) | `ssh-mldsa44-ed25519` | yes, hybrid, where the service holds one and the client asks for it (OpenSSH 10.6 and later), and for user keys of that type; `ssh-ed25519` and `ssh-rsa` stay classical |
+
+**What stays classical, and why:**
+* **Passkeys** (method 2): WebAuthn authenticators sign with ES256, Ed25519 or RSA; there is no post-quantum authenticator algorithm to ask for (auth.md §7.6).
+* **OPAQUE** (method 3): ristretto255 is a classical group. A recorded sign-in also needs its TLS session broken first, which native TLS's hybrid prevents; behind a proxy that terminates TLS classically, that protection is gone (auth.md §8.7).
+* **TLS client certificates** (method 5): the certificate's key and the handshake signature are classical (auth.md §10.5).
+* **TLS server certificates**: the WebPKI issues classical certificates. A forged certificate needs a quantum computer at the time of the attack (an active attacker), not a recording, so this is no harvest-now risk.
+* **SSH clients without the hybrids**: OpenSSH before 9.0, and other clients that offer only `curve25519-sha256`; and SSH sessions authenticated by classical host or user keys, where an active attacker with a quantum computer could forge the signatures (the key exchange still protects recorded traffic).

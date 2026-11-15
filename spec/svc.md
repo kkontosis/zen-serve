@@ -213,11 +213,11 @@ dir = { seq: uint,            // the next record's sequence number
 The SSH engine (`engine: "ssh"`) is an SSH-2 server (RFC 4251–4254) in the handler. It is its own implementation, without a library's hidden state, so its whole state serializes at every packet boundary, a key exchange in progress included.
 
 **Algorithms.**
-* Key exchange: `mlkem768x25519-sha256` (draft-ietf-sshm-mlkem-hybrid-kex) and `curve25519-sha256` (RFC 8731, also under its old name `curve25519-sha256@libssh.org`).
-* Host key: `ssh-ed25519` (RFC 8709). One host key per service.
+* Key exchange, preferred first: `mlkem768x25519-sha256` (draft-ietf-sshm-mlkem-hybrid-kex), `sntrup761x25519-sha512` (draft-ietf-sshm-ntruprime-ssh, also under its old name `sntrup761x25519-sha512@openssh.com`), and `curve25519-sha256` (RFC 8731, also under its old name `curve25519-sha256@libssh.org`). The first two are post-quantum hybrids; OpenSSH has sntrup761x25519 from 9.0 and mlkem768x25519 from 9.9.
+* Host keys: `ssh-mldsa44-ed25519` (ML-DSA-44 and Ed25519 composite signatures, as OpenSSH 10.6 implements draft-miller-sshm-mldsa44-ed25519-composite-sigs-00) and `ssh-ed25519` (RFC 8709). A service holds at least one host key and at most one of each kind, and offers the hybrid first. The first key exchange fixes the connection's host-key algorithm: the client's first choice among those held; rekeys offer only that one.
 * Ciphers: `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`, both AEAD. Compression: `none`.
 * MACs: `hmac-sha2-256-etm@openssh.com` and `hmac-sha2-256` are offered so that negotiation succeeds, but never used: with an AEAD cipher there is no MAC.
-* User keys: `ssh-ed25519`, and `ssh-rsa` keys signing with `rsa-sha2-256` or `rsa-sha2-512` (RFC 8332), within the RSA key policy (a 2,048 to 4,096-bit modulus, an odd exponent of at least 65,537). `ssh-rsa` signatures (SHA-1) are refused, and so are other key types.
+* User keys: `ssh-mldsa44-ed25519` (both halves must verify), `ssh-ed25519`, and `ssh-rsa` keys signing with `rsa-sha2-256` or `rsa-sha2-512` (RFC 8332), within the RSA key policy (a 2,048 to 4,096-bit modulus, an odd exponent of at least 65,537). `ssh-rsa` signatures (SHA-1) are refused, and so are other key types.
 
 **The version exchange.** The engine sends `SSH-2.0-<software>` (default `zen`) and its first KEXINIT at once: the server speaks first. It accepts a client line `SSH-2.0-…` or `SSH-1.99-…` of at most 255 bytes with its CR LF (a bare LF is accepted too), after at most 20 other lines, which are ignored. The two version lines go into every exchange hash, so they stay in the state.
 
@@ -229,11 +229,12 @@ The SSH engine (`engine: "ssh"`) is an SSH-2 server (RFC 4251–4254) in the han
 
 **Key exchange.**
 * KEXINIT negotiation as RFC 4253 §7.1. A client KEXINIT larger than 8,192 bytes is refused. A wrong guess (`first_kex_packet_follows`) makes the engine ignore the client's next packet.
-* `curve25519-sha256`: the shared secret K is encoded as an mpint. `mlkem768x25519-sha256`: the client's init is its ML-KEM-768 encapsulation key (1,184 bytes) followed by its X25519 key (32); the server's reply is the ML-KEM ciphertext (1,088 bytes) followed by its X25519 key; K = SHA-256(ML-KEM shared secret ‖ X25519 shared secret), encoded as a string. Both refuse an all-zero X25519 result.
-* The exchange hash and the keys are those of RFC 4253 §7.2 and §8 with SHA-256. The first exchange hash is the session id.
+* `curve25519-sha256`: the shared secret K is encoded as an mpint. `mlkem768x25519-sha256`: the client's init is its ML-KEM-768 encapsulation key (1,184 bytes) followed by its X25519 key (32); the server's reply is the ML-KEM ciphertext (1,088 bytes) followed by its X25519 key; K = SHA-256(ML-KEM shared secret ‖ X25519 shared secret), encoded as a string. `sntrup761x25519-sha512`: the client's init is its sntrup761 public key (1,158 bytes) followed by its X25519 key (32); the server's reply is the sntrup761 ciphertext (1,039 bytes) followed by its X25519 key; K = SHA-512(sntrup761 shared secret ‖ X25519 shared secret), encoded as a 64-byte string. An init of any other length is refused, and all three refuse an all-zero X25519 result.
+* The exchange hash and the keys are those of RFC 4253 §7.2 and §8, with the method's hash: SHA-256, or SHA-512 for `sntrup761x25519-sha512`. The first exchange hash is the session id, 32 or 64 bytes; it stays the session id through rekeys of any method.
+* **Host-key signatures.** `ssh-ed25519` signs the exchange hash as RFC 8709. `ssh-mldsa44-ed25519`: the public key blob is string(`ssh-mldsa44-ed25519`) ‖ string(ML-DSA-44 public key (1,312 bytes) ‖ Ed25519 public key (32)). To sign data D, both halves sign M′ = `CompositeAlgorithmSignatures2025` ‖ `COMPSIG-MLDSA44-Ed25519-SHA512` ‖ 0x00 ‖ SHA-512(D): ML-DSA-44 (FIPS 204, hedged) with the context string `COMPSIG-MLDSA44-Ed25519-SHA512`, and Ed25519. The signature blob is string(`ssh-mldsa44-ed25519`) ‖ string(ML-DSA-44 signature (2,420 bytes) ‖ Ed25519 signature (64)), of exactly that length. A verifier checks both halves, Ed25519 strictly (canonical encodings, no small-order keys), as for `ssh-ed25519`. The same applies to user keys' signatures (Authentication, below). Its `openssh-key-v1` private key is string(the public key) ‖ string(ML-DSA-44 seed ξ (32) ‖ Ed25519 seed (32)), and the ML-DSA key is FIPS 204's KeyGen_internal(ξ).
 * **The server's ephemeral secrets never persist.** The engine computes its reply in the step that receives the client's init and forgets them; what persists is the new keys, the session id, and the client's keys waiting for its NEWKEYS.
 * **Strict key exchange** (`kex-strict-s-v00@openssh.com`, against CVE-2023-48795) is on when the client's first KEXINIT offers `kex-strict-c-v00@openssh.com`. Then the client's KEXINIT must be its first packet; any message other than KEXINIT, the kex method's and NEWKEYS during the first key exchange ends the connection; and each direction's sequence number restarts at 0 after every NEWKEYS, in that direction. Without strict kex, IGNORE, DEBUG and UNIMPLEMENTED are accepted anywhere, and other unexpected messages during a key exchange get UNIMPLEMENTED.
-* **EXT_INFO** (RFC 8308): right after its first NEWKEYS, if the client's first KEXINIT offers `ext-info-c`, the engine sends `server-sig-algs` = `ssh-ed25519,rsa-sha2-256,rsa-sha2-512`.
+* **EXT_INFO** (RFC 8308): right after its first NEWKEYS, if the client's first KEXINIT offers `ext-info-c`, the engine sends `server-sig-algs` = `ssh-mldsa44-ed25519,ssh-ed25519,rsa-sha2-256,rsa-sha2-512`.
 * **Rekeying.** A client KEXINIT starts a new key exchange at any time after the first. The engine starts one itself after 2^30 bytes in either direction, 2^31 packets, or an hour (the defaults) since the last one ended. From its KEXINIT to its NEWKEYS it sends only transport and key-exchange messages; other output waits in the state (below).
 * **A key exchange the server started, behind unread data.** While the engine waits for the client's key-exchange messages and its input is held back by the read bound (below), it decrypts ahead through the input it was given, without consuming it, and processes the client's KEXINIT and init there. It then replies and sends NEWKEYS, remembering the two sequence numbers it handled; when in-order processing reaches them, the two packets are skipped. So output held during the key exchange never waits on input that waits on that output.
 
@@ -266,7 +267,8 @@ The SSH engine (`engine: "ssh"`) is an SSH-2 server (RFC 4251–4254) in the han
   vs: bytes,                  // the server's version line, without CR LF
   vc?: bytes,                 // the client's, once received
   lines: uint,                // lines ignored before it
-  sid?: bytes,                // the session id, after the first key exchange
+  sid?: bytes,                // the session id (32 or 64 bytes), after the first key exchange
+  hk?: uint,                  // the host-key algorithm, once the first KEXINITs are negotiated: 1 ssh-mldsa44-ed25519, 2 ssh-ed25519
   strict: bool,               // strict key exchange
   tx: dir, rx: dir,           // the server's sending and receiving directions
   rx_next?: keys,             // the client's next keys, until its NEWKEYS
@@ -284,7 +286,7 @@ keys = { c: uint,             // 1 chacha20-poly1305, 2 aes256-gcm
          key: bytes,          // 64 or 32 bytes
          iv?: bytes }         // aes256-gcm: 12 bytes, its counter included
 kex  = { ours?: bytes, theirs?: bytes,   // the KEXINIT payloads, until the reply
-         alg?: uint, c2s?: uint, s2c?: uint,  // negotiated: 1 mlkem768x25519, 2 curve25519; ciphers as keys.c
+         alg?: uint, c2s?: uint, s2c?: uint,  // negotiated: 1 mlkem768x25519, 2 curve25519, 3 sntrup761x25519; ciphers as keys.c
          replied: bool, skip: bool,       // skip: ignore the client's next packet (a wrong guess)
          ahead?: [uint, uint] }           // sequence numbers handled ahead of order
 chan = { id: uint, peer: uint, peer_window: uint, peer_max: uint,
@@ -294,7 +296,7 @@ chan = { id: uint, peer: uint, peer_window: uint, peer_max: uint,
          req?: uint,                      // 1 exec, 2 shell, 3 subsystem (the command or name is in the event only)
          exit?: uint, flags: uint }       // 1 EOF in, 2 CLOSE in, 4 EOF wanted, 8 EOF sent, 16 CLOSE wanted, 32 CLOSE sent
 ```
-* A state whose `v` the engine doesn't know, or whose fields have the wrong types or lengths or exceed the bounds above, is refused; the runtime then releases the connection with `close`.
+* A state whose `v` the engine doesn't know, or whose fields have the wrong types or lengths or exceed the bounds above, is refused; the runtime then releases the connection with `close`. So is one whose `hk` names a host key the restoring handler's service doesn't hold, or that lacks `hk` while a negotiated key exchange or a session id is present.
 * Keys are in the state, so a rotation doesn't protect a live SSH session (§8); a handler can rekey it.
 
 ## 8. Epochs and delegation
