@@ -124,6 +124,66 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
   * **Go** (the user, after compacting): the 17:46 check-in was already cancelled. Restarted from main by fast-forward (ce0cdf3, PR #84's merge); this file copied to `docs/MILESTONE-10.md`, which brings in the lines since cce7379. Step 10.2 planned in detail below ("Step 10.2 in detail").
 * **Step 10.2** (the git spike and spec/git.md):
   * Planned in detail (below), committed, a new PR opened. Next, on the user's "go": the spike (item 1), then the `spec:` commit and the log, as "Step 10.2 in detail" says.
+  * Committed cd238cb and pushed; PR #85 opened and subscribed. **CI green on both runs of cd238cb** (push 43740993559 and pull_request 43741014251); PR #85 mergeable (clean). A safety-net check-in is set for 18:16 UTC (trig_01Xfk3o2VkSNh8MFecG726KL); plan mode was on, so it wasn't cancelled.
+  * **On approval of this plan (it is the "go" for step 10.2):**
+    1. Cancel the 18:16 check-in (CI is already green).
+    2. Run the spike (item 1 of "Step 10.2 in detail"), logging each answer's commands and numbers here.
+    3. Write the `spec:` commit (item 2), copy this file to `docs/MILESTONE-10.md`, push, and confirm CI green on both runs.
+  * **Approved** (the user); the 18:16 check-in cancelled. **The spike** (the scratchpad's `git-spike/`, real git 2.43.0, Node 22; a directory per repo stood in for the fs, with `packs/<random id>.pack|.idx`, a `db.json` of refs and packs changed by compare-and-set under a lock, and a `pushes.log` for the emit):
+    * **Item 1, the helper's model:** both prototypes of `git-remote-zen` were run through one feature matrix (`matrix.sh a|b sha1|sha256`, 25 checks, plus 4 on the hook for (b)):
+      * **(b) a hidden local mirror behind `connect`: 29 of 29**, with sha1 and with sha256, with this machine's git config and with an empty one (as CI's), over protocol v2 and v0. clone (HEAD, tags, object format, `fsck --strict`), fetch, fast-forward push, non-fast-forward refused, `--force`, `--force-with-lease` (a stale lease refused), deleting a branch (seen by `fetch --prune`), `--atomic` with one non-fast-forward ref (nothing pushed), two concurrent pushes (exactly one wins; the loser's `pull --rebase` and push work), **`clone --depth 1` (shallow) and `clone --filter=blob:none` (5 blobs missing: partial)**, a push of known objects only (no pack), and a refusing hook (zen, the mirror's refs and its objects unchanged).
+      * **(a) packs as files (`fetch`/`push`): 23 of 25.** Everything above but shallow and partial clones: git sends `option depth 1` and `option filter blob:none`, the helper answers `unsupported`, and **git silently fetches everything**. Force-with-lease works through `option cas`. Making them work would mean computing reachability on the client from whole packs, which is a fetch anyway.
+      * **Protocol v2 over `connect`:** git gives a `connect` helper no `GIT_PROTOCOL` (its env was dumped), so `upload-pack` speaks v0 unless the helper starts it with `GIT_PROTOCOL=version=2`, which git's client then detects. Without it, `push.negotiate=true` (set in this machine's global config) fails with "--negotiate-only requires protocol v2" (a warning; the push goes on).
+      * **Git sets `GIT_DIR` for the helper,** which overrides `git -C <mirror>`: every git command on the mirror runs with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and the like removed.
+      * **The mirror is one per repo URL** (a hash of it), not per remote name: a clone and an `ls-remote` of the same URL under two names made two mirrors.
+      * **The choice: (b).** It keeps every feature tested, it is the local server's core too (10.5), and its pushes go through `git receive-pack`, so git's own checks (fast-forward, atomic, leases) are real ones. Its costs are below.
+    * **Item 3, numbers on this repo's full history** (585 commits, 5,326 objects, 4.78 MiB as one pack; the session's checkout is shallow, so a full `--bare` clone into the scratchpad):
+      * **One push per commit** (585 pushes, topo order, model (a)'s cut): 585 packs, **24.7 MB, 5.2× the one pack** (no deltas across pushes), 109 ms per push here. Every 6th commit: 98 packs, 16.4 MB; every 58th: 11 packs, 7.6 MB.
+      * **Clones** (plain `git clone --bare file://` of the one pack: 0.33 s, 4 MB):
+
+        | packs | (a) | (b) | (a) disk | (b) disk: mirror + clone |
+        |---|---|---|---|---|
+        | 1 | 0.40 s | 0.51 s | 4 MB | 4 + 4 MB |
+        | 11 | 0.78 s | 0.68 s | 8 MB | 8 + 4 MB |
+        | 98 | 1.88 s | 1.03 s | 17 MB | 17 + 4 MB |
+        | 585 | 7.30 s | 1.69 s | 30 MB | 28 + 3 MB |
+
+        (a) grows with the pack count (an `index-pack --strict` per pack); (b) copies the packs into the mirror and `upload-pack` sends the clone one pack.
+      * **Memory:** the largest process in every clone is the helper's Node (47 to 58 MB peak RSS, most of it Node's own baseline); git's processes stay below it (a plain clone's largest is 12.7 MB).
+      * **The mirror repacks itself:** `git repack -a -d` in the 585-pack mirror took 1.08 s and left 4 MB; push and fetch kept working, since the mirror records which zen packs it has imported by their ids, not by its own files.
+      * **Content-defined chunking on packs** (a gear CDC shaped like the fs defaults, 8 KiB min, ~32 KiB average, 88 KiB max): a full repack shares **5.5%** of its bytes with the 585 small packs it replaces, and **21%** with the full repack of the same repo 10 commits earlier (with or without `-f`). So CDC (the fs default) helps a little, and rewriting the whole history on each repack is the cost to avoid.
+      * **A geometric repack** (`git repack --geometric=2 -d`) rolled the 585 small packs into one (3.6 MB) in 0.94 s. Later small packs then roll up with each other, and the large pack is rewritten only when the small ones add up to its size: the policy for 10.4.
+    * **Item 2, cutting a pack:** `pack-objects --revs --stdout` of `main ^main~20` held exactly the 1,071 objects `rev-list --objects` lists. A `--thin` pack is refused by `index-pack --strict --stdin` ("pack has 38 unresolved deltas"). A pack cut against an older tip is valid and only larger. **`index-pack --strict` needs the objects the pack builds on in its repository** ("did not receive expected object" in an empty one), and **git 2.43 segfaults running it outside any repository**. So a reader imports packs in their push order, or indexes them without `--strict` and checks connectivity once at the end.
+    * **Item 4, the `pre-receive` hook:** it ran with the new objects in the quarantine (`objects/tmp_objdir-incoming-…`), readable by `pack-objects`, with the push's `old new ref` lines on stdin (the mirror's refs, so they are the compare-and-set's old values). A refusing hook left no refs and no objects. **The window after the hook:** with the mirror's `refs/heads/main.lock` held, zen committed the push and git then reported `failed to update ref` to the client, though the push had happened; the next sync moved the mirror to zen's tip. A `reference-transaction` hook at `prepared` holds the ref locks, but it runs once per ref unless the push is `--atomic`, which would split one push into several zen commits. So the hook stays `pre-receive`, and the helper holds the mirror exclusively for the whole `receive-pack`, which leaves only a crash or a full disk in that window.
+    * **Item 5, HTTP and SSH to a mirror:** `git http-backend` behind 40 lines of Node (CGI env, `Git-Protocol` passed through) served clone, fetch (protocol v2) and push; a wrong token got 401 and a foreign `Host` 421. Over SSH, git runs `ssh -o SendEnv=GIT_PROTOCOL -p <port> git@<host> "git-upload-pack '/repo.git'"`, so protocol v2 needs the server to accept an `env` request for `GIT_PROTOCOL`. The SSH engine has no `env` request handling yet, so stock git gets v0 there, which works; 10.5 adds `env` for `GIT_PROTOCOL` only.
+    * **Also checked:** `git push -o ci.skip` is refused ("the receiving end does not support push options") and `git push --signed` too ("the receiving end does not support --signed push"); `--signed=if-asked` pushes unsigned. Both are listed in git.md §12 and TD-GIT-SCOPE.
+  * **`spec:` 146a687:**
+    * spec/git.md:
+      * §1, the three ways in
+      * §2, a repo: names, a tree per repo, packs under git's names, the object format
+      * §3, the `git` database: `repos`, `refs` and `packs`, `authenticated` by default
+      * §4, a push as one transaction
+      * §5, a fetch as a sync of the mirror
+      * §6, the mirror
+      * §7, `git-remote-zen`
+      * §8, the local server and the relayed service
+      * §9, repack and gc
+      * §10, rights
+      * §11, what the server sees
+      * §12, what isn't supported
+    * Also: the index row, four glossary terms, the label `zen/v1/sig/git-ssh-key` (members sign their own SSH keys for the relayed service), and TD-GIT-SCOPE and TD-GIT-REF-POLICY.
+    * **Changes from the plan:**
+      * **Packs keep git's names** (`objects/pack/pack-<hash>.pack`), not random ids. Node names are sealed in node metadata (fs.md §1), so the server never sees them, and the plan's worry about a pack hash in the clear doesn't apply.
+      * **Each repo has a tree of its own,** so pushes to different repos don't serialize on one tree's header (fs.md §7). The cost, in §11: the server can tell repos apart, though not their names.
+      * **`packs.seq`** orders a repo's packs, so a sync imports them oldest first for `index-pack --strict`. Repacks roll up only the newest packs (geometric, factor 2), which keeps that order.
+      * **A push conflicting only on the `repos` row is retried by the hook** (two pushes to different branches); one conflicting on a ref is refused.
+      * **The mirror is per user, not per clone** (`$XDG_CACHE_HOME/zen-git/<fs>/<repo>.git`), so clones on one machine share it. It is locked exclusively for a sync and a `receive-pack`, shared for an `upload-pack`, and repacks itself past 16 packs.
+    * `npm run check` passes.
+  * **What this changes for the later steps:**
+    * **10.3:** `git-remote-zen` is model (b), `connect` to a mirror, and the hook is §4's transaction. `fetch`/`push` over packs isn't built.
+    * **10.4:** the repack is §9's geometric roll-up.
+    * **10.5:** the SSH engine learns an `env` request for `GIT_PROTOCOL` only (svc.md §7.2), and the HTTP side is `git http-backend` behind the server (item 5's 40 lines).
+    * **10.5 and 10.6 share 10.3's mirror code.**
 
 ## Steps (one PR each; each planned in detail before it starts)
 
