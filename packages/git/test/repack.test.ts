@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UnlockedFs } from '@zen/client';
-import { type Db, decodeMsg } from '@zen/db';
+import type { Db } from '@zen/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { until } from '../../../apps/shared/harness.js';
 import type { WorkerContext } from '../../../apps/shared/node.js';
@@ -327,32 +327,34 @@ describe('a repack (§9)', () => {
     expect(await t.g('bob', ['rev-parse', 'HEAD'], 'during')).toBe(l.tip);
   });
 
-  it('two repacks at once: one commits, the other is refused; nothing is lost', async () => {
+  it('two repacks at once: the later one commits, the first is refused; nothing is lost', async () => {
     const l = await seeded('twice', 6);
-    let waiting = 0;
-    let open!: () => void;
-    const both = new Promise<void>((r) => {
-      open = r;
-    });
-    const barrier = async () => {
-      if (++waiting === 2) open();
-      await both;
-    };
-    // bob repacks too, through a database instance of his own.
+    // bob repacks too, through a database instance of his own, while the
+    // first repack waits after its upload: over one more push, so his run
+    // (and his pack) differs.
     const bob = await t.signIn('bob');
+    let second: Awaited<ReturnType<typeof repack>> | undefined;
     try {
       const bdb = await bob.open('git', DB_OPTS);
-      const rs = await Promise.all([
-        repack(adb, afs, 'twice', { min: 1, afterUpload: barrier }),
-        repack(bdb, bob.fs, 'twice', { min: 1, afterUpload: barrier }),
-      ]);
-      expect(rs.filter((r) => r.ok)).toHaveLength(1);
-      expect(rs.find((r) => !r.ok)).toEqual({ ok: false, why: 'the packs changed' });
+      const first = await repack(adb, afs, 'twice', {
+        min: 1,
+        afterUpload: async () => {
+          await l.commitAndPush();
+          second = await repack(bdb, bob.fs, 'twice', { min: 1 });
+        },
+      });
+      expect(second).toMatchObject({ ok: true, rolled: 7 });
+      expect(first).toEqual({ ok: false, why: 'the packs changed' });
     } finally {
       await bob.close();
     }
     const st = await readState(adb, 'twice');
     expect(st.packs).toHaveLength(1);
+    // The refused repack's files stay `pending` until their gc.
+    const pending = (await allPacks(adb, 'twice')).filter((p) => p.state === 'pending');
+    expect(pending).toHaveLength(1);
+    expect(await collect(adb, afs, gcMsg('twice', [pending[0]!.hash]))).toBe(1);
+    expect((await allPacks(adb, 'twice')).some((p) => p.state === 'pending')).toBe(false);
     await t.g('bob', ['clone', '-q', t.url('twice'), 'twice']);
     await t.g('bob', ['fsck', '--strict', '--no-dangling'], 'twice');
     expect(await t.g('bob', ['rev-parse', 'HEAD'], 'twice')).toBe(l.tip);
@@ -411,11 +413,14 @@ describe('zen-git worker', () => {
     expect((await allPacks(adb, 'kill')).length).toBe(REPACK_AT + 1);
 
     // The message, never acknowledged, goes to the next worker once the lease lapses.
-    worker = t.spawnZenGit(
-      'alice',
-      ['worker', t.fsUrl, '--grace', '3s', '--publish', `pubrepo=${join(pub, 'git')}`],
-      BENCH ? { ZEN_GIT_TRACE: '1' } : {},
-    );
+    worker = t.spawnZenGit('alice', [
+      'worker',
+      t.fsUrl,
+      '--grace',
+      '3s',
+      '--publish',
+      `pubrepo=${join(pub, 'git')}`,
+    ]);
     await until(
       async () =>
         (await readState(adb, 'kill')).packs.length <= REPACK_AT &&
@@ -430,27 +435,6 @@ describe('zen-git worker', () => {
     const m = freshMirror();
     const read: Uint8Array[] = [];
     const fs = counting(afs, read);
-    // Bench: the repack group's committed cursor, polled.
-    const cursors: { at: number; c: string }[] = [];
-    let polling = !!BENCH;
-    const poll = (async () => {
-      if (!polling) return;
-      const topic = adb.topic('git', 'repack');
-      const c = await topic.group(topic.keysAt(topic.fs.keys.epoch).groupId('repack'), {
-        mode: 'sequential',
-      });
-      while (polling) {
-        try {
-          cursors.push({
-            at: Date.now(),
-            c: Buffer.from((await c.cursor()).cursor).toString('hex'),
-          });
-        } catch (e) {
-          cursors.push({ at: Date.now(), c: `error ${(e as Error).message}` });
-        }
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-    })();
     const t0 = performance.now();
     let maxLive = 0;
     const readMs: number[] = [];
@@ -465,19 +449,6 @@ describe('zen-git worker', () => {
       if (i === 9) await syncRepo(m, { db: adb, fs }, 'many');
     }
     const pushS = (performance.now() - t0) / 1000;
-    polling = false;
-    await poll;
-    if (BENCH) {
-      let best = { n: 0, i: 0 };
-      for (let i = 0, n = 1; i < cursors.length; i++, n++) {
-        if (i > 0 && cursors[i]!.c !== cursors[i - 1]!.c) n = 1;
-        if (n > best.n) best = { n, i };
-      }
-      const c = cursors[best.i];
-      console.log(
-        `bench: cursor polls ${cursors.length}; the longest unchanged ${best.n} polls (${best.n * 2} s), at ${c?.c} until ${c?.at}`,
-      );
-    }
     await until(
       async () => (await readState(adb, 'many')).packs.length <= REPACK_AT,
       120_000,
@@ -513,29 +484,6 @@ describe('zen-git worker', () => {
     const repacks = worker!.lines.filter((x) => x.startsWith('many: ') && x.includes('→'));
     expect(repacks.length).toBeGreaterThan(0);
     if (BENCH) {
-      // The repack topic in offset order: where the gc events sit.
-      const evs: { type: string; at: number; off: string }[] = [];
-      try {
-        for await (const e of adb.topic('git', 'repack').read()) {
-          evs.push({
-            type: decodeMsg(e.payload).type,
-            at: Number(e.hlc >> 16n),
-            off: Buffer.from(e.offset).toString('hex'),
-          });
-        }
-      } catch (e) {
-        console.log(`bench: reading the topic: ${(e as Error).message}`);
-      }
-      const back = evs.filter((x, i) => i > 0 && x.at + 2000 < evs[i - 1]!.at);
-      console.log(
-        [
-          `bench: topic ${evs.length} events, ${evs.filter((x) => x.type === 'gc').length} gc; ${back.length} sent 2 s or more before the event ahead of them`,
-          ...evs
-            .flatMap((x, i) => (x.type === 'gc' ? evs.slice(Math.max(0, i - 2), i + 3) : []))
-            .slice(0, 25)
-            .map((x) => `  ${x.off} ${x.type} ${x.at}`),
-        ].join('\n'),
-      );
       // One `git repack -a -d` of the same history, for the bytes.
       const full = sh(['count-objects', '-v'], l.dir);
       sh(['repack', '-a', '-d', '-q'], l.dir);
@@ -549,28 +497,6 @@ describe('zen-git worker', () => {
           `live packs at most ${maxLive}, now ${live.length}; readState ${Math.min(...readMs).toFixed(0)}–${Math.max(...readMs).toFixed(0)} ms`,
           `live bytes ${bytes} against one git repack -a -d ${one} (${(bytes / one).toFixed(2)}×); before it: ${full.replace(/\n/g, ' ')}`,
           ...repacks.slice(-5),
-          `other worker lines (${worker!.lines.length - repacks.length}):`,
-          ...worker!.lines
-            .filter((x) => !repacks.includes(x) && !x.includes('gc removed'))
-            .slice(-15),
-          (() => {
-            const all = worker!.lines.filter((x) => x.startsWith('trace: '));
-            const at = (x: string) => Number(x.split(' ')[1]);
-            const tr = all.filter((x) => x.includes(' handled '));
-            let gap = 0;
-            let k = 0;
-            for (let i = 1; i < tr.length; i++) {
-              const d = at(tr[i]!) - at(tr[i - 1]!);
-              if (d > gap) [gap, k] = [d, i];
-            }
-            const from = k ? at(tr[k - 1]!) : 0;
-            const to = k ? at(tr[k]!) : 0;
-            const inside = all.filter((x) => at(x) >= from && at(x) <= to);
-            return [
-              `trace: ${tr.length} handled, the largest gap ${gap} ms, with ${inside.length} lines:`,
-              ...inside.slice(0, 60),
-            ].join('\n');
-          })(),
         ].join('\n'),
       );
     }

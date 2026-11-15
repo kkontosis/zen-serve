@@ -53,7 +53,8 @@ export interface PackRow extends Fields {
   size: number;
   objects: number;
   nodes: Uint8Array[];
-  state: 'live' | 'replaced';
+  /** `pending`: a repack's pack whose rows' commit hasn't landed (§9). */
+  state: 'live' | 'replaced' | 'pending';
   replaced_ms?: number;
   by?: string;
   /** A repack's pack: the hashes it rolled up (§9). */
@@ -269,7 +270,10 @@ async function apply(
     const packs = tx.table<PackRow>('packs');
     // A known pack (live, or replaced: its objects are in a live one) is skipped.
     const have = await packs.get([a.repo, a.pack.hash]);
-    if (!have) {
+    if (have?.state === 'pending') {
+      // A repack's files of the same objects, not yet live: they become this push's.
+      await packs.put({ ...have, seq, state: 'live' });
+    } else if (!have) {
       const live = row ? (await livePacks(tx, a.repo, REPACK_AT + 1)).length : 0;
       const files = tx.fs(tree);
       await files.ops(ops);
@@ -452,7 +456,38 @@ export async function repack(
       );
     }
     await o.afterUpload?.();
-    // The transaction.
+    const grace = o.graceMs ?? GRACE_MS;
+    const gcOf = (hashes: string[]) =>
+      new Map<Value, Value>([
+        [1, repo],
+        [2, hashes],
+      ]);
+    // 5. The files' commit: the new pack's files and a `pending` row, whose
+    // gc is scheduled now, so a job that stops before the rows' commit
+    // leaves nothing for good. Tree operations serialize at the tree's
+    // header (fs.md §7), so this commit is kept short and retried alone.
+    const filed = await filesCommit(db, async (tx) => {
+      const packs = tx.table<PackRow>('packs');
+      const have = await packs.get([repo, hash]);
+      if (have) return have.state !== 'pending';
+      const files = tx.fs(tree);
+      await files.ops(ops);
+      for (const u of ups) await files.write(u, { replaces: [] });
+      await packs.put({
+        repo,
+        hash,
+        seq: rolled[rolled.length - 1]!.seq,
+        size,
+        objects: n,
+        nodes,
+        state: 'pending',
+        of: rolled.map((x) => x.hash),
+      });
+      await tx.schedule(repackTopic(db), GC_EVENT, gcOf([hash]), { delayMs: grace });
+      return true;
+    });
+    if (!filed) return { ok: false, why: 'the packs changed' };
+    // 6. The rows' commit, with no tree operations: pushes don't conflict with it.
     return await db.transaction(async (tx): Promise<RepackResult> => {
       const packs = tx.table<PackRow>('packs');
       const rows: PackRow[] = [];
@@ -465,27 +500,11 @@ export async function repack(
       for (const row of rows) {
         await packs.put({ ...row, state: 'replaced', replaced_ms: now, by: hash });
       }
-      if (!(await packs.get([repo, hash]))) {
-        const files = tx.fs(tree);
-        await files.ops(ops);
-        for (const u of ups) await files.write(u, { replaces: [] });
-        await packs.put({
-          repo,
-          hash,
-          seq: rows[rows.length - 1]!.seq,
-          size,
-          objects: n,
-          nodes,
-          state: 'live',
-          of: rows.map((x) => x.hash),
-        });
-      }
-      const body = new Map<Value, Value>([
-        [1, repo],
-        [2, rows.map((x) => x.hash)],
-        [3, rows.flatMap((x) => x.nodes)],
-      ]);
-      await tx.schedule(repackTopic(db), GC_EVENT, body, { delayMs: o.graceMs ?? GRACE_MS });
+      const mine = await packs.get([repo, hash]);
+      if (mine?.state === 'pending') await packs.put({ ...mine, state: 'live' });
+      await tx.schedule(repackTopic(db), GC_EVENT, gcOf(rows.map((x) => x.hash)), {
+        delayMs: grace,
+      });
       return {
         ok: true,
         rolled: rows.length,
@@ -500,14 +519,31 @@ export async function repack(
   }
 }
 
-/** A gc message's body (§9): the repo and the replaced packs' hashes. */
+/**
+ * Run a short commit with tree operations, retrying a conflict apart from
+ * the slow work before it: the tree's header serializes every commit that
+ * touches the tree, pushes included (fs.md §7).
+ */
+async function filesCommit<T>(db: Db, fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
+  for (let attempt = 0, wait = 20; ; attempt++, wait = Math.min(wait * 2, 1000)) {
+    try {
+      return await db.transaction(fn);
+    } catch (e) {
+      if (!isCode(e, 'conflict') || attempt >= 30) throw e;
+      await new Promise((r) => setTimeout(r, wait * (0.5 + Math.random())));
+    }
+  }
+}
+
+/** A gc message's body (§9): the repo and the packs to collect. */
 export function gcBody(body: Value): { repo: string; hashes: string[] } {
   const m = body as Map<Value, Value>;
   return { repo: m.get(1) as string, hashes: (m.get(2) as string[]) ?? [] };
 }
 
 /**
- * The gc (§9): the replaced packs still `replaced` have their files moved to
+ * The gc (§9): the listed packs still `replaced` (or still `pending`: a
+ * repack that stopped between its two commits) have their files moved to
  * `TRASH` and their rows deleted, in one transaction. Delivered again, it
  * finds nothing left to do.
  */
@@ -522,7 +558,7 @@ export async function collect(db: Db, fs: UnlockedFs, body: Value): Promise<numb
     let n = 0;
     for (const h of hashes) {
       const row = await packs.get([repo, h]);
-      if (row?.state !== 'replaced') continue;
+      if (row?.state !== 'replaced' && row?.state !== 'pending') continue;
       for (const node of row.nodes) b.remove(node);
       await packs.delete([repo, h]);
       n++;
