@@ -185,6 +185,73 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * **10.5:** the SSH engine learns an `env` request for `GIT_PROTOCOL` only (svc.md §7.2), and the HTTP side is `git http-backend` behind the server (item 5's 40 lines).
     * **10.5 and 10.6 share 10.3's mirror code.**
   * Pushed 1f478a4 (the log). **CI's `pure-rust` failed, my mistake:** `registry_matches_code` (`crates/zen-core/tests/labels.rs`) requires spec/labels.md to list exactly `labels::ALL`, and the `spec:` commit added `zen/v1/sig/git-ssh-key` to the spec only (here I had run `npm run check`, not the Rust tests). **The fix:** `labels::SIG_GIT_SSH_KEY`, in `ALL` and `SIG_PURPOSES` (the relayed service signs with it in 10.6). `cargo test -p zen-core` (the registry test included) and clippy `-D warnings` pass.
+  * **CI green on both runs of 8bc64b6** (push 43744991670 and pull_request 43744997370), every job. PR #85 is mergeable (clean). **Step 10.2 is done;** PR #85 waits on review and merge. The 18:54 check-in (trig_01Cgzj3Up7qdHVmLS5mpZeLy) is still set: plan mode was on, so it wasn't cancelled.
+  * **Noted from CI's logs:** the runners' git is **2.56.1** (the spike ran 2.43.0). 10.3's tests with real git run against both.
+* **Step 10.3** (`packages/git` and `git-remote-zen`):
+  * Planned in detail below ("Step 10.3 in detail"), in plan mode, while PR #85 waits on merge.
+  * **On approval of this plan (it is the "go" for step 10.3):**
+    1. Wait for the user's merge of PR #85.
+    2. Restart from main by fast-forward, and cancel the 18:54 check-in if it is still pending.
+    3. Copy this file to `docs/MILESTONE-10.md` and commit `docs: step 10.3 plan`.
+    4. Push, open the PR, and subscribe.
+    5. Implement 10.3 as "Step 10.3 in detail" says.
+  * **Approved** (the user). PR #85 merged (18:24 UTC); restarted from main by fast-forward (6d4f598); the 18:54 check-in cancelled. This file copied to `docs/MILESTONE-10.md`, the plan committed, a new PR opened. Then the implementation, as "Step 10.3 in detail" says.
+  * Committed 6c860b8 and pushed; PR #86 opened and subscribed. **The user asked whether to compact: yes, before the implementation.** After compacting, confirm with the user ("go") before implementing; then start with the `spec:` commit (item 1 of "Step 10.3 in detail"), copying this file to `docs/MILESTONE-10.md` first.
+  * **Go** (the user, after compacting). CI on 6c860b8 finished with no failed check (18:36 UTC).
+  * **`spec:` af836a9** (local, not pushed yet). git.md:
+    * §1: `zen://` over HTTPS, `zen+http://` over plain HTTP; the sign-in origin is the URL's origin; the vault in `$ZEN_GIT_VAULT` or `$XDG_CONFIG_HOME/zen-git/vault`; unlocking by a device keyslot (formats.md §6), with integrity attached first.
+    * §6: the lock directory `<repo>.git.lock/` with a pid, taken over from a dead pid; `upload-pack` takes no lock.
+    * §7: the hook signs in again and resumes the vault's session. It is refused without the helper's environment (so a push straight into the mirror is refused), and it cuts its pack inside the quarantine.
+    * §10: `zen-git setup` grants the topic rights.
+    * **Changed from the plan:** §4's transaction is zen-db's retrying `db.transaction`, not a manual one. Its re-run is §4.4's retry rule: it goes on while the refs keep their old values.
+  * **Not yet committed** (the working tree):
+    * In spec/git.md: §7 says the helper is installed as `git-remote-zen` and `git-remote-zen+http`, since git runs `git-remote-<scheme>`. Amend it into the `spec:` commit.
+    * **Fix still needed:** §6's mirror path gained the host (`zen-git/<host>/<fs>/<repo>.git`, so two servers' fs 1 don't collide). The code has it, but spec/git.md still has the old path. Write it into §6 and amend the `spec:` commit too.
+  * **`packages/git`**, written (uncommitted):
+    * `src/url.ts`
+    * `signin.ts`: the vault, integrity, unlock by the device slot, and the `git` database (schema 1: `repos`, `refs` and `packs`, with private `by_repo` indexes)
+    * `store.ts`: `readState`, `downloadPack`, and `push`, which uploads with sessions, then runs one transaction with the compare-and-set, the files, the rows and the emit. It reuses a live pack of the same hash.
+    * `mirror.ts`: `cleanEnv`, `initMirror` (its config and the guarded hook script; recreated when the format or zen's tree differs), `syncMirror` (packs in `seq` order, `index-pack --strict`, the hash checked, the refs, HEAD, a local repack past 16 packs), the pid lock, and `settlePushed`
+    * `hook.ts`: the pack cut in the quarantine, the push, and `forbidden` reported as `push refused`
+    * `helper.ts`: `capabilities`, `option` and `connect`, with v2 unless `protocol.version` is 0 or 1
+    * `setup.ts`
+    * `cli.ts` (`login`, `setup`, `head`, `hook`), `main.ts` (initWasm, `zen: …` errors) and `git-remote-zen.ts`
+    * Also: `scripts/build-zen-git.mjs` (two entries and a shared chunk), the root workspaces and `check`, `vitest-setup.ts`, and vitest.config's comment.
+  * **Tests** (`packages/git/test/git.test.ts`), 14, all passing here with git 2.43:
+    * round trips: create, clone, tags, HEAD, fsck; fetch; a push of known objects only (no pack); delete and `--prune`
+    * non-fast-forward refused, `--force`, `--force-with-lease` (a stale lease refused), `--atomic`
+    * two concurrent pushes to one branch (exactly one wins; the loser rebases), and to different branches (both land)
+    * `--depth 1`, `--filter=blob:none`, sha256
+    * an interrupted push: refs, packs, `next_seq` and the mirror unchanged; the upload sessions listed; the next push works
+    * the consumer: two events with §4's body
+    * carol (fs read only): clones; her push is refused (`push refused: forbidden: no write right`) with nothing changed
+    * no vault: a clear error
+    * a push straight into the mirror is refused
+    * memory
+  * **Found while testing:**
+    * `zen+http` needs the bin name `git-remote-zen+http`.
+    * The wasm must be initialized before `zw` is used (`main.ts`).
+    * A read-only member can't create the `git` database: a writer's first push does.
+    * Concurrent checkpoints of one device from several processes are handled by integrity (`version_mismatch` adopts the other's head).
+  * **Negative controls,** each run once and restored (the sources diffed clean), each failing its test:
+    1. no compare-and-set: the one-branch race (both won)
+    2. packs imported in reverse `seq`: fresh clones of multi-pack repos (the race test's and carol's)
+    3. the hook exits 0 on a refusal: carol's push succeeds
+    4. no emit: the consumer times out
+  * **Costs** (STATS):
+    * **This repo's full history** (584 commits, 5,322 objects, a 3.5 MB pack), two runs: push 1.7–1.8 s, the hook 1.0 s of it; clone 1.0–1.2 s, against 0.33 s for a plain `git clone --bare file://`. Peak RSS: the push's helper 93–100 MB, the hook 115 MB, the clone's helper 121 MB.
+    * **The synthetic 300-commit test:** push 0.78 s (the hook 0.37 s), clone 0.5 s, each process about 95 MB.
+    * Node with the client's wasm is about 90 MB of that. The hook's second sign-in resumes the vault's session.
+  * Plan mode came on mid-step (a worker restart) and was left with the log above. Then:
+    * **`spec:` c4a41e3:** af836a9 amended with §7's two helper names and §6's mirror path with the host.
+    * **`git:` a0fdffc:** packages/git, the tests, the build script and the workspace entries. `npm run check` passes; `npx vitest run packages/git` 3× green (14 of 14 each time).
+  * **`docs:`:**
+    * docs/GIT.md, begun: setting up (keyslots, `zen-git setup`, `login`), using it, the mirror, costs, what isn't supported, troubleshooting
+    * spec/OPS.md: §1.3's `git` row and a new §9, git pitfalls
+    * STATS §5.8: the costs above
+    * README: the package's row
+    * this log
+  * Next: push, and confirm CI is green on both runs (git 2.56.1 there).
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -493,6 +560,130 @@ No product code. The step answers the design questions with real git, then write
 * **The helper's model is the spike's to decide** by the criteria in item 1, (b) expected.
 * **One database per fs** for every repo in it, `authenticated` by default.
 * **A pack's file is named by a random 16-byte id**, not by git's pack hash: that hash names the pack's contents, so in the clear it would let anyone holding the same pack confirm the repo holds it. Git's hash is kept in the sealed `git_packs` row.
+
+## Step 10.3 in detail: `packages/git` and `git-remote-zen`
+
+`@zen/git`, a Node package with two bins: `git-remote-zen` (the remote helper, git.md §7) and `zen-git` (`login`, `setup`, `head`, and the internal `hook`). It implements git.md §2–§7, the mirror core that 10.5 and 10.6 reuse. Nothing in the server changes.
+
+**Survey (this session; file:line from the survey):**
+* **Bins:**
+  * `@zen/svc` declares `bin: {"zen-connect": "./dist/zen-connect.mjs"}`.
+  * `scripts/build-zen-connect.mjs` bundles it with esbuild: ESM, node22, the `@zen/client` aliases, `external: ['node:*', '@zen/wasm']`, then chmod 755.
+  * `scripts/vitest-setup.ts:12` builds it once per run.
+  * A new package is also listed in the root workspaces and `check`, and in `vitest.config.ts`'s aliases.
+* **Signing in without a prompt:**
+  * Build the vault as `credentialVault(sealedStore(nodeDiskLocalStore(dir)))`.
+  * First run: `vault.saveDevice({identity, deviceSeed, cert})` from a device file. Later runs: `vault.signIn(client)` (`packages/fuse/src/cli.ts:235-250`).
+  * `vault.unlock(fs)` needs a **device keyslot** on the fs (`packages/client/src/local/vault.ts:75`). `startWorld` makes only a passphrase slot, so the tests add a device slot.
+  * Attach integrity before unlocking: `session.fs(n).integrity({device, local})`, then `Db.open(fs, ns, {integrity: 'authenticated'})` (`apps/shared/node.ts:104-111`).
+* **The push's pieces:**
+  * `db.begin()` gives a manual transaction (`packages/db/src/db.ts:710`), with `commit()`/`abort()` (`txn.ts:1105`).
+  * `tx.fs(tree).ops(batch)` and `.write(upload, {replaces: []})` (`packages/db/src/files.ts:19,29`). `tree.batch().create(...)` and `.mkdir(...)` (`tree.ts:1676`).
+  * `tree.upload(node, src, {session: true})` and `tree.closeUpload` (`tree.ts:1224,1350`). The closest existing pattern is `packages/loro/src/loro.ts:660-697`: create the node in a batch, upload with a session when `db.features` has `upload_sessions`, then one transaction with ops, write and put, and `closeUpload` in `finally`.
+  * `tx.emit(db.topic('git', repo, 'pushes'), type, body)` (`txn.ts:208`).
+  * Tables come from `m.createTable(name, {pk, pad: true})` and `m.createIndex(t, name, {fields})` (private by default). Index reads go through `tx.table(t).query().where(f, '=', v).all()` (`packages/db/src/query.ts:294`).
+* **Reading a pack:** `tree.readStream(node)` (`tree.ts:785`), streamed to a temporary file.
+* **Topic grants:** `session.acl.update(admin, doc => doc.grants.push({fs, topic: fs.topic('git').id, rights, subject}))` (`apps/shared/harness.ts:155-170`). A grant on the prefix `('git')` covers every repo's topic.
+* **Consumers:** `db.consume({group, topic, mode: 'sequential'}, (msg, tx) => …)` (`db.ts:841`).
+* **Tests:**
+  * `startWorld` (`apps/shared/harness.ts:127`, `until` at :362).
+  * Spawning a bundled CLI: `apps/echo/test/connect.test.ts:44-104`.
+  * A vault CLI's environment, with every `ZEN_*` variable removed: `packages/fuse/test/mount.test.ts:446-520`.
+
+### 1. `spec:` commit (git.md corrections the survey found)
+
+* **§1, URLs:**
+  * `zen://<host>[:port]/<fs>/<repo>` reaches the server over HTTPS. `zen+http://` uses plain HTTP, for a server on localhost and for tests.
+  * The vault directory is `$ZEN_GIT_VAULT`, or `$XDG_CONFIG_HOME/zen-git/vault` (`~/.config` by default).
+* **§10, the topic grants:** a first push can't change the ACL, since only an admin can. So an admin grants them once per fs, with `zen-git setup <fs>`:
+  * `append` on the prefix `("git")` to the fs's writers
+  * `read` and `consume` on it to its readers
+* **§6, locking:** Node has no portable `flock`, and git's readers tolerate concurrent ref updates, new packs, and `repack -a -d`.
+  * So a sync and a `receive-pack` hold an exclusive lock: a lock directory holding the holder's pid, taken over when that pid is gone.
+  * `upload-pack` takes no lock.
+* **§7, the hook:**
+  * It runs in a process of its own (`receive-pack` starts it), so it signs in again from the same vault.
+  * Its environment names the repo URL and the mirror.
+  * The cost of the second sign-in is measured, and is in STATS.
+
+### 2. `git:` commit (`packages/git`)
+
+* `src/url.ts`: parse and check `zen://` and `zen+http://` URLs (git.md §1, §2.1).
+* `src/signin.ts`:
+  * the vault from `$ZEN_GIT_VAULT`
+  * `signIn(url)`: the client, sign-in, integrity with the vault's pins, unlock by the device slot
+  * `openDb(fs)`: `Db.open(fs, 'git', {integrity: 'authenticated', schema: 1, migrations})` with git.md §3's tables
+  * a `basic` database when the fs has no integrity, as §3 allows
+* `src/store.ts`, the zen side:
+  * `readState(db, repo)`: one read transaction (§5.1)
+  * `downloadPack(tree, row, dir)`
+  * `push(db, fs, {repo, updates, packPath, idxPath, hash, format})`: §4 steps 2–4, with the retry rule (§4.4), and `closeUpload` in `finally`
+* `src/mirror.ts`:
+  * the path `$XDG_CACHE_HOME/zen-git/<fs>/<repo>.git`
+  * `init` with §6's config and the hook script, which runs `process.execPath` on `zen-git.mjs hook`
+  * the lock
+  * `git(args)` with git's variables removed (§6)
+  * `sync(state)` (§5: packs in `seq` order with `index-pack --strict`, the imported list, refs, HEAD)
+  * the local repack past 16 packs
+* `src/hook.ts`:
+  * read the `old new ref` lines
+  * cut the pack (§4.1)
+  * sign in, push
+  * on refusal, exit non-zero with a message git shows as `remote: zen: …`
+* `src/helper.ts` (the `git-remote-zen` bin), git.md §7:
+  * `capabilities`, `option`, `connect`, reading stdin one byte at a time
+  * `GIT_PROTOCOL=version=2` for `upload-pack` unless `protocol.version` is 0 or 1
+* `src/cli.ts` (the `zen-git` bin):
+  * `login --server URL --device FILE`: saves the device in the vault
+  * `setup <fs>`: the admin's topic grants
+  * `head <url> <branch>`
+  * `hook`: internal
+* `scripts/build-zen-git.mjs` (as `build-zen-connect.mjs`), the workspace entries, `vitest-setup.ts`.
+
+### Tests (`packages/git/test/`, a real server through `startWorld`, real git, the bundled bins on `PATH`)
+
+Each test gives git a `GIT_CONFIG_GLOBAL` of its own, and the child processes get no `ZEN_*` variables but the vault's.
+* **Round trips** (git.md §4, §5):
+  * the first push creates the repo (its `repos` row, and HEAD at the first branch); clone it back, `fsck --strict`
+  * fetch after another clone's push
+  * tags, light and annotated
+  * deleting a branch, seen by `fetch --prune`
+  * `--force` and `--force-with-lease`, including a stale lease refused
+  * `--atomic` with one non-fast-forward ref: nothing pushed
+* **Concurrency:**
+  * two pushes to one branch at once: exactly one wins, and the loser's `pull --rebase` and push work
+  * two pushes to different branches at once: both land (the retry rule)
+* **Features:** `clone --depth 1`, `clone --filter=blob:none`, and a sha256 repo.
+* **An interrupted push:** the hook killed after its upload, before the transaction (a test-only variable). Then no refs and no `packs` row changed, the upload session is listed, and the next push succeeds.
+* **The emit:** a consumer of `("git", repo, "pushes")` sees one event per push, with §4's body.
+* **Rights:** a member with fs `read` only can clone. Their push is refused with nothing visible: zen unchanged, and their mirror's refs unchanged.
+* **Sign-in:** a helper with no vault fails with a clear message, not a prompt.
+* **Memory:** the helper's and the hook's peak RSS during a clone and a push of this repo's history (585 commits), logged for STATS.
+* **Negative controls,** each run once and restored, each failing its test:
+  1. the hook skips the refs' compare-and-set (the concurrent-push test)
+  2. the sync imports packs in reverse `seq` (`index-pack --strict` refuses: the round trip)
+  3. the hook exits 0 when the transaction fails (the read-only member's test)
+  4. the emit left out of the transaction (the consumer test)
+
+### Docs (`docs:` commit)
+
+* docs/GIT.md, begun:
+  * setting up (`zen-git setup`, `login`)
+  * `git clone zen://…`
+  * the mirror, and that it is plaintext
+  * what isn't supported (git.md §12)
+* spec/OPS.md, the pitfalls:
+  * git's `GIT_DIR` for helpers
+  * `index-pack --strict` outside a repository segfaults in 2.43
+  * `push.negotiate` needs protocol v2
+* STATS: the helper's and the hook's memory and the sign-in cost
+* README's package list, and the log
+
+### Verification
+
+* `npm run check`; `npx vitest run packages/git` 3× green; the touched suites (`packages/db`, `packages/client`) once.
+* With git 2.43 here, and with CI's 2.56.1 on both runs.
+* CI green on both runs.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests.

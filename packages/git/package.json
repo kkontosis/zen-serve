@@ -1,0 +1,23 @@
+{
+  "name": "@zen/git",
+  "version": "0.1.0",
+  "description": "zen-git: git repositories in an encrypted fs, through git-remote-zen (spec/git.md)",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "git-remote-zen": "./dist/git-remote-zen.mjs",
+    "git-remote-zen+http": "./dist/git-remote-zen.mjs",
+    "zen-git": "./dist/zen-git.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-zen-git.mjs"
+  },
+  "dependencies": {
+    "@zen/client": "0.1.0",
+    "@zen/db": "0.1.0"
+  },
+  "sideEffects": false
+}

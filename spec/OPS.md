@@ -61,7 +61,7 @@ The relayed services' tests (`crates/zen-svc`, `apps/echo`, `apps/mail`, `packag
 | `openssl` | `s_client` against the TLS engine; the test certificates (`testCerts`) | `openssl` |
 | `ssh`, `ssh-keygen` | OpenSSH against the SSH engine and the `ssh()` layer; `zen-connect` as a `ProxyCommand` | `openssh-client` |
 | `python3` | `smtplib` and `imaplib` against the mail app (run as `python3 -I`) | `python3` |
-| `git` | `git ls-remote` against the echo app's upload-pack stub | `git` |
+| `git` | `git ls-remote` against the echo app's upload-pack stub; `packages/git`'s tests (clone, push and the rest, with git 2.43 here and the runners' 2.56) | `git` |
 
 * **OpenSSH 9.6** (Ubuntu 24.04) has `sntrup761x25519-sha512`, under its `@openssh.com` name only, which `tests/openssh.rs` tests on every build, but no `mlkem768x25519-sha256` (9.9) and no `ssh-mldsa44-ed25519` keys (10.6). `tests/openssh_pq.rs` is ignored unless `ZEN_TEST_SSH` names an OpenSSH 10.6 or later: `scripts/build-openssh.sh <prefix>` builds 10.6p1 from source in about a minute. CI's `openssh-pq` job does this, on demand only (`workflow_dispatch`); start it after changing `crates/zen-svc/src/ssh/kex.rs`, `keys.rs` or `cipher.rs`.
 * **Ports.** Each test world gives its services free ports on 127.0.0.1; nothing listens on a fixed port.
@@ -215,3 +215,11 @@ Known hot spots, measured or not yet: TD-MEMORY (spec/TECH_DEBT.md).
 * **The content origin is matched by `Host`,** with or without its default port. Behind a proxy, pass the client's `Host` through, or every request on the content host reaches the app's routes.
 * **The content origin needs its own `[content] dir`** with `boot.html` in it: without it, every navigation there gets the sandboxed 503 `starting`, and the worker is never registered.
 
+## 9. Git pitfalls
+
+* **Git sets `GIT_DIR` for a remote helper,** and may set more (`GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, …). They override `git -C <dir>`, so every git command the helper runs on its mirror runs without them (`cleanEnv`, packages/git/src/mirror.ts). The hook is the exception: it keeps the quarantine's variables, since the pushed objects are only there.
+* **Git runs `git-remote-<scheme>`:** `zen+http://` URLs need the program under the name `git-remote-zen+http` too.
+* **`git index-pack --strict` needs a repository holding the pack's bases,** and git 2.43 segfaults running it outside any repository. So the mirror imports packs in their `seq` order, inside the mirror (git.md §5).
+* **`push.negotiate=true` needs protocol v2.** Git gives a `connect` helper no `GIT_PROTOCOL`, so the helper starts `upload-pack` with `version=2`, or that push prints "--negotiate-only requires protocol v2".
+* **The tests give git a config of its own** (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM=1`): a developer's global config (here `push.negotiate`, `init.defaultBranch`) changes what git does.
+* **A read-only member can't create the `git` database:** a test that reads it as one opens it as a writer first.

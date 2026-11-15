@@ -314,6 +314,29 @@ Reading it:
 * **A flush is one commit per 256 blocks:** the blocks, about one level-1 node per touched region, the nodes above, and the root record. Sequential writes touch one level-1 node per 128 blocks, so a 1 MiB commit carries about 1.04 MiB of blocks and nodes.
 * **Every commit replaces the top node and the root record,** so commits of one volume are serial; one writer per volume is the model anyway.
 
+### 5.8 git-remote-zen (measured)
+
+`packages/git/test/git.test.ts`'s memory test (milestone 10 step 3) pushes a repo's whole history through the helper, then clones it into another member's empty cache. The setup:
+* the debug server, with every Node process's peak RSS and wall time logged by a preloaded module (`NODE_OPTIONS=--import`)
+* git 2.43, 4 cores
+* `ZEN_GIT_BENCH_REPO=<a repo>` makes it push that repo's history instead of the synthetic one
+
+Two runs on this repository's history:
+
+| This repository (584 commits, 5,322 objects, one 3.5 MB pack) | Time | Peak RSS |
+|---|---|---|
+| **Push** (a new repo): the whole `git push` | 1.7–1.8 s | |
+| … the helper (sign-in, sync, `receive-pack`) | 1.7–1.8 s | 93–100 MB |
+| … the hook in it (a second sign-in, the pack cut and checked, the upload, the transaction) | 1.0 s | 115 MB |
+| **Clone** into an empty cache: the whole `git clone --bare` | 1.0–1.2 s | |
+| … the helper (sign-in, the pack's download and `index-pack --strict`, `upload-pack`) | 0.8–1.0 s | 121 MB |
+| For comparison: `git clone --bare file://` of the same pack | 0.33 s | |
+
+The synthetic test, run on every CI build (300 commits, 900 objects, a 134 KB pack): push 0.78 s (the hook 0.37 s), clone 0.50 s, each process about 95 MB.
+
+* **Node with the client's wasm is most of the memory** (about 90 MB; the spike's helper, without the client, peaked at 47–58 MB). The packs stream to and from files, so memory grows little with the repo. A clone of this repository adds about 25 MB over the synthetic one.
+* **The hook's second sign-in resumes the vault's session.** The helper stored the session, so the hook makes no device signature and the server no challenge. The hook's cost is Node's start, the wasm, unlocking the fs and attaching integrity again.
+
 ## 6. Integrity: what it costs
 
 Integrity (docs/INTEGRITY.md) costs signatures, round trips and bytes. Where each is measured:
