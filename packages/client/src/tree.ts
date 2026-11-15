@@ -61,8 +61,13 @@ const MAX_GET_NODES = 1000;
 const MAX_GET_CHUNKS = 64;
 const MAX_GET_PAGES = 64;
 const FETCH_PARALLEL = 4;
-/** Plaintext bytes a `readStream` window covers (rounded out to whole chunks). */
+/** Plaintext bytes a `readStream` window covers at most (rounded out to whole chunks). */
 const STREAM_WINDOW = 4 << 20;
+/**
+ * A `readStream`'s first window, doubling up to `STREAM_WINDOW`: a read
+ * from any offset (a media seek) answers after one small fetch.
+ */
+const FIRST_WINDOW = 64 << 10;
 /** Windows `readStream` fetches ahead by default. */
 const READ_AHEAD = 3;
 /** Decoded pages kept per tree, at most (`TreeOptions.pageMemoPages`). */
@@ -771,10 +776,11 @@ export class Tree {
   }
 
   /**
-   * A version's bytes as a stream, fetched lazily in windows of about
-   * 4 MiB (whole chunks): nothing until the first read, then the window
-   * read and `readAhead` more (default 3), so memory stays at a few
-   * windows. Cancel it to stop fetching.
+   * A version's bytes as a stream, fetched lazily in windows of whole
+   * chunks, the first of about 64 KiB and each after it twice the last, up
+   * to about 4 MiB: nothing until the first read, then the window read and
+   * `readAhead` more (default 3), so memory stays at a few windows and the
+   * first bytes come after one small fetch. Cancel it to stop fetching.
    */
   readStream(node: Uint8Array, opts: ReadStreamOptions = {}): ReadableStream<Uint8Array> {
     let v: FileVersion | undefined;
@@ -784,10 +790,12 @@ export class Tree {
     let cancelled = false;
     const ahead = Math.max(0, opts.readAhead ?? READ_AHEAD);
     const queue: Promise<Uint8Array>[] = [];
+    let window = FIRST_WINDOW;
     const plan = async () => {
       while (!cancelled && next < end && queue.length <= ahead) {
         const a = next;
-        const spans = await this.spans(v!, a, Math.min(end, a + STREAM_WINDOW));
+        const spans = await this.spans(v!, a, Math.min(end, a + window));
+        window = Math.min(STREAM_WINDOW, window * 2);
         const last = spans.at(-1)!;
         const b = Math.min(end, last.start + last.len);
         next = b;
