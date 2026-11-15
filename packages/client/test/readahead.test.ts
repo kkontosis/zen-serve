@@ -55,4 +55,30 @@ describe('read-ahead', () => {
       expect(bytes.equal(bytes.concat(...parts), data)).toBe(true);
     }
   });
+
+  it('the first window is about 64 KiB, and each after it twice the last, up to 4 MiB', async () => {
+    const id = Tree.newId();
+    const t = ufs.tree(id);
+    const f = await t.create(ROOT, 'big.bin');
+    const big = new Uint8Array(20 * MiB);
+    for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, i + 65536));
+    await t.writeFile(f, big);
+    // A window covers whole chunks: from where the last ended to the first
+    // cut at or past its size, so it is under its size plus a chunk (at most
+    // 89,936 bytes at the default limits).
+    const maxChunk = 90_000;
+    for (const offset of [0, 5 * MiB + 12_345]) {
+      const parts: Uint8Array[] = [];
+      const reader = ufs.tree(id).readStream(f, { offset }).getReader();
+      for (let x = await reader.read(); !x.done; x = await reader.read()) parts.push(x.value);
+      let want = 64 << 10;
+      for (const [i, p] of parts.entries()) {
+        const last = i === parts.length - 1;
+        if (!last) expect(p.length, `offset ${offset}, window ${i}`).toBeGreaterThanOrEqual(want);
+        expect(p.length, `offset ${offset}, window ${i}`).toBeLessThan(want + maxChunk);
+        want = Math.min(4 * MiB, want * 2);
+      }
+      expect(bytes.equal(bytes.concat(...parts), big.subarray(offset))).toBe(true);
+    }
+  });
 });

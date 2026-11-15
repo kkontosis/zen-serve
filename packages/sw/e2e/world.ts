@@ -17,6 +17,7 @@ import { hex } from '../../client/src/bytes.js';
 import {
   claim,
   connect,
+  type FileSource,
   fullGrants,
   member,
   ROOT,
@@ -132,10 +133,18 @@ export interface SwWorld {
   contentDir: string;
   /** The test app's page on `origin`. */
   appPage(origin?: string): string;
+  /** The nodes of `SwWorldOptions.extra`'s files, by path. */
+  nodes: Map<string, Uint8Array>;
+  /** fs 1 unlocked by the admin in Node, for reads beside the worker's (close it). */
+  unlock(): Promise<UnlockedFs>;
   stop(): Promise<void>;
 }
 
-async function writeSite(ufs: UnlockedFs, files: Map<string, Uint8Array>): Promise<Uint8Array> {
+async function writeSite(
+  ufs: UnlockedFs,
+  files: Map<string, Uint8Array>,
+  extra: Map<string, () => FileSource>,
+): Promise<{ id: Uint8Array; nodes: Map<string, Uint8Array> }> {
   const id = Tree.newId();
   const t = ufs.tree(id);
   const dirs = new Map<string, Uint8Array>([['', await t.mkdir(ROOT, 'site')]]);
@@ -157,11 +166,24 @@ async function writeSite(ufs: UnlockedFs, files: Map<string, Uint8Array>): Promi
     const n = await t.create(await dirOf(path), path.split('/').at(-1)!);
     await t.writeFile(n, data);
   }
-  return id;
+  // Large files, streamed under an upload session.
+  const nodes = new Map<string, Uint8Array>();
+  for (const [path, source] of extra) {
+    const n = await t.create(await dirOf(path), path.split('/').at(-1)!);
+    await t.writeFile(n, source(), { session: true });
+    nodes.set(path, n);
+  }
+  return { id, nodes };
+}
+
+/** Options of `startSwWorld`. */
+export interface SwWorldOptions {
+  /** More files below `/site`, by path, each given as a source to stream (the bench). */
+  extra?: Map<string, () => FileSource>;
 }
 
 /** Start the world. */
-export async function startSwWorld(): Promise<SwWorld> {
+export async function startSwWorld(o: SwWorldOptions = {}): Promise<SwWorld> {
   await initWasm();
   const port = await freePort();
   const app = `http://localhost:${port}`;
@@ -206,7 +228,7 @@ export async function startSwWorld(): Promise<SwWorld> {
   const session = await client.signInDevice(admin);
   const ufs = await session.fs(1).init((k) => [zw.createDeviceSlot(k, admin.device.devicePublic)]);
   const files = siteFiles(app);
-  const tree = await writeSite(ufs, files);
+  const { id: tree, nodes } = await writeSite(ufs, files, o.extra ?? new Map());
   ufs.close();
   return {
     server,
@@ -216,8 +238,10 @@ export async function startSwWorld(): Promise<SwWorld> {
     evil,
     tree: hex(tree),
     files,
+    nodes,
     contentDir,
     appPage: (origin = app) => `${origin}/unencrypted/sw-app/index.html`,
+    unlock: () => session.fs(1).unlock({ device: admin.device }),
     async stop() {
       await server.stop();
       await rm(tmp, { recursive: true, force: true });

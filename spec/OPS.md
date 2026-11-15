@@ -170,7 +170,7 @@ Integrity is described in [`docs/INTEGRITY.md`](../docs/INTEGRITY.md); these are
 | Records waiting to be written to the local store, written or fetched (a read holds up to this much of what it fetched) | `ReplicaOptions.pendingBytes`, `zen-mount --pending-size` | 32 MiB; the service worker's replica 8 MiB (sw.md §8) |
 | Chunk ids in decoded pages kept per tree | `TreeOptions.pageMemoIds` (`ReplicaOptions.pageMemoIds`, `zen-mount --page-memo`) | 65,536 (about 12 MB) |
 | Decoded pages kept per tree | `TreeOptions.pageMemoPages` | 256 |
-| Read-ahead windows of `readStream` | `readAhead` | 3 × 4 MiB |
+| Read-ahead windows of `readStream` | `readAhead` | 3, of up to 4 MiB (the first 64 KiB, each twice the last) |
 | Upload commits in flight | `WriteOptions.parallel` | 3 × `max_commit_bytes` |
 | Content kept on disk (not RAM) | `ReplicaOptions.cacheBytes`, `zen-mount --cache-size` | 1 GiB |
 | **zen-serve:** the embedded backend's page cache | `[storage] cache_bytes` | 256 MiB |

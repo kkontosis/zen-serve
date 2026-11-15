@@ -138,7 +138,7 @@ jobs:
         run: cargo test --release -p zen-ublk --features device-tests,ublk --test devices bench -- --ignored --nocapture --test-threads 1
 
   # Large files (docs/STATS.md §7): the client bench at `files_gib`, the
-  # replica and zen-mount at 4 GiB, in release. By hand only; it measures,
+  # replica, zen-mount and the service worker at 4 GiB, in release. By hand only; it measures,
   # it doesn't gate.
   files-bench:
     if: github.event_name == 'workflow_dispatch'
@@ -193,6 +193,15 @@ jobs:
           ZEN_BENCH_GIB=${{ inputs.files_gib }} npx vitest run packages/client/test/largebench.test.ts
           ZEN_BENCH_GIB=4 npx vitest run packages/fs/test/bench.test.ts
           ZEN_BENCH_GIB=4 npx vitest run packages/fuse/test/bench.test.ts
+      # The service worker in Chromium (docs/STATS.md §7.6).
+      - name: Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Bench the service worker
+        env:
+          ZEN_BENCH: "1"
+          ZEN_BENCH_GIB: "4"
+          ZEN_SERVE_BIN: target/release/zen-serve
+        run: npx playwright test packages/sw/e2e/bench.spec.ts --project sw --trace off
 
   openssh-pq:
     if: github.event_name == 'workflow_dispatch'

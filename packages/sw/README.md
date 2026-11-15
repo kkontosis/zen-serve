@@ -50,4 +50,4 @@ const { fp, inAcl } = await enrollViewer({
 
 **Tests:** `npx vitest run packages/sw` (Node: the core, the start and enrollment); `npx playwright test --project sw` (Chromium: the first visit, enrollment, the headers, the sandbox, seeking, a stopped worker, an update, offline).
 
-**Next (step 9.5):** benches through the worker, and docs/SW.md, the guide to deploying a content origin.
+**Deploying a content origin:** docs/SW.md. **The bench** (step 9.5, opt-in): `ZEN_BENCH=1 ZEN_SERVE_BIN=target/release/zen-serve npx playwright test packages/sw/e2e/bench.spec.ts --project sw` (docs/STATS.md §7.6).
