@@ -90,6 +90,13 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     3. `client` (push run): the zen-mount vault test timed out at 60 s; it passed in the other run on the same image.
 
     The fix: every job is pinned to `ubuntu-24.04`, the image of every earlier green run, which the docs' runner versions also describe. `TD-CI-UBUNTU-2604` records the move to 26.04: a newer Playwright, the new OpenSSH and OpenSSL versions, and the mount test's timeout root-caused there. If the mount test times out on 24.04 too, it is this PR's to root-cause.
+  * **CI on 0aabe09 (the pin):**
+    * Green on both runs, every job: push 43732576357 and pull_request 43732582680.
+    * Dispatch run 43732595233:
+      * **`openssh-pq` passed**, the OpenSSH 10.6p1 tests on CI's runner.
+      * **Its `client` job failed** in the kanban race test, "two concurrent moves of one card", with runs `[1, 3]` against `[1, 2]`. The code isn't this PR's, and it is the race's third failure (milestone 8 saw `[2, 3]`).
+    * **The diagnostic narrows the cause:** one recorded re-run, but three runs. Every re-run inside `kv.ts`'s loop calls `retry`, so the extra run must be another transaction on that `Db` during the race, which `racing`'s instance patch counts. The proposed patch: count only the race's own transactions (an `AsyncLocalStorage` context), and list the others in `why` with their call site. It went to the PR as a comment and is not applied here. The failed job gets its one re-run once the dispatch's benches finish.
+    * **On 26.04, a second zen-mount failure** (run 43732312501, on 2a5075b): `EACCES` unlinking a conflict file (`mount.test.ts:242`). It is added to `TD-CI-UBUNTU-2604`.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
