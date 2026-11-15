@@ -3,8 +3,9 @@
 // and offline reads. One server; each test has a fresh browser context
 // (its own storage, so its own device), and the offline test, which stops
 // the server, runs last.
-import { type BrowserContext, expect, type Page, test } from '@playwright/test';
-import { ADMIN, editWorker, type SwWorld, startSwWorld } from './world.js';
+import { type BrowserContext, expect, test } from '@playwright/test';
+import { controlledPage, enrollIn, fetchIn } from './pages.js';
+import { editWorker, type SwWorld, startSwWorld } from './world.js';
 
 let w: SwWorld;
 test.describe.configure({ mode: 'serial' });
@@ -13,55 +14,8 @@ test.beforeAll(async () => {
 });
 test.afterAll(() => w?.stop());
 
-const mounts = () => [{ name: 's', fs: 1, tree: w.tree, base: '/site' }];
-
-/** Enroll this context's content origin from the test app (sw.md §8). */
-async function enroll(ctx: BrowserContext, admin = true): Promise<{ fp: string; inAcl: boolean }> {
-  const page = await ctx.newPage();
-  await page.goto(w.appPage());
-  const popup = ctx.waitForEvent('page');
-  const result = page.evaluate(
-    (a) =>
-      (
-        globalThis as never as { zenEnroll(a: unknown): Promise<{ fp: string; inAcl: boolean }> }
-      ).zenEnroll(a),
-    {
-      ...ADMIN,
-      contentOrigin: w.content,
-      mounts: mounts(),
-      admin,
-    },
-  );
-  const p = await popup;
-  await expect(p.locator('#origin')).toHaveText(w.app);
-  await p.locator('#confirm').click();
-  const r = await result;
-  await page.close();
-  return r;
-}
-
-/** A page on the content origin, controlled by the worker. */
-async function controlled(ctx: BrowserContext, path = '/s/'): Promise<Page> {
-  const page = await ctx.newPage();
-  await page.goto(`${w.content}${path}`);
-  await page.waitForFunction(() => !!navigator.serviceWorker.controller);
-  return page;
-}
-
-/** `fetch` from the page: status, headers and the body's bytes. */
-function fetchIn(page: Page, path: string, headers: Record<string, string> = {}) {
-  return page.evaluate(
-    async ([p, h]) => {
-      const r = await fetch(p, { headers: h, cache: 'no-store' });
-      return {
-        status: r.status,
-        headers: Object.fromEntries(r.headers),
-        body: Array.from(new Uint8Array(await r.arrayBuffer())),
-      };
-    },
-    [path, headers] as const,
-  );
-}
+const enroll = (ctx: BrowserContext, admin = true) => enrollIn(w, ctx, admin);
+const controlled = (ctx: BrowserContext, path = '/s/') => controlledPage(w, ctx, path);
 
 /** sw.md §4's set. */
 function sandboxed(h: Record<string, string>, what: string): void {
