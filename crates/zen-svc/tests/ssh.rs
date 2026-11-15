@@ -1014,3 +1014,62 @@ fn keys_and_config() {
         .is_err()
     );
 }
+
+/// The cost of a key exchange with each method and host key, the engine
+/// restored at every step as a handler runs it, and the test client's own
+/// work included (STATS.md). Run with `cargo test --release -p zen-svc
+/// --test ssh handshake_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a test"]
+fn handshake_cost() {
+    for kex in Kex::ALL {
+        for (name, keys, o) in [
+            (
+                "ssh-ed25519",
+                vec![host_key()],
+                copts(kex, Cipher::Chacha20Poly1305),
+            ),
+            (
+                "ssh-mldsa44-ed25519",
+                vec![hybrid_host_key()],
+                hybrid_copts(kex, Cipher::Chacha20Poly1305),
+            ),
+        ] {
+            let n = 200;
+            let cfg = config_keys(keys.clone(), Options::default());
+            let mut server = std::time::Duration::ZERO;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                // Pair::run, with the engine's steps timed apart.
+                let mut p = Pair::with(cfg.clone(), o.clone(), 0);
+                loop {
+                    let co = p.c.take_out();
+                    let fresh = !co.is_empty();
+                    p.d.buf.extend_from_slice(&co);
+                    let mut so = Vec::new();
+                    loop {
+                        let s0 = std::time::Instant::now();
+                        let (out, moved) = p.d.step();
+                        server += s0.elapsed();
+                        so.extend(out);
+                        if p.d.ended || !(moved || p.d.pending()) {
+                            break;
+                        }
+                    }
+                    p.c.input(&so).unwrap();
+                    if !fresh && so.is_empty() {
+                        break;
+                    }
+                }
+                assert!(p.c.session_id().is_some());
+            }
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / n as f64;
+            println!(
+                "{:<24} {name:<20} engine {:>6.2} ms, with the client {:>6.2} ms",
+                kex.name(),
+                ms(server),
+                ms(t.elapsed())
+            );
+        }
+    }
+}
