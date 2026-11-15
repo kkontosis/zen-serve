@@ -506,6 +506,14 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
         * At the longest of these, 64 MiB of zeros needs 161 pages of 409 chunks, against 21 at `max`. A manifest under `max_value_bytes` 8,192 holds 112, so every such key fails the old test.
       * `test(fs):` the zeros test runs on fs 2 (fixed chunks), with a comment saying why. STATS.md §7.2 and OPS.md §7 now say how zero runs are cut.
       * **Checks:** `handles.test.ts` 10 times, 9 of 9 passing each time; `npm run check` passes; biome is clean.
+      * ea24a40 pushed. One PR comment (issuecomment 6882445471) gives the failure and its cause, and PR #82's body is updated.
+      * **CI green on both runs of ea24a40** (push 43628352279 and pull_request 43628359472), every job. PR #82 is mergeable. Next, on the user's "go": implement step 9.5 as "Step 9.5 in detail" says.
+      * **PR #82 merged** (the user, 19:45 UTC), with the plan and the zeros-test fix. Its subscription ended with it, and no check-in is pending.
+      * **The implementation goes on a new PR.** On "go":
+        1. Restart from main by fast-forward.
+        2. Copy this file to `docs/MILESTONE-9.md`.
+        3. Implement as "Step 9.5 in detail" says.
+        4. Open the PR and subscribe to it.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

@@ -68,7 +68,7 @@ This replaces the per-device `device_seq` gap rule from DESIGN-2 §2.3, so concu
 `GET /unencrypted/*`, the root aliases (`/`, `/favicon.ico`, …) and the SPA fallback (DESIGN-3 §4.2), streamed, with one byte range (206, 416, `If-Range`; spec/api.md §10).
 
 * **Sources:** `unencrypted_dir` or the bundled files (`unencrypted_source = "dir"`), or the store (`"replicated"`), filled with `zen-serve static push DIR` and listed with `zen-serve static list` (spec/operations.md §9). A push switches every node to the new set at once, and keeps the previous set until the next push.
-* **The content origin** (milestone 9, spec/sw.md §1), `[content] origins` and `dir`: on its host, `/_zen/*` (the worker, its pages, `config.json`) and `/v1/*`; a navigation gets the bootstrap page, anything else 503 `Zen-Reason: starting`, sandboxed. `/v1/info` lists it in `content_origins`.
+* **The content origin** (milestone 9, spec/sw.md §1), `[content] origins` and `dir`: on its host, `/_zen/*` (the worker, its pages, `config.json`) and `/v1/*`; a navigation gets the bootstrap page, anything else 503 `Zen-Reason: starting`, sandboxed. `/v1/info` lists it in `content_origins`. Deploying one: docs/SW.md.
 
 ### Relayed services (milestone 5.5)
 Handlers on member clients serve TCP connections the server relays blind ([SVC.md](SVC.md); normative: spec/api.md §14, spec/svc.md). Rights are topic rights on the service id: `consume` to handle, `append` to connect.

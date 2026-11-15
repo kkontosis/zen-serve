@@ -248,7 +248,7 @@ const { fp, inAcl } = await enrollViewer({
 
 * It opens `/_zen/enroll.html` on the content origin as a popup. The user confirms there, and nothing changes on the server before that. It rejects with `enroll_failed` when declined, when the popup is closed or blocked, or when a step fails.
 * A browser session signed in with a password holds no identity, so it can't enroll (TECH_DEBT TD-SW-IDENTITY).
-* Building and deploying the content origin's files: packages/sw/README.md.
+* Deploying a content origin (DNS, TLS, the config, the content dir, enrolling): docs/SW.md. Building its files: packages/sw/README.md.
 
 ## 9. zen-mount
 
