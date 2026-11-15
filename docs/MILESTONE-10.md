@@ -252,6 +252,27 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * README: the package's row
     * this log
   * Next: push, and confirm CI is green on both runs (git 2.56.1 there).
+  * Pushed 85a6180 (`docs:`).
+    * **CI green on both runs of 85a6180,** every job: push 43757240535 and pull_request 43757244816.
+    * The pull_request run's `client` job ran on git 2.56.1: 76 test files passed and 8 skipped (the opt-in benches), 712 tests.
+    * PR #86 is mergeable (clean).
+    * **Step 10.3 is done;** PR #86 waits on review and merge.
+    * This line reaches `docs/MILESTONE-10.md` with the next step's restart from main; plan mode was on when CI finished.
+  * **Next, on the user's word:**
+    1. Restart from main once PR #86 is merged, bringing this line into the docs copy.
+    2. Plan step 10.4 in detail here: the repack leader job, its gc, and the dumb-HTTP public mirror.
+  * **PR #86 merged** (the user, 21:39 UTC). **Step 10.3 is done.** The PR's subscription ended with it. The user asked whether to compact: yes.
+  * **After compacting, on the user's "go":**
+    1. Restart from main by fast-forward.
+    2. Copy this file to `docs/MILESTONE-10.md`, which brings in the lines since 85a6180.
+    3. Plan step 10.4 in detail here (in plan mode), commit the plan, open a new PR, and subscribe.
+* **Step 10.4** (repack, gc and the public mirror):
+  * **Go** (the user, after compacting). Restarted from main by fast-forward (9aa22ef, PR #86's merge); this file copied to `docs/MILESTONE-10.md`, which brings in the lines since 85a6180. Step 10.4 planned in detail below ("Step 10.4 in detail"), in plan mode.
+  * **On approval of this plan:**
+    1. Copy this file to `docs/MILESTONE-10.md` and commit `docs: step 10.4 plan`.
+    2. Push, open the PR, and subscribe.
+    3. Stop there: implementation starts on the user's next "go".
+  * **Approved** (the user). This file copied to `docs/MILESTONE-10.md`; the plan committed, pushed, a new PR opened and subscribed. Next, on the user's "go": the `spec:` commit (item 1 of "Step 10.4 in detail"), then the code, the tests and the docs.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -684,6 +705,157 @@ Each test gives git a `GIT_CONFIG_GLOBAL` of its own, and the child processes ge
 * `npm run check`; `npx vitest run packages/git` 3× green; the touched suites (`packages/db`, `packages/client`) once.
 * With git 2.43 here, and with CI's 2.56.1 on both runs.
 * CI green on both runs.
+
+## Step 10.4 in detail: repack, gc and the public mirror
+
+`@zen/git` gains three commands: `zen-git worker` (a long-running repack and gc job for one fs), `zen-git repack` (a one-shot roll-up of one repo) and `zen-git publish` (a dumb-HTTP copy of a repo, for `/unencrypted`). The push and the sync change a little (below). Nothing in the server changes.
+
+**Survey (this session):**
+* **git.md §9 as written:** past 16 live packs, a consumer of a `sequential` group `"repack"` on each repo's `pushes` topic rolls up the newest packs geometrically (factor 2). Its transaction checks the rolled-up rows are still `live`, marks them `replaced` (`replaced_ms`, `by`), and puts the new pack's row with `seq` = the highest rolled-up `seq`. Gc is a delayed message at `replaced_ms` + 24 h.
+* **Consumers:**
+  * `db.consume(opts, (msg, tx) => …)` runs the handler inside the delivery's transaction (short by default).
+  * `db.consumeManual(opts, msg => …)` lets the handler do slow work first, then `msg.ack()` or a `db.begin({consumes: msg})` it commits (`packages/db/src/db.ts:856`). A throw nacks, and the message is redelivered.
+  * `ConsumeOptions` (`packages/db/src/broker.ts:456`): `sequential` hands out events under a lease that is renewed automatically, so a long repack keeps it.
+* **The scheduler** (`packages/db/src/sched.ts`):
+  * It runs in the owner unless `DbOptions.scheduler` is false; the helper's `openGitDb` sets false.
+  * It leads through `topic('zen', 'db', ns, 'sched').leader('sched')`.
+  * `tx.schedule(topic, type, body, {delayMs})` adds a `$sched` row (`txn.ts:231`).
+  * So the worker needs rights on `("zen", "db", "git", "sched")`, which `zen-git setup` doesn't grant yet.
+* **Deleting files:** `tree.batch().remove(node)` moves a node to `TRASH` (`packages/client/src/tree.ts:1715`), and the sweeper purges it after the horizon (fs.md §6). `tx.fs(tree).ops(batch)` carries it in a transaction (`packages/db/src/files.ts:29`).
+* **Compound indexes:** `planRange` (`packages/db/src/query.ts:169`) uses an index whose leading fields are bound by `=`, ordered by the next field. So an index `[repo, state, seq]` reads only a repo's live packs, in `seq` order.
+* **`/unencrypted`** (`crates/zen-server/src/statics.rs:587`):
+  * It serves `GET /unencrypted/<path>` by the URL's path, ignoring the query (git's `info/refs?service=…`), and a missing file is a real 404.
+  * Its source is `unencrypted_dir` or `static push`'s generation (operations.md §9); a push replaces the whole set.
+  * The test harness's server takes `server.top.unencrypted_dir` (`apps/shared/harness.ts:132`).
+
+### 1. `spec:` commit (git.md §3, §4, §5, §9, a new §13, §10, §11)
+
+* **§9, one repack topic per fs:** `("git", "repack")`, `sequential` group `"repack"`, not each repo's `pushes`.
+  * One consumer then serves every repo of the fs, including repos created later. A group per repo would need a consumer, and a long-poll, per repo.
+  * **§4 step 3.5:** a push whose pack makes the repo's live packs more than 16 also emits `repack` `{1: repo}` there, in the same transaction. The count is a range read of the new index (17 rows or so).
+* **§9, the roll-up's pack:**
+  * It is built in a temporary repository holding only the rolled-up packs (`index-pack` without `--strict`, since their bases' older objects aren't there).
+  * Then `pack-objects --stdout` of every object in it (`cat-file --batch-all-objects`), never thin.
+  * Its object count must equal the union of the rolled-up packs'.
+  * So the job needs no mirror, and it downloads only the newest packs (the geometric rule keeps them small, except when the roll-up reaches the oldest).
+* **§9, choosing the run:** at least the newest two packs, and the shortest such run that leaves every older pack at least twice the bytes of all the packs after it.
+* **§9, its transaction:** as written, plus the new row's `of` (the rolled-up hashes) and a `gc` message scheduled in the same transaction (`tx.schedule`, the grace: 24 h by default) to `("git", "repack")`, carrying `{1: repo, 2: [hash], 3: [node]}`.
+* **§9, gc:** the job moves the listed nodes to `TRASH`, purged by the sweeper (fs.md §6), and deletes the rows still `replaced`.
+* **§3:**
+  * `packs` gains `of: [text]` (absent for a pushed pack).
+  * Its index `by_repo` becomes `live` on `[repo, state, seq]`.
+* **§4 step 3.3:** the pack is skipped when its hash has a row, `live` or `replaced`. A replaced pack's objects are in a live pack, so a re-push of the same pack bytes adds nothing, and no two nodes get one name.
+* **§5:**
+  * A live pack whose `of` hashes are all imported is marked imported without a download, since the mirror already has its objects. So a mirror that kept up never downloads a roll-up.
+  * A pack that has gone (gc after a very old listing) makes the helper read the state again and sync once more.
+* **New §13, the public mirror:**
+  * `zen-git publish <url> <dir>` writes `<dir>/<repo>.git` for git's dumb HTTP protocol: one pack (`repack -a -d`), `info/refs` and `objects/info/packs` (`update-server-info`), and `HEAD`.
+  * It is built in a temporary directory and swapped in by a rename. The previous copy is removed after the swap.
+  * It is served by `/unencrypted` (an `unencrypted_dir`, or the site that `static push` uploads).
+  * It is plaintext and public by design: the repo's whole history, its refs and its names.
+  * Dumb HTTP has no shallow or partial clones, and it is read only.
+  * `zen-git worker --publish <repo>=<dir>` publishes again after each push: a `consumeManual` group `"publish"` on that repo's `pushes` topic.
+* **§10:**
+  * The worker needs fs `write`.
+  * `zen-git setup` also grants writers `read`, `append` and `consume` on `("zen", "db", "git", "sched")`, the scheduler's lease topic (the exact rights are confirmed against `Leader` in the code).
+* **§11:**
+  * The server sees each repack: a new pack's size, the replaced rows, and the `repack` topic's events and their times.
+  * It doesn't see the public mirror's contents unless the mirror is published; once published, they are public.
+* **The pack manifest the placeholder named is not built:** the `packs` table is that manifest, one range read on `live`. §3 says so.
+
+### 2. `git:` commit (`packages/git`)
+
+* **`signin.ts`:**
+  * Schema 1 changed in place (no deployed data): `packs.of`, and the index `live` `[repo text, state text, seq int]`.
+  * `openGitDb(…, {scheduler})`, true for the worker only.
+* **`store.ts`:**
+  * `readState` reads through `live`.
+  * `push`: skips a known hash (§4 3.3), and counts the live packs and emits `repack` (§4 3.5).
+  * `repackTopic(db)`.
+  * `rollUp(packs): PackRow[] | undefined`, a pure function (§9's run).
+  * `repack(db, fs, repo, {graceMs})`, which in order:
+    1. reads the state and chooses the run
+    2. downloads the run's packs into a temporary bare repo
+    3. builds and checks the new pack
+    4. uploads it under a session
+    5. runs the transaction (the rows still `live`, else `{ok: false}`; mark them `replaced`; put the new row; `tx.schedule` the gc)
+    6. closes the upload, and removes the temporary repo in `finally`
+
+    A test variable makes it SIGKILL itself after the upload, as the hook's does.
+  * `collect(db, fs, body)`, the gc.
+* **`mirror.ts`:** `syncMirror` marks a pack covered by `of`. A pack that is missing on download throws a typed `PackGone`, which the helper and the hook's callers catch once to re-read the state.
+* **`worker.ts`, `zen-git worker <zen://host/fs> [--grace 24h] [--publish <repo>=<dir>]…`:**
+  * signs in, opens the db with the scheduler, and runs `consumeManual` on `repackTopic`
+  * `repack` messages: `repack` when the live packs still exceed 16, else ack
+  * `gc` messages: `collect`
+  * the publish groups
+  * stops cleanly on SIGINT and SIGTERM, releasing its leases
+  * logs one line per repack (`repo: N packs → 1, X MB, T s`) to stderr
+* **`publish.ts`:** the sync under the mirror lock, then §13's directory.
+* **`cli.ts`:** `worker`, `repack <url>` (one-shot) and `publish <url> <dir>`.
+* **`setup.ts`:** the scheduler's grant.
+
+### Tests (`packages/git/test/`, the same world as 10.3's, real git and the bins)
+
+* **Unit:** `rollUp` on hand-made size lists: nothing at 16 or fewer; the newest two at least; the shortest run; a run reaching the oldest pack.
+* **Many pushes, repacked:**
+  * 300 pushes through `store.push` (packs cut by `git pack-objects` from a local repo, so the test takes seconds, not 300 helper runs), with a `zen-git worker --grace 3s` process running.
+  * Then:
+    * the live packs settle at 16 or fewer
+    * a fresh `git clone` passes `fsck --strict`, with every ref
+    * a clone made before the repacks fetches without downloading any roll-up (no `pack-<roll-up hash>.pack` in its mirror)
+    * after the grace, the replaced rows and their nodes are gone
+* **A fetch during a repack:**
+  * A state read before a repack still syncs a fresh mirror after the repack, within the grace.
+  * After the gc, a sync from that stale state hits `PackGone`, re-reads, and succeeds.
+* **Concurrency:**
+  * A push during a repack: both commit (the repack reads only the rows it replaces).
+  * Two `zen-git repack` at once: one commits, the other is refused (`the packs changed`). Nothing is lost, and `fsck` passes.
+* **A worker killed after its upload:** nothing changes. The unacked message is redelivered to the next worker, which repacks.
+* **A re-pushed pack after a repack:** no new row, the refs move, and a clone works.
+* **The public mirror** (the world's server with `unencrypted_dir` set to a temporary directory):
+  * `zen-git publish`, then `git clone http://127.0.0.1:<port>/unencrypted/<…>/<repo>.git` (dumb HTTP): refs, tags, HEAD, `fsck --strict`.
+  * After a push, `worker --publish` brings the copy up to date, and a `git fetch` from it gets the new commit.
+* **Setup:** `zen-git setup` adds the scheduler's grant, and running it twice adds nothing.
+* **Bench (opt-in, `ZEN_GIT_BENCH_PUSHES`):** 2,000 pushes with a worker. Logged:
+  * the repack count and each one's time
+  * the live packs over time and `readState`'s time
+  * the roll-ups' total bytes against one `git repack -a -d` of the same history
+  * the worker's peak RSS
+* **Negative controls,** each run once and restored, each failing its test:
+  1. the repack transaction not checking the rows are still `live`: the two-repacks test
+  2. the `of` cover skipped: the old clone downloads a roll-up
+  3. the helper's `PackGone` retry removed: the stale sync after gc
+  4. the push not emitting `repack`: the live packs never settle
+  5. `publish` without `update-server-info`: the dumb clone fails
+
+### Docs (`docs:` commit)
+
+* **docs/GIT.md:**
+  * running the worker: one per fs, on an always-on machine; a systemd user unit; what happens without one (packs pile up, so fresh clones slow down; the mirrors repack themselves)
+  * `repack`
+  * publishing a public repo (with an `unencrypted_dir`, or with `static push`, which replaces the whole site)
+  * setup's new grant
+* **STATS §5.8:** the repack and gc costs, and the bench's figures.
+* **spec/OPS.md §9:**
+  * a `static push` of a published repo replaces the whole site
+  * dumb HTTP is read only
+* **TECH_DEBT:** TD-GIT-SCOPE gains dumb HTTP's limits.
+* **The log.**
+
+### Verification
+
+* `npm run check`.
+* `npx vitest run packages/git` 3× green, with git 2.43 here; `packages/db` once.
+* CI green on both runs (git 2.56.1 there).
+* The bench run once here, its figures logged.
+
+**Defaults chosen (overridable):**
+* **One `("git", "repack")` topic per fs,** not a group on each repo's `pushes` topic (a spec change to §9).
+* **The roll-up is built from the rolled-up packs alone** in a temporary repo, so it needs no mirror. If its packs are much larger than `git repack`'s (measured against the spike's 3.6 MB), pack-objects is given paths from `rev-list --objects` for its delta heuristics, and the log says so.
+* **A push skips any known pack hash,** live or replaced.
+* **The worker runs the scheduler** (gc by delayed messages, as §9 says), and the grace is 24 h.
+* **`publish` writes one full pack each time,** not incrementally.
 
 ## Verification (each sub-step)
 * **Rust:** `cargo fmt --check`; clippy `--all-targets -D warnings` (default, `--no-default-features`, `--all-features`); the touched crates' tests.
