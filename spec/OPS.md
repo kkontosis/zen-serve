@@ -63,7 +63,7 @@ The relayed services' tests (`crates/zen-svc`, `apps/echo`, `apps/mail`, `packag
 | `python3` | `smtplib` and `imaplib` against the mail app (run as `python3 -I`) | `python3` |
 | `git` | `git ls-remote` against the echo app's upload-pack stub | `git` |
 
-* **OpenSSH 9.6** (Ubuntu 24.04) has no `mlkem768x25519-sha256`. `tests/openssh_pq.rs` is ignored unless `ZEN_TEST_SSH` names an OpenSSH 9.9 or later: `scripts/build-openssh.sh <prefix>` builds 10.6p1 from source in about 10 s. CI's `openssh-pq` job does this, on demand only (`workflow_dispatch`).
+* **OpenSSH 9.6** (Ubuntu 24.04) has `sntrup761x25519-sha512`, under its `@openssh.com` name only, which `tests/openssh.rs` tests on every build, but no `mlkem768x25519-sha256` (9.9) and no `ssh-mldsa44-ed25519` keys (10.6). `tests/openssh_pq.rs` is ignored unless `ZEN_TEST_SSH` names an OpenSSH 10.6 or later: `scripts/build-openssh.sh <prefix>` builds 10.6p1 from source in about a minute. CI's `openssh-pq` job does this, on demand only (`workflow_dispatch`); start it after changing `crates/zen-svc/src/ssh/kex.rs`, `keys.rs` or `cipher.rs`.
 * **Ports.** Each test world gives its services free ports on 127.0.0.1; nothing listens on a fixed port.
 * **Takeover tests** SIGKILL handler workers and wait out a 1 s lease. A loaded machine stretches them; their bounds leave room for that, so a failure there is worth reading, not re-running.
 
