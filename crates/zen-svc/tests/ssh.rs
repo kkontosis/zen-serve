@@ -2,19 +2,28 @@
 //! sessions fed at once and one byte at a time, with the engine restored
 //! at every step; the strict-kex rules; authentication's limits and a
 //! question across a restore; the read and write bounds; rekeys from
-//! either side; channel refusals; malformed input; the state's checks.
+//! either side; both host-key kinds and hybrid user keys; channel
+//! refusals; malformed input; the state's checks.
 
 mod sshcommon;
 
 use sshcommon::*;
 use zen_svc::ssh::client::{Client, ClientOptions, Msg, msg, parse};
 use zen_svc::ssh::{
-    Cipher, Config, Conn, Error, Event, HostKey, Kex, Options, PublicKey, QUEUE_MAX, UNREAD_MAX,
-    reason,
+    Cipher, Config, Conn, Error, Event, HostAlg, HostKey, Kex, Options, PublicKey, QUEUE_MAX,
+    UNREAD_MAX, reason,
 };
 
 fn user() -> HostKey {
     HostKey::from_seed(&[9; 32])
+}
+
+fn hybrid_user() -> HostKey {
+    HostKey::hybrid_from_seeds(&[10; 32], &[11; 32])
+}
+
+fn users() -> App {
+    App::new(vec![user().public(), hybrid_user().public()])
 }
 
 fn copts(kex: Kex, cipher: Cipher) -> ClientOptions {
@@ -24,16 +33,30 @@ fn copts(kex: Kex, cipher: Cipher) -> ClientOptions {
     }
 }
 
+/// Client options expecting the hybrid host key.
+fn hybrid_copts(kex: Kex, cipher: Cipher) -> ClientOptions {
+    ClientOptions {
+        host: Some(hybrid_host_key().public()),
+        ..ClientOptions::new(kex, cipher)
+    }
+}
+
 /// The client and a driven engine.
 struct Pair {
     d: Driver,
     c: Client,
     got: Vec<Msg>,
+    /// The user key `login` uses.
+    user: HostKey,
 }
 
 impl Pair {
     fn new(o: ClientOptions, opts: Options, feed: usize) -> Pair {
-        let (mut d, out) = Driver::new(config(opts), App::new(vec![user().public()]));
+        Pair::with(config(opts), o, feed)
+    }
+
+    fn with(cfg: Config, o: ClientOptions, feed: usize) -> Pair {
+        let (mut d, out) = Driver::new(cfg, users());
         d.feed = feed;
         let mut c = Client::new(o);
         c.input(&out).unwrap();
@@ -41,6 +64,7 @@ impl Pair {
             d,
             c,
             got: Vec::new(),
+            user: user(),
         }
     }
 
@@ -81,9 +105,9 @@ impl Pair {
         self.send(&msg::userauth_none("test"));
         self.run();
         let sid = self.c.session_id().unwrap().to_vec();
-        self.send(&msg::userauth_ed25519(&sid, "test", &user(), false));
+        self.send(&msg::userauth_ed25519(&sid, "test", &self.user, false));
         self.run();
-        self.send(&msg::userauth_ed25519(&sid, "test", &user(), true));
+        self.send(&msg::userauth_ed25519(&sid, "test", &self.user, true));
         self.run();
         assert_eq!(
             self.take(),
@@ -121,7 +145,22 @@ impl Pair {
 }
 
 fn session(kex: Kex, cipher: Cipher, feed: usize) {
-    let mut p = Pair::new(copts(kex, cipher), Options::default(), feed);
+    run_session(
+        Pair::new(copts(kex, cipher), Options::default(), feed),
+        cipher,
+    );
+}
+
+/// A session with both host keys held, the hybrid negotiated, and a
+/// hybrid user key.
+fn hybrid_session(kex: Kex, cipher: Cipher, feed: usize) {
+    let cfg = config_keys(vec![host_key(), hybrid_host_key()], Options::default());
+    let mut p = Pair::with(cfg, hybrid_copts(kex, cipher), feed);
+    p.user = hybrid_user();
+    run_session(p, cipher);
+}
+
+fn run_session(mut p: Pair, cipher: Cipher) {
     p.login();
     // The client's channel 5 is the engine's 0.
     p.send(&msg::channel_open(5, 1 << 20, 32_768));
@@ -152,9 +191,10 @@ fn session(kex: Kex, cipher: Cipher, feed: usize) {
 
 #[test]
 fn whole_sessions() {
-    for kex in [Kex::MlKem768X25519, Kex::Curve25519] {
+    for kex in Kex::ALL {
         for cipher in [Cipher::Chacha20Poly1305, Cipher::Aes256Gcm] {
             session(kex, cipher, 0);
+            hybrid_session(kex, cipher, 0);
         }
     }
 }
@@ -164,10 +204,105 @@ fn sessions_one_byte_at_a_time() {
     // Every byte is a step, and the engine is restored before each: the
     // version exchange, the key exchange and authentication resume at any
     // point.
-    for kex in [Kex::MlKem768X25519, Kex::Curve25519] {
+    for kex in Kex::ALL {
         session(kex, Cipher::Chacha20Poly1305, 1);
     }
     session(Kex::Curve25519, Cipher::Aes256Gcm, 3);
+    hybrid_session(Kex::Sntrup761X25519, Cipher::Aes256Gcm, 1);
+}
+
+#[test]
+fn sntrup761_has_a_64_byte_session_id() {
+    let mut p = Pair::new(
+        copts(Kex::Sntrup761X25519, Cipher::Chacha20Poly1305),
+        Options::default(),
+        0,
+    );
+    p.run();
+    assert_eq!(p.c.session_id().unwrap().len(), 64);
+    assert_eq!(p.conn().session_id().unwrap().len(), 64);
+    // SHA-256's methods: 32.
+    let mut p = Pair::new(
+        copts(Kex::Curve25519, Cipher::Chacha20Poly1305),
+        Options::default(),
+        0,
+    );
+    p.run();
+    assert_eq!(p.c.session_id().unwrap().len(), 32);
+}
+
+#[test]
+fn host_key_negotiation() {
+    let both = || config_keys(vec![hybrid_host_key(), host_key()], Options::default());
+    // The client's order decides among the keys held: the hybrid first...
+    let mut p = Pair::with(both(), hybrid_copts(Kex::Curve25519, Cipher::Aes256Gcm), 0);
+    p.login();
+    assert_eq!(p.c.host_algs_used, [HostAlg::MlDsa44Ed25519]);
+    assert_eq!(p.conn().host_alg(), Some(HostAlg::MlDsa44Ed25519));
+    // ... or Ed25519, for a client that prefers it.
+    let mut o = copts(Kex::Curve25519, Cipher::Aes256Gcm);
+    o.host_algs = vec![HostAlg::Ed25519, HostAlg::MlDsa44Ed25519];
+    let mut p = Pair::with(both(), o, 0);
+    p.login();
+    assert_eq!(p.c.host_algs_used, [HostAlg::Ed25519]);
+    // A client of the hybrid only, and a service of Ed25519 only.
+    let mut o = hybrid_copts(Kex::Curve25519, Cipher::Aes256Gcm);
+    o.host_algs = vec![HostAlg::MlDsa44Ed25519];
+    let mut p = Pair::new(o, Options::default(), 0);
+    p.run();
+    assert_eq!(
+        p.d.stats.error,
+        Some(Error::Protocol {
+            reason: reason::KEY_EXCHANGE_FAILED,
+            detail: "no algorithm in common",
+        })
+    );
+    // The service offers the hybrid first, whatever the order given.
+    let cfg = both();
+    assert_eq!(cfg.host_keys()[0].alg(), HostAlg::MlDsa44Ed25519);
+    let (_, out) = Conn::new(&cfg, now());
+    let mut c = Client::new(hybrid_copts(Kex::Curve25519, Cipher::Aes256Gcm));
+    c.input(&out).unwrap();
+    assert_eq!(c.server_host_algs, ["ssh-mldsa44-ed25519", "ssh-ed25519"]);
+}
+
+#[test]
+fn rekeys_keep_the_host_key_algorithm() {
+    for (first, kex) in [
+        (HostAlg::MlDsa44Ed25519, Kex::Sntrup761X25519),
+        (HostAlg::Ed25519, Kex::MlKem768X25519),
+    ] {
+        let other = [HostAlg::MlDsa44Ed25519, HostAlg::Ed25519]
+            .into_iter()
+            .find(|h| *h != first)
+            .unwrap();
+        let cfg = config_keys(vec![host_key(), hybrid_host_key()], Options::default());
+        let mut o = copts(kex, Cipher::Chacha20Poly1305);
+        o.host = None;
+        o.host_algs = vec![first, other];
+        let mut p = Pair::with(cfg, o, 0);
+        p.login();
+        assert_eq!(
+            p.c.server_host_algs.len(),
+            2,
+            "the first KEXINIT offers both"
+        );
+        // The client still offers both; the server offers only the first
+        // exchange's, in rekeys from either side.
+        let sid = p.c.session_id().unwrap().to_vec();
+        p.c.rekey();
+        p.run();
+        assert_eq!(p.c.server_host_algs, [first.name()]);
+        let mut c = p.conn();
+        let out = c.rekey();
+        p.d.state = c.state();
+        p.c.input(&out).unwrap();
+        p.run();
+        assert_eq!(p.c.server_host_algs, [first.name()]);
+        assert_eq!(p.c.host_algs_used, [first, first, first]);
+        assert_eq!(p.d.stats.kexes, 3);
+        assert_eq!(p.c.session_id().unwrap(), &sid[..]);
+    }
 }
 
 #[test]
@@ -180,6 +315,8 @@ fn ext_info_and_strict_kex() {
     p.run();
     let e = p.c.ext_info.clone().expect("EXT_INFO");
     assert!(e.windows(15).any(|w| w == b"server-sig-algs"));
+    let algs = b"ssh-mldsa44-ed25519,ssh-ed25519,rsa-sha2-256,rsa-sha2-512";
+    assert!(e.windows(algs.len()).any(|w| w == algs));
     // Strict kex: the sequence numbers restarted at NEWKEYS.
     assert_eq!(p.c.tx_seq(), 0);
 }
@@ -187,7 +324,7 @@ fn ext_info_and_strict_kex() {
 /// A driver and a client whose first bytes carry a plain IGNORE between
 /// the version line and the KEXINIT.
 fn ignore_first(o: ClientOptions) -> Pair {
-    let (d, out) = Driver::new(config(Options::default()), App::new(vec![user().public()]));
+    let (d, out) = Driver::new(config(Options::default()), users());
     let mut c = Client::new(o);
     c.input(&out).unwrap();
     let mut co = c.take_out();
@@ -197,6 +334,7 @@ fn ignore_first(o: ClientOptions) -> Pair {
         d,
         c,
         got: Vec::new(),
+        user: user(),
     };
     p.d.buf.extend_from_slice(&co);
     p
@@ -222,7 +360,7 @@ fn without_strict_kex_ignores_are_ignored() {
     // client sends itself, during the key exchange, that is tested here.)
     let mut o = copts(Kex::Curve25519, Cipher::Aes256Gcm);
     o.strict = false;
-    let (d, out) = Driver::new(config(Options::default()), App::new(vec![user().public()]));
+    let (d, out) = Driver::new(config(Options::default()), users());
     let mut c = Client::new(o);
     c.input(&out).unwrap();
     c.send(&msg::ignore(b"x"));
@@ -230,6 +368,7 @@ fn without_strict_kex_ignores_are_ignored() {
         d,
         c,
         got: Vec::new(),
+        user: user(),
     };
     p.login();
     p.send(&msg::channel_open(0, 1 << 20, 32_768));
@@ -291,6 +430,11 @@ fn authentication_limits() {
 
 #[test]
 fn a_question_survives_a_restore() {
+    question_across_a_restore(&user());
+    question_across_a_restore(&hybrid_user());
+}
+
+fn question_across_a_restore(user_key: &HostKey) {
     let cfg = config(Options::default());
     let (mut conn, out) = Conn::new(&cfg, now());
     let mut c = Client::new(copts(Kex::Curve25519, Cipher::Chacha20Poly1305));
@@ -308,7 +452,7 @@ fn a_question_survives_a_restore() {
     }
     let sid = c.session_id().unwrap().to_vec();
     c.send(&msg::service_request("ssh-userauth"));
-    c.send(&msg::userauth_ed25519(&sid, "test", &user(), true));
+    c.send(&msg::userauth_ed25519(&sid, "test", user_key, true));
     // Pipelined behind the question: not read until it is answered.
     c.send(&msg::channel_open(0, 1 << 20, 32_768));
     let (ev, held) = step(&mut conn, &mut c, &mut buf);
@@ -318,7 +462,7 @@ fn a_question_survives_a_restore() {
         e => panic!("{e:?}"),
     };
     assert!(q.signed);
-    assert_eq!(q.key, user().public());
+    assert_eq!(q.key, user_key.public());
     assert!(!buf.is_empty(), "the channel open waits");
     // Another handler takes over: it asks its own application.
     let mut conn = Conn::restore(&cfg, &conn.state()).unwrap();
@@ -430,12 +574,23 @@ fn the_write_bound_and_the_queue() {
 
 #[test]
 fn rekeys_from_either_side_mid_transfer() {
-    for feed in [0, 5] {
-        let mut p = Pair::new(
-            copts(Kex::MlKem768X25519, Cipher::Chacha20Poly1305),
-            Options::default(),
-            feed,
-        );
+    for (feed, hybrid) in [(0, false), (5, false), (0, true), (5, true)] {
+        let mut p = if hybrid {
+            let cfg = config_keys(vec![host_key(), hybrid_host_key()], Options::default());
+            let mut p = Pair::with(
+                cfg,
+                hybrid_copts(Kex::Sntrup761X25519, Cipher::Chacha20Poly1305),
+                feed,
+            );
+            p.user = hybrid_user();
+            p
+        } else {
+            Pair::new(
+                copts(Kex::MlKem768X25519, Cipher::Chacha20Poly1305),
+                Options::default(),
+                feed,
+            )
+        };
         p.login();
         p.send(&msg::channel_open(0, 1 << 20, 32_768));
         p.send(&msg::exec(0, b"cat", false));
@@ -468,6 +623,9 @@ fn rekeys_from_either_side_mid_transfer() {
         assert_eq!(p.output(0, &got), (sent, true), "feed {feed}");
         assert_eq!(p.d.stats.kexes, 3);
         assert_eq!(p.c.kexes, 3);
+        if hybrid {
+            assert_eq!(p.c.host_algs_used, [HostAlg::MlDsa44Ed25519; 3]);
+        }
     }
 }
 
@@ -754,6 +912,32 @@ fn state_checks() {
         Conn::restore(&cfg, b"\xa0"),
         Err(Error::BadState(_))
     ));
+    // A session id of 32 or 64 bytes, and nothing else.
+    for n in [32, 64] {
+        assert!(edit(&set("sid", Value::Bytes(vec![0; n]))).is_ok(), "{n}");
+    }
+    for n in [31, 33, 63, 65] {
+        assert!(
+            matches!(
+                edit(&set("sid", Value::Bytes(vec![0; n]))),
+                Err(Error::BadState(_))
+            ),
+            "{n}"
+        );
+    }
+    // The host-key algorithm: present after a key exchange, known, and one
+    // the service holds (this one holds Ed25519 only).
+    assert!(matches!(
+        edit(&|m| m.retain(|(k, _)| *k != Value::Text("hk".into()))),
+        Err(Error::BadState("no hk"))
+    ));
+    for hk in [1, 3] {
+        assert!(matches!(
+            edit(&set("hk", Value::Integer(hk.into()))),
+            Err(Error::BadState(_))
+        ));
+    }
+    assert!(edit(&set("hk", Value::Integer(2.into()))).is_ok());
     // A key of the wrong length.
     let tx = |m: &mut Map| {
         for (k, v) in m.iter_mut() {
@@ -778,12 +962,30 @@ fn state_checks() {
 #[test]
 fn keys_and_config() {
     let k = HostKey::from_seed(&[1; 32]);
+    let h = HostKey::hybrid_from_seeds(&[1; 32], &[2; 32]);
+    assert!(Config::new(vec![], Options::default()).is_err());
+    assert!(Config::new(vec![k.clone(), k.clone()], Options::default()).is_err());
+    assert!(Config::new(vec![h.clone(), h.clone()], Options::default()).is_err());
+    let c = Config::new(vec![k.clone(), h.clone()], Options::default()).unwrap();
+    assert_eq!(c.host_key(HostAlg::Ed25519).unwrap().public(), k.public());
+    assert_eq!(
+        c.host_key(HostAlg::MlDsa44Ed25519).unwrap().public(),
+        h.public()
+    );
+    let c = Config::new(vec![k.clone()], Options::default()).unwrap();
+    assert!(c.host_key(HostAlg::MlDsa44Ed25519).is_none());
+    // A generated key of each kind signs and verifies as its own.
+    for alg in [HostAlg::Ed25519, HostAlg::MlDsa44Ed25519] {
+        let g = HostKey::generate(alg);
+        assert_eq!(g.alg(), alg);
+        assert_eq!(g.public().algorithm(), alg.name());
+    }
     let line = k.public_line();
     assert_eq!(PublicKey::from_line(&line).unwrap(), k.public());
     assert!(PublicKey::from_line("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=").is_err());
     assert!(
         Config::new(
-            k.clone(),
+            vec![k.clone()],
             Options {
                 software: "a b".into(),
                 ..Options::default()
@@ -793,7 +995,7 @@ fn keys_and_config() {
     );
     assert!(
         Config::new(
-            k.clone(),
+            vec![k.clone()],
             Options {
                 kex: vec![],
                 ..Options::default()
@@ -803,7 +1005,7 @@ fn keys_and_config() {
     );
     assert!(
         Config::new(
-            k,
+            vec![k],
             Options {
                 window: 10,
                 ..Options::default()

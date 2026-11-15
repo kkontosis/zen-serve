@@ -2508,7 +2508,7 @@ version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
- "rand_chacha",
+ "rand_chacha 0.9.0",
  "rand_core 0.9.5",
 ]
 
@@ -2531,6 +2531,16 @@ checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -3197,6 +3207,21 @@ dependencies = [
  "async-process",
  "blocking",
  "futures-lite",
+]
+
+[[package]]
+name = "sntrup-kem"
+version = "0.1.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86b48594a12d974c3918201c617b839e60a0a493fbc19a137047972b3fca5ff0"
+dependencies = [
+ "ctutils",
+ "hex",
+ "rand 0.10.3",
+ "rand_chacha 0.10.0",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -4273,11 +4298,13 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "ml-dsa",
  "ml-kem",
  "poly1305",
  "rsa",
  "rustls",
  "sha2 0.11.0",
+ "sntrup-kem",
  "x25519-dalek",
  "zen-svc",
  "zen-tls-rustcrypto",

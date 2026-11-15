@@ -23,8 +23,19 @@ pub fn host_key() -> HostKey {
     HostKey::from_seed(&[42; 32])
 }
 
+/// The service's `ssh-mldsa44-ed25519` host key, where a test holds one.
+pub fn hybrid_host_key() -> HostKey {
+    HostKey::hybrid_from_seeds(&[43; 32], &[44; 32])
+}
+
+/// A service with the Ed25519 host key only.
 pub fn config(opts: Options) -> Config {
-    Config::new(host_key(), opts).unwrap()
+    Config::new(vec![host_key()], opts).unwrap()
+}
+
+/// A service with these host keys.
+pub fn config_keys(keys: Vec<HostKey>, opts: Options) -> Config {
+    Config::new(keys, opts).unwrap()
 }
 
 /// What a channel does.
@@ -235,6 +246,9 @@ pub struct Stats {
     pub ciphers: Option<(zen_svc::ssh::Cipher, zen_svc::ssh::Cipher)>,
     pub user: Option<String>,
     pub asked: Vec<(String, bool)>,
+    /// The session id's length: 64 for sntrup761x25519, else 32.
+    pub sid_len: Option<usize>,
+    pub host_alg: Option<zen_svc::ssh::HostAlg>,
 }
 
 /// One connection, driven step by step with a restore before each.
@@ -308,6 +322,8 @@ impl Driver {
         self.stats.steps += 1;
         self.stats.kexes = c.kexes();
         self.stats.ciphers = c.ciphers().or(self.stats.ciphers);
+        self.stats.sid_len = c.session_id().map(<[u8]>::len).or(self.stats.sid_len);
+        self.stats.host_alg = c.host_alg().or(self.stats.host_alg);
         if let Some(u) = c.user() {
             self.stats.user = Some(u.to_owned());
         }
@@ -399,6 +415,19 @@ pub fn ssh_bin() -> PathBuf {
     p
 }
 
+/// That `ssh`'s version, as (major, minor): `OpenSSH_9.6p1` is (9, 6).
+pub fn ssh_version() -> (u32, u32) {
+    let o = Command::new(ssh_bin()).arg("-V").output().unwrap();
+    let v = String::from_utf8_lossy(&o.stderr);
+    let v = v
+        .strip_prefix("OpenSSH_")
+        .unwrap_or_else(|| panic!("an OpenSSH version: {v}"));
+    let mut it = v.split(|c: char| !c.is_ascii_digit());
+    let major = it.next().unwrap().parse().unwrap();
+    let minor = it.next().unwrap().parse().unwrap();
+    (major, minor)
+}
+
 /// `ssh-keygen` next to that `ssh`, or on PATH.
 pub fn keygen_bin() -> PathBuf {
     let ssh = ssh_bin();
@@ -432,6 +461,26 @@ pub fn user_key(dir: &Path, name: &str, args: &[&str]) -> (PathBuf, PublicKey) {
     (f, PublicKey::from_line(&line).unwrap())
 }
 
+/// `ssh-keygen -y` on `key`'s `to_openssh` PEM: the public line OpenSSH
+/// derives from it.
+pub fn keygen_reads(dir: &Path, name: &str, key: &HostKey) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = dir.join(name);
+    std::fs::write(&f, key.to_openssh().as_bytes()).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let o = Command::new(keygen_bin())
+        .args(["-y", "-f"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "ssh-keygen -y: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8(o.stdout).unwrap()
+}
+
 /// What an `ssh` run gave.
 #[derive(Debug)]
 pub struct Run {
@@ -443,12 +492,28 @@ pub struct Run {
 /// Runs `ssh` against `port` with the key `key` and extra options; `args`
 /// after the destination (the command, or `-s` and a subsystem before it).
 pub fn ssh(dir: &Path, port: u16, key: &Path, opts: &[&str], args: &[&str], stdin: &[u8]) -> Run {
+    // Both host keys: a client takes the line of the algorithm it
+    // negotiated, and one without the hybrid skips its line.
+    let known = [host_key().public_line(), hybrid_host_key().public_line()];
+    ssh_known(dir, port, key, &known, opts, args, stdin)
+}
+
+/// [`ssh`] with these `known_hosts` keys for the service.
+pub fn ssh_known(
+    dir: &Path,
+    port: u16,
+    key: &Path,
+    known: &[String],
+    opts: &[&str],
+    args: &[&str],
+    stdin: &[u8],
+) -> Run {
     let kh = dir.join(format!("known_hosts_{port}"));
-    std::fs::write(
-        &kh,
-        format!("[127.0.0.1]:{port} {}\n", host_key().public_line()),
-    )
-    .unwrap();
+    let lines: String = known
+        .iter()
+        .map(|k| format!("[127.0.0.1]:{port} {k}\n"))
+        .collect();
+    std::fs::write(&kh, lines).unwrap();
     let mut cmd = Command::new(ssh_bin());
     cmd.arg("-F")
         .arg("/dev/null")

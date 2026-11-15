@@ -18,12 +18,18 @@ base64 = "0.22"
 chacha20 = { version = "0.10", default-features = false, features = ["legacy"] }
 ciborium = "0.2"
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "zeroize"] }
-getrandom = "0.4"
+# sys_rng: the CryptoRng that sntrup761 encapsulation and ML-DSA signing take.
+getrandom = { version = "0.4", features = ["sys_rng"] }
+# ssh-mldsa44-ed25519 host and user keys (hedged signing takes rand_core).
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 ml-kem = { version = "0.3", default-features = false, features = ["zeroize"] }
 poly1305 = "0.9"
 # User keys (rsa-sha2-256/512), verification only, under zen-tls-rustcrypto's
 # key policy; pinned as there.
 rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["sha2"] }
+# sntrup761x25519-sha512; a release candidate, pinned, checked by its KATs and
+# by OpenSSH (tests/openssh.rs).
+sntrup-kem = "=0.1.0-rc.0"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 sha2 = { version = "0.11", default-features = false }
 x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }

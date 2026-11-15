@@ -214,6 +214,31 @@ describe('the SSH binding against OpenSSH', () => {
     }
   }, 60_000);
 
+  it('serves sntrup761x25519 by its OpenSSH name, and two host keys', async () => {
+    // OpenSSH before 10.6 takes the Ed25519 key of the two.
+    const hybrid = sw.sshGenerateHostKey('ssh-mldsa44-ed25519');
+    const config = new sw.SshConfig([keys.hostKey, hybrid], {
+      kex: ['sntrup761x25519-sha512@openssh.com'],
+    });
+    expect(config.hostKeyLines).toEqual([sw.sshHostKeyLine(hybrid), keys.hostLine]);
+    expect(config.hostKeyLine).toBe(sw.sshHostKeyLine(hybrid));
+    const s = await server(config, [keys.userLine]);
+    try {
+      const r = await runSsh([
+        ...keys.sshArgs(s.port, {
+          options: ['KexAlgorithms=sntrup761x25519-sha512@openssh.com'],
+        }),
+        'echo pq',
+      ]);
+      expect(r.stderr).toBe('');
+      expect(r.code).toBe(0);
+      expect(r.stdout.toString()).toBe('pq\n');
+    } finally {
+      s.close();
+      config.free();
+    }
+  });
+
   it('refuses a key the server does not know', async () => {
     const config = new sw.SshConfig(keys.hostKey);
     const s = await server(config, [keys.userLine]);
@@ -249,6 +274,28 @@ describe('the SSH binding', () => {
     expect(k.algorithm).toBe('ssh-ed25519');
     expect(k.fingerprint).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
     expect(k.blob.length).toBe(51);
+  });
+
+  it('makes host keys of either kind', () => {
+    for (const [alg, blob] of [
+      ['ssh-ed25519', 51],
+      ['ssh-mldsa44-ed25519', 4 + 19 + 4 + 1312 + 32],
+    ] as const) {
+      const pem = sw.sshGenerateHostKey(alg);
+      expect(pem).toMatch(/^-----BEGIN OPENSSH PRIVATE KEY-----\n/);
+      const line = sw.sshHostKeyLine(pem);
+      expect(line.startsWith(`${alg} `)).toBe(true);
+      const k = sw.sshPublicKey(line);
+      expect(k.algorithm).toBe(alg);
+      expect(k.blob.length).toBe(blob);
+      // A new key each time.
+      expect(sw.sshHostKeyLine(sw.sshGenerateHostKey(alg))).not.toBe(line);
+    }
+    expect(failing(() => sw.sshGenerateHostKey('ssh-rsa')).message).toBe('config');
+    // Two of one kind, or none, are refused.
+    expect(failing(() => new sw.SshConfig([keys.hostKey, keys.hostKey])).message).toBe('config');
+    expect(failing(() => new sw.SshConfig([])).message).toBe('config');
+    expect(failing(() => new sw.SshConfig([keys.hostKey, 'x'])).message).toBe('key');
   });
 
   it('refuses with stable codes', () => {
