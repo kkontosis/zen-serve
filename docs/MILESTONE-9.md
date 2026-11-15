@@ -561,6 +561,38 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
         * throughput: unchanged, 45–49 MiB/s
       * **The bench's negative control:** the worker passing every request to the network fails it at the first navigation (`fromServiceWorker` false). The worker was then restored.
       * The `docs:` commit: STATS.md §7.6 (the figures), TD-SW-THROUGHPUT (new), the worker's figure in TD-MEMORY, docs/SW.md's costs, the Outcome below, and this log.
+      * ecc887a (the `docs:` commit) pushed.
+      * **The checks:**
+        * the full `npx vitest run`: 696 passed, 22 skipped
+        * every Playwright project: 25 passed, 1 skipped (the bench)
+        * `npm run check` refused the new test's `for await` over a `ReadableStream` (the client's test lib). 9bdf946 reads with a reader, and the check then passes.
+      * PR #83 opened and subscribed.
+      * One `files-bench` dispatch run started on the branch, with `files_gib` 4. The client bench's 16 GiB figures are milestone 8's, and the worker's bench runs at 4 GiB.
+      * **CI green on both runs of 9bdf946** (push 43696193389 and pull_request 43696216278), every job. **The dispatch run 43696219828 was green in full:**
+        * `files-bench`, with the worker's bench at 4 GiB (5.2 min)
+        * `devices-bench`
+        * `openssh-pq`
+      * **The worker on CI's runner** (`ubuntu-latest`, Playwright's Chromium 141, 4 GiB, one run):
+
+        | What | Measured |
+        |---|---|
+        | First start after enrollment | 47 ms |
+        | A running worker, a small file | median 1.4 ms |
+        | A stopped worker, a navigation | median 58 ms, p90 63 |
+        | Read whole, cold / again (GC every 250 ms) / a third time | 53.4 / 43.8 / 61.5 MiB/s; the headers in 15 ms |
+        | In Node: `Tree.readStream` / a replica / `handle` | 178.9 / 166.6 / 163.0 MiB/s |
+        | The worker's heap and buffers, with garbage / live | +102 / +37.6 MiB |
+        | 64 KiB ranges, cold / again, to the end | median 5.4 / 6.1 ms |
+        | Open-ended ranges, to the headers | median 20 ms |
+        | `<audio>` seeks | median 35 ms, p90 99 |
+
+        It is the same gap as here: the worker reads at a third of Node's rate.
+      * **On approval** (plan mode came back on before these could be committed):
+        1. STATS.md §7.6 gets the CI table above, beside the local one.
+        2. TD-SW-THROUGHPUT gets the runner's figures.
+        3. Copy this file to `docs/MILESTONE-9.md`.
+        4. One `docs:` commit, then push and confirm CI green on both runs.
+        5. PR #83 then waits on review and merge.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

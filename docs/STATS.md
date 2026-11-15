@@ -521,6 +521,17 @@ A document whose snapshot is past half of `max_commit_bytes` compacts to a zen-f
 | **Open-ended ranges** (`bytes=a-`, as media asks), to the headers | **median 19–21 ms** (287 ms before the fix below) |
 | **`<audio>` seeks** to random points of the WAV, until `seeking` is false (polled: a few ms of resolution) | **median 47–72 ms**, p90 103–122 (320–527 ms before) |
 
+On **CI's runner** (`files-bench`: GitHub's `ubuntu-latest`, 4 cores, Playwright's Chromium 141), **4 GiB**, one run:
+
+| | Through the worker |
+|---|---|
+| First start after enrollment / a running worker, a small file / a stopped worker | 47 ms / median 1.4 ms / median 58 ms (p90 63) |
+| Read whole, cold / again (collected every 250 ms) / a third time | **53.4** / 43.8 / 61.5 MiB/s, the headers in 15 ms |
+| In Node: `Tree.readStream` / a replica's `createReadStream` / `handle` | 178.9 / 166.6 / 163.0 MiB/s |
+| The worker's heap and buffers, with garbage / live | +102 / **+37.6 MiB** |
+| 64 KiB ranges, cold / read before, to the end | median 5.4 / 6.1 ms |
+| Open-ended ranges, to the headers / `<audio>` seeks | median 20 ms / median 35 ms (p90 99) |
+
 * **The fix the bench found** (milestone 9 step 5): a media seek waited for 16 MiB. `handle` answers once it has the first piece (sw.md §6), and a read with no end started with a 4 MiB window and 3 more fetched alongside. `readStream`'s windows now start at about 64 KiB and double up to 4 MiB (docs/CLIENT.md), so the first bytes come after one small fetch. The largest window, and so a read's memory, is unchanged.
-* **The worker reads at a third of Node's rate.** The replica and `handle` run at `readStream`'s rate in Node, so the cost is in the browser, and not separated yet (TECH_DEBT TD-SW-THROUGHPUT).
+* **The worker reads at a third of Node's rate,** here and on the runner. The replica and `handle` run at `readStream`'s rate in Node, so the cost is in the browser, and not separated yet (TECH_DEBT TD-SW-THROUGHPUT).
 * **Live memory through the worker** (+28–35 MiB) matches `handle` in Node (§7.3: 20.8–35.5 MiB at `pendingBytes` 4 MiB).

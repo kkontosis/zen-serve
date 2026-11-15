@@ -519,7 +519,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 ## TD-SW-THROUGHPUT
 
 * **Status:** open (the user's choice in milestone 9 step 5: recorded, not investigated yet).
-* **Context:** the service worker reads a large file at 42–49 MiB/s in Chromium. In Node, on the same server, `Tree.readStream` reads it at 123–144 MiB/s, and a replica opened as the worker opens it (a memory store, `pendingBytes` 8 MiB), with `@zen/sw`'s `handle` over it, at 130–137 MiB/s (docs/STATS.md §7.6). So neither the replica nor `handle` is the cost: it is in the browser.
+* **Context:** the service worker reads a large file at 42–49 MiB/s in Chromium. In Node, on the same server, `Tree.readStream` reads it at 123–144 MiB/s, and a replica opened as the worker opens it (a memory store, `pendingBytes` 8 MiB), with `@zen/sw`'s `handle` over it, at 130–137 MiB/s (docs/STATS.md §7.6). On CI's runner, at 4 GiB, the same gap: 53–62 MiB/s through the worker, 163–179 in Node. So neither the replica nor `handle` is the cost: it is in the browser.
 * **Candidates, not yet separated:**
   1. the replica's sealed records written to IndexedDB, which is a memory store in Node
   2. wasm and WebCrypto in a worker, against Node's
