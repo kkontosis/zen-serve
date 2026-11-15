@@ -15,7 +15,9 @@ Built in milestone 10 (docs/MILESTONE-10.md). The design rests on step 10.2's sp
 | **The relayed service** (§8.2) | `ssh://git@<host>:<port>/<fs>/<repo>` | a handler machine of a member (svc.md) | the handler machine, for every repo it serves |
 
 * `<host>` is the zen-serve server. `<fs>` is the fs id in decimal. `<repo>` is a repo name (§2.1); a trailing `.git` in a URL is ignored.
-* The helper and the local server sign in through the vault as the member's device (CLIENT.md, `credentialVault`), without a prompt.
+* **The helper's schemes:** `zen://<host>[:<port>]/<fs>/<repo>` reaches the server over HTTPS. `zen+http://` reaches it over plain HTTP, for a server on localhost and for tests. Nothing else is accepted: no user, password, query or fragment. The sign-in origin (auth.md §5.1) is the URL's `https://` or `http://` origin.
+* The helper and the local server sign in through the vault as the member's device (CLIENT.md, `credentialVault`), without a prompt. The vault is a sealed local store (`sealedStore` with the device layer) in the directory `$ZEN_GIT_VAULT`, or else `$XDG_CONFIG_HOME/zen-git/vault` (`~/.config` by default). `zen-git login` puts the device in it once, from a device key file. A helper whose vault holds no device fails with a message naming `zen-git login`, and never prompts: git may run it with no terminal.
+* **Unlocking:** the helper unlocks the fs with the vault's device, so the fs needs a device keyslot for it (formats.md §6; `fs.addDevice`, by an admin). Integrity (formats.md §14) is attached first, its pins kept in the vault, and the vault's device signs the checkpoints.
 
 ## 2. A repo
 
@@ -62,7 +64,7 @@ A push is cut as one pack (or none) and applied in one transaction:
 
 1. **The pack.** `git pack-objects --revs --stdout` of the pushed tips, excluding (`^`) every tip zen had when the mirror was synced, never `--thin`. Then `git index-pack --strict` in the mirror, which checks every object and writes the `.idx`. A pack with no objects (a push of known objects, or of deletes only) is dropped.
 2. **The upload.** The pack's and the index's chunks go up under an upload session (api.md §12.1), before the transaction, so a large pack's transaction carries only its `write`s (zendb.md §7.6). An upload interrupted here leaves nothing visible, and the session keeps what it uploaded for a resume.
-3. **The transaction**, a manual one (zendb.md §7.2):
+3. **The transaction** (zendb.md §7.1), whose function zen-db runs again on a `conflict` (item 4):
    1. Read the `repos` row (a new repo has none: it is created here) and every `refs` row the push updates.
    2. Each ref's current oid must equal the push's old value (the mirror's, which `receive-pack` gives the hook): absent for a new ref. If one differs, another push landed since the sync, and the hook refuses every ref it was given (`fetch first`).
    3. Write the pack's two files into the repo's tree, and put its `packs` row with `seq = next_seq`. Put the `repos` row with `next_seq + 1`.
@@ -73,8 +75,8 @@ A push is cut as one pack (or none) and applied in one transaction:
       ```
    6. Commit.
 4. **A conflict** at commit (a concurrent push read or wrote the same rows):
-   * The hook re-reads and retries when every updated ref still has its old value: only the `repos` row moved, as when two pushes update different branches. The pack is reused, and its `seq` is taken again.
-   * Otherwise the push is refused (`fetch first`), and git reports it as it reports a non-fast-forward.
+   * zen-db runs the function again (up to its `attempts`), which re-reads. When every updated ref still has its old value, only the `repos` row moved, as when two pushes update different branches: the push goes on, with the pack reused and its `seq` taken again.
+   * Otherwise step 3.2 refuses it (`fetch first`), and git reports it as it reports a non-fast-forward.
 * **Exactly one of two racing pushes to one ref wins** (spike: two clones pushing at once).
 * **Fast-forward, `--force`, `--force-with-lease` and `--atomic`** are checked by `receive-pack` against the mirror's refs, which equal zen's refs read in step 3.1. So they are git's own checks. A push that is not `--atomic` but refused for one ref is applied for the others, as git does.
 * **The window after the hook.** The hook commits before `receive-pack` updates the mirror's refs. If that update fails (a crash, a full disk), zen has the push but git reports `failed to update ref`, and the next sync (§5) brings the mirror to zen's refs. So a push reported as failed may have happened, as on a stock server whose ref update fails after its hook. To keep ref locks out of that window, a mirror is held exclusively for the whole `receive-pack` (§6). A `reference-transaction` hook would hold git's locks, but it runs once per ref unless the push is `--atomic`, which would split one push into several transactions (the spike).
@@ -94,17 +96,19 @@ Before `upload-pack` or `receive-pack` runs, the mirror is synced:
 ## 6. The mirror
 
 * A bare repository with the repo's object format, kept on the machine that serves git:
-  * the helper's, per user: `$XDG_CACHE_HOME/zen-git/<fs>/<repo>.git` (`~/.cache` by default), so every clone of a repo on the machine shares one
+  * the helper's, per user: `$XDG_CACHE_HOME/zen-git/<host>/<fs>/<repo>.git` (`~/.cache` by default; `<host>` is the URL's `host[:port]`, so two servers' fs ids don't meet), so every clone of a repo on the machine shares one
   * the local server's and the handler's: the same layout, under their own data directory
 * Its config: `uploadpack.allowFilter true`, `uploadpack.allowAnySHA1InWant true`, `receive.unpackLimit 1`, and the `pre-receive` hook of §4.
-* **Locking:** a sync and a `receive-pack` hold the mirror exclusively (a lock file next to it); `upload-pack` holds it shared. So no two pushes on one machine meet in one mirror, and none of git's ref locks is contended.
+* **Locking:** a sync and a `receive-pack` hold the mirror exclusively; `upload-pack` takes no lock. So no two pushes on one machine meet in one mirror, and none of git's ref locks is contended.
+  * The lock is a directory next to the mirror, `<repo>.git.lock/`, made with `mkdir` (atomic), holding a file `pid` with the holder's process id. A process that finds it waits and tries again. It takes the lock over when that pid is no longer running (a crashed holder), by removing the directory and making it again. Node has no portable `flock`, and `mkdir` works on every local file system.
+  * `upload-pack` needs no lock: git's readers tolerate refs being updated, packs being added, and `git repack -a -d` running while they read (they rescan the packs). The sync before it holds the lock, and releases it before `upload-pack` starts.
 * **It repacks itself** when it holds more than 16 packs (`git repack -a -d`, local only). That kept 4 MB of the 28 MB that 585 small packs took (the spike).
 * **Git's environment:** git sets `GIT_DIR` (and may set `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_PREFIX`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`) for the helper. Those are removed for every git command run on the mirror, or `GIT_DIR` would override `-C`.
 * **Plaintext:** the mirror holds the repo's full plaintext history, as a clone does. The docs say so, and recommend disk encryption.
 
 ## 7. `git-remote-zen`
 
-The remote helper (gitremote-helpers(7)) for `zen://` URLs. It speaks only:
+The remote helper (gitremote-helpers(7)) for `zen://` URLs. Git runs `git-remote-<scheme>`, so the same program is installed under two names: `git-remote-zen` and `git-remote-zen+http`. It speaks only:
 
 * **`capabilities`** → `connect`, `option`
 * **`option <name> <value>`** → `ok` for `verbosity` and `progress`, `unsupported` for the rest (git then keeps its defaults)
@@ -112,6 +116,9 @@ The remote helper (gitremote-helpers(7)) for `zen://` URLs. It speaks only:
   * **Protocol v2:** git gives a `connect` helper no `GIT_PROTOCOL`, so the helper starts `git-upload-pack` with `GIT_PROTOCOL=version=2`, unless git's `protocol.version` is 0 or 1. Git's client detects the v2 advertisement. Without it, `push.negotiate` fails with a warning (the spike).
   * The helper reads its commands one byte at a time, so nothing after the `connect` line is consumed before the service takes over.
 * The `receive-pack` service's `pre-receive` hook does §4's transaction, signed in as the helper's device.
+  * The hook is a process of its own, which `receive-pack` starts, so it signs in again from the same vault. The vault keeps the helper's session, so that sign-in resumes it rather than signing a new challenge (STATS gives the cost).
+  * The helper passes the hook what it needs in its environment: the repo's URL, and the command that runs `zen-git hook`. The hook script refuses a push without them, so a push made straight into the mirror's directory with stock git (not through the helper) is refused and changes nothing.
+  * The hook cuts the pack (§4 step 1) with git's quarantine variables in place (`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`), since the pushed objects are in the quarantine until it succeeds. It excludes every ref the mirror has, which are zen's refs as of the sync.
 
 ## 8. The servers
 
@@ -150,7 +157,11 @@ Implemented in 10.4. The rules:
 ## 10. Rights
 
 * **The fs grants** (formats.md §9.1): `read` to fetch, `write` to push and repack. A grant covers the whole fs, so a repo with its own readers or writers lives in an fs of its own.
-* **The topic:** a pusher needs `append` on `("git", repo, "pushes")`, or the push's transaction fails (403) and nothing is pushed. CI consumers need `read` and `consume` there. Creating a repo grants these to the fs's writers and readers.
+* **The topic:** a pusher needs `append` on `("git", repo, "pushes")`, or the push's transaction fails (403) and nothing is pushed. CI consumers need `read` and `consume` there.
+  * A push can't grant these: only an admin changes the ACL (formats.md §9). So an admin grants them once per fs, with `zen-git setup <host>/<fs>`, on the topic prefix `("git")`, which covers every repo's topic:
+    * `append` to every member with fs `write`
+    * `read` and `consume` to every member with fs `read`
+  * `setup` adds only the grants missing, so running it again (after adding members) is safe. A member added later has no topic grants until it runs again.
 * **Branch protection, force-push rules and protected tags are cooperative.** The local server and handlers enforce what the repo's rules say for pushes through them. A member with fs `write` can still write any ref with a client of their own: the server can't read refs, so it can't check them (TECH_DEBT TD-GIT-REF-POLICY).
 
 ## 11. What the server sees
