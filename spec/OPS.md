@@ -223,3 +223,7 @@ Known hot spots, measured or not yet: TD-MEMORY (spec/TECH_DEBT.md).
 * **`push.negotiate=true` needs protocol v2.** Git gives a `connect` helper no `GIT_PROTOCOL`, so the helper starts `upload-pack` with `version=2`, or that push prints "--negotiate-only requires protocol v2".
 * **The tests give git a config of its own** (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM=1`): a developer's global config (here `push.negotiate`, `init.defaultBranch`) changes what git does.
 * **A read-only member can't create the `git` database:** a test that reads it as one opens it as a writer first.
+* **`git repack` runs `update-server-info` itself** unless given `-n`. `zen-git publish` passes `-n` and runs it explicitly, after HEAD is set, so the dumb-HTTP files describe the final copy (and a test that leaves the step out fails).
+* **A `static push` of a published repo replaces the whole site,** and dumb HTTP is read only: pushes go to the `zen://` URL.
+* **A purged node reads as an empty stream,** not an error: `Tree.readStream` finds no version. So a pack download checks its byte count against the `packs` row, and an empty one is `PackGone` (git.md §5).
+* **A consumer's lease is renewed only between deliveries:** a handler longer than the lease (10 s) loses it. The repack worker renews it every 3 s while it works.
