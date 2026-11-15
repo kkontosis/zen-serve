@@ -13,9 +13,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job runs on Ubuntu 24.04, pinned: `ubuntu-latest` moved to 26.04
+# (November 2026), whose newer OpenSSL, OpenSSH and Playwright support the
+# tests don't yet expect (TD-CI-UBUNTU-2604).
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,7 +49,7 @@ jobs:
   # (spec/operations.md §8). The jobs around it test the default build,
   # with ring.
   pure-rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -74,7 +78,7 @@ jobs:
   # zen-ublk as a real block device: FUSE, loop devices, ext4 and ublk,
   # as root (crates/zen-ublk/tests/devices.rs).
   devices:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A hung device fails in minutes, not after GitHub's 6 hours.
     timeout-minutes: 20
     steps:
@@ -100,7 +104,7 @@ jobs:
   # ext4 over both frontends, in release (docs/STATS.md §6.3). By hand only.
   devices-bench:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -142,7 +146,7 @@ jobs:
   # it doesn't gate.
   files-bench:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -205,7 +209,7 @@ jobs:
 
   openssh-pq:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -227,7 +231,7 @@ jobs:
   # The FoundationDB backend, the supervisor and every server test against
   # a real cluster that zen-serve itself starts.
   fdb:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -261,7 +265,7 @@ jobs:
   # the WASM core, then the TypeScript packages tested against a spawned
   # embedded zen-serve, in Node and in Chromium, and FUSE mounts.
   client:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -84,6 +84,12 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * **Negative controls**, each run once and restored, each failing its test: (1) the hybrid verified by its Ed25519 half only → `hybrid_needs_both_halves`; (2) sntrup's K with SHA-256 and (3) its H with SHA-256 → OpenSSH 9.6 refuses (`sntrup761_exec_with_each_cipher`); (4) a rekey offering both host-key algorithms → `rekeys_keep_the_host_key_algorithm`; (5) the restored ask refusing a hybrid key → `a_question_survives_a_restore`; (6) a restored `hk` the service doesn't hold accepted → `state_checks`.
   * **`test(svc):` adcd676**, the ignored `handshake_cost` measurement. **Costs** (STATS §5.5): the engine's key exchange is 0.2 to 1.4 ms in Rust and 2.5 to 8 ms per connection through the WASM in Node; the hybrid host key adds about 0.4 ms (Rust), sntrup761x25519 about 0.7 ms on the server (the client's key generation is the expensive part). `zen_svc_wasm_bg.wasm` is 1.36 MB, 503 KB gzipped (was 1.23 MB, 465 KB).
   * **`docs:`** SVC.md §3–§4, CLIENT.md's `ssh()` (the host keys, which OpenSSH takes which, the key exchanges by version), spec/OPS.md's OpenSSH note, STATS §4 and §5.5, this log. Next: push, CI green on both runs, then one `openssh-pq` dispatch run.
+  * **CI on 597072b failed, for a reason outside this PR:** GitHub's `ubuntu-latest` had moved to Ubuntu 26.04 (Playwright's log: "Playwright does not support chromium on ubuntu26.04-x64"). The SSH tests all passed, against the runners' OpenSSH included. What failed, all on the new image:
+    1. `rust` and `pure-rust`, both runs: `s_client_tls12_every_suite_and_group` (`crates/zen-svc/tests/openssl.rs`). The handshakes worked; the newer OpenSSL prints `Peer Temp Key` where 3.0 printed `Server Temp Key`. The test now accepts either. Negative control: a wrong expected group still fails it.
+    2. `client` (pull_request run): Playwright 1.56.1 refuses to install Chromium's dependencies on 26.04.
+    3. `client` (push run): the zen-mount vault test timed out at 60 s; it passed in the other run on the same image.
+
+    The fix: every job is pinned to `ubuntu-24.04`, the image of every earlier green run, which the docs' runner versions also describe. `TD-CI-UBUNTU-2604` records the move to 26.04: a newer Playwright, the new OpenSSH and OpenSSL versions, and the mount test's timeout root-caused there. If the mount test times out on 24.04 too, it is this PR's to root-cause.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

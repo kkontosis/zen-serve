@@ -361,7 +361,14 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 * **Status:** open
 * **Context:** The runners' OpenSSH (Ubuntu 24.04: 9.6) has `sntrup761x25519-sha512`, which every build tests against it (`crates/zen-svc/tests/openssh.rs`), but no `mlkem768x25519-sha256`, which came with 9.9, and no `ssh-mldsa44-ed25519`, which came with 10.6. CI's `openssh-pq` job builds OpenSSH 10.6p1 from source (`scripts/build-openssh.sh`) and runs the SSH engine's OpenSSH tests against it, those two included (`crates/zen-svc/tests/openssh_pq.rs`). It ran on every push of milestone 5.5 step 9's PR and passed, and now runs only when started by hand (`workflow_dispatch`), so ordinary builds don't spend a minute building OpenSSH. Every build still tests both against the crate's own test client (`tests/ssh.rs`), which shares the engine's code.
 * **Why deferred:** Building OpenSSH on every push costs time for a check that changes only when the engine's key exchange does.
-* **What it would take:** Install the runners' `openssh-client` in the Rust jobs and drop the `#[ignore]` once `ubuntu-latest` ships OpenSSH 10.6 or later; until then, start the job by hand after changing `crates/zen-svc/src/ssh/kex.rs`, `keys.rs` or `cipher.rs`.
+* **What it would take:** Install the runners' `openssh-client` in the Rust jobs and drop the `#[ignore]` once CI's runners ship OpenSSH 10.6 or later (Ubuntu 26.04 may: `TD-CI-UBUNTU-2604`); until then, start the job by hand after changing `crates/zen-svc/src/ssh/kex.rs`, `keys.rs` or `cipher.rs`.
+
+## TD-CI-UBUNTU-2604
+
+* **Status:** open
+* **Context:** GitHub's `ubuntu-latest` moved to Ubuntu 26.04 in November 2026. On it, three things broke at once (CI runs 43731848734 and 43731854078, on 597072b): Playwright 1.56.1 refuses to install Chromium's dependencies on that OS; OpenSSL's `s_client` prints `Peer Temp Key` where 3.0 printed `Server Temp Key` (`crates/zen-svc/tests/openssl.rs` now accepts both); and the zen-mount vault test (`packages/fuse/test/mount.test.ts`, "signs in with a device key once, then from the vault, then offline") timed out once in two runs. CI's jobs are pinned to `ubuntu-24.04` instead, the image every earlier run used.
+* **Why deferred:** Moving is its own change: a newer Playwright and its Chromium, the OpenSSH there (its version decides which of `tests/openssh_pq.rs` can run on every build), and the mount test's timeout understood on that image. GitHub keeps `ubuntu-24.04` available for a while.
+* **What it would take:** Upgrade Playwright to a release that supports Ubuntu 26.04; run the whole CI on `ubuntu-26.04` from a branch; root-cause the mount test's timeout there; check `ssh -V` and `openssl version` and update the docs that name the runners' versions (spec/OPS.md, TD-SVC-SSH-PQ-CI); then unpin.
 
 ## TD-SVC-CONNECT-BACKPRESSURE
 
