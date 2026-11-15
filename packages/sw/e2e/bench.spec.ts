@@ -14,9 +14,11 @@
 // (CDP), whose promises resolve there, and media is polled from Node.
 import { createHash } from 'node:crypto';
 import { type Browser, expect, type Page, test } from '@playwright/test';
-import type { FileSource } from '../../client/src/index.js';
+import { type FileSource, memoryLocalStore, sealedStore } from '../../client/src/index.js';
 import { benchBytes, keystream, mib, prng, quantile, rate } from '../../client/test/benchkit.js';
-import { controlledPage, enrollIn } from './pages.js';
+import { openReplica } from '../../fs/src/index.js';
+import { handle, parseMounts } from '../src/index.js';
+import { controlledPage, enrollIn, siteMounts } from './pages.js';
 import { type SwWorld, startSwWorld, wav } from './world.js';
 
 const ON = !!process.env.ZEN_BENCH;
@@ -78,6 +80,34 @@ function readAll(page: Page, path: string) {
     }
     return { status: r.status, n, head, total: performance.now() - t0 };
   }, path);
+}
+
+/** An open-ended `Range` from the page, as media sends: the time to the headers and to the first bytes. */
+function openRange(page: Page, path: string, a: number) {
+  return page.evaluate(
+    async ([p, range]) => {
+      const t0 = performance.now();
+      const r = await fetch(p, { cache: 'no-store', headers: { Range: range } });
+      const head = performance.now() - t0;
+      const reader = r.body!.getReader();
+      const { value } = await reader.read();
+      const first = performance.now() - t0;
+      await reader.cancel();
+      return { status: r.status, head, first, n: value?.length ?? 0 };
+    },
+    [path, `bytes=${a}-`] as const,
+  );
+}
+
+/** Read a stream to its end: the bytes. */
+async function drain(s: ReadableStream<Uint8Array>): Promise<number> {
+  const reader = s.getReader();
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return n;
+    n += value.length;
+  }
 }
 
 /** One `Range` read from the page: the time to the headers and to the end, and the body's SHA-256. */
@@ -254,15 +284,35 @@ test('the worker, measured', async ({ browser }) => {
   try {
     const t = ufs.tree(Uint8Array.from(Buffer.from(w.tree, 'hex')));
     t0 = performance.now();
-    let n = 0;
-    const reader = t.readStream(w.nodes.get('big.bin')!).getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      n += value.length;
-    }
-    expect(n).toBe(N);
+    expect(await drain(t.readStream(w.nodes.get('big.bin')!))).toBe(N);
     report(`Tree.readStream in Node, the same file: ${rate(N, performance.now() - t0)} MiB/s`);
+
+    // A replica in Node, on a memory store, as the worker opens it: its stream, then `handle`.
+    const r = await openReplica(ufs, t.id, {
+      local: sealedStore(memoryLocalStore()),
+      locks: null,
+      channel: null,
+      pendingBytes: 8 << 20,
+    });
+    try {
+      await r.sync();
+      t0 = performance.now();
+      expect(await drain(await r.createReadStream('/site/big.bin'))).toBe(N);
+      report(
+        `a replica in Node (a memory store), createReadStream: ${rate(N, performance.now() - t0)} MiB/s`,
+      );
+      const site = {
+        mounts: parseMounts(siteMounts(w).map((m) => ({ ...m, tree: t.id }))),
+        replica: async () => r,
+      };
+      t0 = performance.now();
+      const res = await handle(new Request(`${w.content}/s/big.bin`), site);
+      expect(res.status).toBe(200);
+      expect(await drain(res.body!)).toBe(N);
+      report(`the same through @zen/sw's handle in Node: ${rate(N, performance.now() - t0)} MiB/s`);
+    } finally {
+      await r.close();
+    }
   } finally {
     ufs.close();
   }
@@ -285,6 +335,20 @@ test('the worker, measured', async ({ browser }) => {
     }
     report(`64 KiB ranges, ${pass}: to the headers ${summary(head)}; to the end ${summary(total)}`);
   }
+
+  // Open-ended ranges, as a media element asks: what a seek waits for.
+  const opens: number[] = [];
+  const firsts: number[] = [];
+  for (let i = 0; i < 10; i++) {
+    const r = await openRange(page, '/s/big.bin', Math.floor(rnd() * (N - (64 << 20))));
+    expect(r.status).toBe(206);
+    expect(r.n).toBeGreaterThan(0);
+    opens.push(r.head);
+    firsts.push(r.first);
+  }
+  report(
+    `open-ended ranges (bytes=a-), cold: to the headers ${summary(opens)}; to the first bytes ${summary(firsts)}`,
+  );
 
   // `<audio>` seeks: from setting `currentTime` until `seeking` is false (polled from Node).
   const media = await ctx.newPage();
