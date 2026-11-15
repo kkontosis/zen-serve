@@ -184,6 +184,7 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * **10.4:** the repack is §9's geometric roll-up.
     * **10.5:** the SSH engine learns an `env` request for `GIT_PROTOCOL` only (svc.md §7.2), and the HTTP side is `git http-backend` behind the server (item 5's 40 lines).
     * **10.5 and 10.6 share 10.3's mirror code.**
+  * Pushed 1f478a4 (the log). **CI's `pure-rust` failed, my mistake:** `registry_matches_code` (`crates/zen-core/tests/labels.rs`) requires spec/labels.md to list exactly `labels::ALL`, and the `spec:` commit added `zen/v1/sig/git-ssh-key` to the spec only (here I had run `npm run check`, not the Rust tests). **The fix:** `labels::SIG_GIT_SSH_KEY`, in `ALL` and `SIG_PURPOSES` (the relayed service signs with it in 10.6). `cargo test -p zen-core` (the registry test included) and clippy `-D warnings` pass.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

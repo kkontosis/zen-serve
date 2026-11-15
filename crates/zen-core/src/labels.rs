@@ -147,6 +147,8 @@ pub const SIG_PASSWORD_SESSION: &str = "zen/v1/sig/password-session";
 pub const SIG_DB_ROOT: &str = "zen/v1/sig/db-root";
 /// Signature purpose: signed fs header (spec/formats.md §12.1).
 pub const SIG_FS_HEADER: &str = "zen/v1/sig/fs-header";
+/// Signature purpose: a member's SSH key for the relayed git service (spec/git.md §8.2).
+pub const SIG_GIT_SSH_KEY: &str = "zen/v1/sig/git-ssh-key";
 /// Signature purpose: a signed app bundle (reserved, milestone 11).
 pub const SIG_APP_BUNDLE: &str = "zen/v1/sig/app-bundle";
 
@@ -223,6 +225,7 @@ pub const ALL: &[&str] = &[
     SIG_PASSWORD_SESSION,
     SIG_DB_ROOT,
     SIG_FS_HEADER,
+    SIG_GIT_SSH_KEY,
     SIG_APP_BUNDLE,
 ];
 
@@ -239,5 +242,6 @@ pub const SIG_PURPOSES: &[&str] = &[
     SIG_PASSWORD_SESSION,
     SIG_DB_ROOT,
     SIG_FS_HEADER,
+    SIG_GIT_SSH_KEY,
     SIG_APP_BUNDLE,
 ];
