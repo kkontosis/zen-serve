@@ -273,6 +273,22 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     2. Push, open the PR, and subscribe.
     3. Stop there: implementation starts on the user's next "go".
   * **Approved** (the user). This file copied to `docs/MILESTONE-10.md`; the plan committed, pushed, a new PR opened and subscribed. Next, on the user's "go": the `spec:` commit (item 1 of "Step 10.4 in detail"), then the code, the tests and the docs.
+  * Committed fec5631 and pushed. PR #87 is open and subscribed.
+    * **CI green on both runs of fec5631:** push 43765972554 and pull_request 43765994079.
+    * PR #87 is mergeable (clean).
+    * A safety-net check-in is set for 22:42 UTC (trig_01UvokdwekTzLSkSP32Z7Puf). Plan mode was on when CI finished, so it hasn't been cancelled.
+  * **Once plan mode ends:**
+    1. Cancel the 22:42 check-in, since CI is already green.
+    2. On the user's "go", start with the `spec:` commit, copying this file to `docs/MILESTONE-10.md` first.
+  * The 22:42 check-in was cancelled.
+  * **PR #87 merged** (the user, 22:03 UTC). It held only the plan, so step 10.4's implementation needs a new PR. The PR's subscription ended with the merge.
+  * **On the user's "go":**
+    1. Restart from main by fast-forward.
+    2. Copy this file to `docs/MILESTONE-10.md`.
+    3. Write the `spec:` commit.
+    4. Push, open a new PR, and subscribe.
+    5. Then the code, the tests and the docs, as "Step 10.4 in detail" says.
+  * **Go** (the user, after compacting). Restarted from main by fast-forward (e022f1c, PR #87's merge); this file copied to `docs/MILESTONE-10.md`.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

@@ -543,9 +543,9 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
 ## TD-GIT-SCOPE
 
 * **Status:** open
-* **Context:** Git over zen-serve (git.md) supports clone, fetch (shallow and partial ones too), push (`--force`, `--force-with-lease`, `--atomic`), deletes, tags, HEAD, and sha1 and sha256 repos. It doesn't support push options (`git push -o`), signed pushes (`--signed`), Git LFS, submodules as one unit, symbolic refs other than HEAD, or changing HEAD by a push (git.md §12).
+* **Context:** Git over zen-serve (git.md) supports clone, fetch (shallow and partial ones too), push (`--force`, `--force-with-lease`, `--atomic`), deletes, tags, HEAD, and sha1 and sha256 repos. It doesn't support push options (`git push -o`), signed pushes (`--signed`), Git LFS, submodules as one unit, symbolic refs other than HEAD, or changing HEAD by a push (git.md §12). The public mirror (git.md §13) is git's dumb HTTP: read only, with no shallow or partial clones, and a fetch downloads the whole pack again after each publish.
 * **Why deferred:** None is needed to keep code in zen and push to it from stock git. Push options and signed pushes need `receive-pack` configuration and a place in the push's event; LFS needs a server of its own for large objects.
-* **What it would take:** Push options: `receive.advertisePushOptions`, and the options in the event (git.md §4). Signed pushes: `receive.certNonceSeed` per mirror, and the push certificate kept with the refs. LFS: an LFS endpoint in the local server storing objects as files of the repo's tree.
+* **What it would take:** Push options: `receive.advertisePushOptions`, and the options in the event (git.md §4). Signed pushes: `receive.certNonceSeed` per mirror, and the push certificate kept with the refs. LFS: an LFS endpoint in the local server storing objects as files of the repo's tree. A public mirror over smart HTTP: a server-side `git http-backend` on the published copy, which the zen-serve server doesn't run (it serves `/unencrypted` as plain files).
 
 ## TD-GIT-REF-POLICY
 
