@@ -180,7 +180,7 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   * the client's page memo: `pageMemoIds`, 65,536 ids, about 12 MB, and `pageMemoPages`, 256 (step 6b)
   * pinned content fetched in windows of 256 chunks (step 6b); content fetched for reads isn't kept past `pendingBytes`
   * `readStream` read-ahead and pipelined uploads: a few windows or commits each
-  * **a streamed read** (milestone 9 step 3b): the window read and exactly `readAhead` more, nothing before the first read (`readahead.test.ts` counts them), plus up to `pendingBytes` of fetched content waiting to be written. Measured live: 16–17 MiB for the tree's stream, 20.8–35.5 MiB through `@zen/sw`'s `handle` at `pendingBytes` 4 MiB, bounded at 48 MiB by `packages/sw/test/memory.test.ts` (STATS.md §7.3). The 59–73 MiB step 9.3 found was mostly freed array buffers not yet swept (OPS.md §6, **Measuring**). The service worker's replica uses `pendingBytes` 8 MiB (sw.md §8).
+  * **a streamed read** (milestone 9 step 3b): the window read and exactly `readAhead` more, nothing before the first read (`readahead.test.ts` counts them), plus up to `pendingBytes` of fetched content waiting to be written. Measured live: 16–17 MiB for the tree's stream, 20.8–35.5 MiB through `@zen/sw`'s `handle` at `pendingBytes` 4 MiB, bounded at 48 MiB by `packages/sw/test/memory.test.ts` (STATS.md §7.3). The 59–73 MiB step 9.3 found was mostly freed array buffers not yet swept (OPS.md §6, **Measuring**). The service worker's replica uses `pendingBytes` 8 MiB (sw.md §8). In Chromium the worker holds +28–35 MiB live while it streams 1 GiB (STATS.md §7.6), as `handle` does in Node; its wasm memory isn't in that figure. Since step 9.5 a read's first window is 64 KiB, doubling to 4 MiB, so the largest window is unchanged.
   * **a written file's chunk index** (step 8): packed, about 52 B a chunk; it was about 390, and all of the client's live growth under a large file (11 MiB per GiB). `chunkindex.test.ts` bounds it at 120 B
   * **the server** (step 7): the embedded backend's page cache (`[storage] cache_bytes`, 256 MiB), commit bodies in flight (`limits.commit_buffer_bytes`, 64 MiB), 2 malloc arenas, and one copy of each value in a transaction. Measured: 587–637 MiB under one 4 GiB writer and 691–712 MiB under 16 (1.9–3.1 GiB before; docs/STATS.md §7.3)
 * **Not bounded, or not measured yet:**
@@ -515,3 +515,20 @@ Fields: **Status** (`open`, `in progress`, `resolved`), **Context**, **Why defer
   2. **A passkey-wrapped identity:** the identity seed sealed under a passkey's PRF output (TD-AUTH-WEBAUTHN-PRF-KEYSLOT), unwrapped only for the enrollment, with a user gesture.
   3. **Delegation:** no identity at enrollment at all, but a session handed to the worker (TD-SW-SESSION-HANDOVER), with an admin adding the device later.
 * **What it would take:** for 1 or 2, the stored form (CLIENT.md §10), a recovery path when the device or passkey is lost, and an "enable viewing" button in one example app with a Playwright test. For 3, that TD.
+
+## TD-SW-THROUGHPUT
+
+* **Status:** open (the user's choice in milestone 9 step 5: recorded, not investigated yet).
+* **Context:** the service worker reads a large file at 42–49 MiB/s in Chromium. In Node, on the same server, `Tree.readStream` reads it at 123–144 MiB/s, and a replica opened as the worker opens it (a memory store, `pendingBytes` 8 MiB), with `@zen/sw`'s `handle` over it, at 130–137 MiB/s (docs/STATS.md §7.6). So neither the replica nor `handle` is the cost: it is in the browser.
+* **Candidates, not yet separated:**
+  1. the replica's sealed records written to IndexedDB, which is a memory store in Node
+  2. wasm and WebCrypto in a worker, against Node's
+  3. the worker's own `fetch`es to the server, through the browser's network stack
+  4. the response's stream from the worker to the page, across processes
+* **Why deferred:** a viewer reads pages, images and media, for which 40+ MiB/s is enough. Seeks were the user-visible cost, and they are fixed (`readStream`'s first window, milestone 9 step 5).
+* **What it would take:** a spike in the bench that times each candidate on its own:
+  * the replica in the worker on a memory store
+  * a stream of fixed bytes from the worker to the page
+  * `chunks/get` fetched from a page
+  * `zw.decodeChunks` timed in the worker
+  Then a fix for the largest, with the bench as its check.

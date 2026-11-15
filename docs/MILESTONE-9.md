@@ -514,6 +514,53 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
         2. Copy this file to `docs/MILESTONE-9.md`.
         3. Implement as "Step 9.5 in detail" says.
         4. Open the PR and subscribe to it.
+      * **The user's "go"** (no compaction in between): restarted from main by fast-forward (0cd6da6, PR #82's merge), and this file copied to `docs/MILESTONE-9.md` (not committed yet). Plan mode came back on, so the implementation waits for this plan's approval:
+        1. the `test(sw):` bench, with `startSwWorld`'s option for extra files
+        2. the `ci:` change to `files-bench`
+        3. the `docs:` commit
+        4. then the PR, CI on both runs, and one `files-bench` dispatch run
+      * **The implementation, so far** (pushed, no PR yet):
+        * 70e3ca8 `test(sw):` the bench. `startSwWorld` gained extra streamed files, their nodes, and `unlock()`. The page helpers moved to `e2e/pages.ts`.
+        * d65e46b `ci:` `files-bench` runs it at 4 GiB.
+        * bb0798d `docs:` docs/SW.md, plus links from CLIENT.md, API.md and the package README, G15 done, the README and DESIGN-3 §6 item 9 marked done.
+        * **Changed from the plan:** Playwright's `--project` takes several values, so the file comes before it: `npx playwright test packages/sw/e2e/bench.spec.ts --project sw`.
+        * The release server on disk predated step 9.2, so it was rebuilt first.
+      * **The figures, 1 GiB here** (release server, 3 runs; ranges cover them):
+
+        | What | Measured |
+        |---|---|
+        | First start after enrollment (a navigation) | 116–128 ms |
+        | A running worker, a small file, to the headers | median 2.9–3.6 ms |
+        | A stopped worker, a navigation | median 85–110 ms, p90 91–113 |
+        | Read whole through the worker, cold / again / a third time | 41.7–48.5 / 41.0–44.8 (GC every 250 ms) / 47.3–48.1 MiB/s |
+        | `Tree.readStream` in Node, the same file | 136–144 MiB/s |
+        | A replica in Node (memory store), `createReadStream` / through `handle` | 130 / 135 MiB/s |
+        | The worker's heap and array buffers over rest: with garbage / live | +111–114 / +28–35 MiB (at rest 1.4 MiB heap, 0.7 MiB buffers; wasm memory not reported by CDP) |
+        | 64 KiB ranges, cold / again, to the end | median 6.4–8.5 / 5.0–6.7 ms |
+        | Open-ended ranges (`bytes=a-`), to the headers | median 287 ms, p90 370 |
+        | `<audio>` seeks in a 600 s WAV | median 320–527 ms, p90 637–840 |
+
+      * **Two findings, for the user's choice:**
+        1. **The worker reads at a third of Node's rate** (42–48 against 130–144 MiB/s). The replica and `handle` aren't the cause: in Node both run at `readStream`'s rate. So it is in the browser. The candidates, not yet separated:
+           * the replica's sealed records written to IndexedDB (a memory store in Node)
+           * wasm and WebCrypto in the worker
+           * the worker's fetches to the server
+           * the response's trip from the worker to the page
+        2. **A media seek waits for 16 MiB.** An open-ended range (what `<audio>` sends) answers in 287 ms, against 7 ms for a 64 KiB range. `handle` reads the first piece before it answers, and a read with no end starts with a 4 MiB window plus 3 ahead. A fix in the client: a read's first window small, growing to 4 MiB.
+      * **Decided (the user): fix the seek in this PR, and record the rate as debt** (TD-SW-THROUGHPUT).
+      * 5801af4 `client:` `readStream`'s windows start at about 64 KiB and double up to 4 MiB (`FIRST_WINDOW`, tree.ts). The largest window is unchanged, so a read's memory is too.
+        * `readahead.test.ts` gets a new test that checks each window's size, from the start and from an offset: at least its share, and under it plus a chunk.
+        * **Negative control:** the first window at 4 MiB fails it (4,231,905 against under 155,536).
+        * CLIENT.md and OPS.md §6's row say how windows grow.
+        * **Checks:** the client, fs and sw suites passed (281 tests).
+      * b8e7a83 `test(sw):` the bench's Node lines (a replica on a memory store, `handle` over it) and the open-ended ranges.
+      * **After the fix** (two runs at 1 GiB):
+        * open-ended ranges to the headers: median 19–21 ms (from 287)
+        * `<audio>` seeks: 47–72 ms (from 320–527)
+        * a whole read's headers: 23–29 ms (from 241)
+        * throughput: unchanged, 45–49 MiB/s
+      * **The bench's negative control:** the worker passing every request to the network fails it at the first navigation (`fromServiceWorker` false). The worker was then restored.
+      * The `docs:` commit: STATS.md §7.6 (the figures), TD-SW-THROUGHPUT (new), the worker's figure in TD-MEMORY, docs/SW.md's costs, the Outcome below, and this log.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
@@ -1388,3 +1435,91 @@ The likely fixes, to be confirmed by the measurements:
 * **A non-admin's worker** serves only kept content until an admin adds its device (TD-SW-SESSION-HANDOVER).
 * **Only Chromium is installed here and on CI,** so Firefox and WebKit behaviour isn't tested. The docs will say so.
 * **The worker's memory and wake time** (the wasm, and the replica loading every node at start) could be large for big trees. Measured in 9.5, with TD-MEMORY.
+
+## Outcome
+
+Done. Milestone 9 makes an encrypted fs viewable in a browser. A content origin next to the app serves a mounted directory of a tree through a service worker:
+* decrypted in the browser
+* streamed, with single ranges, so media seeks
+* offline from the worker's replica
+* with no script running in what it serves
+
+The server sees only what any replica shows. The isolation model was measured before anything was designed. In Chromium, a page in an opaque origin isn't controlled by the worker, so content keeps the content origin and loses scripts instead (the user's choice). The other models are kept in TD-SW-SCRIPTS.
+
+What was built:
+* **The spec** (9.1, then each step's `spec:` commit):
+  * spec/sw.md, new: the content origin and the worker's lifecycle (§1), mounts (§2), URL to node (§3), the sandbox headers (§4), media types (§5), validators and ranges (§6), errors (§7), enrollment and credentials (§8), leakage (§9)
+  * api.md §2 (`content_origins`) and §10 (ranges, the static sources, the content origin)
+  * keyspace.md §3.11 (`sg`, `sf`, `sc`)
+  * operations.md §9 (`static push`, `static list`)
+  * a DESIGN-3 §0 note
+* **The server** (9.2):
+  * static files streamed from all three sources (bundled, a directory, the store), with single ranges, `If-Range`, HEAD and `Content-Length`
+  * the content origin, routed by `Host`, serving `/_zen/` from `[content] dir`, `/_zen/config.json`, the bootstrap page for navigations and a sandboxed 503 otherwise
+  * fs 0: `unencrypted_source = "replicated"` and `zen-serve static push|list`, with generations switched whole
+  * `push_input`'s diagnostics
+* **`@zen/sw`** (9.3, 9.4), a new package:
+  * `handle(request, site)`: routing, index files, listings, media types, ETags and ranges read by the version the ETag names, the headers on every response, the error mapping
+  * `startSite`: one start per worker instance from the content origin's vault, a replica opened on its mount's first request, which catches up before it serves
+  * `enrollPage` and `enrollViewer`: enrollment as a conversation, with nothing changed on the server until the user confirms
+  * `web/`: the module worker, which keeps its wasm in Cache Storage so it starts offline, and the bootstrap and enrollment pages, under Trusted Types
+  * `scripts/build-sw.mjs`
+  * Worker-safety is checked by tsc (the WebWorker lib, no DOM) for `@zen/fs`, `@zen/sw` and the worker.
+* **`@zen/fs` and `@zen/client`** (9.3, 9.3b, 9.5):
+  * `Replica.streamOf`
+  * records being written stay readable until written (a bug since milestone 8)
+  * `readStream` holds exactly `readAhead` windows (`highWaterMark` 0), and its first window is 64 KiB, doubling to 4 MiB
+  * a lease that lands after a leader's stop or forget isn't kept (booking's failover, open since milestone 8)
+* **The store** (9.3c): the FoundationDB client network stops as the main thread's `exit()` begins, which fixes a SIGSEGV after the `fdb` tests passed.
+* **The guides** (9.5):
+  * docs/SW.md, new: deploying a content origin
+  * STATS §7.3 (a streamed read, live) and §7.6 (the worker)
+  * OPS §6 (measuring array buffers) and §8 (static-file and content-origin pitfalls, new)
+  * CLIENT.md (viewing in a browser), API.md, the package README
+  * GAPS G15 done
+  * TECH_DEBT:
+    * new: TD-SW-SCRIPTS, TD-SW-SESSION-HANDOVER, TD-SW-IDENTITY, TD-SW-THROUGHPUT
+    * updated: TD-MEMORY, TD-DB-SHAREDWORKER, TD-TEST-OPEN-FAILURES (items 2, 7, 8)
+
+Differences from the plan above:
+* **No scripts, one content origin** (9.1, the user's choice after the spike). The plan left the model open.
+* **The worker signs in as a device in the ACL** (the user's choice). A handed-over session became TD-SW-SESSION-HANDOVER, and as a delegated session, since a shared token would share the app's credential id.
+* **Enrollment is a conversation** (9.4): the plan had the app certify the device before the user confirmed. The device key is kept in memory only until it is saved, and the page checks the certificate.
+* **The wasm in Cache Storage** (9.4): found by the offline test. Without it a stopped worker couldn't start offline.
+* **A fresh replica catches up before it serves** (9.4): it had answered 404 for files the server had.
+* **Step 9.3b, a streamed read's memory** (the user's choice): most of 9.3's figure was freed buffers not yet swept. The fix was `highWaterMark` 0 rather than the spike's off-by-one, which was wrong.
+* **Step 9.3c, the FDB exit crash** (the user's choice): the planned `atexit` hook crashed every time, for the same reason CI did. The stop runs as a thread-local destructor of the main thread instead.
+* **The bench found two things** (9.5):
+  * the seek, fixed: the first window
+  * the browser's throughput, recorded: TD-SW-THROUGHPUT (the user's choice)
+* **TD-DB-SHAREDWORKER stays open:** the serving worker is on the content origin, so it can't own the app origin's `Db`.
+* **Fixed along the way:**
+  * `cdc.test.ts`'s bound, which wasn't one (exact counts now)
+  * `handles.test.ts`'s zeros on CDC: a zero run is cut at one length the key decides, shorter than `max` for 1.87 % of keys at its parameters
+  * that claim in STATS and OPS
+  * booking's failover
+
+Tests:
+* **Rust:**
+  * zen-server `tests/statics.rs` (8): ranges on all three sources, pushes, the content origin, its sign-in, export and import
+  * the config refusals
+  * `SANDBOX_CSP` against sw.md §4
+  * zen-store `tests/fdb_exit.rs`
+* **TypeScript:**
+  * `packages/sw/test`: `unit.test.ts` (12), `handle.test.ts` (14), `memory.test.ts`, `enroll.test.ts` (10)
+  * `store.test.ts` (4), `readahead.test.ts` (2), the `streamOf` test, the lease cases in `log.test.ts`
+* **Playwright,** the new project `sw` (8): the first visit, enrollment and its refusal, the headers, the sandbox, seeking, a stopped worker, an update, offline. Plus the opt-in bench.
+* **Negative controls,** each run once and logged per step: every new check failed with its mechanism off.
+
+Measurements (docs/STATS.md §7.3, §7.6), 1 GiB in Chromium here:
+* A stopped worker answers in a median 85–110 ms, and a running one answers a small file in about 3 ms.
+* 64 KiB ranges take 6–8 ms, and `<audio>` seeks 47–72 ms.
+* A large file streams at 42–49 MiB/s, against 123–144 in Node (TD-SW-THROUGHPUT).
+* The worker holds +28–35 MiB live while streaming, as `handle` does in Node.
+
+What stays open:
+* sites with scripts (TD-SW-SCRIPTS)
+* enrolling from a password session (TD-SW-IDENTITY)
+* a non-admin's viewer without an admin step (TD-SW-SESSION-HANDOVER)
+* the browser's read rate (TD-SW-THROUGHPUT)
+* Firefox and WebKit, untested

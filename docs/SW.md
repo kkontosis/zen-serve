@@ -117,9 +117,10 @@ The mount `docs` with `base: '/site'` maps `https://view.example.org/docs/a/b.ht
 ## 8. Costs
 
 docs/STATS.md §7.6 has the measurements: throughput through the worker against `Tree.readStream`, the time to answer from a running and a stopped worker, seeks, and the worker's memory. In short:
-* A stopped worker answers in about 0.1 s: the wasm comes from Cache Storage, the vault resumes the session, the fs unlocks, and the replica loads from IndexedDB.
-* A large file streams at about half of `readStream`'s rate in Node.
-* The worker's replica holds up to 8 MiB of fetched content waiting to be written (`pendingBytes`). A read holds about `readAhead` 4 MiB windows besides.
+* **A stopped worker answers in about 0.1 s:** the wasm comes from Cache Storage, the vault resumes the session, the fs unlocks, and the replica loads from IndexedDB. A running one answers a small file in about 3 ms.
+* **Seeks:** a 64 KiB range takes about 7 ms, and an `<audio>` seek 50–70 ms.
+* **A large file streams at 42–49 MiB/s,** a third of `readStream`'s rate in Node. The cost is in the browser, not yet found (TECH_DEBT TD-SW-THROUGHPUT).
+* **Memory while streaming: about 30 MiB live.** That is the worker's replica's fetched content waiting to be written (`pendingBytes`, 8 MiB) and the read's windows (up to 4 MiB each, `readAhead` 3), besides the wasm's memory.
 
 ## 9. Limits
 
