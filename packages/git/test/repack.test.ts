@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UnlockedFs } from '@zen/client';
-import type { Db } from '@zen/db';
+import { type Db, decodeMsg } from '@zen/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { until } from '../../../apps/shared/harness.js';
 import type { WorkerContext } from '../../../apps/shared/node.js';
@@ -479,6 +479,29 @@ describe('zen-git worker', () => {
     const repacks = worker!.lines.filter((x) => x.startsWith('many: ') && x.includes('→'));
     expect(repacks.length).toBeGreaterThan(0);
     if (BENCH) {
+      // The repack topic in offset order: where the gc events sit.
+      const evs: { type: string; at: number; off: string }[] = [];
+      try {
+        for await (const e of adb.topic('git', 'repack').read()) {
+          evs.push({
+            type: decodeMsg(e.payload).type,
+            at: Number(e.hlc >> 16n),
+            off: Buffer.from(e.offset).toString('hex'),
+          });
+        }
+      } catch (e) {
+        console.log(`bench: reading the topic: ${(e as Error).message}`);
+      }
+      const back = evs.filter((x, i) => i > 0 && x.at + 2000 < evs[i - 1]!.at);
+      console.log(
+        [
+          `bench: topic ${evs.length} events, ${evs.filter((x) => x.type === 'gc').length} gc; ${back.length} sent 2 s or more before the event ahead of them`,
+          ...evs
+            .flatMap((x, i) => (x.type === 'gc' ? evs.slice(Math.max(0, i - 2), i + 3) : []))
+            .slice(0, 25)
+            .map((x) => `  ${x.off} ${x.type} ${x.at}`),
+        ].join('\n'),
+      );
       // One `git repack -a -d` of the same history, for the bytes.
       const full = sh(['count-objects', '-v'], l.dir);
       sh(['repack', '-a', '-d', '-q'], l.dir);
