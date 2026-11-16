@@ -299,6 +299,8 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     * **After the fix, four runs kept up:** at most 23–44 live packs, 129–131 repacks, the longest 1.0–2.8 s, the worker 188–230 MiB. STATS §5.8 has the figures.
   * **Negative controls,** each run once and restored (the sources diffed clean), each failing its test: (1) the live check removed: the two-repacks test (rewritten so the two runs differ, after the first fix made it pass through the files' commit); (2) the roll-up cover skipped: the cover test downloads them; (3) the `PackGone` retry removed: the stale sync; (4) no `repack` emit: the worker test times out; (5) `publish` without `update-server-info`: the dumb clone fails.
   * **CI:** the `client` job of 497f387 failed in `apps/echo/e2e/echo.spec.ts`: a port that `freePort()` picked was taken before the server bound it (two Playwright workers). Not this PR's code; one re-run passed; a proposed harness patch is in a PR comment, for its own PR. CI on c75b8a9 and 4fe1607 finished with no failed check.
+  * **`docs:` 3438c75:** STATS §5.8's repack bench, GIT.md's worker costs and troubleshooting, this log.
+  * **Verified here:** `npm run check`; `npx vitest run packages/git` 3× green (24 of 24 each, git 2.43); `packages/db` once (222 passed, 7 skipped); the bench as above. Next: CI green on both runs of the next head; then PR #88 waits on review and merge, and step 10.5 (`zen-git serve`) is planned on the user's word.
 
 ## Steps (one PR each; each planned in detail before it starts)
 
