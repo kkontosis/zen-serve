@@ -56,16 +56,28 @@ export const MIGRATIONS = {
     await m.createTable('refs', { pk: ['repo', 'ref'], pad: true });
     await m.createIndex('refs', 'by_repo', { fields: [['repo', 'text']] });
     await m.createTable('packs', { pk: ['repo', 'hash'], pad: true });
-    await m.createIndex('packs', 'by_repo', { fields: [['repo', 'text']] });
+    await m.createIndex('packs', 'live', {
+      fields: [
+        ['repo', 'text'],
+        ['state', 'text'],
+        ['seq', 'int'],
+      ],
+    });
   },
 };
 
+/** Options of `openGitDb` and `signIn`. */
+export interface GitDbOptions {
+  /** Run the scheduler (§9: the repack job's gc messages); default false. */
+  scheduler?: boolean;
+}
+
 /** Open the `git` database of an unlocked fs (§3): authenticated. */
-export function openGitDb(fs: UnlockedFs): Promise<Db> {
+export function openGitDb(fs: UnlockedFs, o: GitDbOptions = {}): Promise<Db> {
   return Db.open(fs, 'git', {
     locks: null,
     channel: null,
-    scheduler: false,
+    scheduler: o.scheduler ?? false,
     integrity: 'authenticated',
     schema: SCHEMA,
     migrations: MIGRATIONS,
@@ -78,7 +90,12 @@ export function openGitDb(fs: UnlockedFs): Promise<Db> {
  * checkpoints signed by its device), unlock the fs by its device slot, and
  * open the `git` database. Never prompts.
  */
-export async function signIn(server: string, fsId: number, v = openVault()): Promise<Opened> {
+export async function signIn(
+  server: string,
+  fsId: number,
+  v = openVault(),
+  o: GitDbOptions = {},
+): Promise<Opened> {
   const d = await v.vault.device();
   if (!d) {
     throw new GitError(
@@ -115,7 +132,7 @@ export async function signIn(server: string, fsId: number, v = openVault()): Pro
   }
   let db: Db;
   try {
-    db = await openGitDb(fs);
+    db = await openGitDb(fs, o);
   } catch (e) {
     await integrity.close().catch(() => {});
     fs.close();

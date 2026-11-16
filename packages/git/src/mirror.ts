@@ -1,6 +1,6 @@
 // The mirror (spec/git.md §5, §6): a bare repository synced from zen and
 // served by git's own upload-pack and receive-pack.
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import {
   appendFileSync,
   existsSync,
@@ -14,37 +14,12 @@ import {
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { bytes, type UnlockedFs } from '@zen/client';
-import { downloadPack, type RepoState } from './store.js';
+import { git } from './gitcmd.js';
+import type { Opened } from './signin.js';
+import { downloadPack, PackGone, type RepoState, readState } from './store.js';
 import { GitError, type RepoUrl } from './url.js';
 
-/** Git's variables for a helper or a hook; removed for git run on the mirror (§6). */
-const GIT_VARS =
-  /^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|PREFIX|COMMON_DIR|NAMESPACE|QUARANTINE_PATH)$/;
-
-/** `env` without git's repository variables. */
-export function cleanEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(env).filter(([k]) => !GIT_VARS.test(k)));
-}
-
-/** Run git with `env` (default: the clean one); returns stdout. */
-export function git(
-  args: string[],
-  opts: { input?: string | Buffer; env?: NodeJS.ProcessEnv; cwd?: string } = {},
-): string {
-  try {
-    return execFileSync('git', args, {
-      encoding: 'utf8',
-      maxBuffer: 1 << 28,
-      env: opts.env ?? cleanEnv(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-      ...(opts.input !== undefined ? { input: opts.input } : {}),
-      ...(opts.cwd ? { cwd: opts.cwd } : {}),
-    });
-  } catch (e) {
-    const err = (e as { stderr?: string }).stderr?.trim();
-    throw new GitError(`git ${args.slice(0, 3).join(' ')}: ${err || (e as Error).message}`);
-  }
-}
+export { cleanEnv, git } from './gitcmd.js';
 
 /** The mirror's path: `$XDG_CACHE_HOME/zen-git/<host>/<fs>/<repo>.git` (§6). */
 export function mirrorPath(u: RepoUrl, env: NodeJS.ProcessEnv = process.env): string {
@@ -127,6 +102,12 @@ export async function syncMirror(m: string, fs: UnlockedFs, state: RepoState): P
   mkdirSync(tmp, { recursive: true });
   for (const p of state.packs) {
     if (have.has(p.hash)) continue;
+    // A roll-up of packs the mirror has: their objects are here (§5 step 2).
+    if (p.of?.length && p.of.every((h) => have.has(h))) {
+      addImported(m, p.hash);
+      have.add(p.hash);
+      continue;
+    }
     const pack = join(tmp, `${p.hash}.pack`);
     const idx = join(tmp, `${p.hash}.idx`);
     try {
@@ -145,6 +126,7 @@ export async function syncMirror(m: string, fs: UnlockedFs, state: RepoState): P
       renameSync(pack, `${dst}.pack`);
       renameSync(idx, `${dst}.idx`);
       addImported(m, p.hash);
+      have.add(p.hash);
     } finally {
       rmSync(pack, { force: true });
       rmSync(idx, { force: true });
@@ -153,6 +135,31 @@ export async function syncMirror(m: string, fs: UnlockedFs, state: RepoState): P
   setRefs(m, state);
   const packs = readdirSync(join(m, 'objects', 'pack')).filter((f) => f.endsWith('.pack'));
   if (packs.length > LOCAL_REPACK) git(['--git-dir', m, 'repack', '-a', '-d', '-q']);
+}
+
+/**
+ * Read the state and sync the mirror to it (§5), creating the mirror if
+ * needed (`format` for a repo zen doesn't have yet). A pack gone meanwhile
+ * (a repack's gc) makes it read the state again, once.
+ */
+export async function syncRepo(
+  m: string,
+  z: Pick<Opened, 'db' | 'fs'>,
+  repo: string,
+  format: 'sha1' | 'sha256' = 'sha1',
+  /** Tests: the first state to sync to (one read earlier). */
+  first?: RepoState,
+): Promise<RepoState> {
+  for (let attempt = 0; ; attempt++) {
+    const state = attempt === 0 && first ? first : await readState(z.db, repo);
+    initMirror(m, state.repo?.format ?? format, state.repo?.tree);
+    try {
+      await syncMirror(m, z.fs, state);
+      return state;
+    } catch (e) {
+      if (!(e instanceof PackGone) || attempt > 0) throw e;
+    }
+  }
 }
 
 /** The mirror's refs set to zen's, and HEAD (§5 step 3). */

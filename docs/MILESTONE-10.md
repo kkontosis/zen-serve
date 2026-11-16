@@ -273,6 +273,34 @@ On the user's "go": a `spec:` commit if needed, then code and docs. Log the step
     2. Push, open the PR, and subscribe.
     3. Stop there: implementation starts on the user's next "go".
   * **Approved** (the user). This file copied to `docs/MILESTONE-10.md`; the plan committed, pushed, a new PR opened and subscribed. Next, on the user's "go": the `spec:` commit (item 1 of "Step 10.4 in detail"), then the code, the tests and the docs.
+  * Committed fec5631 and pushed. PR #87 is open and subscribed.
+    * **CI green on both runs of fec5631:** push 43765972554 and pull_request 43765994079.
+    * PR #87 is mergeable (clean).
+    * A safety-net check-in is set for 22:42 UTC (trig_01UvokdwekTzLSkSP32Z7Puf). Plan mode was on when CI finished, so it hasn't been cancelled.
+  * **Once plan mode ends:**
+    1. Cancel the 22:42 check-in, since CI is already green.
+    2. On the user's "go", start with the `spec:` commit, copying this file to `docs/MILESTONE-10.md` first.
+  * The 22:42 check-in was cancelled.
+  * **PR #87 merged** (the user, 22:03 UTC). It held only the plan, so step 10.4's implementation needs a new PR. The PR's subscription ended with the merge.
+  * **On the user's "go":**
+    1. Restart from main by fast-forward.
+    2. Copy this file to `docs/MILESTONE-10.md`.
+    3. Write the `spec:` commit.
+    4. Push, open a new PR, and subscribe.
+    5. Then the code, the tests and the docs, as "Step 10.4 in detail" says.
+  * **Go** (the user, after compacting). Restarted from main by fast-forward (e022f1c, PR #87's merge); this file copied to `docs/MILESTONE-10.md`.
+  * **`spec:` 9aa3a73** (git.md §3–§5, §9–§13, TD-GIT-SCOPE): one repack topic per fs, the geometric roll-up from the rolled-up packs alone, a push skipping known packs, a covered roll-up, `PackGone`, the scheduler's grant, §13's public mirror. Pushed; **PR #88** opened and subscribed.
+  * **`git:` fdad63e:** `zen-git worker`, `repack` and `publish`, `gitcmd.ts`, `publish.ts`, `worker.ts`; schema 1's `packs.of` and index `live`; the test world shared (`test/world.ts`); `repack.test.ts` (10 tests). **Found by the tests:** a purged node reads as an empty stream, not an error (the download now checks its byte count); `git repack` writes the dumb-HTTP files itself unless `-n` (so negative control 5 first passed; `publish` now passes `-n`).
+  * **The bench found a stall** (2,000 pushes in a row, a worker beside them): in about half the runs the live packs grew to 1,600–1,984, then one repack took 50–98 s. Traced over several runs (the consumer's lease, `next` and ack calls; each handler's start; the group's cursor; the topic's order):
+    1. The server was fine: `next` returns the first event after the cursor, and the cursor moves one event at a time.
+    2. The repack handler started again and again without finishing: zen-db's consumer reruns a handler that throws `conflict`, without reporting it.
+    3. The conflict: every writer of an authenticated database conflicts with every other on its NsRoot (zendb.md §14.5), and commits with tree operations serialize at the tree's header (fs.md §7). The repack's commit read each rolled-up row with a `get` of its own, so once behind by hundreds of packs it never landed between pushes.
+    * **Fixed** (`spec:` 28ea8d4 and 4fe1607, `git:` 497f387 and c75b8a9): a repack is short commits, each retried alone: the files with a `pending` row and its gc; one range read that makes the new pack live; the old rows marked replaced 16 per commit, each with its gc. The gc deletes 16 per commit. The worker also renews its lease every 3 s while it works (the client renews only between deliveries), and logs handler errors and retries under `ZEN_GIT_DEBUG` (8c632a8).
+    * **After the fix, four runs kept up:** at most 23–44 live packs, 129–131 repacks, the longest 1.0–2.8 s, the worker 188–230 MiB. STATS §5.8 has the figures.
+  * **Negative controls,** each run once and restored (the sources diffed clean), each failing its test: (1) the live check removed: the two-repacks test (rewritten so the two runs differ, after the first fix made it pass through the files' commit); (2) the roll-up cover skipped: the cover test downloads them; (3) the `PackGone` retry removed: the stale sync; (4) no `repack` emit: the worker test times out; (5) `publish` without `update-server-info`: the dumb clone fails.
+  * **CI:** the `client` job of 497f387 failed in `apps/echo/e2e/echo.spec.ts`: a port that `freePort()` picked was taken before the server bound it (two Playwright workers). Not this PR's code; one re-run passed; a proposed harness patch is in a PR comment, for its own PR. CI on c75b8a9 and 4fe1607 finished with no failed check.
+  * **`docs:` 3438c75:** STATS §5.8's repack bench, GIT.md's worker costs and troubleshooting, this log.
+  * **Verified here:** `npm run check`; `npx vitest run packages/git` 3× green (24 of 24 each, git 2.43); `packages/db` once (222 passed, 7 skipped); the bench as above. Next: CI green on both runs of the next head; then PR #88 waits on review and merge, and step 10.5 (`zen-git serve`) is planned on the user's word.
 
 ## Steps (one PR each; each planned in detail before it starts)
 

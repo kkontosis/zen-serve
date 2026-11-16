@@ -1,209 +1,48 @@
-// git over zen-serve with real git (spec/git.md): git-remote-zen and
-// zen-git, bundled (packages/git/dist), on each member's PATH, each member
-// with a vault, a cache (its mirrors) and a git config of their own.
-import { execFile, execFileSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+// git over zen-serve with real git (spec/git.md §1–§8, §10, §12): the
+// helper's round trips, concurrency, features, rights and memory.
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { bytes } from '@zen/client';
 import type { Db } from '@zen/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ROOT_DIR, startWorld, until, type World } from '../../../apps/shared/harness.js';
-import { signInWorker, type WorkerContext } from '../../../apps/shared/node.js';
+import { until, type World } from '../../../apps/shared/harness.js';
+import { signInWorker } from '../../../apps/shared/node.js';
 import { testUser } from '../../client/src/testing/index.js';
-import { setupGrants } from '../src/setup.js';
-import { MIGRATIONS, SCHEMA } from '../src/signin.js';
 import { PUSH_EVENT, pushesTopic, readState } from '../src/store.js';
+import { GitWorld } from './world.js';
 
-const DIST = join(ROOT_DIR, 'packages/git/dist');
 const USERS = ['alice', 'bob', 'carol', 'ci'];
 /** carol reads only; ci reads only (a CI consumer). */
 const READ_ONLY = [{ rights: ['read' as const] }];
 
+let t: GitWorld;
 let w: World;
-let dir: string;
-let url: (repo: string) => string;
-/** The test's own view of the `git` database, as ci (read). */
-let ci: WorkerContext;
 let db: Db;
-/** RSS lines written by every Node process the members run (`rss.mjs`). */
 let rssLog: string;
 
-interface Member {
-  name: string;
-  home: string;
-  env: NodeJS.ProcessEnv;
-}
-const members = new Map<string, Member>();
-
-function member(name: string): Member {
-  const m = members.get(name);
-  if (!m) throw new Error(`no member ${name}`);
-  return m;
-}
-
 beforeAll(async () => {
-  w = await startWorld({ users: USERS, grantsOf: { carol: READ_ONLY, ci: READ_ONLY } });
-  dir = await mkdtemp(join(tmpdir(), 'zen-git-'));
-  const port = new URL(w.url).port;
-  url = (repo) => `zen+http://localhost:${port}/1/${repo}`;
-  // The fs gets a device keyslot per member (git.md §1), and the topic grants (§10).
-  const ufs = await w.admin.fs(1).unlock({ passphrase: w.passphrase });
-  for (const [i] of USERS.entries()) await ufs.addDevice(testUser(i + 2).device.devicePublic);
-  await setupGrants(w.admin, testUser(1).identity, 1, ufs.topic('git').id);
-  ufs.close();
-  // git-remote-zen on PATH, as npm would link it.
-  const bin = join(dir, 'bin');
-  mkdirSync(bin);
-  for (const name of ['git-remote-zen', 'git-remote-zen+http']) {
-    symlinkSync(join(DIST, 'git-remote-zen.mjs'), join(bin, name));
-  }
-  rssLog = join(dir, 'rss.log');
-  const rss = join(dir, 'rss.mjs');
-  writeFileSync(
-    rss,
-    [
-      "import { appendFileSync } from 'node:fs';",
-      "import { basename } from 'node:path';",
-      "process.on('exit', () => {",
-      "  const [, script = '', arg = ''] = process.argv;",
-      `  appendFileSync(${JSON.stringify(rssLog)}, \`\${basename(script)} \${arg} \${Math.round(performance.now())} \${process.resourceUsage().maxRSS}\\n\`);`,
-      '});',
-      '',
-    ].join('\n'),
-  );
-  const base = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.startsWith('ZEN_') && !k.startsWith('GIT_')),
-  );
-  for (const name of USERS) {
-    const home = join(dir, name);
-    mkdirSync(home);
-    const gitconfig = join(home, 'gitconfig');
-    writeFileSync(
-      gitconfig,
-      `[user]\n\tname = ${name}\n\temail = ${name}@zen.test\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n`,
-    );
-    const env: NodeJS.ProcessEnv = {
-      ...base,
-      HOME: home,
-      PATH: `${bin}:${process.env.PATH}`,
-      ZEN_GIT_VAULT: join(home, 'vault'),
-      XDG_CACHE_HOME: join(home, 'cache'),
-      XDG_CONFIG_HOME: join(home, 'config'),
-      GIT_CONFIG_GLOBAL: gitconfig,
-      GIT_CONFIG_NOSYSTEM: '1',
-      NODE_OPTIONS: `--import=${rss}`,
-    };
-    members.set(name, { name, home, env });
-    execFileSync(
-      process.execPath,
-      [
-        join(DIST, 'zen-git.mjs'),
-        'login',
-        '--server',
-        w.origin,
-        '--device',
-        w.user(name).deviceFile,
-      ],
-      { env },
-    );
-  }
-  // A writer creates the database (alice); the test then reads it as ci.
-  const opts = {
-    integrity: 'authenticated' as const,
-    schema: SCHEMA,
-    migrations: MIGRATIONS,
-    scheduler: false,
-    warn: () => {},
-  };
-  const first = await signInWorker({
-    url: w.url,
-    origin: w.origin,
-    device: w.user('alice').deviceFile,
-    passphrase: w.passphrase,
-    integrity: true,
+  t = await GitWorld.start({
+    users: USERS,
+    grantsOf: { carol: READ_ONLY, ci: READ_ONLY },
+    writer: 'alice',
+    reader: 'ci',
   });
-  await first.open('git', opts);
-  await first.close();
-  ci = await signInWorker({
-    url: w.url,
-    origin: w.origin,
-    device: w.user('ci').deviceFile,
-    passphrase: w.passphrase,
-    integrity: true,
-  });
-  db = await ci.open('git', opts);
+  ({ w, db, rssLog } = t);
 }, 180_000);
 
 afterAll(async () => {
-  await ci?.close();
-  await w?.stop();
-  if (dir) await rm(dir, { recursive: true, force: true });
+  await t?.stop();
 });
 
-interface Run {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-/** Run git as `who` in `cwd` (relative to their home). */
-function run(who: string, args: string[], cwd = '.', env: NodeJS.ProcessEnv = {}): Promise<Run> {
-  const m = member(who);
-  return new Promise((ok) => {
-    execFile(
-      'git',
-      args,
-      { cwd: join(m.home, cwd), env: { ...m.env, ...env }, maxBuffer: 1 << 26 },
-      (e, stdout, stderr) => {
-        ok({ code: e ? ((e as { code?: number }).code ?? 1) : 0, stdout, stderr });
-      },
-    );
-  });
-}
-
-/** git that must succeed: its stdout. */
-async function g(who: string, args: string[], cwd = '.', env: NodeJS.ProcessEnv = {}) {
-  const r = await run(who, args, cwd, env);
-  if (r.code !== 0)
-    throw new Error(`git ${args.join(' ')} (${who}) exited ${r.code}:\n${r.stderr}`);
-  return r.stdout.trim();
-}
-
-/** git that must fail: its stderr. */
-async function refused(who: string, args: string[], cwd = '.') {
-  const r = await run(who, args, cwd);
-  if (r.code === 0) throw new Error(`git ${args.join(' ')} (${who}) succeeded:\n${r.stderr}`);
-  return r.stderr;
-}
-
-/** A new commit in `repo` (a work tree under `who`'s home). */
-async function commit(who: string, repo: string, msg: string, file = 'f'): Promise<string> {
-  const p = join(member(who).home, repo, file);
-  writeFileSync(p, `${msg}\n`, { flag: 'a' });
-  await g(who, ['add', file], repo);
-  await g(who, ['commit', '-q', '-m', msg], repo);
-  return g(who, ['rev-parse', 'HEAD'], repo);
-}
-
-/** A local repo with `n` commits on main. */
-async function newRepo(who: string, name: string, n = 3, format = 'sha1'): Promise<void> {
-  await g(who, ['init', '-q', `--object-format=${format}`, name]);
-  for (let i = 1; i <= n; i++) await commit(who, name, `${name} c${i}`);
-}
-
-/** zen's refs of a repo, read by the test (ci). */
-async function zenRefs(repo: string): Promise<Record<string, string>> {
-  return Object.fromEntries((await readState(db, repo)).refs);
-}
-
-/** The mirror of a repo in `who`'s cache. */
-function mirrorOf(who: string, repo: string): string {
-  const hosts = join(member(who).home, 'cache', 'zen-git');
-  const [host] = readdirSync(hosts);
-  return join(hosts, host!, '1', `${repo}.git`);
-}
+const url = (repo: string) => t.url(repo);
+const member = (name: string) => t.member(name);
+const run = (...a: Parameters<GitWorld['run']>) => t.run(...a);
+const g = (...a: Parameters<GitWorld['g']>) => t.g(...a);
+const refused = (...a: Parameters<GitWorld['refused']>) => t.refused(...a);
+const commit = (...a: Parameters<GitWorld['commit']>) => t.commit(...a);
+const newRepo = (...a: Parameters<GitWorld['newRepo']>) => t.newRepo(...a);
+const zenRefs = (repo: string) => t.zenRefs(repo);
+const mirrorOf = (who: string, repo: string) => t.mirrorOf(who, repo);
 
 describe('round trips', () => {
   it('a first push creates the repo; a clone gets it back, tags and HEAD', async () => {

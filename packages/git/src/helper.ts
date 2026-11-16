@@ -5,15 +5,13 @@ import { fileURLToPath } from 'node:url';
 import {
   cleanEnv,
   git,
-  initMirror,
   lockMirror,
   mirrorPath,
   runService,
   settlePushed,
-  syncMirror,
+  syncRepo,
 } from './mirror.js';
 import { signIn } from './signin.js';
-import { readState } from './store.js';
 import { GitError, parseRepoUrl, type RepoUrl } from './url.js';
 
 /** Read one line from fd 0, a byte at a time: nothing past it is consumed (§7). */
@@ -73,12 +71,10 @@ async function connect(u: RepoUrl, service: 'upload-pack' | 'receive-pack'): Pro
   try {
     const z = await signIn(u.server, u.fs);
     try {
-      const state = await readState(z.db, u.repo);
+      const state = await syncRepo(m, z, u.repo, localFormat());
       if (!state.repo && service === 'upload-pack') {
         throw new GitError(`${u.url}: no such repo (a first push creates it)`);
       }
-      initMirror(m, state.repo?.format ?? localFormat(), state.repo?.tree);
-      await syncMirror(m, z.fs, state);
     } finally {
       await z.close();
     }
