@@ -468,7 +468,7 @@ export async function repack(
     // gc is scheduled now, so a job that stops before the rows' commit
     // leaves nothing for good. Tree operations serialize at the tree's
     // header (fs.md §7), so this commit is kept short and retried alone.
-    const filed = await filesCommit(db, o.onRetry, async (tx) => {
+    const filed = await retried(db, o.onRetry, async (tx) => {
       const packs = tx.table<PackRow>('packs');
       const have = await packs.get([repo, hash]);
       if (have) return have.state !== 'pending';
@@ -489,44 +489,62 @@ export async function repack(
       return true;
     });
     if (!filed) return { ok: false, why: 'the packs changed' };
-    // 6. The rows' commit, with no tree operations: pushes don't conflict with it.
-    return await db.transaction(async (tx): Promise<RepackResult> => {
+    // 6. The new pack made live, if every rolled-up pack still is: one range
+    // read and one row. Every writer of an authenticated database conflicts
+    // with every other on its NsRoot (zendb.md §14.5), so each commit here is
+    // short enough to land between pushes.
+    const live = await retried(db, o.onRetry, async (tx) => {
+      const now = new Set((await livePacks(tx, repo)).map((p) => p.hash));
+      if (!rolled.every((p) => now.has(p.hash))) return false;
       const packs = tx.table<PackRow>('packs');
-      const rows: PackRow[] = [];
-      for (const p of rolled) {
-        const cur = await packs.get([repo, p.hash]);
-        if (cur?.state !== 'live') return { ok: false, why: 'the packs changed' };
-        rows.push(cur);
-      }
-      const now = Date.now();
-      for (const row of rows) {
-        await packs.put({ ...row, state: 'replaced', replaced_ms: now, by: hash });
-      }
       const mine = await packs.get([repo, hash]);
       if (mine?.state === 'pending') await packs.put({ ...mine, state: 'live' });
-      await tx.schedule(repackTopic(db), GC_EVENT, gcOf(rows.map((x) => x.hash)), {
-        delayMs: grace,
-      });
-      return {
-        ok: true,
-        rolled: rows.length,
-        hash,
-        size,
-        left: state.packs.length - rows.length + 1,
-      };
+      return true;
     });
+    if (!live) return { ok: false, why: 'the packs changed' };
+    // 7. The rolled-up packs marked replaced, a few per commit, each commit
+    // scheduling their gc. Until a batch lands, its packs and the new one are
+    // both live: the same objects twice, which readers take.
+    const at = Date.now();
+    for (let i = 0; i < rolled.length; i += BATCH) {
+      const part = rolled.slice(i, i + BATCH);
+      await retried(db, o.onRetry, async (tx) => {
+        const packs = tx.table<PackRow>('packs');
+        const done: string[] = [];
+        for (const p of part) {
+          const cur = await packs.get([repo, p.hash]);
+          if (cur?.state !== 'live') continue;
+          await packs.put({ ...cur, state: 'replaced', replaced_ms: at, by: hash });
+          done.push(p.hash);
+        }
+        if (done.length) {
+          await tx.schedule(repackTopic(db), GC_EVENT, gcOf(done), { delayMs: grace });
+        }
+      });
+    }
+    return {
+      ok: true,
+      rolled: rolled.length,
+      hash,
+      size,
+      left: state.packs.length - rolled.length + 1,
+    };
   } finally {
     for (const u of ups) if (u.session) await tree.closeUpload(u.session).catch(() => {});
     rmSync(tmp, { recursive: true, force: true });
   }
 }
 
+/** Rows per commit when a repack marks packs replaced, and when a gc deletes them. */
+const BATCH = 16;
+
 /**
- * Run a short commit with tree operations, retrying a conflict apart from
- * the slow work before it: the tree's header serializes every commit that
- * touches the tree, pushes included (fs.md §7).
+ * Run a short commit, retrying a conflict apart from the slow work before
+ * it: every writer of the authenticated `git` database conflicts with every
+ * other on its NsRoot (zendb.md §14.5), and commits with tree operations
+ * also serialize at the tree's header (fs.md §7), pushes included.
  */
-async function filesCommit<T>(
+async function retried<T>(
   db: Db,
   onRetry: ((e: unknown) => void) | undefined,
   fn: (tx: DbTransaction) => Promise<T>,
@@ -559,18 +577,23 @@ export async function collect(db: Db, fs: UnlockedFs, body: Value): Promise<numb
   const r = await db.table<RepoRow>('repos').get(repo);
   if (!r) return 0;
   const tree = fs.tree(r.tree);
-  return db.transaction(async (tx) => {
-    const packs = tx.table<PackRow>('packs');
-    const b = tree.batch();
-    let n = 0;
-    for (const h of hashes) {
-      const row = await packs.get([repo, h]);
-      if (row?.state !== 'replaced' && row?.state !== 'pending') continue;
-      for (const node of row.nodes) b.remove(node);
-      await packs.delete([repo, h]);
-      n++;
-    }
-    if (n) await tx.fs(tree).ops([...b.ops]);
-    return n;
-  });
+  let n = 0;
+  for (let i = 0; i < hashes.length; i += BATCH) {
+    const part = hashes.slice(i, i + BATCH);
+    n += await retried(db, undefined, async (tx) => {
+      const packs = tx.table<PackRow>('packs');
+      const b = tree.batch();
+      let k = 0;
+      for (const h of part) {
+        const row = await packs.get([repo, h]);
+        if (row?.state !== 'replaced' && row?.state !== 'pending') continue;
+        for (const node of row.nodes) b.remove(node);
+        await packs.delete([repo, h]);
+        k++;
+      }
+      if (k) await tx.fs(tree).ops([...b.ops]);
+      return k;
+    });
+  }
+  return n;
 }
