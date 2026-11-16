@@ -108,6 +108,7 @@ These are measured in [STATS.md](STATS.md) §5.8.
 * Each git command that reaches zen starts the helper (Node with the client's wasm, about 90–120 MB peak).
 * A push also starts the hook, a second process of the same size. Its sign-in resumes the vault's session, so the server signs no new challenge.
 * This repository's history (584 commits, 3.5 MB packed) pushes in about 1.8 s and clones in about 1.1 s. A plain `git clone` of it from a local bare repo takes 0.33 s.
+* **The worker** keeps up with a push every 100 ms: about one repack per 16 pushes, each under a second or so, at 190–230 MiB peak. The live packs stay within 1.15× of one full `git repack -a -d`.
 
 ## 7. Not supported
 
@@ -127,4 +128,4 @@ These are git.md §12 and TECH_DEBT TD-GIT-SCOPE:
 * **`zen: push refused: forbidden …`:** the fs has no `write` for this member, or `zen-git setup` hasn't been run for the topic.
 * **`zen: pack … has gone (repacked)`:** a sync listed packs that a repack's gc then deleted, twice in a row. Run the command again.
 * **The live packs keep growing:** no worker runs for the fs (§4), or its member lacks the scheduler's grant (run `zen-git setup` again).
-* **`ZEN_GIT_DEBUG=1`** prints the stack of an unexpected error.
+* **`ZEN_GIT_DEBUG=1`** prints the stack of an unexpected error. For the worker it also logs each failed repack attempt and each retried commit.

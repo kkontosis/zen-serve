@@ -337,6 +337,24 @@ The synthetic test, run on every CI build (300 commits, 900 objects, a 134 KB pa
 * **Node with the client's wasm is most of the memory** (about 90 MB; the spike's helper, without the client, peaked at 47–58 MB). The packs stream to and from files, so memory grows little with the repo. A clone of this repository adds about 25 MB over the synthetic one.
 * **The hook's second sign-in resumes the vault's session.** The helper stored the session, so the hook makes no device signature and the server no challenge. The hook's cost is Node's start, the wasm, unlocking the fs and attaching integrity again.
 
+**Repacking** (milestone 10 step 4: `packages/git/test/repack.test.ts`, opt-in with `ZEN_GIT_BENCH_PUSHES=2000`). The setup:
+* 2,000 pushes in a row through `store.push` (each pack cut by `git pack-objects` from a local repo: one commit each, 7,000 to 8,000 objects in all), with a `zen-git worker --grace 3s` running as another process
+* the debug server (its trash purged after 3 s, so gc'd packs are really gone), git 2.43, 4 cores
+
+Four runs:
+
+| | Measured |
+|---|---|
+| A push, in process, with its pack cut | 99–110 ms |
+| Repacks | 129–131, about one per 16 pushes; 58–64 s in all |
+| One repack (16 small packs → 1: download, build, upload, the commits) | 0.4–0.6 s typically; the longest 1.0–2.8 s |
+| Live packs, at most (polled every 10 pushes) | 23–44; `readState` 6–45 ms |
+| The live packs' bytes at the end, against one `git repack -a -d` of the same history (0.8 MB) | 1.10–1.15× |
+| The worker's peak RSS | 188–230 MiB |
+
+* **The first repack stalled** in about half the runs: the live packs grew to 1,600–1,984, one repack then took 50–98 s, and the worker peaked at up to 600 MB. Every writer of the authenticated `git` database conflicts with every other on its NsRoot (zendb.md §14.5), and that repack marked every rolled-up row in one commit, reading each row with a request of its own. A repack behind by hundreds of packs never landed between pushes, and zen-db's consumer reran it on each conflict without reporting it. A repack is now a few short commits (git.md §9), and the four runs above never fell behind. One logged a single conflict, retried at once.
+* **Geometric roll-ups cost little:** each repack rewrites about the bytes pushed since the last one, so the live packs stay near the size of one full repack.
+
 ## 6. Integrity: what it costs
 
 Integrity (docs/INTEGRITY.md) costs signatures, round trips and bytes. Where each is measured:
